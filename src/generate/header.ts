@@ -1,8 +1,10 @@
 /**
  * The notice at the top of every generated file. It names the policy files the
- * file comes from, so a reader knows where to make a change. It holds no
- * timestamp or version: a fresh build must be byte-identical to the deployed
- * one, which is how Task 6's audit detects drift.
+ * file comes from, so a reader knows where to make a change. YAML, env and
+ * Squid files carry it as `#` comments; JSON has no comments, so a JSON file
+ * carries it as a `$comment` string, its first key. It holds no timestamp or
+ * version: a fresh build must be byte-identical to the deployed one, which is
+ * how Task 6's audit detects drift.
  */
 
 /** Word-wrap one line of text to `width` columns. A word longer than that gets a line of its own. */

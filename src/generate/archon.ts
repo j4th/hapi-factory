@@ -12,7 +12,7 @@
  *   off, and the Pi worker settings (spec §9.2, §9.3).
  */
 import YAML from "yaml";
-import type { ModelSpec, Policy, Role, RosterName, Tier } from "../policy/types";
+import { type ModelSpec, type Policy, ROLES, type RosterName, type Tier } from "../policy/types";
 import { hashComment, notice, wrap } from "./header";
 
 /**
@@ -24,8 +24,8 @@ export const PI_AGENT_DIR = "/opt/hapi/pi-agent";
 
 const TIERS: Tier[] = ["small", "medium", "large"];
 
-/** The roles that run inside Archon. hermes_main and hermes_auxiliary run in Hermes (./hermes.ts). */
-const ARCHON_ROLES: Role[] = ["planner", "implement", "review", "scout", "router", "eval_judge"];
+/** The roles that run inside Archon: every role but hermes_*, which run in Hermes (./hermes.ts). */
+const ARCHON_ROLES = ROLES.filter((role) => !role.startsWith("hermes_"));
 
 /** An Archon tier or alias preset: the roster entry without `retry_effort`. */
 function preset(spec: ModelSpec, effort = spec.effort): { provider: string; model: string; effort: string } {

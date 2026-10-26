@@ -7,11 +7,13 @@
  * policy/schemas/policy-defs.schema.json. The schemas use it (as `nonForgeHost`)
  * for a work order's `egress_extra` and for the archon zone's hosts and tiers,
  * so any JSON Schema validator enforces it, Python ones included. This module
- * reads the same pattern, for `applyOverlay` and for error messages.
+ * reads the same pattern, for `applyOverlay`, the egress generator and error
+ * messages, and the schema's `hostname` pattern for `isHostname`.
  */
 import defs from "../../policy/schemas/policy-defs.schema.json";
 
 const FORGE_HOST = new RegExp(defs.$defs.forgeHost.pattern, "u");
+const HOSTNAME = new RegExp(defs.$defs.hostname.pattern, "u");
 
 /**
  * The forge domains, read from the pattern's final group "(a\.com|b\.org)$". A host
@@ -22,12 +24,22 @@ export const FORGE_DOMAINS: readonly string[] = Object.freeze(
 );
 
 /**
- * The forge domain a host belongs to, or undefined if it isn't a forge host.
- * `host` is a plain lowercase domain (the schema's `hostname`), e.g.
- * forgeDomain("raw.githubusercontent.com") === "githubusercontent.com".
+ * The forge domain a host belongs to, or undefined if it isn't a forge host,
+ * e.g. forgeDomain("raw.githubusercontent.com") === "githubusercontent.com".
+ * Case is ignored, as Squid ignores it when it matches a domain, so
+ * "GitHub.com" is a forge host too; the result is lowercase.
  */
 export function forgeDomain(host: string): string | undefined {
-  return FORGE_HOST.exec(host)?.[1];
+  return FORGE_HOST.exec(host.toLowerCase())?.[1];
+}
+
+/**
+ * Whether `host` is a plain, lowercase domain name with at least two labels:
+ * the schema's `hostname`, read from the same pattern. No scheme, port, path,
+ * wildcard, leading or trailing dot, whitespace or IP address.
+ */
+export function isHostname(host: string): boolean {
+  return HOSTNAME.test(host);
 }
 
 /** The message for a forge host where the archon zone could reach it. */

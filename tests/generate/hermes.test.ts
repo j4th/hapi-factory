@@ -60,6 +60,24 @@ test("the Hermes main model is the anthropic roster's hermes_main tier", () => {
   expect(c.agent.reasoning_effort).toBe("low");
 });
 
+test("a claude-provider tier's Anthropic model id passes through to Hermes", () => {
+  // The anthropic roster's medium tier is {provider: claude, model: claude-sonnet-5-5, effort: medium}.
+  const c = config({ ...p, roles: { ...p.roles, hermes_main: "medium", hermes_auxiliary: "medium" } });
+  expect(c.model).toEqual({ provider: "anthropic", default: "claude-sonnet-5-5" });
+  expect(c.agent.reasoning_effort).toBe("medium");
+  expect(c.auxiliary.compression).toEqual({ provider: "anthropic", model: "claude-sonnet-5-5" });
+});
+
+test("Hermes refuses a hermes_* tier that maps to a model of another vendor: it runs on the anthropic provider", () => {
+  const openrouter = { provider: "pi" as const, model: "openrouter/qwen/qwen3-coder", effort: "low" as const };
+  for (const [role, tier] of [["hermes_main", "large"], ["hermes_auxiliary", "small"]] as const) {
+    const anthropic = { ...p.rosters.anthropic, [tier]: openrouter };
+    expect(() => emitHermes({ ...p, rosters: { ...p.rosters, anthropic } })).toThrow(
+      `Hermes runs on the anthropic provider, but ${role} maps to "openrouter/qwen/qwen3-coder" in the anthropic roster`,
+    );
+  }
+});
+
 test("hermes emits no hooks and never turns approvals off", () => {
   const c = config();
   // Plan 01 has no hapi-cmd-allow script yet; a fail_closed hook pointing at a missing script

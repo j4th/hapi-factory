@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import YAML from "yaml";
 import { emitArchon, PI_AGENT_DIR } from "../../src/generate/archon";
 import { loadPolicy } from "../../src/policy/load";
-import type { Tier } from "../../src/policy/types";
+import { ROLES, type Tier } from "../../src/policy/types";
 
 const p = loadPolicy("policy");
 const TIERS: Tier[] = ["small", "medium", "large"];
@@ -67,6 +67,16 @@ test("archon aliases name each Archon role's tier, with a retry alias at the tie
     "@router": { provider: "pi", model: "anthropic/claude-haiku-5-5", effort: "low" },
     "@scout": { provider: "pi", model: "anthropic/claude-haiku-5-5", effort: "low" },
   });
+});
+
+test("every role but Hermes's gets an alias, so a role added to ROLES can't be left without one", () => {
+  const c = config(p);
+  const archonRoles = ROLES.filter((r) => !r.startsWith("hermes_"));
+  expect(archonRoles.length).toBeGreaterThan(0);
+  // Every role roles.yaml defines is in ROLES, and the base aliases are exactly the non-Hermes roles.
+  expect(Object.keys(p.roles).sort()).toEqual([...ROLES].sort());
+  const base = Object.keys(c.aliases).filter((a) => !a.endsWith("-retry"));
+  expect(base.sort()).toEqual(archonRoles.map((r) => `@${r.replaceAll("_", "-")}`).sort());
 });
 
 test("a role moved to another tier moves its alias", () => {

@@ -186,7 +186,7 @@ The patterns are a second line of defense: no positional pattern accepts `$`, a 
 | `archon` | T0–T1 | `api.anthropic.com`, `openrouter.ai`, `opencode.ai`, `registry.npmjs.org`, `pypi.org`, `files.pythonhosted.org` | Archon and its Pi workers. **No forge host**: the Archon zone has no route to GitHub (spec §4.3). |
 | `research` | T0–T3 | None | `openWeb: true`. Only hapi-research touches the open web. Private address ranges stay blocked. |
 
-A zone's allowlist is its own `hosts` **plus** the hosts of every tier it lists (`zoneHosts` in `src/policy/zones.ts` computes it; the egress generator uses it). Hosts are plain, lowercase domains with at least two labels: no scheme, port, path, wildcard or leading dot, and no IP addresses. The egress generator allows each domain and its subdomains, so `slack.com` also covers `wss-primary.slack.com`.
+A zone's allowlist is its own `hosts` **plus** the hosts of every tier it lists (`zoneHosts` in `src/policy/zones.ts` computes it; the egress generator uses it). Hosts are plain, lowercase domains with at least two labels: no scheme, port, path, wildcard or leading dot, and no IP addresses. The egress generator allows each domain and its subdomains, so `slack.com` also covers `wss-primary.slack.com`. It checks every host again before writing it, for a policy built in code ([generated configs](generated-configs.md#buildegresssquidconf)).
 
 The schema enforces spec §10's tier entitlements: the `hermes` zone may list only T0–T2, the `archon` zone only T0–T1, and only the `research` zone may set `openWeb`.
 
@@ -413,11 +413,12 @@ Later plans build on these functions:
 | `applyOverlay(p, o): Policy` | `src/policy/overlay.ts` | Tighten-only merge. Throws `PolicyLoosenError { path, message }`. The result's `repo` holds the overlay's `default_risk` and `workflow`. |
 | `matchCommand(rules, argv): {allowed, rule?, reason}` | `src/policy/commands.ts` | Whether `commands.yaml`'s `hermes.allow` rules allow an argv ([how a rule matches](#how-a-rule-matches)) |
 | `commandRuleIssues(rules): Issue[]` | `src/policy/commands.ts` | The command patterns that don't compile. `loadPolicy` runs it. |
-| `forgeDomain(host): string \| undefined` | `src/policy/hosts.ts` | The forge domain a host belongs to, e.g. `raw.githubusercontent.com` → `githubusercontent.com`. `FORGE_DOMAINS` lists them. |
+| `forgeDomain(host): string \| undefined` | `src/policy/hosts.ts` | The forge domain a host belongs to, e.g. `raw.githubusercontent.com` → `githubusercontent.com`. Case is ignored, as Squid ignores it, so `GitHub.com` → `github.com`. `FORGE_DOMAINS` lists them. |
+| `isHostname(host): boolean` | `src/policy/hosts.ts` | Whether a host is a plain, lowercase domain name: the schema's `hostname` pattern. The egress generator checks every host with it before writing `squid.conf`. |
 | `effectiveModes(p, path): PathModes` | `src/policy/paths.ts` | A file's modes: the strictest across every matching glob ([how globs combine](#how-globs-combine)). Every guard and generator uses it, or the same rule. Throws on a path outside the repo, or one with NUL, a control character or a backslash. |
 | `globMatches(glob, path): boolean` | `src/policy/paths.ts` | Whether one glob matches an already-normalized repo path |
 | `zoneHosts(p, zone): string[]` | `src/policy/zones.ts` | A zone's allowlist: its own hosts plus its tiers' hosts, sorted and de-duplicated. A zone with `openWeb` also reaches any public host, which this list doesn't say. |
 | `validateWorkOrder(obj): WorkOrder` | `src/workorder/validate.ts` | Validates a parsed work order. Throws `WorkOrderError { path, message, issues }`. |
 | `loadWorkOrder(file): WorkOrder` | `src/workorder/validate.ts` | Reads, parses and validates a work-order file |
 
-The types (`Policy`, `Mode`, `Tier`, `Roster`, `ZoneName` and the rest) are in `src/policy/types.ts`; `WorkOrder` is in `src/workorder/validate.ts`. Schema compilation and error formatting are in `src/policy/schema.ts`.
+The types (`Policy`, `Mode`, `Tier`, `Roster`, `ZoneName` and the rest) are in `src/policy/types.ts`, with `ROLES`, the list of every role that the `Role` type comes from; `WorkOrder` is in `src/workorder/validate.ts`. Schema compilation and error formatting are in `src/policy/schema.ts`.

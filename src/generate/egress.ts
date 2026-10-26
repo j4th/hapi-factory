@@ -14,10 +14,15 @@
  *
  * An allowlisted zone (hermes, archon) allows only HTTPS tunnels to its
  * allowlist (`zoneHosts`, src/policy/zones.ts): each domain and its subdomains,
- * as a Squid dstdomain with a leading dot. The research zone (`openWeb`) allows
- * any public host: HTTPS tunnels to 443 and plain HTTP to 80.
+ * as a Squid dstdomain with a leading dot, matched by name only. An IP-address
+ * destination is refused. The research zone (`openWeb`) allows any public host:
+ * HTTPS tunnels to 443 and http:// requests to 80.
+ *
+ * Hosts and tier names are pasted into squid.conf, so the emitter checks every
+ * one first (`checkedHosts`): it is the last gate before the network boundary.
  */
-import { forgeDomain, forgeHostMessage } from "../policy/hosts";
+import defs from "../../policy/schemas/policy-defs.schema.json";
+import { forgeDomain, forgeHostMessage, isHostname } from "../policy/hosts";
 import type { Policy, ZoneName } from "../policy/types";
 import { zoneHosts } from "../policy/zones";
 import { hashComment, notice, wrap } from "./header";
@@ -36,7 +41,14 @@ const ABOUT: Record<ZoneName, string> = {
 /** Clients allowed to use a proxy: the private container networks, and the proxy's own loopback. */
 const CLIENT_RANGES = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7", "fe80::/10", "127.0.0.0/8", "::1"];
 
-/** Destinations no zone may reach, whatever a name resolves to. */
+/**
+ * Destinations no zone may reach, whatever a name resolves to.
+ *
+ * IPv4-mapped IPv6 (::ffff:0:0/96) has no entry of its own: Squid holds every
+ * IPv4 address in that form, so each IPv4 range below also covers its mapped
+ * form, and an ::ffff:0:0/96 entry would match every IPv4 address and refuse
+ * all IPv4 egress (checked with Squid 7.6).
+ */
 const PRIVATE_RANGES: [range: string, what: string][] = [
   ["0.0.0.0/8", "this network"],
   ["10.0.0.0/8", "private"],
@@ -49,7 +61,10 @@ const PRIVATE_RANGES: [range: string, what: string][] = [
   ["198.18.0.0/15", "benchmarking"],
   ["224.0.0.0/4", "multicast"],
   ["240.0.0.0/4", "reserved, and broadcast"],
+  ["::/128", "unspecified: on Linux, connecting to it reaches the local host"],
   ["::1", "loopback"],
+  ["64:ff9b::/96", "NAT64 well-known prefix: a translator maps it onto IPv4"],
+  ["64:ff9b:1::/48", "NAT64 local-use prefix (RFC 8215)"],
   ["fc00::/7", "unique local"],
   ["fe80::/10", "link-local"],
   ["ff00::/8", "multicast"],
@@ -67,22 +82,44 @@ function dstdomains(hosts: string[]): string[] {
   return hosts.filter((h) => !covered(h)).map((h) => `.${h}`);
 }
 
-/** Refuse a policy that breaks a zone rule the schema also enforces: a policy built in code skips the schema. */
-function checkZone(p: Policy, zone: ZoneName, hosts: string[]): void {
-  if (p.trustedSources.zones[zone].openWeb && zone !== "research") {
+/** The source tiers (the schema's `sourceTier`). */
+const SOURCE_TIERS: readonly string[] = defs.$defs.sourceTier.enum;
+
+/**
+ * The zone's allowlist, checked: lowercased, sorted and de-duplicated. A policy
+ * built in code skips the schema, so this refuses what the schema would:
+ * - `openWeb` on any zone but research;
+ * - a tier that isn't a source tier: its name goes into a comment;
+ * - a host that, once lowercased, isn't a plain domain name (`isHostname`).
+ *   Squid matches domains case-insensitively, so case is folded, not refused.
+ *   Anything else, such as a host holding a space or a newline, could add a
+ *   squid.conf directive (`http_access allow all`);
+ * - a forge host in the archon zone, in any case (spec §4.3).
+ */
+function checkedHosts(p: Policy, zone: ZoneName): string[] {
+  const z = p.trustedSources.zones[zone];
+  if (z.openWeb && zone !== "research") {
     throw new Error(`only the research zone may set openWeb, but the ${zone} zone does (spec §10)`);
   }
-  if (zone !== "archon") return;
-  for (const host of hosts) {
-    const forge = forgeDomain(host);
-    if (forge !== undefined) throw new Error(`archon zone: ${forgeHostMessage(host, forge)}`);
+  for (const tier of z.tiers) {
+    if (!SOURCE_TIERS.includes(tier)) throw new Error(`${zone} zone: unknown source tier ${JSON.stringify(tier)}`);
   }
+  const hosts = new Set<string>();
+  for (const host of zoneHosts(p, zone) as unknown[]) {
+    const name = typeof host === "string" ? host.toLowerCase() : undefined;
+    if (name === undefined || !isHostname(name)) {
+      throw new Error(`${zone} zone: ${JSON.stringify(host)} is not a plain domain name (the policy schema's hostname)`);
+    }
+    const forge = zone === "archon" ? forgeDomain(name) : undefined;
+    if (forge !== undefined) throw new Error(`archon zone: ${forgeHostMessage(host as string, forge)}`);
+    hosts.add(name);
+  }
+  return [...hosts].sort();
 }
 
 function squidConf(p: Policy, zone: ZoneName): string {
   const z = p.trustedSources.zones[zone];
-  const hosts = zoneHosts(p, zone);
-  checkZone(p, zone, hosts);
+  const hosts = checkedHosts(p, zone);
   const open = z.openWeb === true;
 
   const head = hashComment([
@@ -91,7 +128,7 @@ function squidConf(p: Policy, zone: ZoneName): string {
     ...wrap(`Zone ${zone} (tiers ${z.tiers.join(", ")}): ${ABOUT[zone]}.`),
     ...wrap(
       open
-        ? "Open web: any public host, as HTTPS tunnels to port 443 or plain HTTP to port 80."
+        ? "Open web: any public host, as HTTPS tunnels to port 443 or http:// requests to port 80."
         : "Default-deny: only HTTPS tunnels (CONNECT to port 443) to the domains below and their subdomains.",
     ),
     "Private, loopback and link-local addresses are refused whatever a name resolves to.",
@@ -117,11 +154,13 @@ function squidConf(p: Policy, zone: ZoneName): string {
     "",
     "acl CONNECT method CONNECT",
     "acl https_port port 443",
-    ...(open ? ["acl plain_http port 80"] : []),
+    ...(open ? ["acl port_80 port 80", "acl http_proto proto HTTP"] : []),
     "# Clients: the zone's containers on the private container network.",
     `acl zone_clients src ${CLIENT_RANGES.join(" ")}`,
     "# Never reachable from any zone:",
     ...PRIVATE_RANGES.map(([range, what]) => `#   ${range.padEnd(16)}${what}`),
+    "# IPv4-mapped addresses need no entry: Squid holds IPv4 in that form, so the IPv4",
+    "# ranges cover it, and ::ffff:0:0/96 would refuse every IPv4 address.",
     `acl to_localnet dst ${PRIVATE_RANGES.map(([r]) => r).join(" ")}`,
   ];
   if (open) {
@@ -131,19 +170,26 @@ function squidConf(p: Policy, zone: ZoneName): string {
       "http_access deny to_localnet",
       "http_access deny CONNECT !https_port",
       "http_access allow CONNECT",
-      "http_access allow plain_http",
+      "# Plain HTTP is http:// on port 80 only: ftp://host:80/ and other schemes are refused.",
+      "http_access allow http_proto port_80",
       "http_access deny all",
     );
   } else {
     const domains = dstdomains(hosts);
     lines.push(
-      "# A destination given as an IP address. Refused, so the dstdomain check below never",
-      "# falls back to a reverse DNS lookup, whose answer the address's owner controls.",
-      "acl ip_literal dstdom_regex ^[0-9.]+$ :",
-      domains.length > 0
-        ? "# The allowlist: the zone's hosts plus its tiers' hosts (zoneHosts in src/policy/zones.ts)."
-        : "# The allowlist is empty, so everything is refused.",
-      ...domains.map((d) => `acl allowed dstdomain ${d}`),
+      "# A destination written as an IP address, in any form. IPv4 is all digits and dots",
+      "# (Squid rewrites 0x7f.1, 2130706433 and 127.1 as 127.0.0.1, and ::ffff:1.2.3.4 as",
+      "# 1.2.3.4), and IPv6 always holds a colon. A host name has no colon, and its last label",
+      "# is never all digits. -n: no DNS lookups.",
+      "acl ip_literal dstdom_regex -n ^[0-9.]+$ :",
+      ...(domains.length > 0
+        ? [
+            "# The allowlist: the zone's hosts plus its tiers' hosts (zoneHosts in src/policy/zones.ts).",
+            "# -n: by name only. Without it, Squid matches an IP-address destination by its reverse",
+            "# DNS name, which the address's owner controls.",
+          ]
+        : ["# The allowlist is empty, so everything is refused."]),
+      ...domains.map((d) => `acl allowed dstdomain -n ${d}`),
       "",
       "http_access deny !zone_clients",
       "http_access deny to_localnet",

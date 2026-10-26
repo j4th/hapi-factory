@@ -47,7 +47,14 @@ function modelsJson(p: Policy, roster: RosterName): string {
       { modelOverrides: Object.fromEntries([...byVendor.get(vendor)!].sort().map((id) => [id, { maxTokens: MAX_TOKENS }])) },
     ]),
   );
-  return json({ $schema: MODELS_SCHEMA, providers });
+  return json({
+    // JSON has no comments, so the notice is a $comment, first. Pi 1.3.0 accepts it: its models.json
+    // schema (ModelsConfigSchema, core/model-config.ts) doesn't forbid other keys, and Pi reads
+    // only `providers`.
+    $comment: notice("Pi models.json: the output-token cap for each Pi model", [`policy/rosters/${roster}.yaml`]).join(" "),
+    $schema: MODELS_SCHEMA,
+    providers,
+  });
 }
 
 /**

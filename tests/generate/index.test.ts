@@ -86,6 +86,27 @@ describe("buildAll", () => {
     expect(readdirSync(out)).toEqual([]);
   });
 
+  test("every file starts with the generated-file notice: # comments, or a JSON file's first key, $comment", async () => {
+    const out = tempDir();
+    for (const roster of ["anthropic", "budget", "portable"] as const) {
+      await buildAll(p, out, { roster });
+      for (const f of FILES) {
+        const text = readFileSync(join(out, f), "utf8");
+        let head: string;
+        if (f.endsWith(".json")) {
+          const parsed = JSON.parse(text);
+          expect({ f, first: Object.keys(parsed)[0] }).toEqual({ f, first: "$comment" });
+          head = parsed.$comment;
+        } else {
+          const lines = text.split("\n");
+          head = lines.slice(0, lines.findIndex((l) => !l.startsWith("#"))).join("\n");
+        }
+        expect({ f, notice: head.includes("Do not edit it by hand: change policy/ and run `mise run policy:build`.") }).toEqual({ f, notice: true });
+        expect({ f, notice: head.includes("docs/generated-configs.md") }).toEqual({ f, notice: true });
+      }
+    }
+  });
+
   test("two builds are byte-identical (no timestamps, stable order)", async () => {
     const a = tempDir();
     const b = tempDir();

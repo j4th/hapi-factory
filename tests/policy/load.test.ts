@@ -3,7 +3,8 @@ import { cpSync, mkdtempSync, readdirSync, readFileSync, rmSync, unlinkSync, wri
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadPolicy, PolicyError } from "../../src/policy/load";
-import type { Policy, ZoneName } from "../../src/policy/types";
+import rolesSchema from "../../policy/schemas/policy-roles.schema.json";
+import { ROLES, type Policy, type ZoneName } from "../../src/policy/types";
 
 // Copies of policy/ with one file changed, for the negative tests. Removed after each test.
 let temps: string[] = [];
@@ -106,6 +107,12 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
       router: "small",
       eval_judge: "medium",
     });
+  });
+
+  test("ROLES, which the Role type comes from, is exactly the roles schema's list", () => {
+    const roles: string[] = [...ROLES].sort();
+    expect(roles).toEqual([...rolesSchema.required].sort());
+    expect(roles).toEqual(Object.keys(rolesSchema.properties).sort());
   });
 
   test("anthropic roster follows spec §12", () => {

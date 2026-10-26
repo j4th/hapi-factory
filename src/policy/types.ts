@@ -92,15 +92,14 @@ export type Approval =
   | "outbound_message"
   | "spend_above_threshold";
 
-export type Role =
-  | "hermes_main"
-  | "hermes_auxiliary"
-  | "planner"
-  | "implement"
-  | "review"
-  | "scout"
-  | "router"
-  | "eval_judge";
+/**
+ * Every role, in roles.yaml's order. `Role` comes from this list, so code that
+ * needs every role (Archon's aliases) reads it rather than copying it. The roles
+ * schema's list must match; tests/policy/load.test.ts checks it.
+ */
+export const ROLES = ["hermes_main", "hermes_auxiliary", "planner", "implement", "review", "scout", "router", "eval_judge"] as const;
+
+export type Role = (typeof ROLES)[number];
 
 /** The default tier per role. */
 export type Roles = Record<Role, Tier>;

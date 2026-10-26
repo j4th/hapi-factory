@@ -135,6 +135,11 @@ describe("applyOverlay", () => {
       expect(e.path).toBe("/egress_extra/0");
       expect(e.message).toContain(`"${host}" is a forge host (${forge})`);
     }
+    // Case doesn't hide a forge (Squid matches domains case-insensitively): the overlay
+    // schema's hostname is lowercase, so a mixed-case host is refused before the forge check.
+    for (const host of ["GitHub.com", "Raw.GitHubUserContent.com"]) {
+      expect(() => applyOverlay(p, { egress_extra: [host] })).toThrow("/egress_extra/0: must match pattern");
+    }
     // Look-alikes are other domains, not forge hosts.
     const r = applyOverlay(p, { egress_extra: ["notgithub.com", "github.com.mirror.internal", "gitlab.company.internal"] });
     expect(r.trustedSources.zones.archon.hosts).toContain("notgithub.com");
