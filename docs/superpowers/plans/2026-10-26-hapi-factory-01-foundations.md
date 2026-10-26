@@ -1,0 +1,539 @@
+# hapi-factory Plan 01: Foundations Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Stand up hapi-factory's Phase 0 on this machine:
+- pinned toolchain;
+- `policy/` as the single source of truth, compiled into Hermes, Archon, Pi and egress configs;
+- Hermes and Archon running in rootless containers under a dedicated `hapi` user, behind default-deny egress;
+- secrets from Bitwarden;
+- GitHub App token minting;
+- `mise run audit`;
+- threat model v0.
+
+It also runs the design's "verify early" spikes, whose results shape Plans 02–07.
+
+**Architecture:** A single TypeScript CLI (`hapi`, run on Bun) owns policy loading, config generation, secrets, forge tokens and audit. The deployable stack is a Docker Compose project run by rootless Docker as the `hapi` user. Each zone (Hermes, Archon) sits on an `internal` network whose only exit is its own Squid forward proxy, holding a generated hostname allowlist. Nothing here builds factory runs yet; this is the floor the later plans stand on.
+
+**Tech Stack:**
+- mise (the only host prerequisite besides Docker)
+- Bun + TypeScript (`bun test`)
+- `ajv` (JSON Schema 2020-12)
+- `yaml`
+- Docker Engine rootless + Compose v2
+- Squid
+- Bitwarden Secrets Manager CLI (`bws`)
+- GitHub REST API
+- Hermes Agent v0.22.5 (official image)
+- Archon v0.12.1 (official image + Pi provider)
+
+**Spec:** `docs/superpowers/specs/2026-10-26-hapi-factory-design.md` (approved 2026-10-26). Supporting evidence is in `reports/` and `research_notes/`.
+
+## Plan sequence
+
+This is Plan 01 of 07. Each later plan is written after the plans before it finish, using this plan's spike results (Tasks 8–14).
+
+| Plan | Scope | Produces (for later plans) |
+|---|---|---|
+| **01 Foundations** (this) | Toolchain, policy plus schemas (including work order), generators, secrets, App tokens, stack, egress, audit, threat model v0, spikes | `hapi` CLI; `loadPolicy`, `applyOverlay`, `validateWorkOrder`; `buildAll`; `mintInstallationToken`; `resolveSecrets`; `runAudit`; the running stack; `docs/spikes/*` |
+| 02 Worker | `decide()` with the vendored ten-levels Jev client, mock and decision files; the `hapi decide` CLI; the `hapi-guard` Pi extension (protected paths, budgets, request clamps, trace, Jev level-6 gates) | `decide(name, state)`; the hapi-guard package baked into the Archon image |
+| 03 Run engine | Archon `factory-task` workflow pack (prepare / strip / scout / implement / retry / gates / review / commit); the forge interface; poller (merge + `hapi:rework`); mirror; harvester; `metrics.json`; commit trailers | The end-to-end run from a merged work order to a delivery PR |
+| 04 Coordinator | Hermes plugins `hapi-path-guard` and `hapi-cmd-allow`; skills `hapi-planning`, `new-work-order` and `hapi-research-note` (with citation check); the `hapi-research` profile and container; freshness job; the `hapi-status` tool; Slack gateway; PR-comment queue plus the injection screen | Planning PRs from a Slack conversation |
+| 05 Repo contract | `templates/repo-contract/`, `mise run new-repo`, the reusable CI workflow (gates, schema, trailers, protected-path diff), `.coderabbit.yaml`, ruleset application | New repos born compliant |
+| 06 Evals & metrics | Eval case format and runner, planning eval, `metrics.jsonl`, flags and thresholds, Jev/CodeRabbit calibration records | `mise run eval` |
+| 07 v1 acceptance | The Odoo MCP run-through against the spec's v1 definition of done (§15), plus the budget, portable and jev-off runs | v1 done |
+
+Phases 2–5 (mtg brownfield; showcase depth plus VM; more lanes; GitLab) get their own plans after v1.
+
+## Global Constraints
+
+- Linux only. This machine first. Every host action runs as the dedicated `hapi` user, except the one-time `scripts/host-setup.sh`, which the operator runs with sudo.
+- Pin every tool, image and plugin: exact versions in `mise.toml`, image digests in `stack/compose.yaml`. Never track `main` or `latest`.
+- Hermes: stable tag **v0.22.5**. Archon: **v0.12.1**. The Pi SDK embedded in Archon is **1.3.0**. Any standalone Pi CLI is pinned to **1.3.0** with a separate agent dir.
+- No subscription OAuth in Hermes, Pi or Archon. Anthropic Console API keys only.
+- Budget ceiling is the $200/month credit. Workspaces and spend limits:
+  - `hapi-hermes` **$60**
+  - `hapi-factory` **$100**
+  - `hapi-evals` **$40**
+  - the default workspace is unused.
+- Other keys: OpenRouter **$20/month**; the Jev OpenRouter key **$2/month**.
+- Per-run target: **≤ $3**.
+- Archon env: `HOST=127.0.0.1`, `ARCHON_TELEMETRY_DISABLED=1`, `DO_NOT_TRACK=1`.
+- Pi env (inside Archon): `PI_OFFLINE=1`, `PI_TELEMETRY=0`, read-only `PI_CODING_AGENT_DIR`, `models.json` `maxTokens: 64000`.
+- Hermes defaults (spec §9.1):
+
+  | Setting | Value |
+  |---|---|
+  | `skills.write_approval`, `memory.write_approval` | `true` |
+  | `skills.guard_agent_created` | `true` |
+  | `security.protected_instruction_files` | on |
+  | `approvals.mode` | `manual` |
+  | `approvals.cron_mode`, `unattended_mode`, `single_query_mode` | `deny` |
+  | yolo / `approvals.mode: off` | forbidden |
+  | `plugins.isolation` | `host` |
+  | `auth.adopt_external_logins` | `false` |
+  | `web.keyless_fallback`, `web.keyless_rescue` | `false` |
+  | `security.allow_lazy_installs` | `false` |
+  | `agent.max_turns` | **60** |
+  | every `auxiliary.*` slot, `delegation.model`, `cron.model` | Haiku 5.5 (`claude-haiku-5-5`) |
+  | `cache_ttl` | `auto` |
+  | `hooks_auto_accept` | `false` |
+
+- Protected paths (spec §8.2), exactly:
+  - `AGENTS.md`, `.factory/**`, `.github/**`, `mise.toml`, `.agents/**`: `{interactive: ask, unattended: deny, workers: deny}`
+  - `.pi/**`, `.archon/**`: `{interactive: deny, unattended: deny, workers: deny}`
+- Repo overlays may only **tighten** policy, except for `egress_extra` additions.
+- Secrets come from Bitwarden Secrets Manager (`bws`) at start, into `0600` files under `$XDG_RUNTIME_DIR/hapi/`. Never in the repo, never in `.env` files on disk.
+- All forge calls go through `src/forge/` modules. No raw `gh` in scripts, skills or workflows.
+- Agents never create repos or merge. GitHub App tokens are 1-hour installation tokens minted outside the agents.
+- Models:
+  - `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5` (Anthropic);
+  - portable: OpenCode Go zero-retention models only.
+
+## Review Focus
+
+1. **Loosening overlays.** A repo's `.factory/config.yaml` that tries to loosen policy (e.g. `AGENTS.md: {interactive: allow}`, or removing a protected path) must be rejected with an error naming the path. It must never be silently merged. Test: Task 2, `applyOverlay rejects loosening`.
+2. **A missing secret.** If a secret is missing or `bws` fails at `mise run up`, nothing starts, and the error names the missing secret key. Containers never start with an empty variable. Test: Task 4, `resolveSecrets fails closed on missing secret`.
+3. **The proxy is down or misconfigured.** Zone containers have no direct route out: requests fail, they don't bypass. Test: Task 5, `egress: direct connection is blocked even when proxy is stopped`.
+4. **Drift in deployed config.** A hand edit to deployed config (e.g. `approvals.mode: off`, or `HOST=0.0.0.0`) is detected by `mise run audit`, which exits non-zero. Test: Task 6, `audit detects drift from generated config`.
+5. **Upstream ignores a generated key** after an upgrade (a renamed key, an Archon parse warning). Audit checks each tool's own validation output, not only our files. Test: Task 6, `audit fails on archon parseWarnings`.
+6. **A minted GitHub token comes back broader than requested.** The response's `permissions` or `repositories` must be checked, and anything broader is rejected. Test: Task 4, `mintInstallationToken rejects broader permissions`.
+
+---
+
+### Task 1: Project skeleton and toolchain
+
+**Files:**
+- Create:
+  - `mise.toml`, `package.json`, `tsconfig.json`, `bunfig.toml`, `.gitignore`
+  - `src/cli.ts`, `src/version.ts`
+  - `.github/workflows/ci.yml`
+  - `README.md`
+- Test: `tests/cli.test.ts`
+- Commit as-is: `docs/`, `reports/`, `research_notes/`
+
+**Interfaces:**
+- Produces:
+  - **`hapi` CLI entry** `src/cli.ts`, run as `bun run src/cli.ts <cmd>`, aliased by mise task `hapi`. Subcommand dispatch is `main(argv: string[]): Promise<number>` (the exit code). Later tasks register `policy build`, `workorder validate`, `secrets resolve`, `token mint` and `audit`.
+  - **`version.ts`** exports `HAPI_VERSION = "0.1.0"`.
+  - **mise tasks** `test`, `lint`, `hapi`, `policy:build`, `audit`, `up`, `down`. Stubs are fine where later tasks fill them in.
+
+- [ ] **Step 1: Write the failing test** `tests/cli.test.ts`:
+
+```ts
+import { main } from "../src/cli";
+test("prints version", async () => {
+  const out: string[] = []; const orig = console.log; console.log = (s) => out.push(String(s));
+  expect(await main(["--version"])).toBe(0); console.log = orig;
+  expect(out.join("\n")).toContain("0.1.0");
+});
+test("unknown command exits 2", async () => {
+  expect(await main(["nope"])).toBe(2);
+});
+```
+
+- [ ] **Step 2: Run** `bun test tests/cli.test.ts`. Expected: FAIL, because `../src/cli` isn't found.
+
+- [ ] **Step 3: Implement `main(argv)` in `src/cli.ts`**, with `--version` and a subcommand registry (`register(name, handler)`). Write `mise.toml`:
+  - `[tools]` pins exact current stable `bun`, `node`, `uv`, `python`, `gh`, `gitleaks`;
+  - `[tasks]` covers `test = "bun test"`, `lint = "bunx tsc --noEmit"`, `hapi = "bun run src/cli.ts"`, and stubs for the others.
+
+  `.gitignore` adds `build/`, `node_modules/`, `.env*` and `spikes/scratch/`. CI runs `mise install && mise run lint && mise run test` on `ubuntu-latest`, with actions pinned to full SHAs.
+
+- [ ] **Step 4: Run** `mise install && mise run test && mise run lint`. Expected: PASS, with 2 tests passing and no type errors.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add -A
+git commit -m "chore: hapi-factory skeleton, toolchain, CI; add design, recon report and research notes"
+```
+
+- [ ] **Step 6: Manual (the operator; outward-facing).** Rename the local repo to `hapi-factory`. Create the **public** GitHub repo `j4th/hapi-factory`, push `main`, and add a ruleset on `main`: 1 approving review, required check `ci`. Task 5 clones from this remote.
+
+---
+
+### Task 2: Policy files, JSON Schemas, loader, overlay, work-order validator
+
+**Files:**
+- Create:
+  - policy files: `policy/{protected_paths,commands,trusted_sources,budgets,approvals,roles,flags}.yaml`, `policy/rosters/{budget,anthropic,portable}.yaml`
+  - schemas: `policy/schemas/{policy-*,work-order,repo-overlay}.schema.json`
+  - `src/policy/types.ts`, `src/policy/load.ts`, `src/policy/overlay.ts`, `src/workorder/validate.ts`
+- Test: `tests/policy/load.test.ts`, `tests/policy/overlay.test.ts`, `tests/workorder/validate.test.ts`, fixtures under `tests/fixtures/`
+
+**Interfaces:**
+- Produces:
+  - **`loadPolicy(dir: string): Policy`** throws `PolicyError { file, path, message }`.
+  - **`Policy` fields:**
+    - `protectedPaths: Record<glob, {interactive: Mode; unattended: Mode; workers: Mode}>`, where `Mode = "allow"|"ask"|"deny"`;
+    - `commands: {hermes: {allow: string[]}; workers: {tools: string[]}}`;
+    - `trustedSources: {tiers: Record<"T0"|"T1"|"T2"|"T3", {hosts: string[]}>; zones: Record<ZoneName, {tiers: Tier[]; hosts: string[]; openWeb?: boolean}>}`;
+    - `budgets`, `approvals`, `roles`, `rosters: Record<"budget"|"anthropic"|"portable", Roster>`, `flags`.
+  - **`ZoneName = "hermes"|"archon"|"research"`.**
+  - **`loadOverlay(file): RepoOverlay`** and **`applyOverlay(p: Policy, o: RepoOverlay): Policy`**. The latter throws `PolicyLoosenError { path }`.
+  - **`validateWorkOrder(obj: unknown): WorkOrder`** throws `WorkOrderError { path, message }`. `WorkOrder` mirrors spec §6:
+    - `id`, `lane`, `workflow`;
+    - `risk: "low"|"medium"|"high"`;
+    - `roles: {implement: Tier; review: Tier}`, with `Tier = "small"|"medium"|"large"`;
+    - `budget: {usd; turns; minutes}`;
+    - `pieces: {id; files: string[]; size: "small"|"medium"|"large"}[]`;
+    - `verify: {smoke: boolean}`, `egress_extra: string[]`, `trace: {traceparent}`, `sources: string[]`.
+  - **Values fixed here (from the spec):**
+    - `flags.yaml` exactly as spec §13.3, plus the `jev` and `coderabbit` lines;
+    - `budgets.yaml`: `workspaces {hapi-hermes: 60, hapi-factory: 100, hapi-evals: 40}`, `openrouter_monthly_usd: 20`, `jev_monthly_usd: 2`, `run_usd: 3.00`, `hermes_max_turns: 60`;
+    - `approvals.yaml`: `[merge, new_dependency, new_skill_or_mcp, ci_workflow_change, outbound_message, spend_above_threshold]`;
+    - `anthropic.yaml` roster from spec §12 (implement `claude-opus-5-5` effort low, retry high; review `claude-sonnet-5-5` medium via provider `claude`; small tier `claude-haiku-5-5`);
+    - `budget.yaml`: every tier `claude-haiku-5-5`;
+    - `portable.yaml`: implement `opencode-go/kimi-k3.1-pro`, review on a different family (`opencode-go/glm-5.3`). Model ids are confirmed against OpenCode Go's list at implementation time.
+
+- [ ] **Step 1: Write the failing tests:**
+
+```ts
+// tests/policy/load.test.ts
+test("loads repo policy", () => {
+  const p = loadPolicy("policy");
+  expect(p.protectedPaths["AGENTS.md"]).toEqual({ interactive: "ask", unattended: "deny", workers: "deny" });
+  expect(p.protectedPaths[".pi/**"].interactive).toBe("deny");
+  expect(p.budgets.workspaces["hapi-factory"]).toBe(100);
+  expect(p.flags.jev).toEqual({ enabled: true, fallback: "haiku", via: "openrouter" });
+});
+test("rejects unknown keys with file and path", () => {
+  expect(() => loadPolicy("tests/fixtures/policy-unknown-key")).toThrow(/budgets\.yaml.*\/wokspaces/);
+});
+// tests/policy/overlay.test.ts
+test("applyOverlay tightens", () => { /* overlay adds "src/secrets/**": all deny → present in result */ });
+test("applyOverlay rejects loosening", () => {
+  expect(() => applyOverlay(p, { protected_paths: { "AGENTS.md": { interactive: "allow" } } }))
+    .toThrow(PolicyLoosenError); // message names AGENTS.md
+});
+test("applyOverlay rejects removing a protected path", () => { /* overlay sets "AGENTS.md": null → PolicyLoosenError */ });
+test("applyOverlay allows egress_extra additions", () => { /* egress_extra: ["odoo.internal"] → zones.archon.hosts includes it */ });
+// tests/workorder/validate.test.ts
+test("accepts spec §6 example", () => { expect(validateWorkOrder(load("tests/fixtures/order-0002.yaml")).id).toBe("0002-search-partners-tool"); });
+test("rejects model ids in roles", () => { /* roles.implement: "claude-opus-5-5" → WorkOrderError path /roles/implement */ });
+test("rejects malformed traceparent", () => { /* "00-xyz" → path /trace/traceparent */ });
+```
+
+- [ ] **Step 2: Run** `bun test tests/policy tests/workorder`. Expected: FAIL, because the modules don't exist.
+
+- [ ] **Step 3: Write the schemas and the policy files with the values above. Implement the loader, overlay and validator** using `ajv` (2020-12, `allErrors`, `additionalProperties: false` everywhere) and `yaml`.
+  - **Tightening order:** `allow < ask < deny`. Overlay modes must be ≥ base.
+  - **Overlay restrictions:** an overlay may add protected paths and `egress_extra`, and may lower budgets. Anything else is rejected.
+  - **Traceparent regex:** `^00-[0-9a-f]{32}-[0-9a-f]{16}-0[01]$`.
+
+- [ ] **Step 4: Run** `bun test tests/policy tests/workorder`. Expected: PASS.
+
+- [ ] **Step 5: Add `hapi workorder validate <path>`.** It exits 0 and prints the id, or exits 1 and prints `path: message`. Test it in `tests/cli.test.ts` with the fixture. Run `bun test`. Expected: PASS.
+
+- [ ] **Step 6: Commit** `git commit -am "feat(policy): policy files, schemas, loader, tighten-only overlay, work-order validator"`
+
+---
+
+### Task 3: Config generators and `hapi policy build`
+
+**Files:**
+- Create: `src/generate/{index,hermes,archon,pi,egress}.ts`
+- Test: `tests/generate/*.test.ts`
+
+**Interfaces:**
+- Consumes: `Policy` (Task 2).
+- Produces:
+  - **`buildAll(p: Policy, outDir: string, opts?: {roster?: "budget"|"anthropic"|"portable"}): Promise<string[]>`** returns the paths written. `roster` defaults to `"anthropic"`.
+    - `build/hermes/config.yaml`
+    - `build/archon/config.yaml`, `build/archon/archon.env`
+    - `build/pi/models.json`, `build/pi/hapi-guard.json`
+    - `build/egress/{hermes,archon,research}.squid.conf`
+  - **Each emitter is pure:** `emitHermes(p): Record<filename, string>`, `emitArchon(p, roster)`, `emitPi(p, roster)`, `emitEgress(p)`, all with the same return shape.
+  - **No Hermes hooks are emitted in Plan 01.** The `hapi-cmd-allow` hook script arrives in Plan 04. A `fail_closed` hook pointing at a missing script would block every tool call.
+  - **`hapi policy build [--policy dir] [--out dir] [--roster name]`.**
+
+- [ ] **Step 1: Write the failing tests** (parse the emitted YAML/JSON, then assert on it):
+
+```ts
+test("hermes flips defaults", () => {
+  const c = YAML.parse(emitHermes(p)["config.yaml"]);
+  expect(c.skills.write_approval).toBe(true); expect(c.skills.guard_agent_created).toBe(true);
+  expect(c.memory.write_approval).toBe(true); expect(c.approvals.mode).toBe("manual");
+  expect([c.approvals.cron_mode, c.approvals.unattended_mode, c.approvals.single_query_mode]).toEqual(["deny","deny","deny"]);
+  expect(c.plugins.isolation).toBe("host"); expect(c.auth.adopt_external_logins).toBe(false);
+  expect(c.web.keyless_fallback).toBe(false); expect(c.web.keyless_rescue).toBe(false);
+  expect(c.security.allow_lazy_installs).toBe(false); expect(c.agent.max_turns).toBe(60);
+  expect(Object.values(c.auxiliary).every((s: any) => s.model === "claude-haiku-5-5")).toBe(true);
+  expect(c.hooks_auto_accept).toBe(false);
+});
+test("hermes protected_instruction_files lists filename rules", () => { /* includes AGENTS.md */ });
+test("archon env is loopback with telemetry off", () => {
+  const env = emitArchon(p)["archon.env"];
+  expect(env).toMatch(/^HOST=127\.0\.0\.1$/m); expect(env).toMatch(/^ARCHON_TELEMETRY_DISABLED=1$/m); expect(env).toMatch(/^DO_NOT_TRACK=1$/m);
+  expect(env).toMatch(/^PI_OFFLINE=1$/m); expect(env).toMatch(/^PI_TELEMETRY=0$/m);
+});
+test("archon tiers come from the selected roster", () => { /* emitArchon(p, "budget") → every tier model claude-haiku-5-5 */ });
+test("pi models.json caps maxTokens at 64000", () => { /* every model entry maxTokens === 64000 */ });
+test("pi hapi-guard.json carries workers modes", () => { /* AGENTS.md → "deny"; budgets.run_usd 3 */ });
+test("egress archon allowlist is exact and denies by default", () => {
+  const conf = emitEgress(p)["archon.squid.conf"];
+  expect(conf).toContain("acl allowed dstdomain .api.anthropic.com");
+  expect(conf).not.toMatch(/dstdomain .*github\.com/);      // Archon zone has no forge route
+  expect(conf.trim().endsWith("http_access deny all")).toBe(true);
+});
+test("research zone allows open web but blocks private ranges", () => { /* to_localnet deny present */ });
+```
+
+- [ ] **Step 2: Run** `bun test tests/generate`. Expected: FAIL.
+
+- [ ] **Step 3: Implement the emitters.**
+  - **Hermes key names:** take them from the pinned Hermes v0.22.5 `cli-config.yaml.example`, as quoted in `research_notes/Agentic software factory recon/hermes_agent.md`. Where a key's name differs at the pinned tag, follow the tag and update the test. That's a one-line decision, recorded in the commit message.
+  - **Archon tier syntax:** follow `archon_plugins_integration.md` §Q4. Squid configs deny `to_localnet` for every zone and allow `CONNECT` only to allowlisted domains on 443.
+  - **Zone hosts from policy:**
+    - `archon`: model APIs (`api.anthropic.com`, `openrouter.ai`, `opencode.ai`) plus package registries (`registry.npmjs.org`, `pypi.org`, `files.pythonhosted.org`). **No GitHub hosts.**
+    - `hermes`: model APIs, `api.github.com`, `github.com`, and the Slack hosts listed in the policy.
+
+- [ ] **Step 4: Run** `bun test tests/generate`. Expected: PASS.
+
+- [ ] **Step 5: Wire up the build.** Add `hapi policy build` and point mise task `policy:build` at it. Run `mise run policy:build && ls build/*`. Expected: the 9 files above.
+
+- [ ] **Step 6: Commit** `git commit -am "feat(generate): compile policy into Hermes, Archon, Pi and egress configs"`
+
+---
+
+### Task 4: Secrets from Bitwarden, GitHub App token minting, setup runbooks
+
+**Files:**
+- Create:
+  - `src/secrets/bws.ts`, `stack/secrets.map.yaml`, `src/forge/github/app-token.ts`
+  - runbooks: `docs/runbooks/github-apps.md`, `docs/runbooks/provider-keys.md`
+- Test: `tests/secrets/bws.test.ts`, `tests/forge/app-token.test.ts`
+
+**Interfaces:**
+- Produces:
+  - **`resolveSecrets(map: SecretMap, opts: {bws?: (args: string[]) => Promise<string>, outDir: string}): Promise<Record<zone, string>>`.** It writes `<outDir>/<zone>.env` with mode `0600` and returns the paths. It throws `SecretError { key }` on any miss.
+  - **`SecretMap = Record<zone, Record<ENV_NAME, bwsSecretId>>`.**
+  - **`mintInstallationToken(o: {appId: string; privateKeyPem: string; installationId: number; repositories: string[]; permissions: Record<string, "read"|"write">; fetch?: typeof fetch; now?: () => number}): Promise<{token: string; expiresAt: string}>`.** Throws `TokenScopeError` if the response's permissions or repositories exceed the request.
+  - **`hapi secrets resolve`, `hapi token mint --app planner|factory --repo owner/name`.**
+
+- [ ] **Step 1: Write the failing tests:**
+
+```ts
+test("resolveSecrets writes 0600 env files", async () => { /* stub bws returns {"value":"x"}; stat mode & 0o777 === 0o600 */ });
+test("resolveSecrets fails closed on missing secret", async () => {
+  await expect(resolveSecrets({ archon: { ANTHROPIC_API_KEY: "id-1" } }, { bws: async () => { throw new Error("404"); }, outDir }))
+    .rejects.toThrow(/ANTHROPIC_API_KEY/);
+  expect(existsSync(join(outDir, "archon.env"))).toBe(false);   // nothing partial left behind
+});
+test("mintInstallationToken sends scoped request", async () => { /* fake fetch asserts POST /app/installations/123/access_tokens body {repositories:["odoo-mcp"], permissions:{contents:"write", pull_requests:"write"}} and RS256 JWT with iat=now-60, exp=now+540 */ });
+test("mintInstallationToken rejects broader permissions", async () => {
+  // fake response permissions {contents:"write", administration:"write"}
+  await expect(mintInstallationToken({ ...o, fetch: fake })).rejects.toThrow(TokenScopeError);
+});
+```
+
+- [ ] **Step 2: Run** `bun test tests/secrets tests/forge`. Expected: FAIL.
+
+- [ ] **Step 3: Implement.**
+  - `bws`: shell out to `bws secret get <id> --output json` and read `value`. Resolve everything into memory first, then write the files atomically.
+  - JWT: use `crypto.subtle` RS256, with no extra dependency.
+  - **Runbooks:**
+    - `github-apps.md` covers the exact settings for **`hapi-planner`**: contents write, pull requests write, issues read, metadata read; branches restricted by ruleset to `plan/*`.
+    - The same file covers **`hapi-factory`**: contents write, pull requests write, metadata read; `factory/*` branches.
+    - Neither App gets administration, a ruleset bypass or merge rights.
+    - Both private keys are stored in `bws`.
+    - `provider-keys.md` covers creating the Console workspaces and limits above, the OpenRouter keys (`hapi-portable` $20/mo, `hapi-jev` $2/mo), and the OpenCode Go settings (training endpoints blocked, EU/US regions, **Extra Usage off**).
+
+- [ ] **Step 4: Run** `bun test tests/secrets tests/forge`. Expected: PASS.
+
+- [ ] **Step 5: Manual (the operator).** Follow both runbooks. Confirm with `hapi secrets resolve --dry-run`, which lists every key as found without printing values. Expected: all found.
+
+- [ ] **Step 6: Commit** `git commit -am "feat: fail-closed bws secrets, scoped GitHub App token minting, setup runbooks"`
+
+---
+
+### Task 5: Host setup and the stack (rootless Docker, internal networks, Squid egress, Hermes, Archon)
+
+**Files:**
+- Create:
+  - `scripts/host-setup.sh`
+  - `stack/compose.yaml`, `stack/archon/Dockerfile`, `stack/hermes/Dockerfile`
+  - `src/stack/up.ts`
+- Test: `tests/stack/egress.int.test.ts` (integration; runs under `mise run test:int`)
+
+**Interfaces:**
+- Consumes: `buildAll` (Task 3), `resolveSecrets` (Task 4).
+- Produces:
+  - **`mise run up`:** policy build → resolve secrets → `docker compose up -d`. If `$USER != hapi`, it re-execs via `sudo -iu hapi`.
+  - **`mise run down`.**
+  - **Service names:** `hermes`, `archon`, `egress-hermes`, `egress-archon`.
+  - **Networks:** `hermes-net` and `archon-net`, both `internal: true`. Only the egress proxies also join `outbound`.
+  - **Each zone container** gets `HTTP_PROXY`/`HTTPS_PROXY` pointing at its proxy.
+  - **The Archon image** = the pinned `ghcr.io/coleam00/archon` digest + `archon provider add` for Pi at the matching version + baked Python/uv/node toolchains. Runtime needs no GitHub egress. `build/pi` is mounted read-only at `PI_CODING_AGENT_DIR`.
+  - **The Hermes image** = the pinned official image. `build/hermes` is mounted as config, and the `local` terminal backend runs inside the container, which is itself the boundary.
+
+- [ ] **Step 1: Write `scripts/host-setup.sh`** (idempotent; the operator runs it once with sudo). It:
+  - creates user `hapi`;
+  - installs and enables rootless Docker for `hapi` (`dockerd-rootless-setuptool.sh install`, `loginctl enable-linger hapi`);
+  - installs mise for `hapi`;
+  - clones hapi-factory into `/home/hapi/hapi-factory` from the GitHub remote.
+
+  Run: `sudo scripts/host-setup.sh && sudo -iu hapi docker info --format '{{.SecurityOptions}}'`. Expected: the output contains `rootless`.
+
+- [ ] **Step 2: Write the failing integration tests** `tests/stack/egress.int.test.ts`, using a throwaway `curlimages/curl` container on `archon-net`:
+
+```ts
+test("egress: allowed host via proxy succeeds", () => { expect(curlVia("archon", "https://api.anthropic.com")).toMatch(/^HTTP\/\S+ (2|4)\d\d/); });
+test("egress: disallowed host via proxy is denied", () => { expect(curlVia("archon", "https://github.com")).toMatch(/403/); });
+test("egress: direct connection is blocked even when proxy is stopped", () => {
+  stop("egress-archon"); expect(curlDirect("archon-net", "https://api.anthropic.com").ok).toBe(false); start("egress-archon");
+});
+test("archon listens on loopback only", () => { /* from another container on archon-net, connecting to archon:<server port from Archon's docs at v0.12.1> fails */ });
+```
+
+- [ ] **Step 3: Run** `mise run test:int`. Expected: FAIL, because there's no stack yet.
+
+- [ ] **Step 4: Write `stack/compose.yaml`, both Dockerfiles (digest-pinned) and `src/stack/up.ts`** (`up()` calls `buildAll`, then `resolveSecrets`, then `compose up`, and aborts on any error).
+  - Add `read_only: true` where the images allow, `cap_drop: [ALL]` and `security_opt: [no-new-privileges:true]` on every service.
+  - Env files come from `$XDG_RUNTIME_DIR/hapi/*.env`.
+
+- [ ] **Step 5: Run** `mise run up && mise run test:int`. Expected: PASS (4 tests). Then `docker compose ps` shows all 4 services healthy.
+
+- [ ] **Step 6: Commit** `git commit -am "feat(stack): rootless hapi user, internal-only networks, Squid egress, Hermes and Archon containers"`
+
+---
+
+### Task 6: `mise run audit`
+
+**Files:**
+- Create: `src/audit/{index,types}.ts`, `src/audit/checks/{generated,runtime,pins,github,tools}.ts`
+- Test: `tests/audit/*.test.ts`, with fixtures
+
+**Interfaces:**
+- Consumes: `loadPolicy`, `buildAll`, `mintInstallationToken`.
+- Produces:
+  - **`runAudit(ctx: AuditContext): Promise<CheckResult[]>`**, where `CheckResult = {id: string; status: "pass"|"fail"|"skip"; detail: string}`.
+  - **`hapi audit [--repo owner/name ...]`** exits 1 if any check fails.
+  - **The checks:**
+    - **`generated.drift`:** the deployed `/home/hapi/...` configs equal a fresh `buildAll`.
+    - **`runtime.archon-env`:** `docker inspect` env contains the Global Constraints' Archon and Pi values.
+    - **`runtime.hermes-no-yolo`:** no yolo flag, and `approvals.mode != off` in the effective config.
+    - **`pins.versions`:** every `mise.toml` tool and compose image is pinned by version or digest.
+    - **`tools.archon-validate`:** `archon validate workflows --json` has no errors **and** an empty `parseWarnings`.
+    - **`github.rulesets`:** for each `--repo`, `main` requires 1 approval with no App bypass.
+    - **`github.app-perms`:** neither App has administration or a ruleset bypass.
+    - **`repo.ai-workflows`:** for each `--repo`, fail on any workflow that runs an AI action with secrets on `issue_comment`, `issues`, `pull_request_review*` or `pull_request_target` triggers.
+
+- [ ] **Step 1: Write the failing tests:**
+
+```ts
+test("audit detects drift from generated config", async () => { /* deployed fixture with approvals.mode: off → generated.drift fail, detail names approvals.mode */ });
+test("audit fails on archon parseWarnings", async () => { /* fake archon validate output {"errors":[],"parseWarnings":["unknown key foo"]} → tools.archon-validate fail */ });
+test("audit flags comment-triggered AI workflow", async () => { /* fixture = mtg's claude.yml → repo.ai-workflows fail */ });
+test("audit passes a clean fixture", async () => { /* all pass/skip */ });
+```
+
+- [ ] **Step 2: Run** `bun test tests/audit`. Expected: FAIL.
+
+- [ ] **Step 3: Implement the checks.** Command runners and HTTP are injected (`ctx.exec`, `ctx.fetch`) so the tests use fakes.
+
+- [ ] **Step 4: Run** `bun test tests/audit`. Expected: PASS.
+
+- [ ] **Step 5: Run live** `mise run audit`. Expected: exit 0, with every check `pass`, except `skip` for the `github.*` and `repo.*` checks when no `--repo` is given.
+
+- [ ] **Step 6: Commit** `git commit -am "feat(audit): drift, runtime, pins, tool validation, GitHub and AI-workflow checks"`
+
+---
+
+### Task 7: Threat model v0 and kill-switch runbook
+
+**Files:**
+- Create: `docs/security/threat-model.md`, `docs/runbooks/kill-switches.md`
+
+- [ ] **Step 1: Write `threat-model.md`** using CSA MAESTRO's 7 layers and 6 steps, scoped to the Phase 0 stack plus the planned Phase 1 flow (spec §4 and §11).
+  - For each layer, list threats with **OWASP ASI01–ASI10** IDs, LLM Top 10 IDs and **MITRE ATLAS** technique IDs (e.g. AML.T0080, AML.T0086, AML.T0110), then the control (spec section plus the policy file that enforces it).
+  - Include the Rule-of-Two table (spec §11.2) and the six accepted residual risks (spec §11.9), verbatim in substance.
+  - Group the controls under the six SANS Critical AI Security Guidelines domains.
+
+- [ ] **Step 2: Write `kill-switches.md`** with exact commands or UI paths, fastest first:
+  1. zero or revoke the provider keys;
+  2. suspend the GitHub App installations;
+  3. `sudo -iu hapi mise run down`;
+  4. `sudo nft` / `ufw` drop for uid `hapi`.
+
+- [ ] **Step 3: Verify** by having one fresh reader (a subagent) check every residual risk in spec §11.9 against the threat model. Expected: each appears with an owner control and a "next level" item.
+
+- [ ] **Step 4: Commit** `git commit -am "docs(security): MAESTRO threat model v0 and kill-switch runbook"`
+
+---
+
+### Tasks 8–14: Verify-early spikes (spec §19)
+
+Each spike works in `spikes/scratch/<n>/` (gitignored, throwaway). It records **result, evidence (commands and output), decision, and the consequence for Plan 0X** in `docs/spikes/NN-<name>.md`, then commits only that note. A spike that disproves a design assumption stops the line. Raise it with the operator before writing the dependent plan.
+
+Spike 2 of spec §19 (Pi config skew) is **resolved by design**: Archon's Pi uses its own read-only `PI_CODING_AGENT_DIR`, and any standalone Pi CLI is pinned to 1.3.0. Nothing to run.
+
+### Task 8: Spike: Pi under Archon (for Plans 02/03)
+
+- [ ] **Step 1:** In the Archon container, create a target worktree containing:
+  - a `.pi/extensions/evil.ts` that writes `/tmp/pwned`;
+  - a `.pi/settings.json` listing an npm package.
+
+  Add a user-level test extension in the mounted `PI_CODING_AGENT_DIR` that blocks writes to `AGENTS.md` and throws from `before_provider_request` when `FAIL_ME=1`.
+- [ ] **Step 2:** Run a one-node Pi workflow with `enableExtensions: true` **after** a bash node that `rm -rf .pi .agents`. Expected:
+  - no `/tmp/pwned`;
+  - no npm install attempted (Squid log shows no `registry.npmjs.org` hit from install, and `PI_OFFLINE=1` is honored);
+  - the user-level extension loaded (its block fires on an `AGENTS.md` write).
+- [ ] **Step 3:** Re-run with `FAIL_ME=1`. Expected: the node fails, with the extension error as evidence.
+- [ ] **Step 4:** Record the result in `docs/spikes/01-pi-under-archon.md` and commit.
+
+### Task 9: Spike: Hermes path-guard mechanics (for Plan 04)
+
+- [ ] **Step 1:** Write a minimal Python plugin (`plugins.isolation: host`) whose `pre_tool_call` returns an approve decision for writes matching `.factory/**`. Have it log `ctx.current_cron_execution()` and `ctx.session_surface()`.
+- [ ] **Step 2:** Test three surfaces:
+  - (a) an interactive CLI session writing `.factory/x`: expected to prompt;
+  - (b) a cron job doing the same: expected to deny;
+  - (c) an interactive `echo hi > .factory/y` via the terminal tool: record whether it's caught (#143266).
+- [ ] **Step 3:** Record the result in `docs/spikes/02-hermes-path-guard.md`. If (c) isn't caught, record the fallback for Plan 04: `hapi-cmd-allow` denies shell redirection into protected paths. Commit.
+
+### Task 10: Spike: Archon budget, trigger inputs, env propagation (for Plan 03)
+
+- [ ] **Step 1:** Write a 3-node workflow with `budget: {max_spend_usd: 0.05}`: bash, then a Pi prompt, then bash. Fire it with `archon trigger fire --delivery-id spike-1 --inputs '{"work_order_id":"w1","traceparent":"00-<32hex>-<16hex>-01"}'`.
+- [ ] **Step 2:** Expected:
+  - the budget is accepted (no load error);
+  - the run stops when the budget is hit;
+  - the inputs are visible as `$INPUTS_*` in the bash nodes;
+  - record whether `WORKFLOW_ID` and any exported `TRACEPARENT` reach Pi's bash (`env | grep -E 'WORKFLOW_ID|TRACEPARENT'` run from within the Pi node).
+- [ ] **Step 3:** Record the result in `docs/spikes/03-archon-budget-trigger-env.md` and commit.
+
+### Task 11: Spike: Anthropic history-edit rejection and Agent SDK billing (for Plans 02/03/04)
+
+- [ ] **Step 1:** With the `hapi-evals` key on Haiku 5.5, force Hermes compression (a tiny `compression` threshold) and Pi compaction (a tiny window in a test `models.json`) in short sessions. Record any 4xx mentioning edited history, for Opus 5.5 and Sonnet 5.5 too (≤ $1 total).
+- [ ] **Step 2:** Run one Claude-provider Archon node (one short prompt). In the Console, confirm it billed to the `hapi-factory` workspace **API credit**, not the subscription.
+- [ ] **Step 3:** Record the result in `docs/spikes/04-anthropic-history-and-billing.md`, including the spend, and commit.
+
+### Task 12: Spike: images under rootless Docker (for Plan 01 Task 5 hardening, and Plans 03/04)
+
+- [ ] **Step 1:** Under `hapi`, run the pinned Hermes and Archon images with `read_only: true` and `cap_drop: ALL`. Record which paths need `tmpfs` or volumes, and any capability that has to come back.
+- [ ] **Step 2:** Record the result in `docs/spikes/05-rootless-images.md`. If a hardening option had to be relaxed, update `stack/compose.yaml` in the same commit, with a comment naming the spike.
+
+### Task 13: Spike: Hermes Slack gateway in Socket Mode (for Plan 04)
+
+- [ ] **Step 1:** Create a Slack app in a dedicated workspace with Socket Mode on, and an allowlist containing only the operator's user ID. Start the Hermes gateway inside the stack (Slack hosts already allowlisted).
+- [ ] **Step 2:** Expected:
+  - DMs from the operator are answered;
+  - a second test user is ignored;
+  - no inbound port is opened (`ss -ltn` inside the container shows no new listener).
+- [ ] **Step 3:** Record the result in `docs/spikes/06-hermes-slack-socket-mode.md` and commit.
+
+### Task 14: Spike: Odoo sidecar for smoke tests (for Plans 03/05/07)
+
+- [ ] **Step 1:** Run the official `odoo` + `postgres` images, digest-pinned, on `archon-net` as `odoo.internal`. Write `spikes/scratch/odoo/seed.py`, which creates 3 partners and 2 posted customer invoices via Odoo's external JSON-RPC API.
+- [ ] **Step 2:** From the Archon container, call `res.partner` `search_read` through the external API. Expected: 3 partners. Record startup time and RAM.
+- [ ] **Step 3:** Record the result in `docs/spikes/07-odoo-sidecar.md`, including the exact compose snippet Plan 05's template will use, and commit.
+
+---
+
+## Phase 0 done when
+
+- `sudo -iu hapi mise run up` brings up all four services healthy.
+- `mise run test` and `mise run test:int` pass.
+- `mise run audit` exits 0.
+- `docs/security/threat-model.md` exists.
+- All seven spike notes are committed, each with a decision and its consequence for the next plans.
