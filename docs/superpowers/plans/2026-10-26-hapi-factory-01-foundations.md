@@ -38,7 +38,7 @@ This is Plan 01 of 07. Each later plan is written after the plans before it fini
 | **01 Foundations** (this) | Toolchain, policy plus schemas (including work order), generators, secrets, App tokens, stack, egress, audit, threat model v0, spikes | `hapi` CLI; `loadPolicy`, `applyOverlay`, `validateWorkOrder`; `buildAll`; `mintInstallationToken`; `resolveSecrets`; `runAudit`; the running stack; `docs/spikes/*` |
 | 02 Worker | `decide()` with the vendored ten-levels Jev client, mock and decision files; the `hapi decide` CLI; the `hapi-guard` Pi extension (protected paths, budgets, request clamps, trace, Jev level-6 gates) | `decide(name, state)`; the hapi-guard package baked into the Archon image |
 | 03 Run engine | Archon `factory-task` workflow pack (prepare / strip / scout / implement / retry / gates / review / commit); the forge interface; poller (merge + `hapi:rework`); mirror; harvester; `metrics.json`; commit trailers | The end-to-end run from a merged work order to a delivery PR |
-| 04 Coordinator | Hermes plugins `hapi-path-guard` and `hapi-cmd-allow`; skills `hapi-planning`, `new-work-order` and `hapi-research-note` (with citation check); the `hapi-research` profile and container; freshness job; the `hapi-status` tool; Slack gateway; PR-comment queue plus the injection screen | Planning PRs from a Slack conversation |
+| 04 Coordinator | Hermes plugins `hapi-path-guard` and `hapi-cmd-allow`; skills `hapi-planning`, `new-work-order` and `hapi-research-note` (with citation check); the `hapi-research` profile and **its own container** (native Brave and Exa web backends, Context7 MCP from the Task 3b catalog); freshness job; the `hapi-status` tool; Slack gateway; PR-comment queue plus the injection screen | Planning PRs from a Slack conversation |
 | 05 Repo contract | `templates/repo-contract/`, `mise run new-repo`, the reusable CI workflow (gates, schema, trailers, protected-path diff), `.coderabbit.yaml`, ruleset application | New repos born compliant |
 | 06 Evals & metrics | Eval case format and runner, planning eval, `metrics.jsonl`, flags and thresholds, Jev/CodeRabbit calibration records | `mise run eval` |
 | 07 v1 acceptance | The Odoo MCP run-through against the spec's v1 definition of done (§15), plus the budget, portable and jev-off runs | v1 done |
@@ -294,6 +294,101 @@ test("research zone allows open web but blocks private ranges", () => { /* to_lo
 - [ ] **Step 5: Wire up the build.** Add `hapi policy build` and point mise task `policy:build` at it. Run `mise run policy:build && ls build/*`. Expected: the 9 files above.
 
 - [ ] **Step 6: Commit** `git commit -am "feat(generate): compile policy into Hermes, Archon, Pi and egress configs"`
+
+---
+
+### Task 3b: MCP catalog, advisory floors, tool-description lock, per-zone emission
+
+The spec is §10.1. The evidence is in `research_notes/Hapi factory plugins and o11y/mcp_baseline.md`.
+
+**Files:**
+- Create:
+  - `policy/mcp.yaml`, `policy/mcp.lock.json`
+  - `policy/schemas/policy-mcp.schema.json`, `policy/schemas/mcp-lock.schema.json`
+  - `src/policy/mcp.ts`, `src/mcp/lock.ts`, `src/generate/mcp.ts`
+- Modify:
+  - `src/policy/types.ts`, `src/policy/load.ts` (add `mcp` to `Policy`)
+  - `policy/trusted_sources.yaml` (drop T2 from the `hermes` zone; fix the Context7 comment)
+  - `src/generate/hermes.ts` (emit `mcp_servers` for the hermes zone), `src/generate/index.ts`
+  - `src/cli.ts`
+  - `docs/policy.md`, `docs/generated-configs.md`
+- Test: `tests/policy/mcp.test.ts`, `tests/mcp/lock.test.ts`, `tests/generate/mcp.test.ts`, plus additions to `tests/generate/hermes.test.ts` and `tests/policy/zones.test.ts`
+
+**Interfaces:**
+- Consumes: `loadPolicy`, `zoneHosts`, `forgeDomain`, `emitHermes`, `buildAll` (Tasks 2–3).
+- Produces:
+  - **`Policy.mcp: {servers: Record<string, McpServer>; blocked: string[]}`**, where `McpServer` is:
+    ```
+    {zones: ZoneName[];
+     transport: "stdio"|"http";
+     package?: {name: string; version: string /* exact */; integrity: string /* sha512-… */};
+     image?: string /* name@sha256:… */;
+     url?: string /* http only, https, first-party */;
+     floor?: {min: string; advisory: string} /* our own advisory floor */;
+     cooldown_exception?: string /* advisory id */;
+     tools: {include: string[]};
+     env: Record<string, string> /* ENV → bws key name, or a literal for flags like OTEL_SDK_DISABLED */;
+     egress: string[];
+     trust: "untrusted";
+     elicitation: "deny";
+     enabled_when?: "always"|"o11y"}
+    ```
+  - **`serversForZone(p, zone, opts?: {o11y?: boolean}): [string, McpServer][]`.**
+  - **`hashToolSurface(s: {tools: Tool[]; instructions?: string; prompts?: unknown[]; resources?: unknown[]}): string`**: sha256 of canonical JSON, with tools sorted by name.
+  - **`verifyLock(p, lock, fetchSurface: (name: string) => Promise<Surface>): Promise<{name: string; status: "ok"|"changed"|"unpinned"; expected?: string; actual: string}[]>`.**
+  - **`emitMcpJson(p, zone): string`**: a standard `mcp.json` per zone, written to `build/mcp/<zone>.mcp.json`, for the CI scanners (Plan 05).
+  - **`hapi mcp verify`** and **`hapi mcp pin --server <name>`.** `fetchSurface` launches the pinned server inside a throwaway container on its zone's network. The live wiring is in Task 5; unit tests inject fakes.
+- **Catalog values (v1):**
+  - **`context7`:**
+    - zones `[research]`, stdio;
+    - package `@upstash/context7-mcp` **4.3.0** with integrity `sha512-fuDt5nWjE5JkAPLjU0m+m0LlJphxyegAvAmcwHoA5jrzAhKo/rVV0RFA8TOwODGdDVdt/nPxNslkxeDIDp/rPA==` (it clears the 14-day cooldown; 4.4.4 doesn't yet);
+    - floor `{min: "2.1.3", advisory: "CVE-2026-75130"}`;
+    - tools `[resolve-library-id, query-docs]`;
+    - env `{CONTEXT7_API_KEY: <bws key name>, OTEL_SDK_DISABLED: "true"}`;
+    - egress `[context7.com]`; trust untrusted; elicitation deny; enabled_when always.
+  - **`phoenix`:**
+    - zones `[hermes]`, stdio, enabled_when `o11y`;
+    - package `@arizeai/phoenix-mcp`: the newest version that clears the 14-day cooldown, with its registry integrity (`npm view` via registry.npmjs.org);
+    - tools: the 23 read-only tools listed in the research note, **excluding** `phoenix-support`, `upsert-prompt`, `add-prompt-version-tag` and `add-dataset-examples`;
+    - env `{PHOENIX_ENDPOINT: <explicit>, PHOENIX_API_KEY: <bws key name, VIEWER role>, PHOENIX_DISCOVER_CONFIG: "false"}`;
+    - egress: the Phoenix host only.
+  - **`blocked`:** `@modelcontextprotocol/server-brave-search`, `crawl4ai`, `ai.smithery/*`, `@upstash/context7-pi`, `@upstash/context7-admin-mcp` (patterns match package names).
+  - **`trusted_sources.yaml`:** the `hermes` zone keeps tiers `[T0, T1]` only (spec §10 as amended).
+
+- [ ] **Step 1: Write the failing tests:**
+
+```ts
+test("context7 is research-only and hermes has no MCP outside o11y", () => {
+  const p = loadPolicy("policy");
+  expect(serversForZone(p, "research").map(([n]) => n)).toEqual(["context7"]);
+  expect(serversForZone(p, "hermes")).toEqual([]);
+  expect(serversForZone(p, "hermes", { o11y: true }).map(([n]) => n)).toEqual(["phoenix"]);
+  expect(serversForZone(p, "archon")).toEqual([]);
+});
+test("rejects an inexact pin or a missing integrity", () => { /* version "^4.3.0" or "latest" → PolicyError at /mcp/servers/context7/package */ });
+test("enforces the advisory floor", () => { /* context7 version 2.1.2 → PolicyError naming CVE-2026-75130 */ });
+test("rejects any server enabled for the archon zone", () => { /* zones: [archon] → PolicyError */ });
+test("rejects blocked packages", () => { /* package @modelcontextprotocol/server-brave-search → PolicyError */ });
+test("rejects write tools for phoenix", () => { /* include upsert-prompt → PolicyError (a write-tool denylist per server) */ });
+test("hermes zone has no T2 sources", () => { /* zoneHosts(p,"hermes") excludes context7.com and deepwiki.com */ });
+test("hashToolSurface is order-independent and instruction-sensitive", () => { /* reordered tools → same; changed instructions → different */ });
+test("verifyLock reports changed, unpinned and ok", async () => { /* fakes */ });
+test("emitHermes carries mcp_servers only for enabled hermes-zone servers, with include lists and env by name", () => { /* o11y off → no mcp_servers; on → phoenix only */ });
+test("emitMcpJson writes a scanner-compatible file per zone", () => { /* research.mcp.json has context7 with a pinned command */ });
+```
+
+- [ ] **Step 2: Run** `bun test tests/policy/mcp.test.ts tests/mcp tests/generate`. Expected: FAIL.
+
+- [ ] **Step 3: Implement.**
+  - Verify the Context7 integrity value against registry.npmjs.org. Fetch Phoenix's newest version that clears the cooldown, and its integrity.
+  - Use the Hermes `mcp_servers` keys from the research notes: `command`, `args`, `env` (explicit only), `tools.include`, `trust`.
+  - `mcp.lock.json` starts as `{}`, and `verifyLock` treats a missing entry as `unpinned`.
+
+- [ ] **Step 4: Run** the tests. Expected: PASS. Then run `mise run lint && mise run test && mise run policy:build`. Expected: `build/mcp/{hermes,research}.mcp.json` exist.
+
+- [ ] **Step 5: Docs.** Update `docs/policy.md` (mcp.yaml fields, floors, cooldown and exceptions, blocklist, lockfile, `hapi mcp verify|pin`) and `docs/generated-configs.md` (Hermes `mcp_servers`, `build/mcp/*.mcp.json`). Add the spec §10.1 per-layer table to `docs/policy.md`.
+
+- [ ] **Step 6: Commit** `git commit -m "feat(mcp): per-zone pinned MCP catalog with advisory floors, tool-surface lock and emitters"`
 
 ---
 

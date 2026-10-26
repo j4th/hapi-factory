@@ -162,6 +162,18 @@ Two facts drive this layout:
 
 So **nothing inside the Archon container is a human-approval boundary**. The boundary is GitHub's ruleset plus the operator's review, and the Archon zone has no forge write credentials at all.
 
+### 4.4 Many repos, trust domains [user asked; call]
+
+**Segment by trust domain, not by repo.**
+- **Inside one trust domain:** one Hermes profile (its own config, `.env`, memory, sessions, skills, cron and state DB) and one Archon instance serve many repos, through registered codebases, per-repo worktrees and the shared home-scoped workflow pack. Per-repo isolation within a domain:
+  - a work order names exactly **one** repo;
+  - GitHub tokens are minted for that repo only;
+  - each repo has its own overlay and egress;
+  - each repo has its own run queue (resource `github:<owner>/<repo>:factory`).
+- **A new trust domain** gets its own Hermes profile, Archon container and zone, model workspace and spend cap, and Slack channel. Examples: the downstream abliteration.ai security work, or any client or private code. This stops memory and skill bleed between domains: a poisoned memory in one domain can't steer another.
+- **No run ever spans two repos.** A cross-repo feature is one work order per repo, coordinated by Hermes.
+- **v1 has one domain** ("oss": hapi-factory, odoo-mcp, later mtg).
+
 ---
 
 ## 5. Lanes, approvals and commits
@@ -389,14 +401,14 @@ protected_paths:
 - `skill-integrity`
 - `custom-dangerous-patterns`
 - the bundled `grounded-citations` skill, extended with retrieval dates
-- one search plugin (Tavily or Linkup, or a core backend)
+- Hermes **native** web backends in the research zone: Brave (search) + Exa contents (extract), with keyless fallback off (§10.1)
 - Archon's `archon-cli` skill, vendored and pinned, for status only (§9.2)
 
 **Build** [call]:
 1. **`hapi-path-guard`**, a Python plugin. Prompts on glob matches in interactive sessions and blocks in unattended ones (via `ctx.current_cron_execution()` and `ctx.session_surface()`); blocks under yolo. It must also cover shell writes, since the core gate misses them (#143266) [verify].
 2. **`hapi-cmd-allow`**, a default-deny `pre_tool_call` shell hook with `fail_closed: true`.
 3. **`hapi-planning` skill**: brainstorm → research brief → design and threat model → work orders → planning PR. It uses `new-work-order` (deterministic id and `traceparent`, schema validation).
-4. **`hapi-research` profile**, quarantined: web tools only, no terminal, no repo write, no secrets. It returns a schema-validated brief, and the **`hapi-research-note` skill** writes `docs/research/<topic>.md` with retrieval dates, source hashes and a `recheck_by` date.
+4. **`hapi-research` profile**, quarantined in **its own container**: web tools only, no terminal, no repo write, no secrets except spend-capped, search-only keys (§10.1). It returns a schema-validated brief, and the **`hapi-research-note` skill** writes `docs/research/<topic>.md` with retrieval dates, source hashes and a `recheck_by` date.
 5. **Freshness job**: a cron pre-run script that checks `recheck_by` dates and wakes the agent only when something is stale, so it costs nothing otherwise. It opens `lane:planning` update PRs.
 6. **`hapi-status` tool**, fixed-argv: `archon workflow status/list/cancel/resume`.
    - `resume` re-drives a run that a merge already approved, with no new inputs. It's also available to the operator as `mise run factory:resume -- <run-id>` [call].
@@ -552,16 +564,79 @@ Small scripts run by `hapi` (systemd user timers, installed by `mise run up`):
 `policy/trusted_sources.yaml` has four tiers [call; from report]:
 - **T0:** pinned local snapshots
 - **T1:** first-party domains and package registries
-- **T2:** curated aggregators, such as Context7 at ≥ the patched MCP `@upstash/context7-mcp` 2.1.3, and DeepWiki
+- **T2:** curated aggregators, such as Context7 (pinned 4.x client; ContextCrush was fixed server-side, see §10.1) and DeepWiki
 - **T3:** the open web
 
 Who gets which tier:
 - **Only `hapi-research`** touches T3. It returns schema-validated briefs; nothing raw goes downstream.
-- **The Hermes main session** gets T0–T2.
+- **The Hermes main session** gets T0–T1. T2 and T3 content reaches it only as schema-validated briefs from `hapi-research` (amended 2026-10-26 after the MCP research, §10.1).
 - **Pi workers** get T0–T1, and in practice no web tools at all. Their egress is model APIs, the local mirror, package registries and the work order's `egress_extra` hosts.
 - Enforcement lives below the agent: a default-deny egress proxy per container. The builder picks the tool, such as sandbox-runtime, iron-proxy (Docker backend only) or Smokescreen.
 
 For the mtg pilot, Hermes confirms the endpoint change **from a first-party source** and records it. The worker never researches it.
+
+### 10.1 MCP servers per layer [user: add an MCP layer with base configs; call: contents, from `research_notes/Hapi factory plugins and o11y/mcp_baseline.md`, 2026-10-26]
+
+MCP servers are packages that put text into an agent's context. Each one is therefore two risks:
+- a **supply-chain** risk: code we run;
+- an **untrusted-input** source: text the model reads.
+
+**Single source of truth:**
+- **`policy/mcp.yaml`,** the catalog of approved servers. Each entry gives:
+  - the zone(s) that may load it;
+  - its transport;
+  - an **exact pin** (version + registry integrity, or OCI digest);
+  - an advisory **version floor** our own check enforces, because some advisories, like Context7's, have no OSV record and scanners stay silent;
+  - a `tools.include` allowlist (read-only tools only);
+  - `env`, by `bws` key name: each server gets only its own key;
+  - its allowed egress hosts;
+  - `trust: untrusted`;
+  - elicitation `deny`.
+- **`policy/mcp.lock.json`** stores each server's raw `tools/list` output, `instructions`, prompts and resources, plus their hash.
+
+**Who gets what (v1):**
+
+| Layer / zone | MCP servers | Notes |
+|---|---|---|
+| `hapi-research` (`research` zone, **its own container**) | **Context7** (`@upstash/context7-mcp`, T2) | The only general docs server with version-addressed library ids and a pinnable local client. Library-owner and teamspace "rules" can't be switched off client-side, so it stays quarantined: egress `context7.com` only, always with an API key, `OTEL_SDK_DISABLED=true`, no proxy or URL overrides beyond the zone's own. |
+| Hermes main session (`hermes` zone) | **None in v1.** Optional: **Arize Phoenix MCP** (`@arizeai/phoenix-mcp`, stdio) whenever the o11y profile runs | Phoenix needs a VIEWER-role key, `PHOENIX_DISCOVER_CONFIG=false`, an explicit `PHOENIX_ENDPOINT`, the 23 read-only tools only, and `phoenix-support` excluded (it forwards queries to a third party). |
+| Archon Pi workers / Claude review nodes | **None** | Workers see T0–T1 only. Docs reach them as research notes and reviewed, hashed snapshots. |
+| Claude Code lane (phase 4) | Generated from the same catalog, with `--strict-mcp-config` | Context7 only under research-zone quarantine. |
+
+**Web search is NOT an MCP server.** The research zone uses Hermes's **native** `web_search` / `web_extract`:
+- **Brave** for search, **Exa contents** (or Firecrawl) for extract;
+- `keyless_fallback: false`, never `web.backend: nous`;
+- `security.allow_private_urls: false`;
+- vendor extras pre-installed at image build, from Hermes's own exact pins.
+
+Why native beats an MCP server here:
+- The native path exposes a fixed, Hermes-owned two-tool schema, so there's no vendor tool text to rug-pull.
+- It has a fail-closed SSRF guard.
+- The four leading search APIs (Brave, Firecrawl, Exa, Parallel) were statistically tied on the only independent benchmark. Brave is fastest and cheapest per search, and Exa contents is $1 per 1k pages.
+
+**Research-zone keys:** `hapi-research` holds only **spend-capped, search-only** keys: Brave, Exa and Context7 [call]. That's a deliberate exception to "no secrets": low value and capped, with no repo or forge access.
+
+**Deliberately not used in v1** (one line each; reasons in the research note):
+- **GitHub MCP:** forge actions go through `src/forge/`. A read-only GitHub MCP is a phase-2 candidate for mtg triage.
+- **Firecrawl, Tavily, Perplexity and other search MCPs:** native backends cover them.
+- **Reference servers** (filesystem, git, memory, time, sequential-thinking): native tools cover them, and git and filesystem would bypass our command and path policies.
+- **Playwright MCP:** Microsoft now recommends its CLI plus skills.
+- **MCP gateways** (Docker MCP Gateway, etc.): they need the Docker socket, have heavy advisory histories, and none defends against tool poisoning.
+- **Lookalike packages** are blocked by name, e.g. `@modelcontextprotocol/server-brave-search`, Crawl4AI and `ai.smithery/*`.
+
+**Controls:**
+- **Pin:** one image per server, built from a committed lockfile and pinned by digest. A bare `npx`/`uvx pkg@x.y.z` doesn't pin the dependency tree.
+- **Cooldown:** 14-day release cooldown, with a **security-fix exception** recorded in the catalog.
+- **Run stdio servers inside their zone's container,** so the zone's Squid allowlist binds them. Egress is per zone, not per server, in v1. Accepted, because no research-zone server holds a second secret. Per-server isolation (e.g. ToolHive with explicit deny-by-default profiles) is a phase-2 option.
+- **Rug-pull defense:** `hapi mcp pin` records `mcp.lock.json`. Every connect, `hapi audit` (`mcp.tool-hashes`) and stack start-up fail closed on drift. Re-approval is a planning PR, since `new_skill_or_mcp` is on the approvals list. Remote-only endpoints count as review events.
+- **CI scanning** on every change to the catalog or lockfile:
+  1. Cisco `mcp-scanner` (offline YARA and static checks over the lockfile; never runs servers);
+  2. Snyk Agent Scan (sandboxed; it runs servers and uploads their descriptions);
+  3. our advisory-floor check.
+
+  Scanners are a floor, not a verdict.
+- **Untrusted output:** **[verify in Plan 04]** whether a Hermes post-tool hook can run the injection screen (§9.5, L1) over MCP results. Either way, the human gate is the planning PR, since nothing from the research zone reaches workers without it.
+- **Context7 security note:** ContextCrush (CVE-2026-75130, ≤ 2.1.2) was fixed on Upstash's **backend** on 2026-02-23, so a client pin can't enforce it. We pin a current 4.x client and enforce a floor above 2.1.2 ourselves, but the rules channel stays a live injection path. That's the reason for the quarantine.
 
 ---
 
@@ -886,7 +961,6 @@ Because v1 keeps Archon off the forge (§9.4), hapi-factory may need little or n
 - Whether to upstream the Archon Pi-trust fix during phase 1 or later.
 - Deduplicating the trigger key when one merge carries several work orders.
 - The toolchain mise installs inside the Archon container.
-- Giving `hapi-research` its own container, since egress policy is per container.
 - How the ruleset lets the operator merge PRs he authored himself (`lane:direct`). Rulesets don't let an author approve their own PR. Use an owner-only bypass that the Apps and agents can never use.
 
 ## 19. Verify early (spikes)
