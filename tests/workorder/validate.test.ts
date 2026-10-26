@@ -89,6 +89,39 @@ describe("rejects", () => {
   });
 });
 
+describe("egress_extra may not name a forge host (spec §4.3, §10)", () => {
+  // A work order's egress_extra joins the archon zone at run time, and that zone has no forge route.
+  const forges: [string, string][] = [
+    ["github.com", "github.com"],
+    ["api.github.com", "github.com"],
+    ["raw.githubusercontent.com", "githubusercontent.com"],
+    ["avatars.githubassets.com", "githubassets.com"],
+    ["ghcr.io", "ghcr.io"],
+    ["gitlab.com", "gitlab.com"],
+    ["registry.gitlab.com", "gitlab.com"],
+    ["bitbucket.org", "bitbucket.org"],
+    ["api.bitbucket.org", "bitbucket.org"],
+  ];
+  for (const [host, forge] of forges) {
+    test(host, () => {
+      const o = example();
+      o.egress_extra = ["odoo.internal", host];
+      expect(workOrderError(o).issues).toEqual([
+        {
+          path: "/egress_extra/1",
+          message: `"${host}" is a forge host (${forge}); the archon zone has no forge route (spec §4.3)`,
+        },
+      ]);
+    });
+  }
+
+  test("look-alike domains are not forge hosts", () => {
+    const o = example();
+    o.egress_extra = ["notgithub.com", "github.com.mirror.internal", "gitlab.company.internal", "ghcr.io.example"];
+    expect(validateWorkOrder(o).egress_extra).toHaveLength(4);
+  });
+});
+
 describe("loadWorkOrder", () => {
   test("reads and validates a YAML file", () => {
     expect(loadWorkOrder("tests/fixtures/order-0002.yaml").id).toBe("0002-search-partners-tool");

@@ -1,4 +1,5 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { main, register } from "../src/cli";
 import { HAPI_VERSION } from "../src/version";
 import pkg from "../package.json";
@@ -123,4 +124,14 @@ test("workorder validate needs exactly one path", async () => {
   expect(await main(["workorder", "validate"])).toBe(2);
   expect(await main(["workorder", "validate", "a.yaml", "b.yaml"])).toBe(2);
   expect(err.join("\n")).toContain("usage: hapi workorder validate <path>");
+});
+
+test("src/cli.ts's header comment and the README describe the exit codes the same way", () => {
+  // The header is the first /** ... */ block, with its line prefixes removed.
+  const header = (readFileSync("src/cli.ts", "utf8").split("*/")[0] ?? "").replace(/\s*\n\s*\*\s?/g, " ");
+  const readme = readFileSync("README.md", "utf8");
+  const usage = "a usage error: an unknown command, no command at all, or the wrong arguments for a command";
+  expect(readme).toContain(`\`2\`: ${usage}.`);
+  expect(header).toContain(`2 ${usage}.`);
+  expect(header).toContain("0 success, 1 the command failed,");
 });

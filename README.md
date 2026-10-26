@@ -52,11 +52,11 @@ What exists now:
 | `src/version.ts` | `HAPI_VERSION`. It must match `version` in `package.json`, and a test checks that it does. |
 | `policy/` | The single source of truth: protected paths, commands, trusted sources, budgets, approvals, roles, flags and the model rosters (`policy/rosters/`). See [docs/policy.md](docs/policy.md). |
 | `policy/schemas/` | JSON Schemas (draft 2020-12) for every policy file, the repo overlay (`.factory/config.yaml`) and the work order (`order.yaml`) |
-| `src/policy/` | `loadPolicy` (load and validate `policy/`), `loadOverlay` and `applyOverlay` (the repo overlay, which may only tighten policy), `effectiveModes` (a file's protected-path modes: the strictest across every matching glob), the policy types and the shared schema checker |
+| `src/policy/` | `loadPolicy` (load and validate `policy/`), `loadOverlay` and `applyOverlay` (the repo overlay, which may only tighten policy), `effectiveModes` (a file's protected-path modes: the strictest across every matching glob), `matchCommand` (whether Hermes's argv-exact command rules allow a command), `forgeDomain` (forge hosts, which the archon zone may never reach), the policy types and the shared schema checker |
 | `src/workorder/` | `validateWorkOrder` and the `hapi workorder validate` command |
-| `tests/` | Unit tests for `bun test`. `tests/fixtures/` holds example work orders, overlays and a broken policy directory. |
+| `tests/` | Unit tests for `bun test`. `tests/fixtures/` holds example work orders, overlays, a broken policy directory, and `command-vectors.json`, the command-allowlist cases that Plan 04's Python hook must also pass. |
 | `.github/workflows/ci.yml` | [CI](#ci) for this repo. |
-| `docs/policy.md` | The policy files, the overlay rule and the work-order format |
+| `docs/policy.md` | The policy files, the command-allowlist semantics, the overlay rule and the work-order format |
 | `docs/superpowers/specs/` | The design spec. It is the binding authority. |
 | `docs/superpowers/plans/` | Implementation plans. Plan 01 is the current one. |
 | `reports/`, `research_notes/` | The evidence the design rests on: the recon report and the research notes. |
@@ -266,7 +266,7 @@ These steps are outward-facing or privileged, so agents never do them; the opera
 | Document | What's in it |
 |---|---|
 | [Design spec](docs/superpowers/specs/2026-10-26-hapi-factory-design.md) | Intent, architecture, policy, security, phases. It is the binding authority. |
-| [Policy](docs/policy.md) | Each policy file and its schema, the tighten-only overlay rule with examples, the work-order format and `hapi workorder validate` |
+| [Policy](docs/policy.md) | Each policy file and its schema, how Hermes's command rules match (and what the Plan 04 hook must do first), the tighten-only overlay rule with examples, the work-order format and `hapi workorder validate` |
 | [Plan 01: Foundations](docs/superpowers/plans/2026-10-26-hapi-factory-01-foundations.md) | Tasks 1–14: toolchain, policy, generators, secrets, stack, audit, threat model, spikes |
 | [Recon report](reports/Agentic%20software%20factory%20recon.md) | The evidence the design rests on, with sources and versions |
 | [`research_notes/`](research_notes/) | Detailed research notes behind the report |

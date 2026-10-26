@@ -121,6 +121,55 @@ describe("applyOverlay", () => {
     }
   });
 
+  test("egress_extra can't add any forge, GitHub or not (forge-agnostic)", () => {
+    const forges: [string, string][] = [
+      ["gitlab.com", "gitlab.com"],
+      ["registry.gitlab.com", "gitlab.com"],
+      ["bitbucket.org", "bitbucket.org"],
+      ["api.bitbucket.org", "bitbucket.org"],
+      ["githubassets.com", "githubassets.com"],
+      ["pkg.ghcr.io", "ghcr.io"],
+    ];
+    for (const [host, forge] of forges) {
+      const e = loosenError(() => applyOverlay(p, { egress_extra: [host] }));
+      expect(e.path).toBe("/egress_extra/0");
+      expect(e.message).toContain(`"${host}" is a forge host (${forge})`);
+    }
+    // Look-alikes are other domains, not forge hosts.
+    const r = applyOverlay(p, { egress_extra: ["notgithub.com", "github.com.mirror.internal", "gitlab.company.internal"] });
+    expect(r.trustedSources.zones.archon.hosts).toContain("notgithub.com");
+  });
+
+  test("the result shares no objects with the input policy", () => {
+    const base = loadPolicy("policy"); // a private copy: if this test fails, the shared p stays intact
+    const r = applyOverlay(base, {
+      protected_paths: { "src/secrets/**": { workers: "deny" } },
+      egress_extra: ["odoo.internal"],
+      budgets: { run_usd: 2 },
+    });
+    r.protectedPaths["AGENTS.md"]!.interactive = "allow"; // an entry the overlay didn't touch
+    r.protectedPaths[".pi/**"]!.workers = "allow";
+    r.trustedSources.zones.archon.hosts.push("evil.example");
+    r.trustedSources.zones.hermes.hosts.push("evil.example");
+    r.budgets.workspaces["hapi-hermes"] = 999;
+    r.commands.hermes.allow["git-push-plan"]!.args[0] = "^.*$";
+    expect(base).toEqual(loadPolicy("policy"));
+  });
+
+  test("default_risk and workflow are exposed as result.repo (spec §7); they aren't policy, so tighten-only doesn't apply", () => {
+    const r = applyOverlay(p, { default_risk: "high", workflow: "factory-task" });
+    expect(r.repo).toEqual({ default_risk: "high", workflow: "factory-task" });
+    // Any risk is accepted, "low" included: it is the default for new work orders, not a limit.
+    expect(applyOverlay(p, { default_risk: "low" }).repo).toEqual({ default_risk: "low" });
+    expect(applyOverlay(p, { workflow: "factory-docs" }).repo).toEqual({ workflow: "factory-docs" });
+    // Nothing else changes, and the input is untouched.
+    const { repo: _repo, ...rest } = r;
+    expect(rest).toEqual(p);
+    expect(p.repo).toBeUndefined();
+    // Without them, there is no repo key at all.
+    expect("repo" in applyOverlay(p, { budgets: { run_usd: 1 } })).toBe(false);
+  });
+
   test("budgets may be lowered", () => {
     const r = applyOverlay(p, { budgets: { run_usd: 1.5, workspaces: { "hapi-factory": 50 } } });
     expect(r.budgets.run_usd).toBe(1.5);
@@ -182,6 +231,18 @@ describe("loadOverlay", () => {
     expect(r.protectedPaths["src/secrets/**"]).toEqual({ interactive: "deny", unattended: "deny", workers: "deny" });
     expect(r.trustedSources.zones.archon.hosts).toContain("odoo.internal");
     expect(r.budgets.run_usd).toBe(2);
+    expect(r.repo).toEqual({ default_risk: "medium", workflow: "factory-task" });
+  });
+
+  test("default_risk must be a risk and workflow a slug", () => {
+    expect(policyError(overlayFile("default_risk: extreme\n")).path).toBe("/default_risk");
+    for (const w of ["Factory-Task", "factory_task", "../factory-task", "factory-", "-factory", "factory--task"]) {
+      expect(policyError(overlayFile(`workflow: "${w}"\n`)).path).toBe("/workflow");
+    }
+    expect(loadOverlay(overlayFile("default_risk: low\nworkflow: factory-task\n"))).toEqual({
+      default_risk: "low",
+      workflow: "factory-task",
+    });
   });
 
   test("a null entry loads, and applyOverlay rejects it as a removal", () => {
@@ -190,7 +251,7 @@ describe("loadOverlay", () => {
     expect(loosenError(() => applyOverlay(p, o)).path).toBe("/protected_paths/AGENTS.md");
   });
 
-  test("anything other than protected_paths, egress_extra and budgets is rejected", () => {
+  test("anything other than protected_paths, egress_extra, budgets, default_risk and workflow is rejected", () => {
     for (const key of ["commands", "trusted_sources", "approvals", "flags", "roles", "rosters"]) {
       const e = policyError(overlayFile(`${key}: {}\n`));
       expect(e.path).toBe(`/${key}`);

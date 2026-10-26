@@ -168,8 +168,29 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
 
   test("commands", () => {
     expect(p.commands.workers.tools).toEqual(["read", "grep", "find", "ls", "edit", "write", "bash"]);
-    expect(p.commands.hermes.allow).toContain("hapi workorder validate *");
-    expect(p.commands.hermes.allow).toContain("git push origin plan/*");
+    // Argv-exact rules, keyed by id (ruling 5's initial list, made structured by the security review).
+    expect(Object.keys(p.commands.hermes.allow)).toEqual([
+      "hapi-status",
+      "hapi-workorder-validate",
+      "git-status",
+      "git-diff",
+      "git-log",
+      "git-add",
+      "git-commit",
+      "git-switch-plan",
+      "git-push-plan",
+    ]);
+    // A plan branch is the only thing Hermes may push: no ':' refspec, no '+', no flags.
+    expect(p.commands.hermes.allow["git-push-plan"]).toEqual({
+      command: ["git", "push", "origin"],
+      args: ["^plan/[a-z0-9][a-z0-9-]*$"],
+      flags: {},
+    });
+    expect(Object.keys(p.commands.hermes.allow["git-diff"]!.flags)).toEqual([
+      "--stat", "--name-only", "--name-status", "--cached", "--no-color",
+    ]);
+    expect(Object.keys(p.commands.hermes.allow["git-log"]!.flags)).toEqual(["--oneline", "-n", "--stat", "--no-color"]);
+    expect(Object.keys(p.commands.hermes.allow["git-commit"]!.flags)).toEqual(["-m", "--trailer"]);
   });
 });
 
@@ -218,6 +239,19 @@ describe("loadPolicy rejects bad policy with the file and path", () => {
     expect(e.path).toBe("/zones/archon/hosts/2");
   });
 
+  test("a forge host in the archon zone, or in a tier the archon zone reaches (spec §4.3)", () => {
+    const ts = readFileSync("policy/trusted_sources.yaml", "utf8");
+    const archon = policyError(policyWith("trusted_sources.yaml", ts.replace("- opencode.ai", "- gitlab.com")));
+    expect(archon.path).toBe("/zones/archon/hosts/2");
+    expect(archon.message).toContain('"gitlab.com" is a forge host (gitlab.com)');
+    // The first "- pypi.org" is in T1, which the archon zone lists.
+    const t1 = policyError(policyWith("trusted_sources.yaml", ts.replace("- pypi.org", "- raw.githubusercontent.com")));
+    expect(t1.path).toBe("/tiers/T1/hosts/1");
+    expect(t1.message).toContain("forge host (githubusercontent.com)");
+    // The hermes zone may reach the forge.
+    expect(() => loadPolicy(policyWith("trusted_sources.yaml", ts.replace("- slack.com", "- slack.com\n      - gitlab.com")))).not.toThrow();
+  });
+
   test("a protected path entry missing a mode", () => {
     const pp = readFileSync("policy/protected_paths.yaml", "utf8").replace(
       '"mise.toml":   { interactive: ask, unattended: deny, workers: deny }',
@@ -228,21 +262,46 @@ describe("loadPolicy rejects bad policy with the file and path", () => {
   });
 });
 
-test("every object schema sets additionalProperties: false", () => {
-  const offenders: string[] = [];
-  function walk(node: unknown, where: string): void {
-    if (Array.isArray(node)) return node.forEach((n, i) => walk(n, `${where}/${i}`));
-    if (node === null || typeof node !== "object") return;
-    const o = node as Record<string, unknown>;
-    if ((o.properties !== undefined || o.patternProperties !== undefined) && o.additionalProperties !== false) {
-      offenders.push(where);
-    }
-    // `if`/`then`/`else` only add conditions to an enclosing object schema, which is the one
-    // that closes the shape, so they are exempt (closing them would break the condition).
-    for (const [k, v] of Object.entries(o)) if (!["if", "then", "else"].includes(k)) walk(v, `${where}/${k}`);
+/**
+ * The places in a JSON Schema where an object is left open to unknown keys: a node
+ * with `properties` or `patternProperties` whose additionalProperties isn't false,
+ * or a node whose type is or includes "object" whose additionalProperties is
+ * neither false nor itself a schema. `if`, `then` and `else` only add conditions to
+ * an enclosing object schema, which is the one that closes the shape, so they are
+ * exempt (closing them would break the condition).
+ */
+function openObjects(node: unknown, where: string, out: string[] = []): string[] {
+  if (Array.isArray(node)) {
+    node.forEach((n, i) => openObjects(n, `${where}/${i}`, out));
+    return out;
   }
+  if (node === null || typeof node !== "object") return out;
+  const o = node as Record<string, unknown>;
+  const closed = o.additionalProperties === false;
+  const schemaValued = o.additionalProperties !== null && typeof o.additionalProperties === "object";
+  const types = Array.isArray(o.type) ? o.type : [o.type];
+  if ((o.properties !== undefined || o.patternProperties !== undefined) && !closed) out.push(where);
+  else if (types.includes("object") && !closed && !schemaValued) out.push(where);
+  for (const [k, v] of Object.entries(o)) if (!["if", "then", "else"].includes(k)) openObjects(v, `${where}/${k}`, out);
+  return out;
+}
+
+test("openObjects flags every open object shape", () => {
+  expect(openObjects({ type: "object" }, "#")).toEqual(["#"]);
+  expect(openObjects({ type: ["object", "null"] }, "#")).toEqual(["#"]);
+  expect(openObjects({ type: "object", additionalProperties: true }, "#")).toEqual(["#"]);
+  expect(openObjects({ properties: { a: {} } }, "#")).toEqual(["#"]);
+  expect(openObjects({ type: "object", properties: {}, additionalProperties: { type: "string" } }, "#")).toEqual(["#"]);
+  expect(openObjects({ $defs: { x: { type: "object" } } }, "#")).toEqual(["#/$defs/x"]);
+  // Closed, or a map whose values are themselves checked by a schema.
+  expect(openObjects({ type: "object", properties: { a: {} }, additionalProperties: false }, "#")).toEqual([]);
+  expect(openObjects({ type: "object", propertyNames: {}, additionalProperties: { type: "string" } }, "#")).toEqual([]);
+  expect(openObjects({ if: { type: "object", properties: { a: {} } }, then: { type: "object" } }, "#")).toEqual([]);
+});
+
+test("every object schema sets additionalProperties: false", () => {
   const files = readdirSync("policy/schemas").filter((f) => f.endsWith(".schema.json"));
   expect(files.length).toBeGreaterThan(0);
-  for (const f of files) walk(JSON.parse(readFileSync(join("policy/schemas", f), "utf8")), f);
+  const offenders = files.flatMap((f) => openObjects(JSON.parse(readFileSync(join("policy/schemas", f), "utf8")), f));
   expect(offenders).toEqual([]);
 });

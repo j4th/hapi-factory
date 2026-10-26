@@ -7,7 +7,8 @@
  * several words ("policy build"); `main` picks the longest registered name that
  * matches the leading words of argv and passes the rest to the handler.
  *
- * Exit codes: 0 success, 1 the command failed, 2 usage error (unknown command, no command).
+ * Exit codes (as in README.md): 0 success, 1 the command failed, 2 a usage error:
+ * an unknown command, no command at all, or the wrong arguments for a command.
  */
 import { HAPI_VERSION } from "./version";
 import { workorderValidate } from "./workorder/validate";

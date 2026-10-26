@@ -21,6 +21,7 @@ import roster from "../../policy/schemas/policy-roster.schema.json";
 import flags from "../../policy/schemas/policy-flags.schema.json";
 import workOrder from "../../policy/schemas/work-order.schema.json";
 import repoOverlay from "../../policy/schemas/repo-overlay.schema.json";
+import { forgeDomain, forgeHostMessage } from "./hosts";
 
 /** One problem found in a file: where (a JSON Pointer) and what. */
 export interface Issue {
@@ -45,7 +46,8 @@ export type SchemaName = keyof typeof schemas;
 
 const UNKNOWN_KEY = "unknown key";
 
-const ajv = new Ajv2020({ allErrors: true, strict: true, allowUnionTypes: true });
+// verbose: errors carry their (sub)schema and data, so a `not` error can say what it rejected.
+const ajv = new Ajv2020({ allErrors: true, strict: true, allowUnionTypes: true, verbose: true });
 ajv.addSchema(defs);
 const validators = Object.fromEntries(
   Object.entries(schemas).map(([name, schema]) => [name, ajv.compile(schema)]),
@@ -93,6 +95,13 @@ function toIssue(e: ErrorObject): Issue | undefined {
       return { path: e.instancePath, message: `must be one of: ${(p.allowedValues as unknown[]).join(", ")}` };
     case "uniqueItems":
       return { path: at(Number(p.i)), message: `duplicate of item ${String(p.j)}` };
+    case "not": {
+      if (e.propertyName !== undefined) return undefined; // about a key, reported as "invalid key"
+      // The schemas' only `not` is nonForgeHost's `not: {$ref: forgeHost}`; say which forge.
+      const forge = typeof e.data === "string" ? forgeDomain(e.data) : undefined;
+      const message = forge !== undefined ? forgeHostMessage(e.data as string, forge) : (e.message ?? "must not match");
+      return { path: e.instancePath, message };
+    }
     default:
       // The errors inside `propertyNames` describe the key, already reported above.
       if (e.propertyName !== undefined) return undefined;

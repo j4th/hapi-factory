@@ -2,22 +2,90 @@
 #
 # Commands and tools (spec §8.1).
 #
-# hermes.allow  Shell command patterns Hermes may run. Everything else is
-#               denied (default-deny, fail-closed). `*` matches any arguments.
-#               Compiled into the hapi-cmd-allow hook, which arrives in Plan 04;
-#               this is the initial list, and Plan 04 refines it.
+# hermes.allow  The commands Hermes may run: argv-exact rules, keyed by rule id.
+#               Everything else is denied (default-deny, fail-closed). A rule
+#               matches an argv when:
+#               - argv starts with exactly `command`. So git's global options
+#                 (`git -c ...`, `git -C dir`) never match;
+#               - every later token that starts with "-" is a flag named in
+#                 `flags`, spelled exactly: no --flag=value, no bundled -abc. A
+#                 flag with a `value` pattern takes the next token as its value;
+#               - the other tokens are positionals: one per `args` pattern, in
+#                 order, then up to `rest.max` more matching `rest.pattern`.
+#               A pattern must match the whole token. Patterns use a portable
+#               regex subset, so the TypeScript helper and Plan 04's Python hook
+#               read them the same way. The full semantics are in docs/policy.md
+#               (matchCommand in src/policy/commands.ts), and both
+#               implementations run tests/fixtures/command-vectors.json.
+#               Compiled into the hapi-cmd-allow hook (Plan 04). The hook must
+#               tokenize shell-aware and refuse shell operators and expansions
+#               before it matches.
 # workers.tools Pi's built-in tools that factory worker nodes get (Archon
 #               `allowed_tools`). No web tools: workers never browse (spec §10).
 hermes:
   allow:
-    - "hapi status *"
-    - "hapi workorder validate *"
-    - "git status"
-    - "git diff *"
-    - "git log *"
-    - "git add *"
-    - "git commit *"
-    - "git switch -c plan/*"
-    - "git push origin plan/*"
+    # hapi status [<run-id>]
+    hapi-status:
+      command: [hapi, status]
+      args: []
+      rest: { pattern: '^[a-z0-9][a-z0-9-]{0,79}$', max: 1 }
+      flags: {}
+    # hapi workorder validate <file.yaml>, inside the repo
+    hapi-workorder-validate:
+      command: [hapi, workorder, validate]
+      args: ['^(?!(?:.*/)?\.\.(?:/|$))[A-Za-z0-9_.][A-Za-z0-9_./-]{0,199}\.ya?ml$']
+      flags: {}
+    git-status:
+      command: [git, status]
+      args: []
+      flags: {}
+    # Revisions and paths: they start with a letter, digit, "_" or "." (so never
+    # "/", "-" or "~"), have no ".." segment (so never outside the repo, which
+    # would make git diff act as --no-index), and hold no ":", "@", "$", "*",
+    # "?", "[", "{" or quote. Ranges like main...plan/x and HEAD~1 are fine.
+    git-diff:
+      command: [git, diff]
+      args: []
+      rest: { pattern: &revOrPath '^(?!(?:.*/)?\.\.(?:/|$))[A-Za-z0-9_.][A-Za-z0-9_./~^-]{0,199}$', max: 20 }
+      flags:
+        --stat: {}
+        --name-only: {}
+        --name-status: {}
+        --cached: {}
+        --no-color: {}
+    git-log:
+      command: [git, log]
+      args: []
+      rest: { pattern: *revOrPath, max: 20 }
+      flags:
+        --oneline: {}
+        -n: { value: '^[1-9][0-9]{0,3}$' }
+        --stat: {}
+        --no-color: {}
+    # Paths in the repo: like a revision, but no "~" or "^".
+    git-add:
+      command: [git, add]
+      args: [&repoPath '^(?!(?:.*/)?\.\.(?:/|$))[A-Za-z0-9_.][A-Za-z0-9_./-]{0,199}$']
+      rest: { pattern: *repoPath, max: 100 }
+      flags: {}
+    # A message may hold newlines and tabs, but no other control character, "$" or
+    # backtick (defense in depth: the hook already refuses expansions). A trailer
+    # is "Key: value" on one line.
+    git-commit:
+      command: [git, commit]
+      args: []
+      flags:
+        -m: { value: '^[^\x00-\x08\x0b-\x1f\x7f-\x9f$`]{1,5000}$' }
+        --trailer: { value: '^[A-Za-z][A-Za-z0-9-]{0,63}: [^\x00-\x1f\x7f-\x9f$`]{1,500}$' }
+    # A plan branch: plan/ and a lowercase slug. So no ":" (a refspec that
+    # updates another branch, such as plan/x:main) and no leading "+" (force).
+    git-switch-plan:
+      command: [git, switch, -c]
+      args: [&planBranch '^plan/[a-z0-9][a-z0-9-]*$']
+      flags: {}
+    git-push-plan:
+      command: [git, push, origin]
+      args: [*planBranch]
+      flags: {}
 workers:
   tools: [read, grep, find, ls, edit, write, bash]

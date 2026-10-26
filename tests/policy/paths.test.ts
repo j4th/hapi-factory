@@ -99,6 +99,20 @@ describe("effectiveModes", () => {
     }
   });
 
+  test("a path with NUL, a control character or a backslash is an error that names the problem", () => {
+    expect(() => effectiveModes(p, "AGENTS.md\u0000.txt")).toThrow(/contains NUL \(U\+0000\)/);
+    expect(() => effectiveModes(p, "AGENTS.md\n")).toThrow(/contains a control character \(U\+000A\)/);
+    expect(() => effectiveModes(p, "a\u001b[31m")).toThrow(/control character \(U\+001B\)/);
+    expect(() => effectiveModes(p, "a\u007fb")).toThrow(/control character \(U\+007F\)/);
+    expect(() => effectiveModes(p, "a\u0085b")).toThrow(/control character \(U\+0085\)/); // C1 controls too
+    expect(() => effectiveModes(p, ".github\\workflows\\ci.yml")).toThrow(/contains a backslash/);
+    expect(() => effectiveModes(p, "AGENTS.md\\")).toThrow(/contains a backslash/);
+    // The message shows the path escaped, so it prints safely.
+    expect(() => effectiveModes(p, "a\u001bb")).toThrow('"a\\u001bb"');
+    // Other non-ASCII characters are ordinary.
+    expect(effectiveModes(p, "docs/café.md")).toEqual(ALLOW);
+  });
+
   test("the result is a fresh object", () => {
     const m = effectiveModes(p, "src/cli.ts");
     m.workers = "deny";

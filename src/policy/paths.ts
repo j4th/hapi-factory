@@ -69,13 +69,27 @@ export function globMatches(glob: string, path: string): boolean {
   return globRegExp(glob).test(path);
 }
 
+/** The first control character in a string: Unicode category Cc, U+0000-U+001F and U+007F-U+009F. */
+const CONTROL = /[\u0000-\u001f\u007f-\u009f]/u;
+
 /**
  * Normalize a repo-relative path: resolve "." and ".." segments and drop
- * repeated and trailing slashes. Throws if the path is empty, absolute, the repo
- * root itself, or outside the repo, so a guard never treats it as unprotected.
+ * repeated and trailing slashes. Throws, so a guard never treats the path as
+ * unprotected, if the path:
+ * - contains NUL, any other control character (U+0000-U+001F, U+007F-U+009F)
+ *   or a backslash. A backslash is not a separator here, and a guard on another
+ *   OS or tool could read one as a separator and see a different path;
+ * - is empty, absolute, the repo root itself, or outside the repo.
  */
 function normalize(path: string): string {
-  const fail = () => new Error(`not a repo-relative file path: ${JSON.stringify(path)}`);
+  const shown = JSON.stringify(path); // escapes control characters, so the message prints safely
+  const control = CONTROL.exec(path)?.[0];
+  if (control !== undefined) {
+    const code = `U+${control.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}`;
+    throw new Error(`invalid path ${shown}: contains ${control === "\u0000" ? "NUL" : "a control character"} (${code})`);
+  }
+  if (path.includes("\\")) throw new Error(`invalid path ${shown}: contains a backslash; separate segments with "/"`);
+  const fail = () => new Error(`not a repo-relative file path: ${shown}`);
   if (path === "" || path.startsWith("/")) throw fail();
   const n = posix.normalize(path).replace(/\/+$/, "");
   if (n === "" || n === "." || n === ".." || n.startsWith("../")) throw fail();
@@ -86,7 +100,8 @@ function normalize(path: string): string {
  * The effective modes of one file: for each session kind, the strictest mode
  * across every glob in `p.protectedPaths` that matches it, or allow when none
  * does. The path is normalized first, so "./AGENTS.md" and "docs/../AGENTS.md"
- * are AGENTS.md. Throws on a path that isn't a repo-relative file path.
+ * are AGENTS.md. Throws on a path that isn't a repo-relative file path, and on
+ * one that contains NUL, a control character or a backslash.
  *
  * A guard resolves symlinks and makes the path relative to the repo root before
  * calling this. An action on a directory (a rename or a recursive delete) must

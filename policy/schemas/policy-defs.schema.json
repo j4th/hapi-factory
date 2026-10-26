@@ -19,6 +19,10 @@
       "required": ["interactive", "unattended", "workers"],
       "additionalProperties": false
     },
+    "risk": {
+      "description": "A work order's risk: drives review depth and thresholds.",
+      "enum": ["low", "medium", "high"]
+    },
     "tier": {
       "description": "An abstract model tier. Rosters map tiers to models; work orders and roles name tiers, never model ids.",
       "enum": ["small", "medium", "large"]
@@ -39,6 +43,21 @@
     "hostList": {
       "type": "array",
       "items": { "$ref": "#/$defs/hostname" },
+      "uniqueItems": true
+    },
+    "forgeHost": {
+      "description": "A forge host: one of the forge domains or a subdomain of one. The capture group is the forge domain. This is the one list of forge domains; src/policy/hosts.ts reads it from here.",
+      "type": "string",
+      "pattern": "^(?:.+\\.)?(github\\.com|githubusercontent\\.com|githubassets\\.com|ghcr\\.io|gitlab\\.com|bitbucket\\.org)$"
+    },
+    "nonForgeHost": {
+      "description": "A hostname that is not a forge host. Used wherever a host can reach the archon zone, which has no forge route (spec §4.3).",
+      "allOf": [{ "$ref": "#/$defs/hostname" }],
+      "not": { "$ref": "#/$defs/forgeHost" }
+    },
+    "nonForgeHostList": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/nonForgeHost" },
       "uniqueItems": true
     },
     "repoPath": {

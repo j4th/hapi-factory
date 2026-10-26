@@ -19,6 +19,9 @@ export interface PathModes {
   workers: Mode;
 }
 
+/** A work order's risk: drives review depth and thresholds. */
+export type Risk = "low" | "medium" | "high";
+
 /** An abstract model tier. Rosters map tiers to models; roles and work orders name tiers only. */
 export type Tier = "small" | "medium" | "large";
 
@@ -45,9 +48,25 @@ export interface TrustedSources {
 /** Pi's built-in tools. */
 export type WorkerTool = "read" | "bash" | "edit" | "write" | "grep" | "find" | "ls";
 
+/**
+ * One argv-exact command rule from commands.yaml. Read it with `matchCommand`
+ * (./commands.ts), which defines the semantics; docs/policy.md has them too.
+ * Every pattern must match a whole token.
+ */
+export interface CommandRule {
+  /** The exact leading tokens, e.g. ["git", "push", "origin"]. */
+  command: string[];
+  /** One pattern per required positional argument, in order. */
+  args: string[];
+  /** Up to `max` more positionals after `args`, each matching `pattern`. Absent: none. */
+  rest?: { pattern: string; max: number };
+  /** The only flags allowed: name -> {} (no value) or {value: pattern} (the next token is its value). */
+  flags: Record<string, { value?: string }>;
+}
+
 export interface Commands {
-  /** Shell command patterns Hermes may run; everything else is denied. */
-  hermes: { allow: string[] };
+  /** Rule id -> rule. A command Hermes runs must match one rule; everything else is denied. */
+  hermes: { allow: Record<string, CommandRule> };
   /** Pi built-ins that factory worker nodes get. */
   workers: { tools: WorkerTool[] };
 }
@@ -135,17 +154,36 @@ export interface Policy {
   roles: Roles;
   rosters: Record<RosterName, Roster>;
   flags: Flags;
+  /**
+   * The repo's own settings from its overlay (spec §7). Only `applyOverlay` sets
+   * it, and only when the overlay names one of them; `loadPolicy` never does.
+   */
+  repo?: RepoSettings;
+}
+
+/**
+ * Settings a repo's overlay may choose. They are not policy: they don't loosen
+ * anything, so tighten-only doesn't apply to them (Plan 03 reads them).
+ */
+export interface RepoSettings {
+  /** The risk new work orders for this repo start from. */
+  default_risk?: Risk;
+  /** The Archon workflow this repo's work orders use by default. */
+  workflow?: string;
 }
 
 /**
  * A target repo's `.factory/config.yaml` (spec §7). It may only tighten policy,
  * except that it may add `egress_extra` hosts. `null` for a protected path is a
- * removal attempt, which `applyOverlay` rejects.
+ * removal attempt, which `applyOverlay` rejects. `default_risk` and `workflow`
+ * are repo settings, not policy.
  */
 export interface RepoOverlay {
   protected_paths?: Record<string, Partial<PathModes> | null>;
-  /** Hosts added to the archon zone. */
+  /** Hosts added to the archon zone. Never a forge host. */
   egress_extra?: string[];
   /** Budgets to lower; each must be at most the base value. */
   budgets?: Partial<Omit<Budgets, "workspaces">> & { workspaces?: Partial<Record<Workspace, number>> };
+  default_risk?: Risk;
+  workflow?: string;
 }

@@ -4,9 +4,13 @@
  * policy/schemas/work-order.schema.json, plus the rules a schema can't say
  * (piece ids are unique). The same check runs in Hermes before a planning PR,
  * in CI and in Archon's prepare step.
+ *
+ * `egress_extra` joins the archon zone for the run (spec §10), so the schema
+ * rejects a forge host there (`nonForgeHost`, the same list `applyOverlay`
+ * uses; see src/policy/hosts.ts).
  */
 import { check, formatIssue, type Issue, readYaml } from "../policy/schema";
-import type { Tier } from "../policy/types";
+import type { Risk, Tier } from "../policy/types";
 
 export interface WorkOrder {
   /** e.g. "0002-search-partners-tool": names the work-order directory and the factory/<id> branch. */
@@ -14,13 +18,14 @@ export interface WorkOrder {
   lane: "planning" | "factory" | "direct";
   /** Archon workflow name. */
   workflow: string;
-  risk: "low" | "medium" | "high";
+  risk: Risk;
   /** Abstract tiers, never model ids. */
   roles: { implement: Tier; review: Tier };
   budget: { usd: number; turns: number; minutes: number };
   /** Each piece's declared file scope, relative to the repo root. */
   pieces: { id: string; files: string[]; size: Tier }[];
   verify: { smoke: boolean };
+  /** Hosts the run adds to the archon zone. Never a forge host. */
   egress_extra: string[];
   trace: { traceparent: string };
   sources: string[];

@@ -21,7 +21,7 @@
     },
     "risk": {
       "description": "Drives review depth and thresholds.",
-      "enum": ["low", "medium", "high"]
+      "$ref": "policy-defs.schema.json#/$defs/risk"
     },
     "roles": {
       "description": "Abstract tiers per role, never model ids. The run's roster maps them to models.",
@@ -75,8 +75,8 @@
       "additionalProperties": false
     },
     "egress_extra": {
-      "description": "Extra hosts this run needs, e.g. a private sidecar for the smoke check.",
-      "$ref": "policy-defs.schema.json#/$defs/hostList"
+      "description": "Extra hosts this run needs, e.g. a private sidecar for the smoke check. They join the archon zone for the run (spec §10), so a forge host is rejected: that zone has no forge route (spec §4.3).",
+      "$ref": "policy-defs.schema.json#/$defs/nonForgeHostList"
     },
     "trace": {
       "type": "object",

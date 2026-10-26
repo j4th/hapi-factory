@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "repo-overlay.schema.json",
   "title": ".factory/config.yaml",
-  "description": "A target repo's overlay on the central policy (spec §7, §8.1). It may add or tighten protected paths, add egress_extra hosts and lower budgets; any other key is rejected. Loosening is caught by applyOverlay, which needs the base policy to compare against.",
+  "description": "A target repo's overlay on the central policy (spec §7, §8.1). It may add or tighten protected paths, add egress_extra hosts and lower budgets, and it may set the repo's default_risk and workflow, which are repo settings rather than policy. Any other key is rejected. Loosening is caught by applyOverlay, which needs the base policy to compare against.",
   "type": "object",
   "properties": {
     "protected_paths": {
@@ -43,6 +43,14 @@
         "hermes_max_turns": { "$ref": "policy-defs.schema.json#/$defs/count" }
       },
       "additionalProperties": false
+    },
+    "default_risk": {
+      "description": "The risk new work orders for this repo start from (spec §7). A repo setting, not policy: tighten-only doesn't apply. applyOverlay exposes it as repo.default_risk.",
+      "$ref": "policy-defs.schema.json#/$defs/risk"
+    },
+    "workflow": {
+      "description": "The Archon workflow this repo's work orders use by default (spec §7), a slug like a work order's workflow. A repo setting, not policy: tighten-only doesn't apply. applyOverlay exposes it as repo.workflow.",
+      "$ref": "policy-defs.schema.json#/$defs/slug"
     }
   },
   "additionalProperties": false
