@@ -1,0 +1,11 @@
+{
+  "name": "hapi-factory",
+  "version": "0.1.0",
+  "description": "Hermes + Archon + Pi: a reference stack for an end-to-end agentic software factory",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "@types/bun": "1.4.4",
+    "typescript": "7.0.2"
+  }
+}

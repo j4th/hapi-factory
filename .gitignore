@@ -1,3 +1,7 @@
 .remember/
 .superpowers/
 .worktrees/
+build/
+node_modules/
+.env*
+spikes/scratch/

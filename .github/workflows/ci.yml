@@ -1,0 +1,39 @@
+# CI for hapi-factory itself: install the pinned toolchain, type-check, run the unit tests.
+#
+# - The job is named `ci`; the `main` ruleset requires a passing `ci` check (see README, "Manual setup steps").
+# - Every action is pinned to a full commit SHA (spec §11.7). The comment after each SHA is the
+#   release tag it was resolved from (`gh api repos/<owner>/<repo>/git/ref/tags/<tag>`).
+# - Least privilege: the token can only read the repo, and checkout doesn't keep it in .git/config.
+# - mise itself is pinned to the version in mise.toml's `min_version`; mise then installs the
+#   exact tool versions from mise.toml.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@82a612c5ab8bcda7cc5db6b7e81a8e7584c3dc6e # v5.2.3
+        with:
+          version: 2026.10.3
+
+      # `mise run lint` first runs `setup` (bun install --frozen-lockfile), so a stale bun.lock fails here.
+      - name: Install tools, type-check, unit tests
+        run: mise install && mise run lint && mise run test

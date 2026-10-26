@@ -1,0 +1,64 @@
+# hapi-factory toolchain and tasks.
+#
+# mise is the only host prerequisite besides Docker: `mise install` gets every
+# tool below at the pinned version, and `mise tasks` lists the tasks.
+#
+# Pinning rule (spec §3, §11.6): every tool is an exact version. Never `latest`,
+# never a range. To upgrade, bump the version here, run
+# `mise install && mise run lint && mise run test`, and say why in the PR.
+#
+# This file is a protected path (spec §8.2): agents may not edit it.
+
+min_version = "2026.10.3"
+
+[tools]
+bun = "1.4.4"                         # runtime, package manager and test runner for the hapi CLI
+node = "26.12.1"                      # for Node-based tools (e.g. a standalone Pi CLI later)
+uv = "0.13.5"                         # Python package manager (Hermes-side tooling)
+python = "3.15.1"
+gh = "2.103.2"                        # GitHub CLI, for the operator's manual setup steps only; factory code uses src/forge/
+gitleaks = "8.30.1"                   # secret scanner
+bitwarden-secrets-manager = "2.1.0"   # provides `bws`; secrets are resolved from Bitwarden at start (spec §11.5)
+
+# ---------------------------------------------------------------------------
+# Tasks. Stubs exit 1 with a message naming the plan task that implements
+# them, so a stub can never pass as a real check.
+# ---------------------------------------------------------------------------
+
+[tasks.setup]
+description = "Install the pinned JS dependencies from bun.lock (frozen; fails if the lockfile is out of date)"
+run = "bun install --frozen-lockfile"
+
+[tasks.test]
+description = "Run the unit test suite (no Docker, network or secrets needed)"
+run = "bun test"
+
+[tasks."test:int"]
+description = "Run the integration tests in tests/stack with HAPI_INT=1 (needs Docker; tests arrive in Plan 01 Task 5)"
+env = { HAPI_INT = "1" }
+run = "bun test tests/stack"
+
+[tasks.lint]
+description = "Type-check the project with tsc (strict, no emit)"
+depends = ["setup"]
+run = "bunx tsc --noEmit"
+
+[tasks.hapi]
+description = "Run the hapi CLI, e.g. `mise run hapi -- --help`"
+run = "bun run src/cli.ts"
+
+[tasks."policy:build"]
+description = "Compile policy/ into build/ configs (arrives in Plan 01 Task 3)"
+run = "echo 'policy:build is not implemented yet (arrives in Plan 01 Task 3)' >&2; exit 1"
+
+[tasks.audit]
+description = "Check deployed config, pins and settings against policy (arrives in Plan 01 Task 6)"
+run = "echo 'audit is not implemented yet (arrives in Plan 01 Task 6)' >&2; exit 1"
+
+[tasks.up]
+description = "Build policy, resolve secrets and start the stack (arrives in Plan 01 Task 5)"
+run = "echo 'up is not implemented yet (arrives in Plan 01 Task 5)' >&2; exit 1"
+
+[tasks.down]
+description = "Stop the stack (arrives in Plan 01 Task 5)"
+run = "echo 'down is not implemented yet (arrives in Plan 01 Task 5)' >&2; exit 1"
