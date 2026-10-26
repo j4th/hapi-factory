@@ -1,6 +1,7 @@
 # CI for hapi-factory itself: install the pinned toolchain, type-check, run the unit tests.
 #
-# - The job is named `ci`; the `main` ruleset requires a passing `ci` check (see README, "Manual setup steps").
+# - The job is named `ci`. The `main-protect` ruleset requires a passing `ci` check and has no
+#   bypass actors, so nobody can merge with `ci` red or missing (see README, "Manual setup steps").
 # - Every action is pinned to a full commit SHA (spec §11.7). The comment after each SHA is the
 #   release tag it was resolved from (`gh api repos/<owner>/<repo>/git/ref/tags/<tag>`).
 # - Least privilege: the token can only read the repo, and checkout doesn't keep it in .git/config.

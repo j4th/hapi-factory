@@ -170,7 +170,7 @@ For JS dependencies, use `bun add -d <pkg>@<exact-version>` (or without `-d` for
 2. Installs the pinned mise with `jdx/mise-action`.
 3. Runs `mise install && mise run lint && mise run test`.
 
-The `main` ruleset requires the `ci` check to pass (see the manual steps below). The reusable security-gates workflow for target repos (gitleaks, SAST, OSV-Scanner, zizmor, work-order schema, commit trailers) is separate; it arrives in Plan 05 (spec §11.7).
+The `main-protect` ruleset requires the `ci` check to pass, and nobody can bypass it, not even the repo admin (see the manual steps below). The reusable security-gates workflow for target repos (gitleaks, SAST, OSV-Scanner, zizmor, work-order schema, commit trailers) is separate; it arrives in Plan 05 (spec §11.7).
 
 ## Using hapi-factory with another repo
 
@@ -187,7 +187,7 @@ Plan 05 builds the template and `mise run new-repo`. This section will become th
 
 These steps are outward-facing or privileged, so agents never do them; the operator does them by hand. Later tasks add their own steps here (GitHub Apps and Bitwarden secrets in Task 4, `sudo scripts/host-setup.sh` in Task 5).
 
-### Plan 01 Task 1: the GitHub remote and the `main` ruleset
+### Plan 01 Task 1: the GitHub remote and the `main` rulesets
 
 1. **Rename the local repo to `hapi-factory`.** This is already done: the working directory is `hapi-factory`.
 
@@ -201,12 +201,34 @@ These steps are outward-facing or privileged, so agents never do them; the opera
    git push -u origin plan-01-foundations   # then open a PR from it into main
    ```
 
-3. **Add a ruleset on `main`.** It needs 1 approving review and a passing `ci` check. It also blocks force-pushes and deletion, and gives the repo admin role, and only that role, a PR-only bypass. Without the bypass, the operator couldn't merge his own `lane:direct` PRs, because GitHub doesn't let a PR's author approve it (spec §18). The GitHub Apps are never given a bypass. `integration_id` 15368 is GitHub Actions, so only Actions can satisfy the `ci` check, and in `bypass_actors`, `actor_id` 5 is the repository Admin role.
+3. **Add two rulesets on `main`.** Together they require 1 approving review and a passing `ci` check, and they block force-pushes and deletion. They are two rulesets, not one, because a ruleset's bypass list covers *every* rule in that ruleset. If the approval bypass and the `ci` check sat in one ruleset, the bypass would also let a merge through with `ci` red or missing. GitHub applies every ruleset that targets a branch, and a bypass in one ruleset doesn't carry over to another.
+
+   - **`main-protect`** holds the required `ci` check and the force-push and deletion blocks. It has **no bypass actors**. Nobody, the operator included, can merge with `ci` failing or not yet run, force-push `main` or delete it. This is how every lane, `lane:direct` included, gets the same CI gates (spec §5.1).
+   - **`main-review`** holds only the pull-request rule: 1 approving review. Its only bypass actor is the repository Admin role, in PR-only mode. Without that bypass, the operator couldn't merge his own `lane:direct` PRs, because GitHub doesn't let a PR's author approve it (spec §18). The bypass covers the approval rule and nothing else; **`ci` can never be bypassed**. Because the bypass is PR-only, it applies only when merging a PR. the operator still can't push straight to `main`.
+
+   The GitHub Apps get no bypass in either ruleset. `integration_id` 15368 is GitHub Actions, so only Actions can satisfy the `ci` check. In `bypass_actors`, `actor_id` 5 is the repository Admin role.
 
    ```bash
    gh api -X POST repos/j4th/hapi-factory/rulesets --input - <<'EOF'
    {
-     "name": "main",
+     "name": "main-protect",
+     "target": "branch",
+     "enforcement": "active",
+     "conditions": { "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] } },
+     "bypass_actors": [],
+     "rules": [
+       { "type": "deletion" },
+       { "type": "non_fast_forward" },
+       { "type": "required_status_checks", "parameters": {
+           "strict_required_status_checks_policy": false,
+           "required_status_checks": [ { "context": "ci", "integration_id": 15368 } ] } }
+     ]
+   }
+   EOF
+
+   gh api -X POST repos/j4th/hapi-factory/rulesets --input - <<'EOF'
+   {
+     "name": "main-review",
      "target": "branch",
      "enforcement": "active",
      "conditions": { "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] } },
@@ -214,23 +236,25 @@ These steps are outward-facing or privileged, so agents never do them; the opera
        { "actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "pull_request" }
      ],
      "rules": [
-       { "type": "deletion" },
-       { "type": "non_fast_forward" },
        { "type": "pull_request", "parameters": {
            "required_approving_review_count": 1,
            "dismiss_stale_reviews_on_push": true,
            "require_code_owner_review": false,
            "require_last_push_approval": false,
-           "required_review_thread_resolution": false } },
-       { "type": "required_status_checks", "parameters": {
-           "strict_required_status_checks_policy": false,
-           "required_status_checks": [ { "context": "ci", "integration_id": 15368 } ] } }
+           "required_review_thread_resolution": false } }
      ]
    }
    EOF
    ```
 
-   Then check it with `gh api repos/j4th/hapi-factory/rulesets`, or under **Settings → Rules → Rulesets**. Open a test PR and confirm two things: the `ci` check runs and is required, and merging is blocked until there's an approval or an admin bypass. The command was written from GitHub's REST docs but hasn't been run yet. If GitHub rejects a field, set the same rules in the UI.
+   **Check the result.** Run `gh api repos/j4th/hapi-factory/rulesets`, or open **Settings → Rules → Rulesets**. You should see both rulesets, and `main-protect` should list no bypass actors. To see the combined rules that apply to `main`, run `gh api repos/j4th/hapi-factory/rules/branches/main`.
+
+   Then open a test PR and confirm three things:
+   - The `ci` check runs and is required.
+   - Merging is blocked until there's an approval or an admin bypass.
+   - While `ci` is still running or has failed, merging stays blocked, even with the admin bypass.
+
+   These commands follow GitHub's REST docs, but nobody has run them yet. If GitHub rejects a field, set up the same two rulesets in the UI. Keep the rules split the same way: never put the `ci` check in a ruleset that has a bypass actor.
 
 4. **Task 5 needs this remote.** Task 5's `scripts/host-setup.sh` clones hapi-factory from `github.com/j4th/hapi-factory` into `/home/hapi/hapi-factory`.
 
