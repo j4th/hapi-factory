@@ -1,0 +1,23 @@
+# yaml-language-server: $schema=schemas/policy-commands.schema.json
+#
+# Commands and tools (spec §8.1).
+#
+# hermes.allow  Shell command patterns Hermes may run. Everything else is
+#               denied (default-deny, fail-closed). `*` matches any arguments.
+#               Compiled into the hapi-cmd-allow hook, which arrives in Plan 04;
+#               this is the initial list, and Plan 04 refines it.
+# workers.tools Pi's built-in tools that factory worker nodes get (Archon
+#               `allowed_tools`). No web tools: workers never browse (spec §10).
+hermes:
+  allow:
+    - "hapi status *"
+    - "hapi workorder validate *"
+    - "git status"
+    - "git diff *"
+    - "git log *"
+    - "git add *"
+    - "git commit *"
+    - "git switch -c plan/*"
+    - "git push origin plan/*"
+workers:
+  tools: [read, grep, find, ls, edit, write, bash]

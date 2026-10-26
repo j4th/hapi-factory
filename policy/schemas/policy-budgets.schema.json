@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "policy-budgets.schema.json",
+  "title": "policy/budgets.yaml",
+  "description": "Spend and turn limits (spec §3, §8.1). Provider-side caps are applied by hand or API; the run and turn caps are compiled into Hermes, Archon and hapi-guard.",
+  "type": "object",
+  "properties": {
+    "workspaces": {
+      "description": "Monthly spend limit in USD per Anthropic Console workspace.",
+      "type": "object",
+      "properties": {
+        "hapi-hermes": { "$ref": "policy-defs.schema.json#/$defs/usd" },
+        "hapi-factory": { "$ref": "policy-defs.schema.json#/$defs/usd" },
+        "hapi-evals": { "$ref": "policy-defs.schema.json#/$defs/usd" }
+      },
+      "required": ["hapi-hermes", "hapi-factory", "hapi-evals"],
+      "additionalProperties": false
+    },
+    "openrouter_monthly_usd": {
+      "description": "Monthly cap on the OpenRouter key.",
+      "$ref": "policy-defs.schema.json#/$defs/usd"
+    },
+    "jev_monthly_usd": {
+      "description": "Monthly cap on Jev's own OpenRouter key.",
+      "$ref": "policy-defs.schema.json#/$defs/usd"
+    },
+    "run_usd": {
+      "description": "Target spend per factory run.",
+      "$ref": "policy-defs.schema.json#/$defs/usd"
+    },
+    "hermes_max_turns": {
+      "description": "Hermes agent.max_turns.",
+      "$ref": "policy-defs.schema.json#/$defs/count"
+    }
+  },
+  "required": ["workspaces", "openrouter_monthly_usd", "jev_monthly_usd", "run_usd", "hermes_max_turns"],
+  "additionalProperties": false
+}

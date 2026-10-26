@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "policy-commands.schema.json",
+  "title": "policy/commands.yaml",
+  "description": "What commands Hermes may run, and which built-in tools Pi workers get (spec §8.1).",
+  "type": "object",
+  "properties": {
+    "hermes": {
+      "type": "object",
+      "properties": {
+        "allow": {
+          "description": "Shell command patterns Hermes may run; everything else is denied. `*` matches any arguments. Compiled into the hapi-cmd-allow hook (Plan 04).",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^\\S(?:[^\\u0000-\\u001f]*\\S)?$"
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      },
+      "required": ["allow"],
+      "additionalProperties": false
+    },
+    "workers": {
+      "type": "object",
+      "properties": {
+        "tools": {
+          "description": "Pi's built-in tools that worker nodes may use (Archon `allowed_tools`).",
+          "type": "array",
+          "items": { "enum": ["read", "bash", "edit", "write", "grep", "find", "ls"] },
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      },
+      "required": ["tools"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["hermes", "workers"],
+  "additionalProperties": false
+}

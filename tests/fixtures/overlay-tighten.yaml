@@ -1,0 +1,8 @@
+# A repo overlay (.factory/config.yaml) that only tightens policy, plus one
+# egress_extra host. applyOverlay accepts it.
+protected_paths:
+  "src/secrets/**": { interactive: deny, unattended: deny, workers: deny }
+  "AGENTS.md": { interactive: deny }      # tighter than the base's ask
+egress_extra: ["odoo.internal"]
+budgets:
+  run_usd: 2.00                           # lower than the base's 3.00

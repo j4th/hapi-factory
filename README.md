@@ -2,7 +2,7 @@
 
 hapi-factory is a public, best-practices reference stack for an end-to-end agentic software factory. **HAPi** stands for **H**ermes + **A**rchon + **Pi**: Hermes is the coordinator you talk to, Archon is the run engine and Pi is the worker. The stack puts existing tools together into one working system. It also covers the steps most factories skip: discovery research, architecture, threat modeling and breaking work into tasks. Security is designed in from the start: one policy compiled into every tool's config, rootless containers behind default-deny egress, secrets from a vault, short-lived GitHub App tokens, and an audit that catches drift. Read the design in [docs/superpowers/specs/2026-10-26-hapi-factory-design.md](docs/superpowers/specs/2026-10-26-hapi-factory-design.md). It is the binding reference for everything here.
 
-> **Status: Plan 01 (Phase 0 foundations) is in progress.** Today the repo has the pinned toolchain, the `hapi` CLI skeleton and CI. Anything marked *arrives in Plan 01 Task N* is not built yet. The plan is [docs/superpowers/plans/2026-10-26-hapi-factory-01-foundations.md](docs/superpowers/plans/2026-10-26-hapi-factory-01-foundations.md).
+> **Status: Plan 01 (Phase 0 foundations) is in progress.** Today the repo has the pinned toolchain, the `hapi` CLI skeleton, CI, and `policy/` with its JSON Schemas, loader, tighten-only repo overlay and work-order validator. Anything marked *arrives in Plan 01 Task N* is not built yet. The plan is [docs/superpowers/plans/2026-10-26-hapi-factory-01-foundations.md](docs/superpowers/plans/2026-10-26-hapi-factory-01-foundations.md).
 
 ## Contents
 
@@ -45,13 +45,18 @@ What exists now:
 | Path | What it is |
 |---|---|
 | `mise.toml` | Tool pins and the [mise tasks](#mise-tasks). This is a protected path (spec §8.2): an interactive agent session must ask the operator before editing it, and unattended sessions and workers may not edit it at all. |
-| `package.json`, `bun.lock` | JS project metadata and dev dependencies (`typescript`, `@types/bun`), pinned to exact versions. The lockfile is committed. There are no runtime dependencies yet; Task 2 adds `ajv` and `yaml`. |
+| `package.json`, `bun.lock` | JS project metadata and dependencies, pinned to exact versions: `ajv` (JSON Schema validation) and `yaml` at runtime, `typescript` and `@types/bun` for development. The lockfile is committed. |
 | `bunfig.toml` | Bun install settings: exact versions and a 3-day release-age cooldown (see [Toolchain and pinning](#toolchain-and-pinning)). |
 | `tsconfig.json` | Strict TypeScript settings, used only for type-checking. Bun runs the `.ts` files directly. |
 | `src/cli.ts` | The `hapi` CLI: the entry point, the command registry and `main(argv)`. |
 | `src/version.ts` | `HAPI_VERSION`. It must match `version` in `package.json`, and a test checks that it does. |
-| `tests/` | Unit tests for `bun test`. |
+| `policy/` | The single source of truth: protected paths, commands, trusted sources, budgets, approvals, roles, flags and the model rosters (`policy/rosters/`). See [docs/policy.md](docs/policy.md). |
+| `policy/schemas/` | JSON Schemas (draft 2020-12) for every policy file, the repo overlay (`.factory/config.yaml`) and the work order (`order.yaml`) |
+| `src/policy/` | `loadPolicy` (load and validate `policy/`), `loadOverlay` and `applyOverlay` (the repo overlay, which may only tighten policy), the policy types and the shared schema checker |
+| `src/workorder/` | `validateWorkOrder` and the `hapi workorder validate` command |
+| `tests/` | Unit tests for `bun test`. `tests/fixtures/` holds example work orders, overlays and a broken policy directory. |
 | `.github/workflows/ci.yml` | [CI](#ci) for this repo. |
+| `docs/policy.md` | The policy files, the overlay rule and the work-order format |
 | `docs/superpowers/specs/` | The design spec. It is the binding authority. |
 | `docs/superpowers/plans/` | Implementation plans. Plan 01 is the current one. |
 | `reports/`, `research_notes/` | The evidence the design rests on: the recon report and the research notes. |
@@ -60,8 +65,6 @@ Still to come in Plan 01:
 
 | Path | What it will be | Arrives in |
 |---|---|---|
-| `policy/` | The single source of truth: protected paths, commands, trusted sources, budgets, approvals, roles, flags, model rosters and their JSON Schemas | Task 2 |
-| `src/policy/`, `src/workorder/` | The policy loader, the repo-overlay merge (which may only tighten policy) and the work-order validator | Task 2 |
 | `src/generate/`, `build/` | Generators that compile `policy/` into Hermes, Archon, Pi and egress configs under `build/`. `build/` is generated and gitignored. | Task 3 |
 | `src/secrets/`, `src/forge/`, `stack/secrets.map.yaml` | Secrets resolved from Bitwarden (`bws`), and GitHub App installation-token minting | Task 4 |
 | `docs/runbooks/` | Runbooks for GitHub App setup, provider keys and kill switches | Tasks 4, 7 |
@@ -106,7 +109,7 @@ You can run it two ways:
 **Exit codes:**
 - `0`: success.
 - `1`: the command failed. If a command throws, `hapi` prints `hapi <command>: <message>` to stderr.
-- `2`: a usage error, either an unknown command or no command at all.
+- `2`: a usage error: an unknown command, no command at all, or the wrong arguments for a command.
 
 **Commands:**
 
@@ -114,7 +117,7 @@ You can run it two ways:
 |---|---|---|
 | `--version` | Prints the version (`0.1.0`) | Works |
 | `--help`, `-h` | Prints usage and the registered commands | Works |
-| `workorder validate <path>` | Validates a work order against its schema | Plan 01 Task 2 |
+| `workorder validate <path>` | Validates a work order (`order.yaml`) against `policy/schemas/work-order.schema.json`. Valid: prints its `id` and exits 0. Invalid: prints one `path: message` line per problem to stderr (e.g. `/trace/traceparent: must match pattern ...`) and exits 1. See [docs/policy.md](docs/policy.md#work-orders). | Works |
 | `policy build [--policy dir] [--out dir] [--roster name]` | Compiles policy into `build/` | Plan 01 Task 3 |
 | `secrets resolve [--dry-run]` | Resolves the stack's secrets from Bitwarden into `0600` files under `$XDG_RUNTIME_DIR/hapi/` | Plan 01 Task 4 |
 | `token mint --app planner\|factory --repo owner/name` | Mints a 1-hour GitHub App installation token | Plan 01 Task 4 |
@@ -177,7 +180,7 @@ The `main-protect` ruleset requires the `ci` check to pass, and nobody can bypas
 **This isn't ready yet.** Target repos will *reference* hapi-factory rather than copy it (spec §17), through a small per-repo contract (spec §7):
 - `AGENTS.md`;
 - `mise.toml` tasks;
-- a `.factory/config.yaml` policy overlay;
+- a `.factory/config.yaml` policy overlay, which may only tighten the central policy (see [docs/policy.md](docs/policy.md#repo-overlays-factoryconfigyaml));
 - a thin CI wrapper around the reusable gates workflow, pinned by tag;
 - CODEOWNERS and a `main` ruleset.
 
@@ -263,6 +266,7 @@ These steps are outward-facing or privileged, so agents never do them; the opera
 | Document | What's in it |
 |---|---|
 | [Design spec](docs/superpowers/specs/2026-10-26-hapi-factory-design.md) | Intent, architecture, policy, security, phases. It is the binding authority. |
+| [Policy](docs/policy.md) | Each policy file and its schema, the tighten-only overlay rule with examples, the work-order format and `hapi workorder validate` |
 | [Plan 01: Foundations](docs/superpowers/plans/2026-10-26-hapi-factory-01-foundations.md) | Tasks 1–14: toolchain, policy, generators, secrets, stack, audit, threat model, spikes |
 | [Recon report](reports/Agentic%20software%20factory%20recon.md) | The evidence the design rests on, with sources and versions |
 | [`research_notes/`](research_notes/) | Detailed research notes behind the report |

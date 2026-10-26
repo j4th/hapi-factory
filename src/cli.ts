@@ -10,6 +10,7 @@
  * Exit codes: 0 success, 1 the command failed, 2 usage error (unknown command, no command).
  */
 import { HAPI_VERSION } from "./version";
+import { workorderValidate } from "./workorder/validate";
 
 /** A command handler. It gets the args after the command name and returns the exit code. */
 export type Handler = (args: string[]) => number | Promise<number>;
@@ -104,6 +105,8 @@ export async function main(argv: string[]): Promise<number> {
 // from its own module, e.g.
 //   register("policy build", policyBuild, "Compile policy/ into build/");
 // ---------------------------------------------------------------------------
+
+register("workorder validate", workorderValidate, "Validate a work order (order.yaml) against its schema");
 
 if (import.meta.main) {
   process.exitCode = await main(process.argv.slice(2));

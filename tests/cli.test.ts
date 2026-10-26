@@ -96,3 +96,31 @@ test("HAPI_VERSION matches package.json", () => {
   expect(HAPI_VERSION).toBe("0.1.0");
   expect(pkg.version).toBe(HAPI_VERSION);
 });
+
+test("workorder validate prints the id of a valid work order and exits 0", async () => {
+  const { out, err } = capture();
+  expect(await main(["workorder", "validate", "tests/fixtures/order-0002.yaml"])).toBe(0);
+  expect(out).toEqual(["0002-search-partners-tool"]);
+  expect(err).toEqual([]);
+});
+
+test("workorder validate prints path: message for an invalid work order and exits 1", async () => {
+  const { out, err } = capture();
+  expect(await main(["workorder", "validate", "tests/fixtures/order-bad-traceparent.yaml"])).toBe(1);
+  expect(out).toEqual([]);
+  expect(err).toHaveLength(1);
+  expect(err[0]).toStartWith("/trace/traceparent: must match pattern");
+});
+
+test("workorder validate on a missing file exits 1", async () => {
+  const { err } = capture();
+  expect(await main(["workorder", "validate", "tests/fixtures/no-such-order.yaml"])).toBe(1);
+  expect(err.join("\n")).toContain("no-such-order.yaml");
+});
+
+test("workorder validate needs exactly one path", async () => {
+  const { err } = capture();
+  expect(await main(["workorder", "validate"])).toBe(2);
+  expect(await main(["workorder", "validate", "a.yaml", "b.yaml"])).toBe(2);
+  expect(err.join("\n")).toContain("usage: hapi workorder validate <path>");
+});

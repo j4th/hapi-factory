@@ -1,0 +1,12 @@
+# yaml-language-server: $schema=../schemas/policy-roster.schema.json
+#
+# portable: proving model portability (spec §12), through OpenCode Go.
+#
+# Only 0-day-retention, no-training OpenCode Go models belong here; ids and
+# terms checked against https://opencode.ai/docs/go/ on 2026-10-26. DeepSeek is
+# left out because its zero-retention agreement is renewed monthly. Review runs
+# on a different model family from implement. Every tier runs on Pi, since the
+# claude provider serves only Anthropic models.
+small:  { provider: pi, model: opencode-go/glm-5.3-flash, effort: low }
+medium: { provider: pi, model: opencode-go/glm-5.3, effort: medium }          # review: GLM, a different family from implement
+large:  { provider: pi, model: opencode-go/kimi-k3.1-pro, effort: low, retry_effort: high }  # implement

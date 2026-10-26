@@ -1,0 +1,13 @@
+# yaml-language-server: $schema=schemas/policy-flags.schema.json
+#
+# Flags and thresholds, exactly as spec §13.3. A flagged run gets hapi:flagged
+# on its PR and an alert in #hapi-alerts.
+metrics:      { enabled: true, merge_outcomes: true }
+otel:         { enabled: false, content_capture: off }   # off | preview
+jev:          { enabled: true, fallback: haiku, via: openrouter }  # fallback: haiku | none
+coderabbit:   { enabled: true, include_in_rework: true }
+thresholds:                                              # crossing one flags the run
+  run_usd: 3.00
+  interventions: 1
+  review_rounds: 2
+on_flag: [label_pr, chat_alert]          # chat_alert posts to Slack #hapi-alerts

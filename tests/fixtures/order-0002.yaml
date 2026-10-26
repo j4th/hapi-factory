@@ -1,0 +1,20 @@
+# The spec §6 work-order example, with a real traceparent in place of the
+# "00-<trace-id>-<span-id>-01" placeholder (the W3C Trace Context example value).
+id: 0002-search-partners-tool
+lane: factory
+workflow: factory-task              # Archon workflow name (home-scoped pack)
+risk: medium                        # low | medium | high: drives review depth and thresholds
+roles:                              # abstract tiers, never model ids
+  implement: medium
+  review: medium
+budget: { usd: 3.00, turns: 40, minutes: 30 }
+pieces:
+  - id: search-partners
+    files: ["src/odoo_mcp/tools/partners.py", "tests/tools/test_partners.py"]   # declared scope
+    size: small
+verify:
+  smoke: true                       # run `mise run smoke` against the local Odoo sidecar
+egress_extra: ["odoo.internal"]     # hosts the smoke check needs (here: the private sidecar)
+trace:
+  traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+sources: ["docs/research/odoo-external-api.md", "docs/design/odoo-mcp.md"]

@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "repo-overlay.schema.json",
+  "title": ".factory/config.yaml",
+  "description": "A target repo's overlay on the central policy (spec §7, §8.1). It may add or tighten protected paths, add egress_extra hosts and lower budgets; any other key is rejected. Loosening is caught by applyOverlay, which needs the base policy to compare against.",
+  "type": "object",
+  "properties": {
+    "protected_paths": {
+      "description": "Repo-relative glob -> the modes to tighten. Unnamed modes keep the base value (allow for a new path). null means removal, which applyOverlay always rejects.",
+      "type": "object",
+      "propertyNames": { "$ref": "policy-defs.schema.json#/$defs/repoPath" },
+      "additionalProperties": {
+        "type": ["object", "null"],
+        "properties": {
+          "interactive": { "$ref": "policy-defs.schema.json#/$defs/mode" },
+          "unattended": { "$ref": "policy-defs.schema.json#/$defs/mode" },
+          "workers": { "$ref": "policy-defs.schema.json#/$defs/mode" }
+        },
+        "minProperties": 1,
+        "additionalProperties": false
+      }
+    },
+    "egress_extra": {
+      "description": "Hosts added to the archon zone's allowlist. Never a forge host.",
+      "$ref": "policy-defs.schema.json#/$defs/hostList"
+    },
+    "budgets": {
+      "description": "Budgets to lower. Each value must be at most the base value.",
+      "type": "object",
+      "properties": {
+        "workspaces": {
+          "type": "object",
+          "properties": {
+            "hapi-hermes": { "$ref": "policy-defs.schema.json#/$defs/usd" },
+            "hapi-factory": { "$ref": "policy-defs.schema.json#/$defs/usd" },
+            "hapi-evals": { "$ref": "policy-defs.schema.json#/$defs/usd" }
+          },
+          "additionalProperties": false
+        },
+        "openrouter_monthly_usd": { "$ref": "policy-defs.schema.json#/$defs/usd" },
+        "jev_monthly_usd": { "$ref": "policy-defs.schema.json#/$defs/usd" },
+        "run_usd": { "$ref": "policy-defs.schema.json#/$defs/usd" },
+        "hermes_max_turns": { "$ref": "policy-defs.schema.json#/$defs/count" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

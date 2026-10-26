@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "policy-roster.schema.json",
+  "title": "policy/rosters/*.yaml",
+  "description": "A roster maps each model tier to the Archon provider, model and effort that serve it (spec §12). Rosters are selected per run.",
+  "type": "object",
+  "properties": {
+    "small": { "$ref": "#/$defs/modelSpec" },
+    "medium": { "$ref": "#/$defs/modelSpec" },
+    "large": { "$ref": "#/$defs/modelSpec" }
+  },
+  "required": ["small", "medium", "large"],
+  "additionalProperties": false,
+  "$defs": {
+    "modelSpec": {
+      "type": "object",
+      "properties": {
+        "provider": {
+          "description": "The Archon provider that runs the tier: pi (the embedded Pi SDK) or claude (Claude Code via the Agent SDK).",
+          "enum": ["pi", "claude"]
+        },
+        "model": {
+          "description": "For pi, a Pi model ref '<vendor>/<model-id>', e.g. anthropic/claude-opus-5-5 or opencode-go/kimi-k3.1-pro. For claude, an Anthropic model id, e.g. claude-sonnet-5-5.",
+          "type": "string"
+        },
+        "effort": { "$ref": "policy-defs.schema.json#/$defs/effort" },
+        "retry_effort": {
+          "description": "The effort a retry escalates to, before any change of model (spec §12).",
+          "$ref": "policy-defs.schema.json#/$defs/effort"
+        }
+      },
+      "required": ["provider", "model", "effort"],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "provider": { "const": "pi" } }, "required": ["provider"] },
+          "then": { "properties": { "model": { "type": "string", "pattern": "^[a-z][a-z0-9-]*/[a-z0-9][a-z0-9._-]*$" } } }
+        },
+        {
+          "if": { "properties": { "provider": { "const": "claude" } }, "required": ["provider"] },
+          "then": { "properties": { "model": { "type": "string", "pattern": "^claude-[a-z0-9]+(?:[.-][a-z0-9]+)*$" } } }
+        }
+      ]
+    }
+  }
+}

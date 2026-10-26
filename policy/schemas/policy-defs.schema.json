@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "policy-defs.schema.json",
+  "title": "Shared definitions",
+  "description": "Definitions shared by the policy, repo-overlay and work-order schemas. Not a schema for any one file.",
+  "$defs": {
+    "mode": {
+      "description": "What an agent may do with a protected path. Tightening order: allow < ask < deny.",
+      "enum": ["allow", "ask", "deny"]
+    },
+    "pathModes": {
+      "description": "The mode per session kind (spec §8.2): interactive = the operator is in the session; unattended = Hermes cron, webhook and API surfaces; workers = Pi or Claude Code inside Archon.",
+      "type": "object",
+      "properties": {
+        "interactive": { "$ref": "#/$defs/mode" },
+        "unattended": { "$ref": "#/$defs/mode" },
+        "workers": { "$ref": "#/$defs/mode" }
+      },
+      "required": ["interactive", "unattended", "workers"],
+      "additionalProperties": false
+    },
+    "tier": {
+      "description": "An abstract model tier. Rosters map tiers to models; work orders and roles name tiers, never model ids.",
+      "enum": ["small", "medium", "large"]
+    },
+    "sourceTier": {
+      "description": "A trusted-source tier (spec §10): T0 pinned local snapshots, T1 first-party domains and package registries, T2 curated aggregators, T3 the open web.",
+      "enum": ["T0", "T1", "T2", "T3"]
+    },
+    "effort": {
+      "description": "Reasoning effort, using Archon's ladder; Archon clamps it to what each provider supports.",
+      "enum": ["minimal", "low", "medium", "high", "xhigh", "max"]
+    },
+    "hostname": {
+      "description": "A plain, lowercase domain name with at least two labels: no scheme, port, path, wildcard or leading dot, and not an IP address. The egress generator allows the domain and its subdomains.",
+      "type": "string",
+      "pattern": "^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+    },
+    "hostList": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/hostname" },
+      "uniqueItems": true
+    },
+    "repoPath": {
+      "description": "A path or glob relative to the repo root: not absolute, no '..' segment, no backslash or control characters.",
+      "type": "string",
+      "pattern": "^(?!/)(?!(?:.*/)?\\.\\.(?:/|$))[^\\\\\\u0000-\\u001f]+$"
+    },
+    "slug": {
+      "description": "Lowercase words joined by single hyphens, e.g. factory-task.",
+      "type": "string",
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+      "maxLength": 80
+    },
+    "usd": {
+      "description": "An amount in US dollars, greater than zero.",
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "count": {
+      "description": "A whole number, at least 1.",
+      "type": "integer",
+      "minimum": 1
+    }
+  }
+}

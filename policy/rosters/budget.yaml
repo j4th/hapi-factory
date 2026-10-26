@@ -1,0 +1,8 @@
+# yaml-language-server: $schema=../schemas/policy-roster.schema.json
+#
+# budget: the first end-to-end runs (spec §12). Haiku 5.5 on every tier, with
+# the same providers and efforts as the anthropic roster. Keep prompts under
+# 100K tokens.
+small:  { provider: pi, model: anthropic/claude-haiku-5-5, effort: low }
+medium: { provider: claude, model: claude-haiku-5-5, effort: medium }
+large:  { provider: pi, model: anthropic/claude-haiku-5-5, effort: low, retry_effort: high }

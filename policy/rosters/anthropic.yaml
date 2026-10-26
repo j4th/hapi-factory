@@ -1,0 +1,10 @@
+# yaml-language-server: $schema=../schemas/policy-roster.schema.json
+#
+# anthropic: normal operation (spec §12).
+#
+# Each tier names the Archon provider that runs it. For pi, the model is a Pi
+# model ref '<vendor>/<model-id>'; for claude (Claude Code via the Agent SDK),
+# it is an Anthropic model id. roles.yaml says which role uses which tier.
+small:  { provider: pi, model: anthropic/claude-haiku-5-5, effort: low }       # auxiliaries, scout, router
+medium: { provider: claude, model: claude-sonnet-5-5, effort: medium }         # review, eval judge
+large:  { provider: pi, model: anthropic/claude-opus-5-5, effort: low, retry_effort: high }  # Hermes main, planner, implement
