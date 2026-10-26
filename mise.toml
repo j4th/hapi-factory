@@ -50,8 +50,8 @@ description = "Run the hapi CLI, e.g. `mise run hapi -- --help`"
 run = "bun run src/cli.ts"
 
 [tasks."policy:build"]
-description = "Compile policy/ into build/ configs (arrives in Plan 01 Task 3)"
-run = "echo 'policy:build is not implemented yet (arrives in Plan 01 Task 3)' >&2; exit 1"
+description = "Compile policy/ into the Hermes, Archon, Pi and egress configs under build/ (e.g. `mise run policy:build -- --roster budget`)"
+run = "bun run src/cli.ts policy build"
 
 [tasks.audit]
 description = "Check deployed config, pins and settings against policy (arrives in Plan 01 Task 6)"

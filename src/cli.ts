@@ -10,6 +10,7 @@
  * Exit codes (as in README.md): 0 success, 1 the command failed, 2 a usage error:
  * an unknown command, no command at all, or the wrong arguments for a command.
  */
+import { policyBuild } from "./generate/index";
 import { HAPI_VERSION } from "./version";
 import { workorderValidate } from "./workorder/validate";
 
@@ -103,11 +104,11 @@ export async function main(argv: string[]): Promise<number> {
 
 // ---------------------------------------------------------------------------
 // Commands. Each later task registers its command here, importing the handler
-// from its own module, e.g.
-//   register("policy build", policyBuild, "Compile policy/ into build/");
+// from its own module, as below.
 // ---------------------------------------------------------------------------
 
 register("workorder validate", workorderValidate, "Validate a work order (order.yaml) against its schema");
+register("policy build", policyBuild, "Compile policy/ into Hermes, Archon, Pi and egress configs under build/");
 
 if (import.meta.main) {
   process.exitCode = await main(process.argv.slice(2));

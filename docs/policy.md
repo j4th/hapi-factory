@@ -8,7 +8,7 @@
 - [work orders](#work-orders), with `hapi workorder validate`;
 - [the TypeScript API](#typescript-api) that later code builds on.
 
-The generator that compiles policy into tool configs (`hapi policy build`) arrives in Plan 01 Task 3. Until then, policy is loaded and validated, but nothing is generated from it.
+`hapi policy build` (`mise run policy:build`) compiles policy into each tool's config under `build/`. [docs/generated-configs.md](generated-configs.md) describes every generated file, which policy files feed it and what each setting does.
 
 ## The policy files
 
@@ -186,7 +186,7 @@ The patterns are a second line of defense: no positional pattern accepts `$`, a 
 | `archon` | T0–T1 | `api.anthropic.com`, `openrouter.ai`, `opencode.ai`, `registry.npmjs.org`, `pypi.org`, `files.pythonhosted.org` | Archon and its Pi workers. **No forge host**: the Archon zone has no route to GitHub (spec §4.3). |
 | `research` | T0–T3 | None | `openWeb: true`. Only hapi-research touches the open web. Private address ranges stay blocked. |
 
-A zone's allowlist is its own `hosts` **plus** the hosts of every tier it lists. Hosts are plain, lowercase domains with at least two labels: no scheme, port, path, wildcard or leading dot, and no IP addresses. The egress generator allows each domain and its subdomains, so `slack.com` also covers `wss-primary.slack.com`.
+A zone's allowlist is its own `hosts` **plus** the hosts of every tier it lists (`zoneHosts` in `src/policy/zones.ts` computes it; the egress generator uses it). Hosts are plain, lowercase domains with at least two labels: no scheme, port, path, wildcard or leading dot, and no IP addresses. The egress generator allows each domain and its subdomains, so `slack.com` also covers `wss-primary.slack.com`.
 
 The schema enforces spec §10's tier entitlements: the `hermes` zone may list only T0–T2, the `archon` zone only T0–T1, and only the `research` zone may set `openWeb`.
 
@@ -416,6 +416,7 @@ Later plans build on these functions:
 | `forgeDomain(host): string \| undefined` | `src/policy/hosts.ts` | The forge domain a host belongs to, e.g. `raw.githubusercontent.com` → `githubusercontent.com`. `FORGE_DOMAINS` lists them. |
 | `effectiveModes(p, path): PathModes` | `src/policy/paths.ts` | A file's modes: the strictest across every matching glob ([how globs combine](#how-globs-combine)). Every guard and generator uses it, or the same rule. Throws on a path outside the repo, or one with NUL, a control character or a backslash. |
 | `globMatches(glob, path): boolean` | `src/policy/paths.ts` | Whether one glob matches an already-normalized repo path |
+| `zoneHosts(p, zone): string[]` | `src/policy/zones.ts` | A zone's allowlist: its own hosts plus its tiers' hosts, sorted and de-duplicated. A zone with `openWeb` also reaches any public host, which this list doesn't say. |
 | `validateWorkOrder(obj): WorkOrder` | `src/workorder/validate.ts` | Validates a parsed work order. Throws `WorkOrderError { path, message, issues }`. |
 | `loadWorkOrder(file): WorkOrder` | `src/workorder/validate.ts` | Reads, parses and validates a work-order file |
 
