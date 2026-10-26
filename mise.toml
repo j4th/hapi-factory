@@ -7,15 +7,17 @@
 # never a range. To upgrade, bump the version here, run
 # `mise install && mise run lint && mise run test`, and say why in the PR.
 #
-# This file is a protected path (spec §8.2): agents may not edit it.
+# This file is a protected path (spec §8.2): an interactive agent session must
+# ask the operator before editing it, and unattended sessions and workers may not
+# edit it at all (interactive: ask, unattended: deny, workers: deny).
 
 min_version = "2026.10.3"
 
 [tools]
 bun = "1.4.4"                         # runtime, package manager and test runner for the hapi CLI
-node = "26.12.1"                      # for Node-based tools (e.g. a standalone Pi CLI later)
+node = "24.22.1"                      # LTS line; for Node-based tools (e.g. a standalone Pi CLI later)
 uv = "0.13.5"                         # Python package manager (Hermes-side tooling)
-python = "3.15.1"
+python = "3.14.9"                     # the 3.14 line, which Hermes runs
 gh = "2.103.2"                        # GitHub CLI, for the operator's manual setup steps only; factory code uses src/forge/
 gitleaks = "8.30.1"                   # secret scanner
 bitwarden-secrets-manager = "2.1.0"   # provides `bws`; secrets are resolved from Bitwarden at start (spec §11.5)

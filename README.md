@@ -44,7 +44,7 @@ What exists now:
 
 | Path | What it is |
 |---|---|
-| `mise.toml` | Tool pins and the [mise tasks](#mise-tasks). This is a protected path (spec §8.2), so agents may not edit it. |
+| `mise.toml` | Tool pins and the [mise tasks](#mise-tasks). This is a protected path (spec §8.2): an interactive agent session must ask the operator before editing it, and unattended sessions and workers may not edit it at all. |
 | `package.json`, `bun.lock` | JS project metadata and dev dependencies (`typescript`, `@types/bun`), pinned to exact versions. The lockfile is committed. There are no runtime dependencies yet; Task 2 adds `ajv` and `yaml`. |
 | `bunfig.toml` | Bun install settings: exact versions and a 3-day release-age cooldown (see [Toolchain and pinning](#toolchain-and-pinning)). |
 | `tsconfig.json` | Strict TypeScript settings, used only for type-checking. Bun runs the `.ts` files directly. |
