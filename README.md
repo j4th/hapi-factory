@@ -52,7 +52,7 @@ What exists now:
 | `src/version.ts` | `HAPI_VERSION`. It must match `version` in `package.json`, and a test checks that it does. |
 | `policy/` | The single source of truth: protected paths, commands, trusted sources, budgets, approvals, roles, flags and the model rosters (`policy/rosters/`). See [docs/policy.md](docs/policy.md). |
 | `policy/schemas/` | JSON Schemas (draft 2020-12) for every policy file, the repo overlay (`.factory/config.yaml`) and the work order (`order.yaml`) |
-| `src/policy/` | `loadPolicy` (load and validate `policy/`), `loadOverlay` and `applyOverlay` (the repo overlay, which may only tighten policy), the policy types and the shared schema checker |
+| `src/policy/` | `loadPolicy` (load and validate `policy/`), `loadOverlay` and `applyOverlay` (the repo overlay, which may only tighten policy), `effectiveModes` (a file's protected-path modes: the strictest across every matching glob), the policy types and the shared schema checker |
 | `src/workorder/` | `validateWorkOrder` and the `hapi workorder validate` command |
 | `tests/` | Unit tests for `bun test`. `tests/fixtures/` holds example work orders, overlays and a broken policy directory. |
 | `.github/workflows/ci.yml` | [CI](#ci) for this repo. |

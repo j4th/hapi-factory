@@ -118,7 +118,15 @@ export interface Flags {
 }
 
 export interface Policy {
-  /** Repo-relative glob -> modes. From protected_paths.yaml's `protected_paths` map. */
+  /**
+   * Repo-relative glob -> modes. From protected_paths.yaml's `protected_paths` map.
+   *
+   * Binding rule: a file's effective mode, per session kind, is the STRICTEST mode
+   * across EVERY glob that matches it, never the first, last or most specific
+   * match; a file no glob matches is allow. `allow` in an entry means "this glob
+   * adds no rule for that session". Read it with `effectiveModes` (./paths.ts),
+   * which also defines the glob syntax; never look a file up by key.
+   */
   protectedPaths: Record<string, PathModes>;
   commands: Commands;
   trustedSources: TrustedSources;

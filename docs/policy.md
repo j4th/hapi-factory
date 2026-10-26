@@ -42,7 +42,30 @@ Keys are globs relative to a repo's root. Each entry sets all three modes:
 | `unattended` | Hermes cron, webhook and API surfaces | Always `deny` |
 | `workers` | Pi or Claude Code inside Archon | Always `deny` |
 
-A mode is `allow`, `ask` or `deny`, and they tighten in that order: **allow < ask < deny**. A path that isn't listed is `allow` in every mode. The backstop is CODEOWNERS plus the `main` rulesets: a guard that fails locally still can't land a change.
+A mode is `allow`, `ask` or `deny`, and they tighten in that order: **allow < ask < deny**. The backstop is CODEOWNERS plus the `main` rulesets: a guard that fails locally still can't land a change.
+
+#### How globs combine
+
+This rule is binding on every guard and generator that reads `protected_paths`:
+
+> **A file's effective mode, for each session kind, is the strictest mode across every glob that matches it.** It is never the first match, the last match or the most specific match. A file that no glob matches is `allow` in every mode.
+
+So adding a glob can only tighten. A narrower or later glob never loosens a broader one, and `allow` in an entry means "this glob adds no rule for that session kind", not "permit". For example, with `.github/**` at `{ask, deny, deny}`, a second glob `.github/workflows/**: {interactive: deny, unattended: allow, workers: allow}` makes `.github/workflows/ci.yml` `{deny, deny, deny}`, and `.github/CODEOWNERS` stays `{ask, deny, deny}`.
+
+Code reads this with **`effectiveModes(policy, path)`** in `src/policy/paths.ts`, never by looking up a key. It normalizes the path first, so `./AGENTS.md` and `docs/../AGENTS.md` are both `AGENTS.md`. It throws on a path that is empty, absolute or outside the repo, rather than calling it `allow`. A guard that isn't TypeScript, such as the Python hapi-path-guard (Plan 04), must implement the same rule and pass the same cases as `tests/policy/paths.test.ts`.
+
+#### Glob syntax
+
+The schema (`pathGlob` in `policy-defs.schema.json`) accepts only this dialect, in `protected_paths.yaml` and in overlays:
+
+| Glob | Matches |
+|---|---|
+| `AGENTS.md` | Only the root `AGENTS.md`. A glob is anchored at the repo root and matched against the whole path, case-sensitively. Use `**/AGENTS.md` for every one. |
+| `.github/**` | `.github` itself and everything under it. `**` as a whole segment matches zero or more segments. |
+| `a/**/b` | `a/b`, `a/x/b`, `a/x/y/b` |
+| `*.md`, `docs/?.md` | `*` matches any run of characters within one segment and `?` exactly one. Neither crosses a `/`. Dotfiles aren't special. |
+
+Every other character is literal. A glob may not have a `.`, `..` or empty segment, or a leading or trailing `/`. It may not contain `[`, `]`, `{`, `}`, `!`, a backslash or a control character. `**` must be a whole segment. These rules make each path have one spelling, and they stop another glob dialect from reading a different meaning into a key, such as `!` as negation.
 
 ### `commands.yaml`
 
@@ -177,12 +200,12 @@ An overlay has three keys. **Any other key is rejected.**
 
 | Key | What it may do |
 |---|---|
-| `protected_paths` | **Add** a path, or **raise** a listed path's modes (allow < ask < deny). An entry may name only some of the three modes; the others keep their current value, which is `allow` for a path the base policy doesn't list. `null` asks to remove the path, and that is **always rejected**. |
+| `protected_paths` | **Add** a glob, or **raise** a listed glob's modes (allow < ask < deny). An entry may name only some of the three modes. For a glob the base policy lists, the others keep their base value. A **new** glob may name only `ask` or `deny`; naming `allow` is rejected, because under [strictest-wins](#how-globs-combine) it can't change anything and so reads as a loosening attempt. Its unnamed modes are stored as `allow`, which adds no rule. A new glob that overlaps a protected one can tighten files under it but never loosen them. `null` asks to remove the glob, and that is **always rejected**. |
 | `egress_extra` | **Add** hosts to the `archon` zone's allowlist. The rules are the same as for any host. A **forge host** (`github.com`, `githubusercontent.com`, `githubassets.com`, `ghcr.io`, or a subdomain of one) is rejected, because the Archon zone must never reach the forge (spec §4.3). |
 | `budgets` | **Lower** any budget in `budgets.yaml`. Each value must be at most the base value. |
 
 The overlay is checked in two stages:
-1. **`loadOverlay(file)`** checks the file against `repo-overlay.schema.json`. That catches unknown keys, bad modes and malformed hosts, and throws a `PolicyError`.
+1. **`loadOverlay(file)`** checks the file against `repo-overlay.schema.json`. That catches unknown keys, bad modes, globs outside the [glob syntax](#glob-syntax) and malformed hosts, and throws a `PolicyError`.
 2. **`applyOverlay(policy, overlay)`** compares the overlay with the base policy. It throws a `PolicyLoosenError` at the **first** change that would loosen policy. The error's `path` is a JSON Pointer into the overlay, and its message names the path or glob as written. **A loosening change is never merged silently.** `applyOverlay` returns a new policy and changes neither input. It also re-runs the schema check, so an overlay built in code gets the same checks as one read from a file.
 
 ### An accepted overlay
@@ -199,6 +222,8 @@ budgets:
 
 The result has `src/secrets/**` and `AGENTS.md` denied in every mode, and `odoo.internal` in the archon zone's hosts. Its `budgets.run_usd` is 2. This file is `tests/fixtures/overlay-tighten.yaml`.
 
+A new glob may also overlap a protected one. `".github/workflows/**": { interactive: deny }` is accepted: the workflow files become denied in every mode, and the rest of `.github/**` stays `{ask, deny, deny}`.
+
 ### Rejected overlays
 
 These are the real error messages:
@@ -207,6 +232,8 @@ These are the real error messages:
 |---|---|
 | `protected_paths: { "AGENTS.md": { interactive: allow } }` | `PolicyLoosenError: /protected_paths/AGENTS.md/interactive: loosens "AGENTS.md" interactive from ask to allow; overlays may only tighten policy` |
 | `protected_paths: { ".github/**": null }` | `PolicyLoosenError: /protected_paths/.github~1**: removes protected path ".github/**"; overlays may only tighten policy` |
+| `protected_paths: { ".github/workflows/**": { interactive: allow, unattended: allow, workers: allow } }` | `PolicyLoosenError: /protected_paths/.github~1workflows~1**/interactive: ".github/workflows/**" is a new glob, where allow can't loosen anything (a file's mode is the strictest across every glob that matches it); name only ask or deny; overlays may only tighten policy` |
+| `protected_paths: { "./AGENTS.md": { workers: deny } }` | `PolicyError: .factory/config.yaml: /protected_paths/.~1AGENTS.md: invalid key`. Write `AGENTS.md`: each path has one spelling. |
 | `egress_extra: ["github.com"]` | `PolicyLoosenError: /egress_extra/0: "github.com" is a forge host (github.com); the archon zone has no forge route (spec §4.3); overlays may only tighten policy` |
 | `budgets: { run_usd: 5.00 }` | `PolicyLoosenError: /budgets/run_usd: raises budgets.run_usd from 3 to 5; overlays may only tighten policy` |
 | `commands: { hermes: { allow: ["*"] } }` | `PolicyError: .factory/config.yaml: /commands: unknown key` |
@@ -278,6 +305,8 @@ Later plans build on these functions:
 | `loadPolicy(dir): Policy` | `src/policy/load.ts` | Loads and validates `policy/`. Throws `PolicyError { file, path, message, issues }`. |
 | `loadOverlay(file): RepoOverlay` | `src/policy/overlay.ts` | Loads and schema-checks an overlay. Throws `PolicyError`. |
 | `applyOverlay(p, o): Policy` | `src/policy/overlay.ts` | Tighten-only merge. Throws `PolicyLoosenError { path, message }`. |
+| `effectiveModes(p, path): PathModes` | `src/policy/paths.ts` | A file's modes: the strictest across every matching glob ([how globs combine](#how-globs-combine)). Every guard and generator uses it, or the same rule. Throws on a path outside the repo. |
+| `globMatches(glob, path): boolean` | `src/policy/paths.ts` | Whether one glob matches an already-normalized repo path |
 | `validateWorkOrder(obj): WorkOrder` | `src/workorder/validate.ts` | Validates a parsed work order. Throws `WorkOrderError { path, message, issues }`. |
 | `loadWorkOrder(file): WorkOrder` | `src/workorder/validate.ts` | Reads, parses and validates a work-order file |
 

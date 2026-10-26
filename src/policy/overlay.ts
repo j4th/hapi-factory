@@ -3,17 +3,23 @@
  * policy (spec §7, §8.1).
  *
  * An overlay may only tighten policy. It may:
- * - add protected paths, or raise an existing path's modes (allow < ask < deny);
+ * - add protected-path globs that name only ask or deny, or raise an existing
+ *   glob's modes (allow < ask < deny);
  * - add `egress_extra` hosts to the archon zone (the one exception to tighten-only),
  *   but never a forge host, since the archon zone has no forge route (spec §4.3);
  * - lower budgets.
- * Anything else is rejected: unknown keys by the schema (in `loadOverlay`, and
- * again in `applyOverlay`), and loosening by `applyOverlay`, with a
- * `PolicyLoosenError` naming the path. Nothing is ever merged silently.
+ * Anything else is rejected: unknown keys and non-canonical globs by the schema
+ * (in `loadOverlay`, and again in `applyOverlay`), and loosening by
+ * `applyOverlay`, with a `PolicyLoosenError` naming the path. Nothing is ever
+ * merged silently.
+ *
+ * A new glob that overlaps a protected one can't loosen it, because a file's
+ * mode is the strictest across every glob that matches it (see ./paths.ts).
  */
 import { loadChecked, PolicyError } from "./load";
+import { RANK, SESSIONS, UNPROTECTED } from "./paths";
 import { check, pointerSegment } from "./schema";
-import type { Budgets, Mode, PathModes, Policy, RepoOverlay } from "./types";
+import type { Budgets, Policy, RepoOverlay } from "./types";
 
 /** An overlay tried to loosen policy. `path` is a JSON Pointer into the overlay, e.g. "/protected_paths/AGENTS.md/interactive". */
 export class PolicyLoosenError extends Error {
@@ -31,11 +37,6 @@ export class PolicyLoosenError extends Error {
 export function loadOverlay(file: string): RepoOverlay {
   return loadChecked(file, "repo-overlay") as RepoOverlay;
 }
-
-const RANK: Record<Mode, number> = { allow: 0, ask: 1, deny: 2 };
-const SESSIONS = ["interactive", "unattended", "workers"] as const;
-/** The modes of a path the base policy doesn't protect. */
-const UNPROTECTED: PathModes = { interactive: "allow", unattended: "allow", workers: "allow" };
 
 /**
  * Forge domains (with their subdomains). The archon zone must never reach them:
@@ -87,11 +88,20 @@ function tightenPaths(
           : `null for "${glob}" asks to remove a protected path, which is never allowed`,
       );
     }
+    // A new glob's unnamed modes are allow: the glob adds no rule for that session.
     const from = current ?? UNPROTECTED;
     const next = { ...from };
     for (const session of SESSIONS) {
       const mode = entry[session];
       if (mode === undefined) continue;
+      if (!current && mode === "allow") {
+        // Under strictest-wins, allow on a new glob can't change any file's mode. An
+        // overlay that names it is trying to loosen what another glob protects.
+        throw new PolicyLoosenError(
+          `${at}/${session}`,
+          `"${glob}" is a new glob, where allow can't loosen anything (a file's mode is the strictest across every glob that matches it); name only ask or deny`,
+        );
+      }
       if (RANK[mode] < RANK[from[session]]) {
         throw new PolicyLoosenError(
           `${at}/${session}`,

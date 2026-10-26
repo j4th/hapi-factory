@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadPolicy, PolicyError } from "../../src/policy/load";
 import { applyOverlay, loadOverlay, PolicyLoosenError } from "../../src/policy/overlay";
+import { effectiveModes } from "../../src/policy/paths";
 import type { RepoOverlay } from "../../src/policy/types";
 
 const p = loadPolicy("policy");
@@ -31,9 +32,47 @@ describe("applyOverlay", () => {
     expect(p.protectedPaths["AGENTS.md"]?.interactive).toBe("ask");
   });
 
-  test("a new path's unnamed modes stay at allow, the base for an unprotected path", () => {
+  test("a new glob adds rules only for the modes it names", () => {
     const r = applyOverlay(p, { protected_paths: { "infra/**": { workers: "deny" } } });
+    // allow in a stored entry means "this glob adds no rule for that session".
     expect(r.protectedPaths["infra/**"]).toEqual({ interactive: "allow", unattended: "allow", workers: "deny" });
+    expect(effectiveModes(r, "infra/main.tf")).toEqual({ interactive: "allow", unattended: "allow", workers: "deny" });
+  });
+
+  test("a new glob that overlaps a protected one can tighten it, but never loosen it", () => {
+    const r = applyOverlay(p, { protected_paths: { ".github/workflows/**": { workers: "deny" } } });
+    // Modes combine strictest-wins across every matching glob, so the unnamed modes
+    // (stored as allow) leave .github/** in force for the workflow files.
+    expect(effectiveModes(r, ".github/workflows/ci.yml")).toEqual(p.protectedPaths[".github/**"]!);
+    const t = applyOverlay(p, { protected_paths: { ".github/workflows/**": { interactive: "deny" } } });
+    expect(effectiveModes(t, ".github/workflows/ci.yml")).toEqual({ interactive: "deny", unattended: "deny", workers: "deny" });
+    expect(effectiveModes(t, ".github/CODEOWNERS")).toEqual(p.protectedPaths[".github/**"]!);
+  });
+
+  test("a new glob may not name allow: it can't change anything, so it reads as a loosening attempt", () => {
+    const all = { interactive: "allow", unattended: "allow", workers: "allow" } as const;
+    const e = loosenError(() => applyOverlay(p, { protected_paths: { ".github/workflows/**": all } }));
+    expect(e.path).toBe("/protected_paths/.github~1workflows~1**/interactive");
+    expect(e.message).toContain('".github/workflows/**"');
+    expect(e.message).toContain("strictest");
+    // The first allow is reported even when other modes tighten.
+    const mixed = loosenError(() => applyOverlay(p, { protected_paths: { "infra/**": { interactive: "deny", workers: "allow" } } }));
+    expect(mixed.path).toBe("/protected_paths/infra~1**/workers");
+  });
+
+  test("another spelling of a protected path is rejected by the schema, not merged", () => {
+    for (const glob of ["./AGENTS.md", "docs/../AGENTS.md", ".github//workflows/**"]) {
+      let err: unknown;
+      try {
+        applyOverlay(p, { protected_paths: { [glob]: { workers: "deny" } } });
+      } catch (e) {
+        err = e;
+      }
+      expect(err).toBeInstanceOf(PolicyError);
+      expect((err as PolicyError).issues).toEqual([
+        { path: `/protected_paths/${glob.replaceAll("/", "~1")}`, message: "invalid key" },
+      ]);
+    }
   });
 
   test("an entry equal to the base is accepted", () => {

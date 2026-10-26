@@ -6,9 +6,9 @@
   "type": "object",
   "properties": {
     "protected_paths": {
-      "description": "Repo-relative glob -> {interactive, unattended, workers}.",
+      "description": "Repo-relative glob -> {interactive, unattended, workers}. A file's mode, per session kind, is the strictest across every glob that matches it: never the first, last or most specific match.",
       "type": "object",
-      "propertyNames": { "$ref": "policy-defs.schema.json#/$defs/repoPath" },
+      "propertyNames": { "$ref": "policy-defs.schema.json#/$defs/pathGlob" },
       "additionalProperties": { "$ref": "policy-defs.schema.json#/$defs/pathModes" }
     }
   },

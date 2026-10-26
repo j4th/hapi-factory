@@ -9,6 +9,15 @@
 #
 # Modes tighten in the order allow < ask < deny. A repo's .factory/config.yaml
 # may add paths or tighten modes here, never loosen or remove them.
+#
+# How globs combine (binding on every guard and generator): a file's mode, per
+# session kind, is the STRICTEST mode across EVERY glob that matches it. Never
+# the first, last or most specific match, so no glob can loosen another. A file
+# no glob matches is allow. Use effectiveModes() in src/policy/paths.ts.
+#
+# Glob syntax: anchored at the repo root ("AGENTS.md" is the root file only);
+# "**" as a whole segment matches zero or more segments ("dir/**" covers dir
+# itself too); "*" and "?" stay within one segment; everything else is literal.
 # Backstop: CODEOWNERS plus the main ruleset, so a guard failing locally still
 # can't land a change.
 protected_paths:

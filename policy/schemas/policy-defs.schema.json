@@ -46,6 +46,11 @@
       "type": "string",
       "pattern": "^(?!/)(?!(?:.*/)?\\.\\.(?:/|$))[^\\\\\\u0000-\\u001f]+$"
     },
+    "pathGlob": {
+      "description": "A protected-path glob, anchored at the repo root: segments joined by single slashes; '**' as a whole segment matches zero or more segments, '*' any run of characters within one segment, '?' exactly one; every other character is literal. No '.', '..' or empty segment, no leading or trailing slash, and no '[', ']', '{', '}', '!', backslash or control character. A file's mode is the strictest across every glob that matches it (src/policy/paths.ts).",
+      "type": "string",
+      "pattern": "^(?:\\*\\*|(?!\\.{1,2}(?:/|$))(?:(?!\\*\\*)[^/\\\\\\[\\]{}!\\u0000-\\u001f\\u007f])+)(?:/(?:\\*\\*|(?!\\.{1,2}(?:/|$))(?:(?!\\*\\*)[^/\\\\\\[\\]{}!\\u0000-\\u001f\\u007f])+))*$"
+    },
     "slug": {
       "description": "Lowercase words joined by single hyphens, e.g. factory-task.",
       "type": "string",

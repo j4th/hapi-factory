@@ -6,9 +6,9 @@
   "type": "object",
   "properties": {
     "protected_paths": {
-      "description": "Repo-relative glob -> the modes to tighten. Unnamed modes keep the base value (allow for a new path). null means removal, which applyOverlay always rejects.",
+      "description": "Repo-relative glob -> the modes to tighten. For a glob in the base policy, unnamed modes keep the base value. A new glob may name only ask or deny (applyOverlay rejects allow), and its unnamed modes add no rule. A file's mode is the strictest across every glob that matches it, so a new glob never loosens another. null means removal, which applyOverlay always rejects.",
       "type": "object",
-      "propertyNames": { "$ref": "policy-defs.schema.json#/$defs/repoPath" },
+      "propertyNames": { "$ref": "policy-defs.schema.json#/$defs/pathGlob" },
       "additionalProperties": {
         "type": ["object", "null"],
         "properties": {
