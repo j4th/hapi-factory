@@ -68,7 +68,7 @@ describe("models.json", () => {
 describe("hapi-guard.json", () => {
   test("pi hapi-guard.json carries workers modes", () => {
     const g = guard();
-    expect(g.protected_paths["AGENTS.md"]).toBe("deny");
+    expect(g.protected_paths["**/AGENTS.md"]).toBe("deny");
     expect(g.budgets.run_usd).toBe(3);
     expect(g.combine).toBe("strictest");
     expect(g.session).toBe("workers");

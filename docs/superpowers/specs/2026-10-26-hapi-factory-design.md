@@ -302,7 +302,7 @@ A target repo needs only these files [user: central engine, small contract]:
 | `.factory/work/<id>/` | Work orders (§6) |
 | `docs/research/`, `docs/design/` | Hermes's dated research notes, designs and threat models |
 | `.github/workflows/hapi-gates.yml` | A thin wrapper calling hapi-factory's **reusable workflow, pinned by tag**: runs `mise run check` and the secret, SAST and dependency scans, validates work-order schemas, enforces commit trailers |
-| `.github/CODEOWNERS` | the operator owns `AGENTS.md`, `.factory/**`, `.github/**`, `mise.toml`, `.coderabbit.yaml` |
+| `.github/CODEOWNERS` | the operator owns every protected path (§8.2): the agent instruction files at any depth, `.factory/**`, `.github/**`, `mise.toml`, `.coderabbit.yaml` |
 | Ruleset (forge setting, not a file) | `main` protected; one approving review required, and the PR author can't approve; required checks; no bypass for the Apps |
 
 **New repos (v1):** `mise run new-repo -- <name>`, run by the operator with his own credentials, creates the repo from `templates/repo-contract/` [call]. That template holds:
@@ -340,7 +340,18 @@ The onboarding PR must also **remove or harden any CI workflow that runs an AI a
 
 ```yaml
 protected_paths:
-  "AGENTS.md":   { interactive: ask, unattended: deny, workers: deny }
+  "**/AGENTS.md":       { interactive: ask, unattended: deny, workers: deny }
+  "**/AGENT.md":        { interactive: ask, unattended: deny, workers: deny }
+  "**/CLAUDE.md":       { interactive: ask, unattended: deny, workers: deny }
+  "**/CLAUDE.local.md": { interactive: ask, unattended: deny, workers: deny }
+  "**/GEMINI.md":       { interactive: ask, unattended: deny, workers: deny }
+  "**/REVIEW.md":       { interactive: ask, unattended: deny, workers: deny }
+  "**/.cursorrules":    { interactive: ask, unattended: deny, workers: deny }
+  "**/.windsurfrules":  { interactive: ask, unattended: deny, workers: deny }
+  "**/.claude/**":      { interactive: ask, unattended: deny, workers: deny }
+  "**/.cursor/**":      { interactive: ask, unattended: deny, workers: deny }
+  "**/.clinerules/**":  { interactive: ask, unattended: deny, workers: deny }
+  "**/.rules/**":       { interactive: ask, unattended: deny, workers: deny }
   ".factory/**": { interactive: ask, unattended: deny, workers: deny }
   ".github/**":  { interactive: ask, unattended: deny, workers: deny }
   "mise.toml":   { interactive: ask, unattended: deny, workers: deny }
@@ -358,6 +369,7 @@ protected_paths:
   - hapi-path-guard extends it to globs.
 - **unattended** covers Hermes cron, webhook and API surfaces. Always deny.
 - **workers** covers Pi or Claude Code inside Archon. Always deny.
+- **Agent instruction files at any depth** (added 2026-10-27, the operator's ruling; it replaced the root-only `AGENTS.md`): Pi, Hermes, the later Claude Code lane and CodeRabbit read nested `AGENTS.md`, `CLAUDE.md` and the rest as instructions for that subtree, so a write persists into every later session there. Workers read them and never need to write one: a work order that needs one says so in its PR, and the operator adds it.
 - **`.coderabbit.*`** (added 2026-10-27, the operator's ruling): CodeRabbit reviews a same-repo PR with that PR branch's own config, so a PR that edits it could weaken its own review (§9.6).
 - **Backstop:** CODEOWNERS plus the ruleset. A guard failing locally can't land a change.
 

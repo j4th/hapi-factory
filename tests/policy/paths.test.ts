@@ -59,8 +59,12 @@ describe("effectiveModes", () => {
     expect(effectiveModes(p, ".github/workflows/ci.yml")).toEqual(ASK);
     expect(effectiveModes(p, ".pi/settings.json")).toEqual(DENY);
     expect(effectiveModes(p, "mise.toml")).toEqual(ASK);
-    // Globs are anchored at the root: a nested AGENTS.md is not covered by "AGENTS.md".
-    expect(effectiveModes(p, "src/AGENTS.md")).toEqual(ALLOW);
+    // Agent instruction files are protected at any depth ("**/AGENTS.md" matches the root too).
+    expect(effectiveModes(p, "src/AGENTS.md")).toEqual(ASK);
+    expect(effectiveModes(p, "pkg/web/CLAUDE.md")).toEqual(ASK);
+    expect(effectiveModes(p, "pkg/web/.claude/settings.json")).toEqual(ASK);
+    // Other globs are anchored at the root: only the root .coderabbit.yaml is CodeRabbit's config.
+    expect(effectiveModes(p, "src/.coderabbit.yaml")).toEqual(ALLOW);
     expect(effectiveModes(p, "src/cli.ts")).toEqual(ALLOW);
   });
 

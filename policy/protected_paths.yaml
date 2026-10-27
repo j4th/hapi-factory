@@ -21,7 +21,21 @@
 # Backstop: CODEOWNERS plus the main ruleset, so a guard failing locally still
 # can't land a change.
 protected_paths:
-  "AGENTS.md":   { interactive: ask, unattended: deny, workers: deny }
+  # Agent instruction files, at any depth: every agent that runs in a repo, and
+  # CodeRabbit, reads them as instructions, so a write persists into later
+  # sessions. "**/" matches the root too.
+  "**/AGENTS.md":       { interactive: ask, unattended: deny, workers: deny }
+  "**/AGENT.md":        { interactive: ask, unattended: deny, workers: deny }
+  "**/CLAUDE.md":       { interactive: ask, unattended: deny, workers: deny }
+  "**/CLAUDE.local.md": { interactive: ask, unattended: deny, workers: deny }
+  "**/GEMINI.md":       { interactive: ask, unattended: deny, workers: deny }
+  "**/REVIEW.md":       { interactive: ask, unattended: deny, workers: deny }
+  "**/.cursorrules":    { interactive: ask, unattended: deny, workers: deny }
+  "**/.windsurfrules":  { interactive: ask, unattended: deny, workers: deny }
+  "**/.claude/**":      { interactive: ask, unattended: deny, workers: deny }
+  "**/.cursor/**":      { interactive: ask, unattended: deny, workers: deny }
+  "**/.clinerules/**":  { interactive: ask, unattended: deny, workers: deny }
+  "**/.rules/**":       { interactive: ask, unattended: deny, workers: deny }
   ".factory/**": { interactive: ask, unattended: deny, workers: deny }
   ".github/**":  { interactive: ask, unattended: deny, workers: deny }
   "mise.toml":   { interactive: ask, unattended: deny, workers: deny }

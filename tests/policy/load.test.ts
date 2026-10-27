@@ -38,7 +38,7 @@ function zoneAllowlist(p: Policy, zone: ZoneName): string[] {
 
 test("loads repo policy", () => {
   const p = loadPolicy("policy");
-  expect(p.protectedPaths["AGENTS.md"]).toEqual({ interactive: "ask", unattended: "deny", workers: "deny" });
+  expect(p.protectedPaths["**/AGENTS.md"]).toEqual({ interactive: "ask", unattended: "deny", workers: "deny" });
   expect(p.protectedPaths[".pi/**"]?.interactive).toBe("deny");
   expect(p.budgets.workspaces["hapi-factory"]).toBe(100);
   expect(p.flags.jev).toEqual({ enabled: true, fallback: "haiku", via: "openrouter" });
@@ -58,7 +58,18 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
     const ask = { interactive: "ask", unattended: "deny", workers: "deny" } as const;
     const deny = { interactive: "deny", unattended: "deny", workers: "deny" } as const;
     expect(p.protectedPaths).toEqual({
-      "AGENTS.md": ask,
+      "**/AGENTS.md": ask,
+      "**/AGENT.md": ask,
+      "**/CLAUDE.md": ask,
+      "**/CLAUDE.local.md": ask,
+      "**/GEMINI.md": ask,
+      "**/REVIEW.md": ask,
+      "**/.cursorrules": ask,
+      "**/.windsurfrules": ask,
+      "**/.claude/**": ask,
+      "**/.cursor/**": ask,
+      "**/.clinerules/**": ask,
+      "**/.rules/**": ask,
       ".factory/**": ask,
       ".github/**": ask,
       "mise.toml": ask,

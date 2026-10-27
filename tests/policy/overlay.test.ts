@@ -22,14 +22,14 @@ function loosenError(fn: () => unknown): PolicyLoosenError {
 describe("applyOverlay", () => {
   test("applyOverlay tightens", () => {
     const deny = { interactive: "deny", unattended: "deny", workers: "deny" } as const;
-    const r = applyOverlay(p, { protected_paths: { "src/secrets/**": deny, "AGENTS.md": { interactive: "deny" } } });
+    const r = applyOverlay(p, { protected_paths: { "src/secrets/**": deny, "**/AGENTS.md": { interactive: "deny" } } });
     expect(r.protectedPaths["src/secrets/**"]).toEqual(deny);
     // A partial entry changes only the modes it names.
-    expect(r.protectedPaths["AGENTS.md"]).toEqual({ interactive: "deny", unattended: "deny", workers: "deny" });
+    expect(r.protectedPaths["**/AGENTS.md"]).toEqual({ interactive: "deny", unattended: "deny", workers: "deny" });
     expect(r.protectedPaths[".github/**"]).toEqual(p.protectedPaths[".github/**"]!);
     // The base policy is not mutated.
     expect(p.protectedPaths["src/secrets/**"]).toBeUndefined();
-    expect(p.protectedPaths["AGENTS.md"]?.interactive).toBe("ask");
+    expect(p.protectedPaths["**/AGENTS.md"]?.interactive).toBe("ask");
   });
 
   test("a new glob adds rules only for the modes it names", () => {
@@ -152,7 +152,7 @@ describe("applyOverlay", () => {
       egress_extra: ["odoo.internal"],
       budgets: { run_usd: 2 },
     });
-    r.protectedPaths["AGENTS.md"]!.interactive = "allow"; // an entry the overlay didn't touch
+    r.protectedPaths["**/AGENTS.md"]!.interactive = "allow"; // an entry the overlay didn't touch
     r.protectedPaths[".pi/**"]!.workers = "allow";
     r.trustedSources.zones.archon.hosts.push("evil.example");
     r.trustedSources.zones.hermes.hosts.push("evil.example");
