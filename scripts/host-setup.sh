@@ -41,9 +41,9 @@ readonly HAPI_CHECKOUT=hapi-factory
 # Docker can't unpack an image with an ID it can't map. 2^20 covers it.
 readonly SUBID_COUNT=1048576
 # mise.toml's min_version. SHA-256s from the release's SHASUMS256.txt.
-readonly MISE_VERSION=2026.10.3
-readonly MISE_SHA256_X64=8d48bc510b7d844fad0bc7156c0855c2a1e7230c51e498a7f6b63b021f8b57c5
-readonly MISE_SHA256_ARM64=357260e28904569a6e7124d33b65cef6d043846c07bb8f4906ddf22cc353d61d
+readonly MISE_VERSION=2026.10.9
+readonly MISE_SHA256_X64=6ab6646b52b83f6bbd51c9d0d3ae54264ffa90efd1ac6d7c0ec5a86bbc6a0030
+readonly MISE_SHA256_ARM64=e5cf4820b0d3fd47776acf7811c855a52277262d35dcda1a9e8754e6d5442a39
 
 log() { printf 'host-setup: %s\n' "$*"; }
 die() {

@@ -20,7 +20,7 @@ hapi-factory is a public, best-practices reference stack for an end-to-end agent
 ## Prerequisites
 
 - **Linux.** It is the only supported OS (spec §3).
-- **[mise](https://mise.jdx.dev/getting-started.html) 2026.10.3 or newer.** It installs every other tool at a pinned version. `mise.toml` enforces the minimum with `min_version`.
+- **[mise](https://mise.jdx.dev/getting-started.html) 2026.10.9 or newer.** It installs every other tool at a pinned version. `mise.toml` enforces the minimum with `min_version`.
 - **Docker Engine with Compose v2.** You need it only for the stack and the integration tests. Linting and unit tests don't need Docker. The stack runs on rootless Docker as a dedicated `hapi` user, which `scripts/host-setup.sh` creates ([docs/runbooks/stack.md](docs/runbooks/stack.md)).
 - **git.**
 

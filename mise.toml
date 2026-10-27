@@ -11,7 +11,7 @@
 # ask the operator before editing it, and unattended sessions and workers may not
 # edit it at all (interactive: ask, unattended: deny, workers: deny).
 
-min_version = "2026.10.3"
+min_version = "2026.10.9"
 
 [tools]
 bun = "1.4.4"                         # runtime, package manager and test runner for the hapi CLI
