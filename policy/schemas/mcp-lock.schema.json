@@ -27,7 +27,7 @@
       "properties": {
         "package": { "$ref": "policy-defs.schema.json#/$defs/npmPin" },
         "image": { "$ref": "policy-defs.schema.json#/$defs/imagePin" },
-        "url": { "$ref": "policy-defs.schema.json#/$defs/httpsUrl" }
+        "url": { "$ref": "policy-defs.schema.json#/$defs/mcpUrl" }
       },
       "minProperties": 1,
       "additionalProperties": false

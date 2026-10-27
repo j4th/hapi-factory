@@ -308,7 +308,7 @@ Server names are lowercase slugs. Each entry has these fields:
 | `transport` | Yes | `stdio`: a local process inside the zone's container, so the zone's egress proxy binds it. `http`: a remote endpoint. |
 | `package` | For `stdio` | `{name, version, integrity}`. `version` is exact, `MAJOR.MINOR.PATCH` (calendar versions too): never a range (`^4.3.0`), a tag (`latest`) or a prerelease. `integrity` is the registry's `dist.integrity` for that version, an SRI `sha512-...`. |
 | `image` | No; `stdio` only | The per-server image built from the package and a committed lockfile, pinned by digest: `name[:tag]@sha256:<64 hex>`. A tag alone is rejected. |
-| `url` | For `http`; `http` only | An `https://` URL with no user info. Its host must be one of `egress`, or a subdomain of one. |
+| `url` | For `http`; `http` only | An `https://` URL with no user info and **no `$`**: Hermes expands `${...}` and `${env:...}` in a url, so one could carry Hermes's provider key or another server's key to the host. Its host must be one of `egress`, or a subdomain of one. |
 | `floor` | No | `{min, advisory}`: our own advisory floor. `package.version` must be at least `min`. For advisories the scanners don't track ([docs/mcp.md](mcp.md#advisory-floors)). It needs a `package`. |
 | `cooldown_exception` | No | The advisory id (CVE or GHSA) whose fix lets this pin skip the 14-day release cooldown ([docs/mcp.md](mcp.md#the-release-cooldown-and-the-security-fix-exception)) |
 | `tools.include` | Yes | At least one exact MCP tool name: letters, digits, `_`, `-` and `.`. **Read-only tools only.** No `*`, `?` or `[`: Hermes would read them as fnmatch patterns. |
@@ -338,6 +338,7 @@ These are the real messages:
 | `zones: [archon]` | `policy/mcp.yaml: /servers/context7/zones/0: must be one of: hermes, research` |
 | `name: "@modelcontextprotocol/server-brave-search"` | `policy/mcp.yaml: /servers/context7/package/name: "@modelcontextprotocol/server-brave-search" is blocked (matches "@modelcontextprotocol/server-brave-search" in blocked)` |
 | `upsert-prompt` added to phoenix's `tools.include` | `policy/mcp.yaml: /servers/phoenix/tools/include/23: "upsert-prompt" is on phoenix's tools.deny list (a write or third-party tool); include read-only tools only` |
+| `url: "https://mcp.context7.com/mcp?k=${ANTHROPIC_API_KEY}"` on an `http` server | `policy/mcp.yaml: /servers/context7/url: must match pattern "^[^$]+$"` |
 | `HTTPS_PROXY: http://...` in `env` | `policy/mcp.yaml: /servers/context7/env/HTTPS_PROXY: a server may not set HTTPS_PROXY: the zone's proxy settings come from the stack, never from a server entry (spec §10.1)` |
 | `PHOENIX_API_KEY: bws:hapi-mcp-context7-api-key` | `policy/mcp.yaml: /servers/phoenix/env/PHOENIX_API_KEY: bws key "hapi-mcp-context7-api-key" is already context7's; each server gets only its own key (spec §10.1)` |
 

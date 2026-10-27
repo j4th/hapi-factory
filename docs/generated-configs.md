@@ -114,7 +114,7 @@ mcp_servers:
 | `elicitation.enabled` | `false` | The server can't ask the user for input. Context7's backend can send an anonymous caller an elicitation that asks them to run a setup command (spec §10.1). |
 | `sampling.enabled` | `false` | The server can't run completions on Hermes's model key. No catalog server needs it. |
 
-The emitter checks the catalog again before it writes anything (the schema and `mcpIssues`), so a policy built in code can't emit a server the loader would refuse, such as one in the archon zone, a denied tool, or a literal holding `${...}`.
+The emitter checks the catalog again before it writes anything (the schema and `mcpIssues`), so a policy built in code can't emit a server the loader would refuse, such as one in the archon zone, a denied tool, or a `url` or env literal holding `${...}`. Then it checks each entry it built (`checkOwnRefs`): the only `$` allowed is the server's own `${HAPI_MCP_...}` references, as env values. Hermes v0.22.5 expands `${VAR}` and `${env:VAR}` in a server's `url`, `headers`, `args` and `env`, so any other `$` could hand the server Hermes's provider key or another server's key. That output check also covers any field the entries gain later, such as `headers`.
 
 **No hooks yet.** Plan 01 emits no `hooks:` section. The `hapi-cmd-allow` hook script arrives in Plan 04, and a `fail_closed` hook pointing at a missing script would block every tool call.
 

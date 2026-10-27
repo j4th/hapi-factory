@@ -162,6 +162,15 @@ describe("loadLock", () => {
     writeFileSync(file, "{not json");
     expect(() => loadLock(file)).toThrow(PolicyError);
   });
+
+  test("a pinned url never holds $, as in the catalog", () => {
+    const file = join(tempDir(), "mcp.lock.json");
+    const remote = (url: string) => ({ ...entry("context7", CONTEXT7), pin: { url } });
+    writeFileSync(file, JSON.stringify({ context7: remote("https://mcp.context7.com/mcp") }));
+    expect(() => loadLock(file)).not.toThrow();
+    writeFileSync(file, JSON.stringify({ context7: remote("https://mcp.context7.com/mcp?k=${ANTHROPIC_API_KEY}") }));
+    expect(() => loadLock(file)).toThrow(/\/context7\/pin\/url: must match pattern/);
+  });
 });
 
 describe("hapi mcp verify and pin", () => {

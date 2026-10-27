@@ -21,7 +21,8 @@
  *
  * Every function here re-checks the catalog first (schema and `mcpIssues`), so
  * a policy built in code, which skips the loader, can't emit a server the
- * loader would refuse.
+ * loader would refuse. Then it checks each entry it built (`checkOwnRefs`): the
+ * only `$` in a server's entry is that server's own `${HAPI_MCP_...}` env refs.
  */
 import { check, formatIssue } from "../policy/schema";
 import { MCP_ZONES, type McpOptions, type McpZone, mcpIssues, secretEnvName, secretKey, serversForZone } from "../policy/mcp";
@@ -61,6 +62,42 @@ function envRefs(s: McpServer): Record<string, string> {
 }
 
 /**
+ * Throw unless every `$` in a server's generated entry is one of the server's
+ * own `${HAPI_MCP_...}` references, as an env value. Hermes v0.22.5 expands
+ * `${VAR}` and `${env:VAR}` in a server's url, headers, args and env, so any
+ * other `$` could send Hermes's provider key, or another server's key, to this
+ * server (spec §10.1: each server gets only its own key). The schema already
+ * bans `$` in url and env literals; this holds for any field the entries gain
+ * later, such as headers. Returns the entry.
+ */
+export function checkOwnRefs<T extends object>(name: string, s: Pick<McpServer, "env">, entry: T): T {
+  const own = new Set(
+    Object.values(s.env).flatMap((value) => {
+      const key = secretKey(value);
+      return key === undefined ? [] : [`\${${secretEnvName(key)}}`];
+    }),
+  );
+  const visit = (value: unknown, path: string[]): void => {
+    const where = () => `MCP server ${name}: ${path.length > 0 ? path.join(".") : "(entry)"}`;
+    if (typeof value === "string") {
+      const ownRef = path.length === 2 && path[0] === "env" && own.has(value);
+      if (value.includes("$") && !ownRef) {
+        throw new Error(
+          `${where()} is ${JSON.stringify(value)}: Hermes expands \${...} there, and a server may reference only its own bws keys, as env values (spec §10.1)`,
+        );
+      }
+    } else if (value !== null && typeof value === "object") {
+      for (const [k, v] of Object.entries(value)) {
+        if (k.includes("$")) throw new Error(`${where()} has the key ${JSON.stringify(k)}: no key may hold "$"`);
+        visit(v, [...path, k]);
+      }
+    }
+  };
+  visit(entry, []);
+  return entry;
+}
+
+/**
  * Hermes's `mcp_servers` for a zone (Hermes v0.22.5 keys): `command`, `args`
  * and `env` (Hermes passes a stdio server only these, plus a safe baseline),
  * or `url`; `tools.include` with prompts and resources off; `trust: untrusted`;
@@ -72,14 +109,14 @@ export function hermesMcpServers(p: Policy, zone: McpZone, opts: McpOptions = {}
   return Object.fromEntries(
     serversForZone(p, zone, opts).map(([name, s]) => [
       name,
-      {
+      checkOwnRefs(name, s, {
         ...(s.transport === "http" ? { url: s.url } : { ...launch(name, s), env: envRefs(s) }),
         tools: { include: [...s.tools.include], prompts: false, resources: false },
         trust: s.trust,
         elicitation: { enabled: false },
         // A server may not run completions on our model key (sampling); none in the catalog needs it.
         sampling: { enabled: false },
-      },
+      }),
     ]),
   );
 }
@@ -91,7 +128,7 @@ export function emitMcpJson(p: Policy, zone: McpZone): string {
   const mcpServers = Object.fromEntries(
     serversForZone(p, zone, { o11y: true }).map(([name, s]) => [
       name,
-      s.transport === "http" ? { type: "http", url: s.url } : { type: "stdio", ...launch(name, s), env: envRefs(s) },
+      checkOwnRefs(name, s, s.transport === "http" ? { type: "http", url: s.url } : { type: "stdio", ...launch(name, s), env: envRefs(s) }),
     ]),
   );
   const comment = notice(`mcp.json for the ${zone} zone's MCP servers, for the CI scanners`, ["policy/mcp.yaml"]);

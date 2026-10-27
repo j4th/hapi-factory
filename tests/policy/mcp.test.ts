@@ -227,6 +227,25 @@ describe("loadPolicy rejects a bad catalog with the file and path", () => {
     expect(policyError(remote.replace("https://mcp.context7.com/mcp", "http://mcp.context7.com/mcp")).path).toBe("/servers/context7/url");
   });
 
+  test("a url never holds $, which Hermes would expand into another secret", () => {
+    // An http entry whose host is under its own egress, so only the "$" can fail it.
+    const remote = MCP_YAML.replace(/    package:\n      name: "@upstash\/context7-mcp"\n(?:      .*\n)*?      integrity: "[^"]+"\n/, "")
+      .replace("    transport: stdio\n", "    transport: http\n    url: https://mcp.context7.com/mcp\n")
+      .replace(/    floor: .*\n/, "")
+      .replace(/    env:\n      CONTEXT7_API_KEY: .*\n      OTEL_SDK_DISABLED: .*\n/, "    env: {}\n");
+    expect(() => loadPolicy(withMcp(remote))).not.toThrow();
+    for (const url of [
+      "https://mcp.context7.com/mcp?k=${ANTHROPIC_API_KEY}&c=${HAPI_MCP_CONTEXT7_API_KEY}", // the provider key and another server's key
+      "https://mcp.context7.com/mcp?k=${ANTHROPIC_API_KEY}",
+      "https://mcp.context7.com/${env:ANTHROPIC_API_KEY}", // Hermes's Cursor-style form
+      "https://mcp.context7.com/mcp?k=$ANTHROPIC_API_KEY",
+    ]) {
+      const e = policyError(remote.replace("url: https://mcp.context7.com/mcp", `url: ${JSON.stringify(url)}`));
+      expect(e.file).toEndWith("mcp.yaml");
+      expect(e.issues).toEqual([{ path: "/servers/context7/url", message: 'must match pattern "^[^$]+$"' }]);
+    }
+  });
+
   test("an unknown key in a server is rejected", () => {
     expect(policyError(edited("    elicitation: deny\n    enabled_when: always", "    elicitation: deny\n    enabled_when: always\n    autoapprove: true")).path).toBe(
       "/servers/context7/autoapprove",

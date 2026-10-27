@@ -48,8 +48,8 @@
           "$ref": "policy-defs.schema.json#/$defs/imagePin"
         },
         "url": {
-          "description": "http only: the server's https endpoint. Its host must be one of `egress` or a subdomain of one.",
-          "$ref": "policy-defs.schema.json#/$defs/httpsUrl"
+          "description": "http only: the server's https endpoint, with no '$' (Hermes expands ${...} in it). Its host must be one of `egress` or a subdomain of one.",
+          "$ref": "policy-defs.schema.json#/$defs/mcpUrl"
         },
         "floor": {
           "description": "Our own advisory floor: package.version must be at least `min`. For advisories that OSV and the scanners don't track (spec §10.1).",

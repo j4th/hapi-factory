@@ -4,7 +4,8 @@
  * bws key name and its egress hosts.
  *
  * The schema (policy-mcp.schema.json) checks the shapes, including that no
- * server lists the archon zone. `mcpIssues` adds what a schema can't say:
+ * server lists the archon zone and that no `url` or env literal holds `$`
+ * (Hermes expands `${...}` in both). `mcpIssues` adds what a schema can't say:
  * - the advisory floors: a pinned version below a server's floor names the
  *   advisory, because some advisories (Context7's CVE-2026-75130) have no OSV
  *   record, so the scanners stay silent;
