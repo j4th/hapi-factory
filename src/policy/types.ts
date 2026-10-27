@@ -135,6 +135,52 @@ export interface Flags {
   on_flag: ("label_pr" | "chat_alert")[];
 }
 
+/** An exact npm pin: the version is exact and the integrity is the registry's sha512 for it. */
+export interface McpPackage {
+  name: string;
+  /** MAJOR.MINOR.PATCH: never a range, tag or prerelease. */
+  version: string;
+  /** The registry's dist.integrity, `sha512-...`. */
+  integrity: string;
+}
+
+/**
+ * One MCP server in policy/mcp.yaml (spec §10.1). src/policy/mcp.ts reads the
+ * catalog (`serversForZone`) and holds the checks beyond the schema.
+ */
+export interface McpServer {
+  /** The zones that may load it. Never archon: workers get no MCP server. */
+  zones: ZoneName[];
+  transport: "stdio" | "http";
+  /** stdio: the exact npm pin it runs from. */
+  package?: McpPackage;
+  /** stdio: the per-server image built from the package, `name@sha256:...`. */
+  image?: string;
+  /** http only: the https endpoint; its host is one of `egress` or under one. */
+  url?: string;
+  /** Our own advisory floor: `package.version` must be at least `min`. */
+  floor?: { min: string; advisory: string };
+  /** The advisory whose fix lets this pin skip the 14-day release cooldown. */
+  cooldown_exception?: string;
+  /** `include`: the read-only tools the agent may call. `deny`: write and third-party tools, which `include` may never list. */
+  tools: { include: string[]; deny: string[] };
+  /** ENV -> `bws:hapi-mcp-<name>` (a bws key name) or a literal, e.g. OTEL_SDK_DISABLED: "true". */
+  env: Record<string, string>;
+  /** The hosts it needs; each covers its subdomains. */
+  egress: string[];
+  trust: "untrusted";
+  elicitation: "deny";
+  /** Default always. o11y: only while the observability profile runs. */
+  enabled_when?: "always" | "o11y";
+}
+
+/** policy/mcp.yaml. */
+export interface McpCatalog {
+  servers: Record<string, McpServer>;
+  /** Package-name patterns no server may use; `*` matches any run of characters. */
+  blocked: string[];
+}
+
 export interface Policy {
   /**
    * Repo-relative glob -> modes. From protected_paths.yaml's `protected_paths` map.
@@ -153,6 +199,8 @@ export interface Policy {
   roles: Roles;
   rosters: Record<RosterName, Roster>;
   flags: Flags;
+  /** The MCP catalog (spec §10.1), from mcp.yaml. */
+  mcp: McpCatalog;
   /**
    * The repo's own settings from its overlay (spec §7). Only `applyOverlay` sets
    * it, and only when the overlay names one of them; `loadPolicy` never does.

@@ -5,9 +5,10 @@
 - [how to regenerate the files](#regenerating);
 - [what each file is](#the-files), which policy files feed it and where it goes;
 - [what each hardening setting does and why](#buildhermesconfigyaml), with the spec section it comes from;
-- [how protected paths stay strictest-wins](#protected-paths-stay-strictest-wins) in every output.
+- [how protected paths stay strictest-wins](#protected-paths-stay-strictest-wins) in every output;
+- [the MCP servers](#mcp-servers-mcp_servers) in Hermes's config and [the per-zone `mcp.json` files](#buildmcpmcpjson) for the CI scanners.
 
-`build/` is generated and gitignored. **Never edit a file in it by hand**: change `policy/` and rebuild. Every file starts with a notice that names its policy sources and says not to edit it. The YAML, env and Squid files carry it as `#` comments. JSON has no comments, so `models.json` and `hapi-guard.json` carry it as a `$comment` string, their first key.
+`build/` is generated and gitignored. **Never edit a file in it by hand**: change `policy/` and rebuild. Every file starts with a notice that names its policy sources and says not to edit it. The YAML, env and Squid files carry it as `#` comments. JSON has no comments, so `models.json`, `hapi-guard.json` and the `mcp.json` files carry it as a `$comment` string, their first key.
 
 ## Regenerating
 
@@ -22,20 +23,20 @@ mise run hapi -- policy build --policy policy --out build --roster portable
 | Flag | Default | Meaning |
 |---|---|---|
 | `--policy` | `policy` | The policy directory to load. It is schema-checked first, as `loadPolicy` does. |
-| `--out` | `build` | Where to write. The four subdirectories are created as needed. |
+| `--out` | `build` | Where to write. The five subdirectories are created as needed. |
 | `--roster` | `anthropic` | `budget`, `anthropic` or `portable` (spec §12). It selects **Archon's tiers and Pi's models only**. Hermes always uses the `anthropic` roster, because it runs on the Anthropic provider with a Console key. |
 
 It prints each path it wrote, one per line, and exits 0. A usage error (an unknown flag or roster, or a missing value) exits 2. A policy file that fails to load exits 1 with `hapi policy build: <file>: <problem>`.
 
 **Builds are deterministic.** Keys come out in a fixed order, lists are sorted, and nothing holds a timestamp, so building twice from the same policy gives byte-identical files. That is how Task 6's `mise run audit` will detect a hand edit to a deployed file: it compares the deployed file with a fresh build. Every emitter runs before anything is written, so a policy that an emitter refuses leaves the existing files untouched. `buildAll` only writes files; it never deletes any.
 
-**From code**, `buildAll(policy, outDir, { roster })` in `src/generate/index.ts` writes the files and returns their paths. The emitters are pure functions that return `{ filename: contents }`: `emitHermes(p)`, `emitArchon(p, roster)`, `emitPi(p, roster)` and `emitEgress(p)`, in `src/generate/{hermes,archon,pi,egress}.ts`. Apply a repo overlay first (`applyOverlay`, [docs/policy.md](policy.md#repo-overlays-factoryconfigyaml)) to build for that repo.
+**From code**, `buildAll(policy, outDir, { roster, o11y })` in `src/generate/index.ts` writes the files and returns their paths. `o11y` says whether the observability profile runs, which turns on the o11y-gated MCP servers in Hermes's config. It defaults to the policy's `flags.otel.enabled` (off), so to build with Phoenix MCP set that flag, or pass `o11y: true` from code. The emitters are pure functions that return `{ filename: contents }`: `emitHermes(p, { o11y })`, `emitArchon(p, roster)`, `emitPi(p, roster)`, `emitEgress(p)` and `emitMcp(p)`, in `src/generate/{hermes,archon,pi,egress,mcp}.ts`. `src/generate/mcp.ts` also has `hermesMcpServers(p, zone, { o11y })`, a zone's Hermes `mcp_servers`, which Plan 04's hapi-research profile uses for the research zone. Apply a repo overlay first (`applyOverlay`, [docs/policy.md](policy.md#repo-overlays-factoryconfigyaml)) to build for that repo.
 
 ## The files
 
 | File | What it is | From | Used by (Plan 01 Task 5) |
 |---|---|---|---|
-| `build/hermes/config.yaml` | Hermes's `config.yaml` (Hermes v0.22.5 keys) | `budgets.yaml`, `protected_paths.yaml`, `roles.yaml`, `rosters/anthropic.yaml` | Mounted as the Hermes container's config |
+| `build/hermes/config.yaml` | Hermes's `config.yaml` (Hermes v0.22.5 keys) | `budgets.yaml`, `flags.yaml`, `mcp.yaml`, `protected_paths.yaml`, `roles.yaml`, `rosters/anthropic.yaml` | Mounted as the Hermes container's config |
 | `build/archon/config.yaml` | Archon's global config, `~/.archon/config.yaml` (Archon v0.12.1): model tiers and aliases | `roles.yaml`, `rosters/<roster>.yaml` | The Archon container |
 | `build/archon/archon.env` | The Archon container's environment | Spec §9.2 and §9.3 (no policy file) | The Archon container's `env_file` |
 | `build/pi/models.json` | Pi 1.3.0's model registry: `maxTokens` caps | `rosters/<roster>.yaml` | Mounted read-only at `PI_CODING_AGENT_DIR` |
@@ -43,8 +44,10 @@ It prints each path it wrote, one per line, and exits 0. A usage error (an unkno
 | `build/egress/hermes.squid.conf` | Squid config for the `hermes` zone's egress proxy | `trusted_sources.yaml` | The `egress-hermes` container |
 | `build/egress/archon.squid.conf` | Squid config for the `archon` zone's egress proxy | `trusted_sources.yaml` | The `egress-archon` container |
 | `build/egress/research.squid.conf` | Squid config for the `research` zone's egress proxy | `trusted_sources.yaml` | The research proxy (a later plan) |
+| `build/mcp/hermes.mcp.json` | A standard `mcp.json` with the `hermes` zone's whole MCP catalog | `mcp.yaml` | The CI scanners (Plan 05) |
+| `build/mcp/research.mcp.json` | A standard `mcp.json` with the `research` zone's whole MCP catalog | `mcp.yaml` | The CI scanners (Plan 05) |
 
-Not compiled yet: `commands.yaml` (the Hermes `hapi-cmd-allow` hook arrives in Plan 04; Archon `allowed_tools` sit on workflow nodes, Plan 03), `approvals.yaml` and `flags.yaml` (later plans).
+Not compiled yet: `commands.yaml` (the Hermes `hapi-cmd-allow` hook arrives in Plan 04; Archon `allowed_tools` sit on workflow nodes, Plan 03), `approvals.yaml`, and `flags.yaml` apart from `otel.enabled`, which gates the o11y MCP servers (later plans). `mcp.lock.json` isn't compiled: `hapi mcp verify` reads it ([docs/policy.md](policy.md#mcplockjson)).
 
 ## `build/hermes/config.yaml`
 
@@ -78,6 +81,40 @@ Hermes runs as the coordinator (spec §9.1). These are the "defaults to flip on 
 | `delegation.subagent_auto_approve` | `false` | A subagent's dangerous command is denied, never auto-approved (a child could otherwise write AGENTS.md with no human; `hermes_plugins.md`, issue #120000). Hermes's default, pinned. |
 | `cron.model_provider`, `cron.model` | `anthropic`, `claude-haiku-5-5` | Cron jobs run on Haiku 5.5 (spec §9.1). |
 | `hooks_auto_accept` | `false` | A new shell hook needs a one-time consent prompt; nothing registers silently (spec §9.1). |
+
+### MCP servers (`mcp_servers`)
+
+From `policy/mcp.yaml` (spec §10.1; [docs/mcp.md](mcp.md)): the hermes zone's **enabled** servers, sorted by name. In v1 that is **none**, so the key is left out, unless the observability profile runs (`flags.otel.enabled`, or `o11y: true` from code). Then it holds Phoenix MCP. Context7 is research-zone only and never appears here.
+
+```yaml
+mcp_servers:
+  phoenix:
+    command: npx
+    args: [--yes, "@arizeai/phoenix-mcp@4.3.16"]
+    env:
+      PHOENIX_API_KEY: ${HAPI_MCP_PHOENIX_VIEWER_KEY}
+      PHOENIX_DISCOVER_CONFIG: "false"
+      PHOENIX_ENDPOINT: http://phoenix.hapi.internal:6006
+    tools:
+      include: [list-projects, get-project, ...]   # the 23 read-only tools
+      prompts: false
+      resources: false
+    trust: untrusted
+    elicitation: { enabled: false }
+    sampling: { enabled: false }
+```
+
+| Key | Value | What it does, and why |
+|---|---|---|
+| `command`, `args` | `npx --yes <package>@<version>` | Runs the exact pinned version. It doesn't pin the dependency tree; the per-server image (`image` in the catalog) will replace it ([docs/mcp.md](mcp.md#open-items)). |
+| `env` | The catalog's `env`, keys sorted | Hermes passes a stdio server **only** these, plus a safe baseline (`PATH`, `HOME`, `LANG` and the like), so the server sees no other secret. A `bws:` key becomes `${HAPI_MCP_<NAME>}`, which Hermes resolves from its env at load time; no secret is in the file. Literals pass through. |
+| `tools.include` | The catalog's `tools.include` | Only these tools are registered. They are exact names, never fnmatch patterns. |
+| `tools.prompts`, `tools.resources` | `false` | The server's prompts and resources aren't offered to the model either. No catalog server needs them. |
+| `trust` | `untrusted` | A call to a tool not marked read-only needs approval, and fails closed when unattended (spec §10.1). |
+| `elicitation.enabled` | `false` | The server can't ask the user for input. Context7's backend can send an anonymous caller an elicitation that asks them to run a setup command (spec §10.1). |
+| `sampling.enabled` | `false` | The server can't run completions on Hermes's model key. No catalog server needs it. |
+
+The emitter checks the catalog again before it writes anything (the schema and `mcpIssues`), so a policy built in code can't emit a server the loader would refuse, such as one in the archon zone, a denied tool, or a literal holding `${...}`.
 
 **No hooks yet.** Plan 01 emits no `hooks:` section. The `hapi-cmd-allow` hook script arrives in Plan 04, and a `fail_closed` hook pointing at a missing script would block every tool call.
 
@@ -201,18 +238,41 @@ One Squid config per egress zone (spec §10, §11.4). Each zone's containers sit
 | Zone | Allowlist today |
 |---|---|
 | `archon` | `api.anthropic.com`, `files.pythonhosted.org`, `opencode.ai`, `openrouter.ai`, `pypi.org`, `registry.npmjs.org` |
-| `hermes` | `api.anthropic.com`, `context7.com`, `deepwiki.com`, `files.pythonhosted.org`, `github.com` (covers `api.github.com`), `openrouter.ai`, `pypi.org`, `registry.npmjs.org`, `slack.com` |
+| `hermes` | `api.anthropic.com`, `files.pythonhosted.org`, `github.com` (covers `api.github.com`), `openrouter.ai`, `pypi.org`, `registry.npmjs.org`, `slack.com`. No T2 hosts (`context7.com`, `deepwiki.com`): spec §10.1 made them research-only. |
 | `research` | Open web, minus the private ranges |
 
 **Running it (Task 5).** Start Squid **as a non-root user** (e.g. compose `user: squid`) in the foreground (`squid -N -f <conf>`). The config sets `pid_filename none`, because the container supervises the process. Started as root, Squid drops privileges and then can't open `/dev/stdout` for its access log, and exits.
 
 **Checked against a real Squid** (7.6, Alpine, 2026-10-26). `squid -k parse` is clean for all three files. Running each as a non-root user:
 - `archon`: tunnels to `api.anthropic.com` (also written `API.Anthropic.COM`) and `registry.npmjs.org` worked. These were refused: `github.com`, `api.github.com`, plain `http://`, port 8443, and `pypi.org` when it resolved to `10.9.9.9`.
-- `hermes`: `github.com`, `api.github.com`, `slack.com`, `wss-primary.slack.com` and `context7.com` worked. `example.com` was refused.
+- `hermes`: `github.com`, `api.github.com`, `slack.com` and `wss-primary.slack.com` worked. `example.com` was refused. (The hermes zone still listed T2 then, and `context7.com` worked too; Task 3b removed it.)
 - In **both**, with a reverse name planted so that `203.0.113.7` → `api.anthropic.com`, these were refused: `203.0.113.7`, `1.2.3.4`, `[2001:db8::1]`, `[::ffff:1.2.3.4]`, `[::ffff:203.0.113.7]`, `[::]`, `[64:ff9b::1.2.3.4]` and `2130706433`.
 - `research`: public HTTPS and HTTP worked. These were refused: `169.254.169.254`, a name resolving to `10.9.9.9`, `[::ffff:10.0.0.1]`, a name resolving to `::ffff:10.9.9.9`, `[::]` and a name resolving to `::`, `[64:ff9b::a00:1]` and a name resolving into `64:ff9b::/96`, `ftp://example.com:80/`, `https://example.com:80/`, and port 8080.
 
 Task 5's integration tests repeat these checks on the real stack.
+
+## `build/mcp/*.mcp.json`
+
+One standard `mcp.json` per MCP zone (`hermes`, `research`), from `policy/mcp.yaml`, for the CI scanners (Plan 05; [docs/mcp.md](mcp.md#the-ci-scanners)). The archon zone gets no MCP servers, so it has no file.
+
+```json
+{
+  "$comment": "mcp.json for the research zone's MCP servers, for the CI scanners. Generated by ...",
+  "mcpServers": {
+    "context7": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["--yes", "@upstash/context7-mcp@4.3.0"],
+      "env": { "CONTEXT7_API_KEY": "${HAPI_MCP_CONTEXT7_API_KEY}", "OTEL_SDK_DISABLED": "true" }
+    }
+  }
+}
+```
+
+- **The whole catalog for the zone**, `enabled_when: o11y` servers included, whatever `o11y` is: the scanners vet what may run, not what runs today. So `hermes.mcp.json` always holds Phoenix.
+- A stdio server is `{type: "stdio", command, args, env}`, the same command and env as Hermes gets. An http server is `{type: "http", url}`.
+- **Secrets appear only as `${HAPI_MCP_...}` references**, never values.
+- The `mcpServers` shape is the common one (Claude Code's `.mcp.json` uses it, and Snyk Agent Scan reads it). The scanners themselves arrive in Plan 05, which must confirm that they accept the top-level `$comment`.
 
 ## Protected paths stay strictest-wins
 

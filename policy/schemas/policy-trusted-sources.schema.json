@@ -20,10 +20,10 @@
       "type": "object",
       "properties": {
         "hermes": {
-          "description": "The Hermes main session: T0-T2 (spec §10).",
+          "description": "The Hermes main session: T0-T1 only. T2 aggregators and the T3 open web reach it only as schema-validated briefs from hapi-research (spec §10, amended by §10.1).",
           "type": "object",
           "properties": {
-            "tiers": { "type": "array", "$ref": "#/$defs/zoneTiers", "items": { "enum": ["T0", "T1", "T2"] } },
+            "tiers": { "type": "array", "$ref": "#/$defs/zoneTiers", "items": { "enum": ["T0", "T1"] } },
             "hosts": { "$ref": "policy-defs.schema.json#/$defs/hostList" }
           },
           "required": ["tiers", "hosts"],

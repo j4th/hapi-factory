@@ -2,10 +2,11 @@
 
 `policy/` is the single source of truth for what the factory's agents may do (spec §8). Each tool's native config is generated from it, so a rule lives in one place and is enforced at several points: Hermes, Archon, Pi, the egress proxies and CI. This page covers:
 
-- [the policy files](#the-policy-files) and what each one holds;
+- [the policy files](#the-policy-files) and what each one holds, including [the MCP catalog](#mcpyaml) and its [lockfile](#mcplockjson);
 - [how policy is validated](#validation-and-errors);
 - [repo overlays](#repo-overlays-factoryconfigyaml), which may only tighten policy;
 - [work orders](#work-orders), with `hapi workorder validate`;
+- [`hapi mcp verify` and `hapi mcp pin`](#hapi-mcp-verify-and-hapi-mcp-pin);
 - [the TypeScript API](#typescript-api) that later code builds on.
 
 `hapi policy build` (`mise run policy:build`) compiles policy into each tool's config under `build/`. [docs/generated-configs.md](generated-configs.md) describes every generated file, which policy files feed it and what each setting does.
@@ -21,9 +22,11 @@
 | `approvals.yaml` | `policy-approvals` | The fixed short list of actions that always need the operator | Not compiled in Plan 01; later plans enforce it |
 | `roles.yaml` | `policy-roles` | The default model tier per role | With the rosters: Archon tiers and aliases; Hermes model, auxiliary and delegation settings |
 | `rosters/{budget,anthropic,portable}.yaml` | `policy-roster` | Tier → provider, model and effort, one file per roster | See `roles.yaml` |
-| `flags.yaml` | `policy-flags` | Metrics and observability switches, signal switches, run thresholds | Metrics, observability and run flagging (spec §13; later plans) |
+| `flags.yaml` | `policy-flags` | Metrics and observability switches, signal switches, run thresholds | Metrics, observability and run flagging (spec §13; later plans). `otel.enabled` also turns on the o11y-gated MCP servers. |
+| `mcp.yaml` | `policy-mcp` | The MCP catalog: every MCP server a zone may load, pinned, with its tools, env and egress (spec §10.1) | Hermes `mcp_servers`; `build/mcp/<zone>.mcp.json` for the CI scanners; later, the hapi-research profile (Plan 04) and the Claude Code lane |
+| `mcp.lock.json` | `mcp-lock` | Each MCP server's recorded tool surface and its hash (JSON, written by `hapi mcp pin`) | `hapi mcp verify`; later, `hapi audit` (`mcp.tool-hashes`) and stack start-up |
 
-The schemas are in `policy/schemas/`, named `<schema>.schema.json`. `policy-defs.schema.json` holds the definitions they share: modes, tiers, risk, host names, forge hosts, repo paths and globs. Each policy file starts with a `# yaml-language-server: $schema=...` line, so an editor with the YAML language server checks it as you type.
+The schemas are in `policy/schemas/`, named `<schema>.schema.json`. `policy-defs.schema.json` holds the definitions they share: modes, tiers, risk, host names, forge hosts, repo paths and globs, exact versions, advisory ids and package and image pins. Each policy file starts with a `# yaml-language-server: $schema=...` line, so an editor with the YAML language server checks it as you type.
 
 ### `protected_paths.yaml`
 
@@ -175,20 +178,20 @@ The patterns are a second line of defense: no positional pattern accepts `$`, a 
 |---|---|---|
 | `T0` | Pinned local snapshots | None; no network access needed |
 | `T1` | First-party domains and package registries | `registry.npmjs.org`, `pypi.org`, `files.pythonhosted.org` |
-| `T2` | Curated aggregators | `context7.com`, `deepwiki.com` |
+| `T2` | Curated aggregators (Context7, DeepWiki): the research zone only | `context7.com`, `deepwiki.com` |
 | `T3` | The open web | Not a list. Only a zone with `openWeb: true` reaches it. |
 
 **Zones.** There is one zone per container network, and each has its own egress proxy:
 
 | Zone | Tiers | Own hosts | Notes |
 |---|---|---|---|
-| `hermes` | T0–T2 | `api.anthropic.com`, `openrouter.ai`, `api.github.com`, `github.com`, `slack.com` | The Hermes main session |
+| `hermes` | T0–T1 | `api.anthropic.com`, `openrouter.ai`, `api.github.com`, `github.com`, `slack.com` | The Hermes main session. T2 and T3 content reaches it only as schema-validated briefs from hapi-research (spec §10, amended by §10.1). |
 | `archon` | T0–T1 | `api.anthropic.com`, `openrouter.ai`, `opencode.ai`, `registry.npmjs.org`, `pypi.org`, `files.pythonhosted.org` | Archon and its Pi workers. **No forge host**: the Archon zone has no route to GitHub (spec §4.3). |
 | `research` | T0–T3 | None | `openWeb: true`. Only hapi-research touches the open web. Private address ranges stay blocked. |
 
 A zone's allowlist is its own `hosts` **plus** the hosts of every tier it lists (`zoneHosts` in `src/policy/zones.ts` computes it; the egress generator uses it). Hosts are plain, lowercase domains with at least two labels: no scheme, port, path, wildcard or leading dot, and no IP addresses. The egress generator allows each domain and its subdomains, so `slack.com` also covers `wss-primary.slack.com`. It checks every host again before writing it, for a policy built in code ([generated configs](generated-configs.md#buildegresssquidconf)).
 
-The schema enforces spec §10's tier entitlements: the `hermes` zone may list only T0–T2, the `archon` zone only T0–T1, and only the `research` zone may set `openWeb`.
+The schema enforces spec §10's tier entitlements: the `hermes` and `archon` zones may list only T0–T1, and only the `research` zone may set `openWeb`. Until Task 3b the `hermes` zone also listed T2; spec §10.1 moved the aggregators (Context7, DeepWiki) to the research zone, so `context7.com` and `deepwiki.com` left the hermes allowlist.
 
 **Forge hosts.** The `archon` zone has no route to a forge (spec §4.3). So the schema rejects a **forge host** in the `archon` zone's `hosts`, and in tiers `T0` and `T1`, which that zone reaches. A forge host is one of these domains or a subdomain of one: `github.com`, `githubusercontent.com`, `githubassets.com`, `ghcr.io`, `gitlab.com` and `bitbucket.org`. The stack is meant to stay forge-agnostic, so GitLab and Bitbucket count too. The list is defined once, as `forgeHost` in `policy-defs.schema.json`. The same check covers [overlay](#repo-overlays-factoryconfigyaml) and [work-order](#work-orders) `egress_extra` hosts, and `forgeDomain` in `src/policy/hosts.ts` reads the same pattern. The `hermes` zone may reach the forge.
 
@@ -258,6 +261,114 @@ This file is exactly spec §13.3:
 | `coderabbit` | `{ enabled: true, include_in_rework: true }` |
 | `thresholds` | `{ run_usd: 3.00, interventions: 1, review_rounds: 2 }`. Crossing any one flags the run. |
 | `on_flag` | `[label_pr, chat_alert]`. A flagged run gets `hapi:flagged` on its PR and an alert in Slack `#hapi-alerts`. |
+
+### `mcp.yaml`
+
+The MCP catalog (spec §10.1): every MCP server any zone may load. An MCP server is code we run and text the model reads, so each entry is pinned exactly, allowlists read-only tools only, gets only its own bws key, and is untrusted with elicitation denied. Why each layer gets what it gets, and how to add or upgrade a server, is in [docs/mcp.md](mcp.md).
+
+**Who gets what (v1, spec §10.1):**
+
+| Layer / zone | MCP servers | Notes |
+|---|---|---|
+| hapi-research (`research` zone, its own container) | `context7` (T2), always | Quarantined: egress `context7.com` only, always with an API key, `OTEL_SDK_DISABLED=true`, no proxy or URL overrides |
+| Hermes main session (`hermes` zone) | None, unless the observability profile runs (`flags.otel.enabled`); then `phoenix` | A VIEWER-role key, `PHOENIX_DISCOVER_CONFIG=false`, an explicit `PHOENIX_ENDPOINT`, the 23 read-only tools; `phoenix-support` denied |
+| Archon Pi workers and Claude review nodes (`archon` zone) | None | The schema rejects a server that lists this zone |
+| Claude Code lane (phase 4) | Generated from the same catalog, with `--strict-mcp-config` | Context7 only under research-zone quarantine |
+
+```yaml
+servers:
+  context7:
+    zones: [research]
+    transport: stdio
+    package:
+      name: "@upstash/context7-mcp"
+      version: "4.3.0"
+      integrity: "sha512-fuDt5nWj...Dp/rPA=="
+    floor: { min: "2.1.3", advisory: CVE-2026-75130 }
+    tools:
+      include: [resolve-library-id, query-docs]
+      deny: []
+    env:
+      CONTEXT7_API_KEY: bws:hapi-mcp-context7-api-key
+      OTEL_SDK_DISABLED: "true"
+    egress: [context7.com]
+    trust: untrusted
+    elicitation: deny
+    enabled_when: always
+blocked:
+  - "@modelcontextprotocol/server-brave-search"
+  # ... crawl4ai, "ai.smithery/*", "@upstash/context7-pi", "@upstash/context7-admin-mcp"
+```
+
+Server names are lowercase slugs. Each entry has these fields:
+
+| Field | Required | Rule |
+|---|---|---|
+| `zones` | Yes | `hermes`, `research` or both. **Never `archon`.** |
+| `transport` | Yes | `stdio`: a local process inside the zone's container, so the zone's egress proxy binds it. `http`: a remote endpoint. |
+| `package` | For `stdio` | `{name, version, integrity}`. `version` is exact, `MAJOR.MINOR.PATCH` (calendar versions too): never a range (`^4.3.0`), a tag (`latest`) or a prerelease. `integrity` is the registry's `dist.integrity` for that version, an SRI `sha512-...`. |
+| `image` | No; `stdio` only | The per-server image built from the package and a committed lockfile, pinned by digest: `name[:tag]@sha256:<64 hex>`. A tag alone is rejected. |
+| `url` | For `http`; `http` only | An `https://` URL with no user info. Its host must be one of `egress`, or a subdomain of one. |
+| `floor` | No | `{min, advisory}`: our own advisory floor. `package.version` must be at least `min`. For advisories the scanners don't track ([docs/mcp.md](mcp.md#advisory-floors)). It needs a `package`. |
+| `cooldown_exception` | No | The advisory id (CVE or GHSA) whose fix lets this pin skip the 14-day release cooldown ([docs/mcp.md](mcp.md#the-release-cooldown-and-the-security-fix-exception)) |
+| `tools.include` | Yes | At least one exact MCP tool name: letters, digits, `_`, `-` and `.`. **Read-only tools only.** No `*`, `?` or `[`: Hermes would read them as fnmatch patterns. |
+| `tools.deny` | Yes (may be empty) | The server's write tools, and tools that send data to a third party. `include` may never list one. |
+| `env` | Yes (may be empty) | The server's whole environment. A name is `^[A-Z_][A-Z0-9_]*$`. A value is either **`bws:hapi-mcp-<slug>`**, the bws key whose secret the server gets, or a **literal**, which may not start with `bws:` or contain `$` or a control character (Hermes expands `${...}`, so a literal could otherwise pull in another secret). An `http` server gets no env. |
+| `egress` | Yes (may be empty) | The hosts the server needs, as plain domains; each covers its subdomains. In v1, egress is per zone, so the zone's proxy is the real boundary; this list is for review and phase-2 per-server isolation. |
+| `trust` | Yes | `untrusted` |
+| `elicitation` | Yes | `deny` |
+| `enabled_when` | No | `always` (the default) or `o11y`: only while the observability profile runs |
+
+**`blocked`** is a list of package-name patterns. A pattern matches a **whole** name, and `*` matches any run of characters, so `ai.smithery/*` matches `ai.smithery/anything` and `crawl4ai` matches only `crawl4ai`. A server whose `package.name` matches one is rejected.
+
+**The checks beyond the schema** (`mcpIssues` in `src/policy/mcp.ts`, run by `loadPolicy`):
+- a pinned version below the server's `floor`;
+- a blocked package;
+- a `tools.include` entry that is also in `tools.deny`;
+- `url` on a `stdio` server, `package` or `image` on an `http` server, or a `url` whose host isn't an egress host;
+- a server that sets a proxy variable (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`; the zone's proxy settings belong to the stack), `CONTEXT7_API_URL` (it redirects Context7's traffic and key) or `DANGEROUSLY_READ_README_FILES` (it makes the Phoenix server serve files from disk);
+- a bws key that two servers share. Each server gets only its own key.
+
+These are the real messages:
+
+| Change | Error |
+|---|---|
+| `version: "^4.3.0"` | `policy/mcp.yaml: /servers/context7/package/version: must match pattern "^(?:0\|[1-9][0-9]{0,8})\.(?:0\|[1-9][0-9]{0,8})\.(?:0\|[1-9][0-9]{0,8})$"` |
+| `version: "2.1.2"` | `policy/mcp.yaml: /servers/context7/package/version: 2.1.2 is below this server's advisory floor 2.1.3 (CVE-2026-75130); pin 2.1.3 or later` |
+| `zones: [archon]` | `policy/mcp.yaml: /servers/context7/zones/0: must be one of: hermes, research` |
+| `name: "@modelcontextprotocol/server-brave-search"` | `policy/mcp.yaml: /servers/context7/package/name: "@modelcontextprotocol/server-brave-search" is blocked (matches "@modelcontextprotocol/server-brave-search" in blocked)` |
+| `upsert-prompt` added to phoenix's `tools.include` | `policy/mcp.yaml: /servers/phoenix/tools/include/23: "upsert-prompt" is on phoenix's tools.deny list (a write or third-party tool); include read-only tools only` |
+| `HTTPS_PROXY: http://...` in `env` | `policy/mcp.yaml: /servers/context7/env/HTTPS_PROXY: a server may not set HTTPS_PROXY: the zone's proxy settings come from the stack, never from a server entry (spec §10.1)` |
+| `PHOENIX_API_KEY: bws:hapi-mcp-context7-api-key` | `policy/mcp.yaml: /servers/phoenix/env/PHOENIX_API_KEY: bws key "hapi-mcp-context7-api-key" is already context7's; each server gets only its own key (spec §10.1)` |
+
+**Secrets by name.** A `bws:hapi-mcp-<slug>` value never reaches a generated file. The generators write `${HAPI_MCP_<SLUG>}` instead (`secretEnvName`: upper-case, `-` as `_`), so `bws:hapi-mcp-context7-api-key` becomes `${HAPI_MCP_CONTEXT7_API_KEY}`. Hermes resolves that from its env, which the stack fills from Bitwarden. The `hapi-mcp-` prefix keeps these names apart from every variable Hermes itself reads.
+
+**`serversForZone(p, zone, { o11y })`** returns a zone's enabled servers, sorted by name. `o11y` defaults to `flags.otel.enabled`; an explicit value wins.
+
+### `mcp.lock.json`
+
+The tool-description lock (spec §10.1), the defense against a server changing its tool text under us (a "rug pull"). It is JSON, written by [`hapi mcp pin`](#hapi-mcp-verify-and-hapi-mcp-pin), and starts as `{}`. Each entry is keyed by server name:
+
+```json
+{
+  "context7": {
+    "pin": { "package": { "name": "@upstash/context7-mcp", "version": "4.3.0", "integrity": "sha512-..." } },
+    "hash": "sha256:3f1c...",
+    "surface": {
+      "tools": [{ "name": "resolve-library-id", "description": "...", "inputSchema": { } }],
+      "instructions": "...",
+      "prompts": [],
+      "resources": []
+    }
+  }
+}
+```
+
+- **`pin`** is the catalog's `package`, `image` and `url` when the entry was recorded. **An entry counts only while they still match the catalog**, so after a version bump the server is `unpinned` until someone pins it again.
+- **`surface`** is the server's raw output: the `tools` from `tools/list`, the `instructions` from `initialize`, and the prompts and resources. The schema leaves the items open, because they are upstream data; the loader checks that each tool is an object with a string `name`.
+- **`hash`** is `hashToolSurface(surface)`: `sha256:` and the hex sha256 of the surface's canonical JSON (object keys sorted at every depth, no whitespace). Tools are sorted by name and prompts and resources by their canonical JSON, so order never counts. Every other change does, down to one character of a description, a schema or the instructions. A missing `instructions` hashes as `null`, and missing prompts or resources as `[]`.
+
+`loadLock(file)` checks the schema, the tools and that every hash matches its stored surface, so a hand edit to a surface shows up as `/<server>/hash: does not match the stored surface`.
 
 ## Validation and errors
 
@@ -402,13 +513,40 @@ mise run hapi -- workorder validate .factory/work/0002-search-partners-tool/orde
 - **Invalid:** it prints one `path: message` line per problem to stderr and exits `1`. For example: `/trace/traceparent: must match pattern "^00-[0-9a-f]{32}-[0-9a-f]{16}-0[01]$"`. A file that can't be read or parsed is reported at `(root)`.
 - **Wrong arguments:** with no path, or more than one, it prints usage and exits `2`.
 
+## `hapi mcp verify` and `hapi mcp pin`
+
+These two commands keep [`mcp.lock.json`](#mcplockjson) in step with the servers. Both get a server's live surface through `fetchSurface`, which launches the pinned server in a throwaway container on its zone's network. **That arrives in Plan 01 Task 5.** Until then, both commands exit `1` with a message saying so, so they can never pass as a real check.
+
+```bash
+mise run hapi -- mcp verify                       # every catalog server against policy/mcp.lock.json
+mise run hapi -- mcp pin --server context7        # record one server's live surface
+```
+
+**`hapi mcp verify [--policy dir] [--lock file]`** loads the policy (default `policy`) and the lock (default `<policy>/mcp.lock.json`), fetches every catalog server's surface in name order, o11y-gated servers included, and prints one line per server:
+
+```text
+ok <name> sha256:<hash>
+changed <name> expected sha256:<locked> actual sha256:<live>
+unpinned <name> actual sha256:<live>
+```
+
+- `changed`: the live surface differs from the lock.
+- `unpinned`: the lock has no entry for the server's current pin (it was never pinned, or its version changed since).
+- It exits `0` only when every server is `ok`. Otherwise it exits `1` and prints the re-pin command for each server to stderr. A failed fetch also fails the check.
+
+**`hapi mcp pin --server name [--policy dir] [--lock file]`** fetches one server's surface and writes its entry (pin, hash, raw surface), keeping every other entry. It prints `pinned <name> <hash>`, plus `(was <old hash>)` or `(unchanged)` when there was an entry. It refuses (exit 1, nothing written) a surface the lock's schema wouldn't accept, so the lock always loads. The file is written to a sibling and renamed into place, with server names sorted. An entry for a server no longer in the catalog is ignored; remove it in the PR that removes the server.
+
+**Re-pinning is a reviewed change.** Adding or upgrading a server is `new_skill_or_mcp`, so it goes through a planning PR that carries the new lock entry. The reviewer reads the recorded descriptions. See [docs/mcp.md](mcp.md#adding-or-upgrading-a-server).
+
+Exit codes are the CLI's: `0` success, `1` a failed check or a failed command (a bad policy or lock file is reported as `hapi mcp verify: <file>: <problem>`), and `2` a usage error, such as an unknown flag, a missing `--server` or an unknown server name.
+
 ## TypeScript API
 
 Later plans build on these functions:
 
 | Function | Module | What it does |
 |---|---|---|
-| `loadPolicy(dir): Policy` | `src/policy/load.ts` | Loads and validates `policy/`. Throws `PolicyError { file, path, message, issues }`. |
+| `loadPolicy(dir): Policy` | `src/policy/load.ts` | Loads and validates `policy/`, `mcp.yaml` included (not the lock). Throws `PolicyError { file, path, message, issues }`. |
 | `loadOverlay(file): RepoOverlay` | `src/policy/overlay.ts` | Loads and schema-checks an overlay. Throws `PolicyError`. |
 | `applyOverlay(p, o): Policy` | `src/policy/overlay.ts` | Tighten-only merge. Throws `PolicyLoosenError { path, message }`. The result's `repo` holds the overlay's `default_risk` and `workflow`. |
 | `matchCommand(rules, argv): {allowed, rule?, reason}` | `src/policy/commands.ts` | Whether `commands.yaml`'s `hermes.allow` rules allow an argv ([how a rule matches](#how-a-rule-matches)) |
@@ -418,7 +556,15 @@ Later plans build on these functions:
 | `effectiveModes(p, path): PathModes` | `src/policy/paths.ts` | A file's modes: the strictest across every matching glob ([how globs combine](#how-globs-combine)). Every guard and generator uses it, or the same rule. Throws on a path outside the repo, or one with NUL, a control character or a backslash. |
 | `globMatches(glob, path): boolean` | `src/policy/paths.ts` | Whether one glob matches an already-normalized repo path |
 | `zoneHosts(p, zone): string[]` | `src/policy/zones.ts` | A zone's allowlist: its own hosts plus its tiers' hosts, sorted and de-duplicated. A zone with `openWeb` also reaches any public host, which this list doesn't say. |
+| `serversForZone(p, zone, { o11y? }): [name, McpServer][]` | `src/policy/mcp.ts` | A zone's enabled MCP servers, sorted by name. `o11y` defaults to `flags.otel.enabled` (`o11yEnabled`). |
+| `mcpIssues(catalog): Issue[]` | `src/policy/mcp.ts` | The MCP catalog's problems beyond the schema ([the checks](#mcpyaml)). `loadPolicy` runs it. |
+| `secretEnvName(bwsKey): string` | `src/policy/mcp.ts` | The env var a bws key's secret goes in, referenced as `${NAME}`: `hapi-mcp-context7-api-key` → `HAPI_MCP_CONTEXT7_API_KEY` |
+| `blockedBy(name, blocked)`, `compareVersions(a, b)` | `src/policy/mcp.ts` | The blocklist match (whole name, `*` for any run) and the numeric version order the floors use |
+| `hashToolSurface(surface): string` | `src/mcp/lock.ts` | `sha256:<hex>` of a surface's canonical JSON, order-independent ([the lock](#mcplockjson)) |
+| `verifyLock(p, lock, fetchSurface): Promise<{name, status, expected?, actual}[]>` | `src/mcp/lock.ts` | Every catalog server's live surface against the lock: `ok`, `changed` or `unpinned` |
+| `loadLock(file): McpLock` | `src/mcp/lock.ts` | Reads and checks a lock file. Throws `PolicyError`. |
+| `pinOf(server)`, `canonicalJson(value)`, `lockJson(lock)` | `src/mcp/lock.ts` | A server's pin fields as a lock entry records them; the canonical JSON the hash uses; the lock as written to disk |
 | `validateWorkOrder(obj): WorkOrder` | `src/workorder/validate.ts` | Validates a parsed work order. Throws `WorkOrderError { path, message, issues }`. |
 | `loadWorkOrder(file): WorkOrder` | `src/workorder/validate.ts` | Reads, parses and validates a work-order file |
 
-The types (`Policy`, `Mode`, `Tier`, `Roster`, `ZoneName` and the rest) are in `src/policy/types.ts`, with `ROLES`, the list of every role that the `Role` type comes from; `WorkOrder` is in `src/workorder/validate.ts`. Schema compilation and error formatting are in `src/policy/schema.ts`.
+The types (`Policy`, `Mode`, `Tier`, `Roster`, `ZoneName`, `McpServer`, `McpCatalog` and the rest) are in `src/policy/types.ts`, with `ROLES`, the list of every role that the `Role` type comes from; `WorkOrder` is in `src/workorder/validate.ts`. Schema compilation and error formatting are in `src/policy/schema.ts`.

@@ -144,3 +144,39 @@ describe("protected instruction files", () => {
 test("emitHermes is deterministic", () => {
   expect(emitHermes(p)).toEqual(emitHermes(loadPolicy("policy")));
 });
+
+describe("MCP servers (spec §10.1)", () => {
+  test("emitHermes carries mcp_servers only for enabled hermes-zone servers, with include lists and env by name", () => {
+    // o11y off (flags.otel.enabled is false): the Hermes main session has no MCP server at all.
+    expect(config().mcp_servers).toBeUndefined();
+    const c = YAML.parse(emitHermes(p, { o11y: true })["config.yaml"]!);
+    // Phoenix only: Context7 is research-zone only and never reaches the main session.
+    expect(Object.keys(c.mcp_servers)).toEqual(["phoenix"]);
+    const phoenix = c.mcp_servers.phoenix;
+    expect(phoenix.command).toBe("npx");
+    expect(phoenix.args).toEqual(["--yes", "@arizeai/phoenix-mcp@4.3.16"]);
+    expect(phoenix.tools.include).toEqual(p.mcp.servers.phoenix!.tools.include);
+    expect(phoenix.tools.include).not.toContain("phoenix-support");
+    expect(phoenix.tools.include).toHaveLength(23);
+    // The key is referenced by name, resolved by Hermes from its env; no value is in the file.
+    expect(phoenix.env).toEqual({
+      PHOENIX_API_KEY: "${HAPI_MCP_PHOENIX_VIEWER_KEY}",
+      PHOENIX_DISCOVER_CONFIG: "false",
+      PHOENIX_ENDPOINT: "http://phoenix.hapi.internal:6006",
+    });
+    expect(phoenix.trust).toBe("untrusted");
+    expect(phoenix.elicitation).toEqual({ enabled: false });
+  });
+
+  test("the o11y default follows flags.otel.enabled; the option overrides it", () => {
+    const on = structuredClone(p);
+    on.flags.otel.enabled = true;
+    expect(Object.keys(config(on).mcp_servers)).toEqual(["phoenix"]);
+    expect(YAML.parse(emitHermes(on, { o11y: false })["config.yaml"]!).mcp_servers).toBeUndefined();
+  });
+
+  test("a string literal stays a string in YAML", () => {
+    const text = emitHermes(p, { o11y: true })["config.yaml"]!;
+    expect(text).toContain('PHOENIX_DISCOVER_CONFIG: "false"');
+  });
+});

@@ -6,6 +6,7 @@
  *   build/archon/config.yaml, build/archon/archon.env
  *   build/pi/models.json, build/pi/hapi-guard.json
  *   build/egress/{hermes,archon,research}.squid.conf
+ *   build/mcp/{hermes,research}.mcp.json
  *
  * The emitters are pure and deterministic (stable key order, no timestamps),
  * so a fresh build is byte-identical to the deployed files unless someone
@@ -14,10 +15,12 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { loadPolicy } from "../policy/load";
+import { o11yEnabled } from "../policy/mcp";
 import type { Policy, RosterName } from "../policy/types";
 import { emitArchon } from "./archon";
 import { emitEgress } from "./egress";
 import { emitHermes } from "./hermes";
+import { emitMcp } from "./mcp";
 import { emitPi } from "./pi";
 
 export const ROSTERS: readonly RosterName[] = ["budget", "anthropic", "portable"];
@@ -25,6 +28,11 @@ export const ROSTERS: readonly RosterName[] = ["budget", "anthropic", "portable"
 export interface BuildOptions {
   /** The roster for Archon's tiers and Pi's models. Hermes always uses `anthropic`. Default `anthropic`. */
   roster?: RosterName;
+  /**
+   * Whether the observability profile runs, which turns on the o11y-gated MCP
+   * servers in Hermes's config. Default: the policy's flags.otel.enabled.
+   */
+  o11y?: boolean;
 }
 
 /**
@@ -36,11 +44,13 @@ export interface BuildOptions {
 export async function buildAll(p: Policy, outDir: string, opts: BuildOptions = {}): Promise<string[]> {
   const roster = opts.roster ?? "anthropic";
   if (!ROSTERS.includes(roster)) throw new Error(`unknown roster '${roster}'`);
+  const o11y = o11yEnabled(p, opts);
   const groups: [dir: string, files: Record<string, string>][] = [
-    ["hermes", emitHermes(p)],
+    ["hermes", emitHermes(p, { o11y })],
     ["archon", emitArchon(p, roster)],
     ["pi", emitPi(p, roster)],
     ["egress", emitEgress(p)],
+    ["mcp", emitMcp(p)],
   ];
   const written: string[] = [];
   for (const [dir, files] of groups) {

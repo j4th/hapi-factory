@@ -15,7 +15,11 @@ tiers:
       - registry.npmjs.org
       - pypi.org
       - files.pythonhosted.org
-  T2:                     # curated aggregators (Context7 at >= @upstash/context7-mcp 2.1.3, DeepWiki)
+  # T2, curated aggregators: Context7 and DeepWiki, for the research zone only (spec §10.1).
+  # Context7's ContextCrush fix (CVE-2026-75130) was deployed on Upstash's backend on
+  # 2026-02-23, so a client version can't enforce it. mcp.yaml pins a 4.x client and
+  # checks our own floor above 2.1.2; the research-zone quarantine is the control.
+  T2:
     hosts:
       - context7.com
       - deepwiki.com
@@ -23,8 +27,10 @@ tiers:
     hosts: []
 
 zones:
-  hermes:                 # the Hermes main session: T0-T2, model APIs, GitHub, Slack
-    tiers: [T0, T1, T2]
+  # The Hermes main session: T0-T1, model APIs, GitHub, Slack. T2 and T3 content reaches
+  # it only as schema-validated briefs from hapi-research (spec §10, amended by §10.1).
+  hermes:
+    tiers: [T0, T1]
     hosts:
       - api.anthropic.com
       - openrouter.ai

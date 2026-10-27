@@ -33,7 +33,7 @@ const ZONES: ZoneName[] = ["hermes", "archon", "research"];
 export const PROXY_PORT = 3128;
 
 const ABOUT: Record<ZoneName, string> = {
-  hermes: "the Hermes main session: model APIs, the forge, Slack, registries and curated docs",
+  hermes: "the Hermes main session: model APIs, the forge, Slack and package registries",
   archon: "Archon and its Pi workers: model APIs and package registries. No forge route (spec §4.3)",
   research: "hapi-research, the only role that reaches the open web (spec §10)",
 };

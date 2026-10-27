@@ -164,11 +164,10 @@ describe("allowlisted zones never let an IP-literal destination through", () => 
 });
 
 test("hermes allowlist covers its tiers, GitHub and Slack; a subdomain of a listed domain is folded into it", () => {
-  // api.github.com is covered by .github.com, and Squid warns when both are listed.
+  // api.github.com is covered by .github.com, and Squid warns when both are listed. No T2 hosts
+  // (context7.com, deepwiki.com): the hermes zone lists T0-T1 only (spec §10.1).
   expect(allowed(conf("hermes"))).toEqual([
     ".api.anthropic.com",
-    ".context7.com",
-    ".deepwiki.com",
     ".files.pythonhosted.org",
     ".github.com",
     ".openrouter.ai",

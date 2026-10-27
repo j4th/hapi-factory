@@ -8,6 +8,7 @@ import { emitArchon } from "../../src/generate/archon";
 import { emitEgress } from "../../src/generate/egress";
 import { emitHermes } from "../../src/generate/hermes";
 import { buildAll } from "../../src/generate/index";
+import { emitMcp } from "../../src/generate/mcp";
 import { emitPi } from "../../src/generate/pi";
 import { loadPolicy } from "../../src/policy/load";
 import type { RosterName } from "../../src/policy/types";
@@ -20,6 +21,8 @@ const FILES = [
   "egress/hermes.squid.conf",
   "egress/research.squid.conf",
   "hermes/config.yaml",
+  "mcp/hermes.mcp.json",
+  "mcp/research.mcp.json",
   "pi/hapi-guard.json",
   "pi/models.json",
 ];
@@ -47,8 +50,8 @@ function capture(): { out: string[]; err: string[] } {
 }
 
 describe("buildAll", () => {
-  // The plan's Step 5 says "the 9 files above", but its list names 8: 1 Hermes, 2 Archon, 2 Pi, 3 egress.
-  test("writes the eight generated files and returns their paths", async () => {
+  // Task 3 wrote 8 files (1 Hermes, 2 Archon, 2 Pi, 3 egress); Task 3b adds the 2 per-zone mcp.json files.
+  test("writes the ten generated files and returns their paths", async () => {
     const out = tempDir();
     const paths = await buildAll(p, out);
     expect(paths.map((f) => relative(out, f)).sort()).toEqual(FILES);
@@ -65,6 +68,7 @@ describe("buildAll", () => {
     add("archon", emitArchon(p, "anthropic"));
     add("pi", emitPi(p, "anthropic"));
     add("egress", emitEgress(p));
+    add("mcp", emitMcp(p));
     expect(Object.keys(expected).sort()).toEqual(FILES);
     for (const [file, text] of Object.entries(expected)) expect(readFileSync(join(out, file), "utf8")).toBe(text);
   });
@@ -77,12 +81,32 @@ describe("buildAll", () => {
     expect(readFileSync(join(out, "hermes/config.yaml"), "utf8")).toBe(emitHermes(p)["config.yaml"]!);
   });
 
+  test("the o11y option defaults to flags.otel.enabled and gates Hermes's MCP servers only", async () => {
+    const off = tempDir();
+    await buildAll(p, off);
+    expect(YAML.parse(readFileSync(join(off, "hermes/config.yaml"), "utf8")).mcp_servers).toBeUndefined();
+    const on = tempDir();
+    await buildAll(p, on, { o11y: true });
+    expect(readFileSync(join(on, "hermes/config.yaml"), "utf8")).toBe(emitHermes(p, { o11y: true })["config.yaml"]!);
+    expect(Object.keys(YAML.parse(readFileSync(join(on, "hermes/config.yaml"), "utf8")).mcp_servers)).toEqual(["phoenix"]);
+    // The scanner files cover the whole catalog either way.
+    expect(readFileSync(join(on, "mcp/hermes.mcp.json"), "utf8")).toBe(readFileSync(join(off, "mcp/hermes.mcp.json"), "utf8"));
+    const flagged = structuredClone(p);
+    flagged.flags.otel.enabled = true;
+    const byFlag = tempDir();
+    await buildAll(flagged, byFlag);
+    expect(readFileSync(join(byFlag, "hermes/config.yaml"), "utf8")).toBe(readFileSync(join(on, "hermes/config.yaml"), "utf8"));
+  });
+
   test("an unknown roster or a policy an emitter refuses writes nothing", async () => {
     const out = tempDir();
     await expect(buildAll(p, out, { roster: "cheap" as RosterName })).rejects.toThrow("unknown roster 'cheap'");
     const forge = structuredClone(p);
     forge.trustedSources.zones.archon.hosts.push("github.com");
     await expect(buildAll(forge, out)).rejects.toThrow(/forge host/);
+    const archonMcp = structuredClone(p);
+    archonMcp.mcp.servers.context7!.zones = ["archon"];
+    await expect(buildAll(archonMcp, out)).rejects.toThrow(/\/servers\/context7\/zones\/0/);
     expect(readdirSync(out)).toEqual([]);
   });
 

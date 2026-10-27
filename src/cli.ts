@@ -11,6 +11,7 @@
  * an unknown command, no command at all, or the wrong arguments for a command.
  */
 import { policyBuild } from "./generate/index";
+import { mcpPin, mcpVerify } from "./mcp/lock";
 import { HAPI_VERSION } from "./version";
 import { workorderValidate } from "./workorder/validate";
 
@@ -108,7 +109,9 @@ export async function main(argv: string[]): Promise<number> {
 // ---------------------------------------------------------------------------
 
 register("workorder validate", workorderValidate, "Validate a work order (order.yaml) against its schema");
-register("policy build", policyBuild, "Compile policy/ into Hermes, Archon, Pi and egress configs under build/");
+register("policy build", policyBuild, "Compile policy/ into Hermes, Archon, Pi, egress and MCP configs under build/");
+register("mcp verify", mcpVerify, "Check every MCP server's live tool surface against policy/mcp.lock.json");
+register("mcp pin", mcpPin, "Record one MCP server's live tool surface in policy/mcp.lock.json");
 
 if (import.meta.main) {
   process.exitCode = await main(process.argv.slice(2));

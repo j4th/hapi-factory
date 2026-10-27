@@ -156,9 +156,10 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
     ]);
     expect(zones.hermes.hosts).toEqual(["api.anthropic.com", "openrouter.ai", "api.github.com", "github.com", "slack.com"]);
     expect(zones.research.openWeb).toBe(true);
-    // Spec §10: Pi workers get T0–T1, the Hermes main session T0–T2, and only research touches T3.
+    // Spec §10 (amended by §10.1): Pi workers and the Hermes main session get T0–T1, and only research
+    // touches T2 and T3.
     expect(zones.archon.tiers).toEqual(["T0", "T1"]);
-    expect(zones.hermes.tiers).toEqual(["T0", "T1", "T2"]);
+    expect(zones.hermes.tiers).toEqual(["T0", "T1"]);
     expect(zones.research.tiers).toEqual(["T0", "T1", "T2", "T3"]);
     expect(zones.archon.openWeb).toBeUndefined();
     expect(zones.hermes.openWeb).toBeUndefined();
@@ -235,9 +236,23 @@ describe("loadPolicy rejects bad policy with the file and path", () => {
   });
 
   test("open-web tier T3 in the archon zone", () => {
-    const ts = readFileSync("policy/trusted_sources.yaml", "utf8").replace("tiers: [T0, T1]", "tiers: [T0, T1, T3]");
+    const base = readFileSync("policy/trusted_sources.yaml", "utf8");
+    const ts = base.replace(/(\n  archon:[^\n]*\n    tiers: )\[T0, T1\]/, "$1[T0, T1, T3]");
+    expect(ts).not.toBe(base);
     const e = policyError(policyWith("trusted_sources.yaml", ts));
     expect(e.path).toBe("/zones/archon/tiers/2");
+  });
+
+  test("a T2 or T3 tier in the hermes zone (spec §10.1: aggregators are research-only)", () => {
+    const ts = readFileSync("policy/trusted_sources.yaml", "utf8");
+    expect(ts.split("tiers: [T0, T1]\n    hosts:\n      - api.anthropic.com\n      - openrouter.ai\n      - api.github.com").length).toBe(2);
+    for (const tier of ["T2", "T3"]) {
+      const hermes = ts.replace(
+        "tiers: [T0, T1]\n    hosts:\n      - api.anthropic.com\n      - openrouter.ai\n      - api.github.com",
+        `tiers: [T0, T1, ${tier}]\n    hosts:\n      - api.anthropic.com\n      - openrouter.ai\n      - api.github.com`,
+      );
+      expect(policyError(policyWith("trusted_sources.yaml", hermes)).path).toBe("/zones/hermes/tiers/2");
+    }
   });
 
   test("a host that isn't a plain domain", () => {

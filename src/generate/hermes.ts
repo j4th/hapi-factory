@@ -10,12 +10,18 @@
  * And `security.protected_instruction_files` is a boolean switch; the file
  * patterns go in `security.protected_instruction_extra_patterns`.
  *
+ * `mcp_servers` holds the hermes zone's enabled MCP servers from mcp.yaml
+ * (spec §10.1; ./mcp.ts): none in v1 unless the observability profile runs,
+ * when it holds Phoenix. The key is left out when there are none.
+ *
  * No hooks in Plan 01: the hapi-cmd-allow hook script arrives in Plan 04, and a
  * fail_closed hook pointing at a missing script would block every tool call.
  */
 import YAML, { isMap, isScalar } from "yaml";
+import type { McpOptions } from "../policy/mcp";
 import type { Effort, Policy, Role } from "../policy/types";
 import { notice, wrap } from "./header";
+import { hermesMcpServers } from "./mcp";
 import { splitPiRef } from "./pi";
 
 /**
@@ -91,10 +97,11 @@ function instructionPatterns(p: Policy): { patterns: string[]; directories: stri
   return { patterns: [...patterns].sort(), directories: [...directories].sort() };
 }
 
-function configYaml(p: Policy): string {
+function configYaml(p: Policy, opts: McpOptions): string {
   const main = anthropicModel(p, "hermes_main");
   const aux = anthropicModel(p, "hermes_auxiliary");
   const { patterns, directories } = instructionPatterns(p);
+  const mcpServers = hermesMcpServers(p, "hermes", opts);
   const config = {
     model: { provider: "anthropic", default: main.id },
     agent: { max_turns: p.budgets.hermes_max_turns, reasoning_effort: main.effort },
@@ -109,6 +116,7 @@ function configYaml(p: Policy): string {
     plugins: { isolation: "host" },
     auth: { adopt_external_logins: false },
     web: { keyless_fallback: false, keyless_rescue: false },
+    ...(Object.keys(mcpServers).length > 0 ? { mcp_servers: mcpServers } : {}),
     prompt_caching: { cache_ttl: "auto" },
     terminal: { container_persistent: false },
     auxiliary: Object.fromEntries(AUX_SLOTS.map((slot) => [slot, { provider: "anthropic", model: aux.id }])),
@@ -120,6 +128,8 @@ function configYaml(p: Policy): string {
   const doc = new YAML.Document(config);
   doc.commentBefore = notice("Hermes config.yaml (Hermes v0.22.5 keys)", [
     "policy/budgets.yaml",
+    "policy/flags.yaml",
+    "policy/mcp.yaml",
     "policy/protected_paths.yaml",
     "policy/roles.yaml",
     `policy/rosters/${HERMES_ROSTER}.yaml`,
@@ -151,7 +161,11 @@ function configYaml(p: Policy): string {
   return doc.toString({ lineWidth: 0 });
 }
 
-/** Hermes's generated files: `config.yaml`. Pure. */
-export function emitHermes(p: Policy): Record<string, string> {
-  return { "config.yaml": configYaml(p) };
+/**
+ * Hermes's generated files: `config.yaml`. Pure. `opts.o11y` (default
+ * flags.otel.enabled) says whether the observability profile runs, which
+ * turns on the o11y-gated MCP servers.
+ */
+export function emitHermes(p: Policy, opts: McpOptions = {}): Record<string, string> {
+  return { "config.yaml": configYaml(p, opts) };
 }

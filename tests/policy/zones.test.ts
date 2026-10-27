@@ -15,11 +15,10 @@ test("zoneHosts is the zone's own hosts plus its tiers' hosts, sorted and de-dup
     "pypi.org",
     "registry.npmjs.org",
   ]);
+  // The hermes zone lists T0-T1 only (spec §10, amended by §10.1): no T2 aggregators.
   expect(zoneHosts(p, "hermes")).toEqual([
     "api.anthropic.com",
     "api.github.com",
-    "context7.com", // T2
-    "deepwiki.com", // T2
     "files.pythonhosted.org", // T1
     "github.com",
     "openrouter.ai",

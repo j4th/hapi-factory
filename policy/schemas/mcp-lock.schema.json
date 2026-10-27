@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "mcp-lock.schema.json",
+  "title": "policy/mcp.lock.json",
+  "description": "The tool-description lock (spec §10.1): for each pinned server, the pin it was recorded for, the raw surface it served (tools/list, instructions, prompts, resources) and that surface's hash. `hapi mcp pin` writes an entry; `hapi mcp verify` compares the live surface with it. src/mcp/lock.ts also checks that every hash matches its surface and that every tool has a name.",
+  "type": "object",
+  "propertyNames": { "$ref": "policy-defs.schema.json#/$defs/slug" },
+  "additionalProperties": { "$ref": "#/$defs/entry" },
+  "$defs": {
+    "entry": {
+      "type": "object",
+      "properties": {
+        "pin": { "$ref": "#/$defs/pin" },
+        "hash": {
+          "description": "hashToolSurface(surface): sha256 of the surface's canonical JSON.",
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "surface": { "$ref": "#/$defs/surface" }
+      },
+      "required": ["pin", "hash", "surface"],
+      "additionalProperties": false
+    },
+    "pin": {
+      "description": "The catalog's pin fields at the time of pinning. An entry counts only while they still equal the server's.",
+      "type": "object",
+      "properties": {
+        "package": { "$ref": "policy-defs.schema.json#/$defs/npmPin" },
+        "image": { "$ref": "policy-defs.schema.json#/$defs/imagePin" },
+        "url": { "$ref": "policy-defs.schema.json#/$defs/httpsUrl" }
+      },
+      "minProperties": 1,
+      "additionalProperties": false
+    },
+    "surface": {
+      "description": "What the server served, as it served it. The items are upstream data, kept raw, so the schema leaves them open: tools are checked in code for a string name, and the hash covers everything.",
+      "type": "object",
+      "properties": {
+        "tools": { "description": "The raw tools/list result's tools.", "type": "array" },
+        "instructions": { "description": "The server's `instructions` from initialize.", "type": "string" },
+        "prompts": { "description": "The raw prompts/list result's prompts.", "type": "array" },
+        "resources": { "description": "The raw resources/list result's resources.", "type": "array" }
+      },
+      "required": ["tools"],
+      "additionalProperties": false
+    }
+  }
+}
