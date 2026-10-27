@@ -450,7 +450,7 @@ test("mintInstallationToken rejects broader permissions", async () => {
 
 ### Task 4b: Pluggable secret providers, with sops + age as the default
 
-The spec is §11.5 (as amended for 4b). the operator's call: "portable across secret managers"; "we might as well do sops and age to start; greatly simplifies onboarding and is industry standard now".
+The spec is §11.5 (as amended for 4b). The operator's call: "portable across secret managers"; "we might as well do sops and age to start; greatly simplifies onboarding and is industry standard now".
 
 **Why:** Task 4 tied the stack to Bitwarden and put per-deployment ids in a file shaped like the repo's template. This task splits secrets into three parts:
 - **The manifest:** a committed, public, provider-neutral list of logical names per zone. It holds no ids and no values.

@@ -14,7 +14,7 @@ hapi-factory is a public, best-practices reference stack for an end-to-end agent
 - [Toolchain and pinning](#toolchain-and-pinning)
 - [CI](#ci)
 - [Using hapi-factory with another repo](#using-hapi-factory-with-another-repo)
-- [Manual setup steps (the operator)](#manual-setup-steps-the operator)
+- [Manual setup steps (the operator)](#manual-setup-steps-the-operator)
 - [Documentation map](#documentation-map)
 
 ## Prerequisites
@@ -297,7 +297,7 @@ Set `OWNER` to your GitHub login first (`export OWNER=<your-login>`); the comman
 4. **Add two rulesets on `main`.** Together they make the operator the only one who can merge into `main` (always through a PR), require a passing `ci` check for every merge, the operator's included, and block force-pushes and deletion. They are two rulesets, not one, because a ruleset's bypass list covers *every* rule in that ruleset. If the approval bypass and the `ci` check sat in one ruleset, the bypass would also let a merge through with `ci` red or missing. GitHub applies every ruleset that targets a branch, and a bypass in one ruleset doesn't carry over to another.
 
    - **`main-protect`** holds the required `ci` check and the force-push and deletion blocks. It has **no bypass actors**. Nobody, the operator included, can merge with `ci` failing or not yet run, force-push `main` or delete it. This is how every lane, `lane:direct` included, gets the same CI gates (spec §5.1).
-   - **`main-review`** holds the pull-request rule (1 approving review, from a code owner) and **Restrict updates**. Its only bypass actor is the repository Admin role, in PR-only mode. Without that bypass, the operator couldn't merge his own `lane:direct` PRs, because GitHub doesn't let a PR's author approve it (spec §18). The bypass covers these two rules and nothing else; **`ci` can never be bypassed**. Because the bypass is PR-only, it applies only when merging a PR. the operator still can't push straight to `main`.
+   - **`main-review`** holds the pull-request rule (1 approving review, from a code owner) and **Restrict updates**. Its only bypass actor is the repository Admin role, in PR-only mode. Without that bypass, the operator couldn't merge their own `lane:direct` PRs, because GitHub doesn't let a PR's author approve it (spec §18). The bypass covers these two rules and nothing else; **`ci` can never be bypassed**. Because the bypass is PR-only, it applies only when merging a PR. The operator still can't push straight to `main`.
    - **Restrict updates is what stops an App merging** (spec §11.5: "Neither can merge"). It lets only the ruleset's bypass actors update `main`, and merging a PR updates `main`. So once the operator has approved an App's PR and `ci` is green, the App still can't merge it through the API; only the operator can, through the Admin bypass. It sits in `main-review`, never in `main-protect`: `main-protect` has no bypass actors, so there it would stop every merge, the operator's included. The code-owner review is a second layer: with `.github/CODEOWNERS` naming only the operator ([GitHub Apps runbook](docs/runbooks/github-apps.md#code-owners-a-second-layer)), an App's approval doesn't count either.
 
    The GitHub Apps get no bypass in either ruleset. `integration_id` 15368 is GitHub Actions, so only Actions can satisfy the `ci` check. In `bypass_actors`, `actor_id` 5 is the repository Admin role.

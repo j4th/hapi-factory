@@ -7,7 +7,7 @@ hapi uses two GitHub Apps (spec §11.5). Their tokens last one hour, are minted 
 
 **Neither App gets administration, a ruleset bypass or merge rights** (spec §11.5: "Neither can merge"; §4.3). Their permissions can't express "no merge": Contents write plus Pull requests write is enough to call GitHub's merge API. So a ruleset enforces it. `main-review` **restricts updates** to `main`: only its bypass actor, the Admin role (you), through a PR, may update `main`, and a merge is an update. An App can't merge even after you approve its PR and `ci` is green. [Check it](#check-it) proves this with a test PR before you rely on it.
 
-Creating Apps and changing repo settings are outward-facing steps, so agents never do them. the operator does them by hand.
+Creating Apps and changing repo settings are outward-facing steps, so agents never do them. The operator does them by hand.
 
 This page covers:
 - [before you start](#before-you-start);

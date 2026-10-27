@@ -41,7 +41,7 @@ Keys are globs relative to a repo's root. Each entry sets all three modes:
 
 | Session kind | Who | What it means |
 |---|---|---|
-| `interactive` | the operator is in the session (Hermes, or later a direct-lane Pi session) | `ask` puts the diff in front of him to approve |
+| `interactive` | The operator is in the session (Hermes, or later a direct-lane Pi session) | `ask` puts the diff in front of them to approve |
 | `unattended` | Hermes cron, webhook and API surfaces | Always `deny` |
 | `workers` | Pi or Claude Code inside Archon | Always `deny` |
 
@@ -209,7 +209,7 @@ All amounts are in USD.
 | `run_usd` | 3.00 | Target spend per factory run |
 | `hermes_max_turns` | 60 | Hermes `agent.max_turns` |
 
-The monthly caps are enforced at the provider. the operator sets them on the Console workspaces and OpenRouter keys; the [provider-keys runbook](runbooks/provider-keys.md) covers it. An OpenRouter key's cap is set as a limit that resets daily, the monthly cap divided by 31 (the runbook's rule), so a leaked key can spend only one day's share. The workspaces add up to the $200/month credit, and the default workspace is unused.
+The monthly caps are enforced at the provider. The operator sets them on the Console workspaces and OpenRouter keys; the [provider-keys runbook](runbooks/provider-keys.md) covers it. An OpenRouter key's cap is set as a limit that resets daily, the monthly cap divided by 31 (the runbook's rule), so a leaked key can spend only one day's share. The workspaces add up to the $200/month credit, and the default workspace is unused.
 
 ### `approvals.yaml`
 

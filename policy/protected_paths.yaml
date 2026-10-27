@@ -3,7 +3,7 @@
 # Protected paths, per mode (spec §8.2). Globs are relative to a repo's root.
 #
 #   interactive  the operator is in the session (Hermes, or later a direct-lane Pi
-#                session). ask = put the diff in front of him to approve.
+#                session). ask = put the diff in front of them to approve.
 #   unattended   Hermes cron, webhook and API surfaces. Always deny.
 #   workers      Pi or Claude Code inside Archon. Always deny.
 #

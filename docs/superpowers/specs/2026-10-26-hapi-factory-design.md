@@ -19,18 +19,18 @@ hapi-factory is a **public, best-practices reference stack** for an end-to-end a
 
 ### Why
 
-- the operator's earlier home-rolled kit worked, but it became a maintenance job [user]:
+- The operator's earlier home-rolled kit worked, but it became a maintenance job [user]:
   - keeping up with new models and upstream changes;
   - context ballooning;
   - being tied to one harness.
 - The kit was **copied into each repo** that used it. Every upgrade turned into a loop: upgrade in a repo → find problems → file upstream → re-ingest into every downstream repo → repeat [user].
-- the operator wants to be less hands-on: in the loop for intent and review, not for babysitting [user].
-- It doubles as learning and a showcase. the operator is taking SANS SEC545 and wants security designed in, not bolted on [user].
+- The operator wants to be less hands-on: in the loop for intent and review, not for babysitting [user].
+- It doubles as learning and a showcase. The operator is taking SANS SEC545 and wants security designed in, not bolted on [user].
 
 ### Success
 
 - **v1** is a **net-new, minimal Odoo MCP server** (CRM and finance), taken from a Hermes conversation through research, architecture, threat model and work orders to merged PRs through the full stack.
-  - the operator chose net-new over his existing mtg repo [user]. That repo already carries so much context and old-kit instructions that "drop this into other repos" would become a rabbit hole before the core loop works.
+  - The operator chose net-new over their existing mtg repo [user]. That repo already carries so much context and old-kit instructions that "drop this into other repos" would become a rabbit hole before the core loop works.
   - The designer chose Odoo as the net-new project and set its v1 scope [call].
   - Section 15 gives the definition of done.
 - **Phase 2** is the existing mtg MCP server [user]. Retire the old kit, have Hermes triage its open issues, then do one full run-through as a bundled PR (or a single PR if one issue merits it).
@@ -92,7 +92,7 @@ hapi-factory is a **public, best-practices reference stack** for an end-to-end a
   - The Anthropic Console API key is funded by Max 20x's **$200/month API credit**. It refreshes each cycle, doesn't roll over, and **does not cover Claude Code** [user; verified].
   - Subscription OAuth is never used in Hermes, Pi or Archon [call; Anthropic terms].
   - A cheap provider (via OpenRouter) is used for end-to-end testing once the base works [user].
-  - **The $200 credit is the hard ceiling for now** [user]. the operator's daily work stays in Claude Code on his subscription.
+  - **The $200 credit is the hard ceiling for now** [user]. The operator's daily work stays in Claude Code on their subscription.
   - Workspace limits split it [call; adjust in `budgets.yaml`]:
     - `hapi-hermes` $60
     - `hapi-factory` $100
@@ -146,7 +146,7 @@ You ── chat / TUI ──► HERMES  (container, user `hapi`)
 
 | Zone | Runs as | Has | Lacks |
 |---|---|---|---|
-| Host admin | the operator | Org/repo admin, kill switches, key management | — |
+| Host admin | The operator | Org/repo admin, kill switches, key management | — |
 | `hapi` host user | Dedicated Linux user running rootless containers, the poller and the harvester | GitHub App private keys (to mint short-lived tokens), container control | Your personal credentials and sessions |
 | Hermes container | `hapi` | A capped Anthropic key (Hermes workspace), search API key, chat gateway token, a 1-hour `hapi-planner` GitHub token minted per session | Merge rights, Archon or Pi keys, write access to protected branches |
 | Archon container | `hapi` | Capped model keys (factory workspace), read-only local git mirror, run DB | **Any forge write credential.** No egress to the forge. |
@@ -182,11 +182,11 @@ Lanes are routed by **PR labels**. The **work-order file** says what to build.
 |---|---|---|
 | `lane:planning` | Hermes only | Research, designs, threat models, work orders, context files, doc-only tweaks |
 | `lane:factory` | Archon + Pi | Building a merged work order |
-| `lane:direct` | the operator, hands-on in Pi (later Claude Code; later still, Hermes driving Pi for one-off work) | Work he wants to drive himself |
+| `lane:direct` | The operator, hands-on in Pi (later Claude Code; later still, Hermes driving Pi for one-off work) | Work he wants to drive himself |
 
 All lanes share:
 - the same CI gates;
-- the operator's approval at merge;
+- The operator's approval at merge;
 - commit trailers recording the lane (§13.2).
 
 Git tags are only for releasing and pinning hapi-factory itself.
@@ -207,7 +207,7 @@ Review comments or "request changes" on a planning PR go back to Hermes, which r
 A **lightweight lane** exists for tiny changes: a `lane:planning` doc-only PR with no design doc [call].
 
 **Rework on delivery PRs** [user chose the label option]:
-- the operator requests changes and adds `hapi:rework`. Adding labels needs at least triage permission, so it's a trusted human act.
+- The operator requests changes and adds `hapi:rework`. Adding labels needs at least triage permission, so it's a trusted human act.
 - The poller starts a **follow-up run on the same `factory/<id>` branch**. Inputs:
   - the unchanged work order;
   - **review comments from maintainers only** (untrusted text, passed as data to the planning step of the run, never as instructions to tools).
@@ -298,10 +298,10 @@ A target repo needs only these files [user: central engine, small contract]:
 | `.factory/work/<id>/` | Work orders (§6) |
 | `docs/research/`, `docs/design/` | Hermes's dated research notes, designs and threat models |
 | `.github/workflows/hapi-gates.yml` | A thin wrapper calling hapi-factory's **reusable workflow, pinned by tag**: runs `mise run check` and the secret, SAST and dependency scans, validates work-order schemas, enforces commit trailers |
-| `.github/CODEOWNERS` | the operator owns every protected path (§8.2): the agent instruction files at any depth, `.factory/**`, `.github/**`, `mise.toml`, `.coderabbit.yaml` |
+| `.github/CODEOWNERS` | The operator owns every protected path (§8.2): the agent instruction files at any depth, `.factory/**`, `.github/**`, `mise.toml`, `.coderabbit.yaml` |
 | Ruleset (forge setting, not a file) | `main` protected; one approving review required, and the PR author can't approve; required checks; no bypass for the Apps |
 
-**New repos (v1):** `mise run new-repo -- <name>`, run by the operator with his own credentials, creates the repo from `templates/repo-contract/` [call]. That template holds:
+**New repos (v1):** `mise run new-repo -- <name>`, run by the operator with their own credentials, creates the repo from `templates/repo-contract/` [call]. That template holds:
 - `AGENTS.md`, `mise.toml` tasks, `.factory/config.yaml`, CODEOWNERS, the CI wrapper;
 - the ruleset, applied by API;
 - installation of both GitHub Apps on the repo.
@@ -365,7 +365,7 @@ protected_paths:
 ```
 
 - **interactive** means the operator is in a Hermes session (or later a direct-lane Pi session).
-  - `ask` puts the diff in front of him to approve.
+  - `ask` puts the diff in front of them to approve.
   - Hermes's built-in protected-instruction gate already asks on `AGENTS.md`.
   - hapi-path-guard extends it to globs.
 - **unattended** covers Hermes cron, webhook and API surfaces. Always deny.
@@ -408,7 +408,7 @@ protected_paths:
 - Signal (the operator's personal app) stays possible later as a DM channel.
 - The record of truth stays on GitHub.
 
-**Coexistence:** the operator's existing personal Hermes (`~/.hermes`, running as his own user with his `gh` credentials) keeps running for personal use. It's never pointed at hapi-managed repos. The hapi Hermes starts **fresh** in the `hapi` zone, with no imported memories or skills [call; confirm at review].
+**Coexistence:** the operator's existing personal Hermes (`~/.hermes`, running as their own user with their `gh` credentials) keeps running for personal use. It's never pointed at hapi-managed repos. The hapi Hermes starts **fresh** in the `hapi` zone, with no imported memories or skills [call; confirm at review].
 
 **Use (vetted)** [call; from `hermes_plugins.md`]:
 - `hermes_otel`, pinned ≥ 1.31 for an inbound `HERMES_OTEL_TRACEPARENT`, with `content_capture` set to preview or off
@@ -459,7 +459,7 @@ protected_paths:
 4. **`review`**: separate session, different model, read-only (`mutates_checkout: false`), with an output schema `{verdict, findings}`.
    - Default: the **Claude provider** on the Anthropic roster. It gets enforced schemas, a sandbox and `maxBudgetUsd`.
    - On the portable roster: Pi with a different model family.
-   - The review is advisory. the operator's merge decides.
+   - The review is advisory. The operator's merge decides.
 5. **`commit`** (script): commit per piece with trailers (§13.2), then update the local mirror ref `refs/hapi/<run-id>`.
 
 **Budgets:** `budget: {max_spend_usd, max_work_units}` sits on `factory-task`, which has no loops. A dispatcher with `fan_out` can't carry a budget, so each child carries its own.
@@ -568,7 +568,7 @@ Small scripts run by `hapi` (systemd user timers, installed by `mise run up`):
 - **On delivery and planning PRs:** its findings go into the PR record. The harvester's PR summary also links them.
 - **Rework:** when the operator applies `hapi:rework`, CodeRabbit's comments are included alongside maintainer comments, as **data** from an allowlisted bot identity.
 - **Metrics:** its finding counts per PR are recorded, which feeds the "poor output" measure.
-- **Never a merge authority or a required check in v1.** Like any LLM reviewer, its output can be steered by PR content. the operator's merge decides.
+- **Never a merge authority or a required check in v1.** Like any LLM reviewer, its output can be steered by PR content. The operator's merge decides.
 - **Cost lever** [call]: on `risk: low` work orders, the in-run review may drop to a cheaper tier, leaning on CodeRabbit plus the operator. Evals must show this doesn't raise rework.
 - **[verify]:**
   - which features the free open-source tier includes;
@@ -784,7 +784,7 @@ Cost rules:
 - **Handle Anthropic's 429 `enforced_spend_limit_reached`** as terminal. Don't retry it.
 - **[verify early]:** Anthropic rejects edited conversation history for accounts created on or after 2026-08-31. Make sure Hermes compression and Pi compaction don't break on that.
 - **[verify]:** a one-dollar test of whether Claude-provider (Agent SDK) review draws on the API credit. The credits doc says the Agent SDK is covered.
-- **Provider subscriptions: decided after v1, from measured numbers** [call]. the operator may drop to Max 5x and add a cheaper plan for the factory [user]. Findings as of 2026-10-26 are in the private provider-subscriptions research ([docs/research](../../research/README.md)):
+- **Provider subscriptions: decided after v1, from measured numbers** [call]. The operator may drop to Max 5x and add a cheaper plan for the factory [user]. Findings as of 2026-10-26 are in the private provider-subscriptions research ([docs/research](../../research/README.md)):
   - **Max 5x** is $100/month with a $100 API credit, against $200/$200 for 20x. It also cuts the operator's interactive Claude Code limits to roughly a quarter.
   - **ChatGPT Plus/Pro through Pi's "Sign in with ChatGPT"** has terms that explicitly allow third-party and unattended use (2026-09-29). Caveats:
     - training is on by default and must be opted out;
@@ -921,12 +921,12 @@ A flagged run gets `hapi:flagged` on its PR and an alert in `#hapi-alerts`.
 - Hermes decides the exact cut during planning, and the operator approves it at the planning PR.
 
 **v1 definition of done** [user scope; call specifics]:
-1. the operator runs `mise run new-repo -- odoo-mcp`. The repo exists with the contract, ruleset and both Apps installed.
+1. The operator runs `mise run new-repo -- odoo-mcp`. The repo exists with the contract, ruleset and both Apps installed.
 2. In Slack (`#hapi-intake`), the operator brainstorms the Odoo MCP server with Hermes.
    - `hapi-research` produces dated, first-party-sourced notes on Odoo's external API and the MCP spec.
    - Hermes drafts `docs/design/odoo-mcp.md`, `docs/security/threat-model.md` (MAESTRO, scoped to this server) and the work orders on `plan/odoo-mcp`.
    - Hermes opens a `lane:planning` PR.
-3. the operator merges it. Exactly **one** Archon run per work order starts within the poll interval, without the operator touching Archon.
+3. The operator merges it. Exactly **one** Archon run per work order starts within the poll interval, without the operator touching Archon.
 4. Each run:
    - Pi builds inside the container, with `.pi/` stripped and hapi-guard active.
    - `mise run check` and `mise run smoke` pass against the Odoo sidecar.
@@ -934,7 +934,7 @@ A flagged run gets `hapi:flagged` on its PR and an alert in `#hapi-alerts`.
    - The independent review returns `ready`.
 5. The harvester opens one `lane:factory` PR per work order, with trailers and the run summary.
    - The rework label is exercised at least once.
-   - the operator merges the PRs.
+   - The operator merges the PRs.
 6. `metrics.json` and `metrics.jsonl` record cost, turns, interventions and merge outcomes. Targets: ≤ $3 per run on the `anthropic` roster, total v1 build ≤ $25 [call].
 7. Eval case 1 (a frozen work order) passes on the `budget` roster, and once on `portable`. Planning eval 1 (the recorded intake) passes.
    - Jev decisions are recorded in run metrics.
@@ -984,7 +984,7 @@ Because v1 keeps Archon off the forge (§9.4), hapi-factory may need little or n
 - Whether to upstream the Archon Pi-trust fix during phase 1 or later.
 - Deduplicating the trigger key when one merge carries several work orders.
 - The toolchain mise installs inside the Archon container.
-- How the ruleset lets the operator merge PRs he authored himself (`lane:direct`). Rulesets don't let an author approve their own PR. Use an owner-only bypass that the Apps and agents can never use.
+- How the ruleset lets the operator merge PRs they authored themselves (`lane:direct`). Rulesets don't let an author approve their own PR. Use an owner-only bypass that the Apps and agents can never use.
 
 ## 19. Verify early (spikes)
 
