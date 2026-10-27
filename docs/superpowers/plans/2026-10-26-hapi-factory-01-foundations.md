@@ -905,6 +905,53 @@ test("audit passes a clean fixture", async () => { /* all pass/skip */ });
 
 ---
 
+### Task 7b: Pre-publish cleanup (private split, sanitize, guardrails, history rewrite)
+
+The repo stays private until this task is done. Its requirements are this text plus the register's [§ Plan 01 Task 7b](handoffs.md#plan-01-task-7b-publishing) (H-054–H-060) and H-073. It runs after Task 7 and before the operator's publish steps (H-074–H-078). Nothing else in Plan 01 waits on it: the secrets, provider keys, Slack app, host setup and stage b don't need a public repo.
+
+**Operator gates.** The steps marked **[operator]** stop and wait for the operator:
+- edits to `mise.toml` and `.github/**` (protected paths, `interactive: ask`), so the diff goes to the operator to approve;
+- the license choice (H-073);
+- the history rewrite (Step 7), which is destructive: it runs only after a backup and the operator's go-ahead at that moment;
+- every push, and making the repo public (H-074), which are the operator's.
+
+**Files:**
+- Move (untracked from hapi-factory, kept on disk): `research_notes/`, `reports/` → `private/` (its own git repo, remote `hapi-factory-private`, H-054)
+- Create: `docs/research/README.md`; a gitleaks pre-commit hook and its install step; `private/personal-strings.txt` and `private/replacements.txt` (private, never in the public tree)
+- Modify: the 15 files H-055 lists, README's manual setup steps (H-059), this plan's Task 1 Step 6 (H-059), `src/audit/` (H-058), `.github/workflows/ci.yml` **[operator]** (H-057, H-060), `mise.toml` **[operator]** (H-055's name in its comments), `docs/superpowers/plans/handoffs.md`
+- Create **[operator]**: `LICENSE`, and `license` in `package.json` (H-073)
+
+- [ ] **Step 1: Private split (H-054).** `git init private` (if it isn't a repo yet). Move `research_notes/` and `reports/` into it and commit there, locally (no remote yet). In hapi-factory, `git rm -r --cached research_notes reports`. Write `docs/research/README.md`: what research exists, the conclusions that shaped the spec (with spec section numbers), and that the sources are private. No personal data. Point the spec's and this plan's "Supporting evidence is in `reports/` and `research_notes/`" at it.
+
+- [ ] **Step 2: Sanitize (H-055).** The operator's first name becomes "the operator", the GitHub login becomes `$OWNER` or `<owner>` (as the runbooks and `example-owner` tests already do), and the spec's Owner line loses the full name. List every personal string once in `private/personal-strings.txt`, and the replacement for each in `private/replacements.txt` (filter-repo's `--replace-text` format, used in Step 7). Then `grep -rnF -f private/personal-strings.txt` over the tracked tree must find nothing. The `mise.toml` comment lines are **[operator]**.
+
+- [ ] **Step 3: Publish instructions (H-059).** Rewrite README's manual setup steps for the real sequence: both repos already exist, private and empty; nothing is pushed until this task is done; then push, make hapi-factory public, and apply the two rulesets (`main-protect`, `main-review`; H-075). Point this plan's Task 1 Step 6 at H-074.
+
+- [ ] **Step 4: Audit check (H-058).** Add `repo.private-untracked` to `runAudit`: it fails if `git ls-files private/` lists anything, or if `.gitignore` doesn't ignore `private/`. Tests with fakes (pass, a tracked file, a missing ignore). Document it in docs/audit.md.
+
+- [ ] **Step 5: Guardrails (H-057, H-060).**
+  - A pre-commit hook that runs `gitleaks git --pre-commit --staged --redact` and the personal-strings check (`private/personal-strings.txt`, skipped with a printed notice when `private/` is absent, as in a fresh public clone). Install it with `git config core.hooksPath <dir>`, documented in README.
+  - **[operator]** In `.github/workflows/ci.yml`: a full-history gitleaks job (`fetch-depth: 0`, the pinned gitleaks), and `cancel-in-progress: ${{ github.event_name == 'pull_request' }}` (H-060).
+  - The personal-strings list never goes into the public tree or CI: CI catches secrets, and the hook and Step 7 catch personal strings.
+
+- [ ] **Step 6: License (H-073) [operator].** The operator picks the license; add `LICENSE` and `package.json`'s `license`.
+
+- [ ] **Step 7: History rewrite (H-056) [operator].** Right before the first push, after Steps 1–6 are committed:
+  1. Back up first: `git branch backup/pre-filter-repo` and `git bundle create private/pre-filter-repo.bundle --all`.
+  2. With the operator's go-ahead, run `git filter-repo --invert-paths --path research_notes --path reports --replace-text private/replacements.txt` (run from a pinned version, e.g. `uvx git-filter-repo==<version>`; adding it to mise.toml is **[operator]**).
+  3. Verify:
+     - `gitleaks git --redact` over the whole rewritten history finds nothing;
+     - `git log -p --all | grep -nF -f private/personal-strings.txt` finds nothing;
+     - `git log --all -- research_notes reports` is empty;
+     - `mise run lint && mise run test` pass.
+  4. Remap the SHAs in the register's Closed table from `.git/filter-repo/commit-map`.
+
+- [ ] **Step 8: Hand over to the operator.** The remaining steps are H-074's: push the cleaned history (the operator confirms the first push to each remote), make hapi-factory public, apply the rulesets (H-075), CODEOWNERS (H-076), the Apps (H-077) and the merge-refusal check (H-078), and push `private/` to hapi-factory-private.
+
+- [ ] **Commits:** one per step 1–6, each with the register items it closes. Step 7 rewrites them all.
+
+---
+
 ### Tasks 8–14: Verify-early spikes (spec §19)
 
 Each spike works in `spikes/scratch/<n>/` (gitignored, throwaway). It records **result, evidence (commands and output), decision, and the consequence for Plan 0X** in `docs/spikes/NN-<name>.md`, then commits only that note. A spike that disproves a design assumption stops the line. Raise it with the operator before writing the dependent plan.
