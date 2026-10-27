@@ -322,7 +322,7 @@ describe("repo.ai-workflows", () => {
   test("an AI action with a secret on each forbidden trigger fails, in every spelling of `on`", async () => {
     const body = (on: string) =>
       `on: ${on}\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: openai/codex-action@v1\n        with:\n          openai-api-key: \${{ secrets.OPENAI_API_KEY }}\n`;
-    for (const on of ["issue_comment", "[push, issues]", "{pull_request_target: {types: [opened]}}", "pull_request_review", "{pull_request_review_comment: null}"]) {
+    for (const on of ["issue_comment", "[push, issues]", "{pull_request_target: {types: [opened]}}", "pull_request_review", "{pull_request_review_comment: null}", "discussion", "{discussion_comment: {types: [created]}}"]) {
       const r = await run(await withToken({ workflows: { "x.yml": body(on) } }));
       expect([on, r.workflows.status]).toEqual([on, "fail"]);
       expect(r.workflows.detail).toContain("openai/codex-action");

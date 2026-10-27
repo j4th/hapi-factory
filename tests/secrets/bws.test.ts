@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { SecretError } from "../../src/secrets/provider";
-import { type BwsRunner, bwsProvider, isPlaceholderId } from "../../src/secrets/providers/bws";
+import { type BwsRunner, bwsFailure, bwsProvider, isPlaceholderId } from "../../src/secrets/providers/bws";
 import { caught } from "./helpers";
 
 // Obviously fake values: none of them is, or looks like, a real credential.
@@ -68,6 +68,18 @@ describe("the bws provider (optional)", () => {
       if (id !== "") expect(e.message).not.toContain(id);
     }
     expect(f.calls).toEqual([]);
+  });
+
+  test("bws's own stderr is scrubbed as sops's is: what follows a colon, which could hold a value, never reaches the error", () => {
+    process.env.BWS_ACCESS_TOKEN = "fake-access-token-0b1c";
+    const e = bwsFailure(1, `\u001b[31mError:\u001b[0m \n   0: Received error message from server: [400] ${FAKE} is not valid\nLocation: crates/bws/src/main.rs:12\n`);
+    expect(e.message).toBe("bws exited with status 1: Error (run the same bws command yourself for its full message)");
+    expect(e.message).not.toContain(FAKE);
+    // The access token is masked even where scrubToolError keeps the text (before the first colon).
+    expect(bwsFailure(2, "Invalid access token fake-access-token-0b1c: rejected").message).toBe(
+      "bws exited with status 2: Invalid access token [BWS_ACCESS_TOKEN] (run the same bws command yourself for its full message)",
+    );
+    expect(bwsFailure(3, "").message).toBe("bws exited with status 3 (run the same bws command yourself for its full message)");
   });
 
   test("a bws failure names the logical name and why, never a value or the access token", async () => {

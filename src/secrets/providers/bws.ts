@@ -18,6 +18,7 @@
  * access token is masked in bws's stderr.
  */
 import { type SecretProvider, SecretError } from "../provider";
+import { scrubToolError } from "./sops";
 
 /** Runs `bws` with these args and resolves to its stdout; rejects if it fails. */
 export type BwsRunner = (args: string[]) => Promise<string>;
@@ -52,13 +53,21 @@ export const runBws: BwsRunner = async (args) => {
     throw new Error("cannot run bws: is it on PATH? (add it in mise.local.toml, docs/secrets.md)");
   }
   const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
-  if (code !== 0) {
-    // bws's errors end in a source location and backtrace hints; the message is what comes before.
-    const why = oneLine(stderr).replace(/ Location: .*$/, "");
-    throw new Error(`bws exited with status ${code}${why ? `: ${why}` : ""}`);
-  }
+  if (code !== 0) throw bwsFailure(code, stderr);
   return stdout;
 };
+
+/**
+ * The error for a bws run that failed: its exit status and the start of its
+ * stderr, scrubbed as sops's is (`scrubToolError`: the first line up to its
+ * first colon, plus any path; what follows a colon could hold a value), with
+ * the access token masked. bws's errors end in a source location and backtrace
+ * hints, which go too. Its full message is one manual bws run away.
+ */
+export function bwsFailure(code: number, stderr: string): Error {
+  const why = oneLine(scrubToolError(stderr)).replace(/ Location: .*$/, "");
+  return new Error(`bws exited with status ${code}${why ? `: ${why}` : ""} (run the same bws command yourself for its full message)`);
+}
 
 /** Read one secret's value with `bws secret get`. "" is returned as is: resolve calls it empty, check reports it. */
 async function fetchValue(name: string, id: string, bws: BwsRunner): Promise<string> {

@@ -380,8 +380,8 @@ export async function githubAppPerms(run: AuditRun): Promise<CheckResult[]> {
   return out;
 }
 
-/** The triggers that run a workflow on input from anyone who can comment, open an issue or review, or with a fork's PR and the base's secrets. */
-const FORBIDDEN_TRIGGER = /^(issue_comment|issues|pull_request_review.*|pull_request_target)$/;
+/** The triggers that run a workflow on input from anyone who can comment, open an issue or a discussion, or review, or with a fork's PR and the base's secrets. */
+const FORBIDDEN_TRIGGER = /^(issue_comment|issues|discussion|discussion_comment|pull_request_review.*|pull_request_target)$/;
 /** AI agent actions. */
 const AI_ACTIONS = [
   /^anthropics\/claude-code(?:-base)?-action(?:@|$)/i,
