@@ -60,6 +60,8 @@ What exists now:
 |---|---|
 | `mise.toml` | Tool pins and the [mise tasks](#mise-tasks). This is a protected path (spec §8.2): an interactive agent session must ask the operator before editing it, and unattended sessions and workers may not edit it at all. |
 | `package.json`, `bun.lock` | JS project metadata and dependencies, pinned to exact versions: `ajv` (JSON Schema validation) and `yaml` at runtime, `typescript` and `@types/bun` for development. The lockfile is committed. |
+| `.factory/config.yaml` | hapi-factory's own repo overlay (spec §7): when the factory works on this repo, it also protects `policy/**` and `stack/**`. An overlay can only tighten the central policy, and `.factory/**` is itself a protected path. Enforced once Plan 03's run engine loads overlays (H-172). |
+| `.coderabbit.yaml` | CodeRabbit's review-only config (spec §9.6): every way it can write to the repo is off, and its tools stay on as a second opinion beside CI. A protected path, since CodeRabbit reviews a PR with that branch's own copy. |
 | `bunfig.toml` | Bun install settings: exact versions and a 3-day release-age cooldown (see [Toolchain and pinning](#toolchain-and-pinning)). |
 | `tsconfig.json` | Strict TypeScript settings, used only for type-checking. Bun runs the `.ts` files directly. |
 | `src/cli.ts` | The `hapi` CLI: the entry point, the command registry and `main(argv)`. |

@@ -1,0 +1,20 @@
+# yaml-language-server: $schema=../policy/schemas/repo-overlay.schema.json
+#
+# hapi-factory's own repo overlay (spec §7). It applies only when the factory
+# works on this repo, on top of the central policy in policy/, and can only
+# tighten it (src/policy/overlay.ts). This file is itself protected
+# (.factory/**).
+#
+# The two paths below are hapi-factory-specific, so they live here, not in
+# policy/protected_paths.yaml, whose globs bind every repo the factory works on
+# (many repos have an unrelated policy/ or stack/ directory):
+#   policy/**  the central policy: protected paths, egress allowlists, budgets,
+#              approvals and rosters. A worker that could edit it could loosen
+#              the rules every guard enforces.
+#   stack/**   the stack's security boundary: the compose file, the egress
+#              proxies and the secrets manifest.
+# Same modes as AGENTS.md: the operator approves in an interactive session;
+# unattended sessions and workers may not edit them.
+protected_paths:
+  "policy/**": { interactive: ask, unattended: deny, workers: deny }
+  "stack/**":  { interactive: ask, unattended: deny, workers: deny }
