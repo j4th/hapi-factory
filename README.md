@@ -353,7 +353,7 @@ Set `OWNER` to your GitHub login first (`export OWNER=<your-login>`); the comman
 
    Once the GitHub Apps exist, also confirm that **an App's merge call is refused**, even with the operator's approval and `ci` green ([GitHub Apps runbook, Check it](docs/runbooks/github-apps.md#check-it)).
 
-   These commands follow GitHub's REST docs, but nobody has run them yet. If GitHub rejects a field, set up the same two rulesets in the UI. Keep the rules split the same way: never put the `ci` check in a ruleset that has a bypass actor, and never put Restrict updates in one that has none. `tests/docs/rulesets.test.ts` holds this JSON to those rules.
+   These commands were first run on 2026-10-27, and GitHub accepted every field. Read back, each ruleset also holds GitHub's own defaults: `do_not_enforce_on_create: false` in the status-check rule; `required_reviewers: []`, `require_extra_approval_for_unattributed_changes: true` and all three merge methods in the pull-request rule. If GitHub ever rejects a field, set up the same two rulesets in the UI. Keep the rules split the same way: never put the `ci` check in a ruleset that has a bypass actor, and never put Restrict updates in one that has none. `tests/docs/rulesets.test.ts` holds this JSON to those rules.
 
 5. **CODEOWNERS:** your own PR adds `.github/CODEOWNERS` with `* @<your-login>`, before either App is installed. `main-review` requires a code owner's review, and with you as the only code owner, no App's approval counts ([GitHub Apps runbook](docs/runbooks/github-apps.md#code-owners-a-second-layer)).
 
