@@ -26,6 +26,7 @@ import {
   secretsRevoke,
 } from "./secrets/cli";
 import { CancelledError } from "./secrets/recovery";
+import { stackDown, stackUp } from "./stack/up";
 import { HAPI_VERSION } from "./version";
 import { workorderValidate } from "./workorder/validate";
 
@@ -137,6 +138,8 @@ register("secrets new-recovery", secretsNewRecovery, "Replace the recovery key a
 register("secrets edit", secretsEdit, "Edit the sops store with `sops edit` (sops provider only)");
 register("secrets check", secretsCheck, "List every secret in stack/secrets.yaml as found, missing or empty in the configured store (never a value), and the store's recipients");
 register("secrets resolve", secretsResolve, "Resolve stack/secrets.yaml from the configured provider into $XDG_RUNTIME_DIR/hapi/env/<zone>.env (--dry-run: check)");
+register("stack up", stackUp, "Build policy, resolve secrets and start the stack as the hapi user (stack/compose.yaml); see docs/runbooks/stack.md");
+register("stack down", stackDown, "Stop the stack and remove its containers and networks, keeping its volumes (kill switch 3)");
 register("token mint", tokenMint, "Mint a 1-hour GitHub App token for one repo into a 0600 file under $XDG_RUNTIME_DIR/hapi/tokens/");
 
 if (import.meta.main) {

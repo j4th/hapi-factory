@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { cpSync, mkdtempSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { FORGE_DOMAINS, forgeDomain } from "../../src/policy/hosts";
 import { loadPolicy, PolicyError } from "../../src/policy/load";
 import rolesSchema from "../../policy/schemas/policy-roles.schema.json";
 import { ROLES, type Policy, type ZoneName } from "../../src/policy/types";
@@ -171,7 +172,9 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
   test("the archon zone has no forge route, counting the hosts its tiers add", () => {
     const hosts = zoneAllowlist(p, "archon");
     expect(hosts).toContain("api.anthropic.com");
-    expect(hosts.filter((h) => /(^|\.)github(usercontent)?\.com$/.test(h))).toEqual([]);
+    // Every forge domain the schema names (GitHub, GitLab and Bitbucket included), in any case.
+    expect(FORGE_DOMAINS).toEqual(expect.arrayContaining(["github.com", "githubusercontent.com", "gitlab.com", "bitbucket.org"]));
+    expect(hosts.filter((h) => forgeDomain(h) !== undefined)).toEqual([]);
   });
 
   test("commands", () => {

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { emitEgress } from "../../src/generate/egress";
 import { forgeDomain } from "../../src/policy/hosts";
+import { cidrContains } from "../../src/stack/cidr";
 import { loadPolicy } from "../../src/policy/load";
 import { applyOverlay } from "../../src/policy/overlay";
 import type { Policy, ZoneName } from "../../src/policy/types";
@@ -66,7 +67,7 @@ test("research zone allows open web but blocks private ranges", () => {
   const c = conf("research");
   const lines = directives(c);
   expect(lines).toContain("http_access deny to_localnet");
-  for (const range of ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16", "100.64.0.0/10", "::1", "fc00::/7", "fe80::/10"]) {
+  for (const range of ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16", "100.64.0.0/10", "::/96", "fc00::/7", "fe80::/10"]) {
     expect(toLocalnet(c)).toContain(range);
   }
   expect(c).not.toContain("dstdomain");
@@ -101,8 +102,28 @@ describe("every zone", () => {
     test(`${zone}: refuses the unspecified address and the NAT64 prefixes, whatever a name resolves to`, () => {
       const ranges = toLocalnet(conf(zone));
       // On Linux, connecting to :: reaches the local host. A NAT64 translator maps its
-      // prefixes onto IPv4 addresses, private ones included.
-      for (const range of ["::/128", "::1", "64:ff9b::/96", "64:ff9b:1::/48", "fc00::/7", "fe80::/10", "ff00::/8"]) expect(ranges).toContain(range);
+      // prefixes onto IPv4 addresses, private ones included. ::/96 holds :: and ::1.
+      for (const range of ["::/96", "64:ff9b::/96", "64:ff9b:1::/48", "fc00::/7", "fe80::/10", "ff00::/8"]) expect(ranges).toContain(range);
+      for (const address of ["::", "::1", "::10.9.9.9"]) expect(ranges.some((r) => cidrContains(r, address))).toBe(true);
+    });
+
+    test(`${zone}: refuses the IPv6 ranges that embed or reach an IPv4 or internal address (the Task 5 decision)`, () => {
+      // ::/96 IPv4-compatible (::a.b.c.d), 2002::/16 6to4 (2002:AABB:CCDD::, a relay reaches a.b.c.d),
+      // 2001::/32 Teredo (an obfuscated IPv4 server and client), 100::/64 discard-only, fec0::/10
+      // site-local (deprecated, internal). No public host is reached at any of them.
+      const ranges = toLocalnet(conf(zone));
+      for (const range of ["::/96", "2002::/16", "2001::/32", "100::/64", "fec0::/10"]) expect(ranges).toContain(range);
+      // 2001::/32 is Teredo only: the documentation prefix 2001:db8::/32 and other 2001: space stay outside it.
+      expect(cidrContains("2001::/32", "2001:db8::1")).toBe(false);
+      expect(cidrContains("2001::/32", "2001:0:4136:e378::1")).toBe(true);
+    });
+
+    test(`${zone}: no to_localnet range is covered by another, so squid -k parse stays clean`, () => {
+      // Squid ignores an entry another entry covers, with a warning ("Ignoring ::1 because it is
+      // already covered by ::/96"), which is why ::/128 and ::1 are not listed beside ::/96.
+      const ranges = toLocalnet(conf(zone));
+      const covered = ranges.flatMap((a) => ranges.filter((b) => a !== b && cidrContains(b, a)).map((b) => `${a} in ${b}`));
+      expect(covered).toEqual([]);
     });
 
     test(`${zone}: IPv4-mapped addresses are covered by the IPv4 ranges, never by an ::ffff:0:0/96 entry`, () => {
@@ -114,12 +135,18 @@ describe("every zone", () => {
       for (const range of ["0.0.0.0/8", "10.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16"]) expect(ranges).toContain(range);
     });
 
-    test(`${zone}: no cache, logs to stdout, no pid file, no client addresses upstream`, () => {
+    test(`${zone}: says why refusing the NAT64 prefixes costs IPv4-only sites behind DNS64`, () => {
+      // DNS64 synthesises 64:ff9b::/96 addresses for IPv4-only sites, which to_localnet refuses.
+      expect(conf(zone)).toMatch(/DNS64/);
+    });
+
+    test(`${zone}: no cache, logs to stdout, no pid file, no pinger, no client addresses upstream`, () => {
       const lines = directives(conf(zone));
       for (const d of [
         "http_port 3128",
         `visible_hostname hapi-egress-${zone}`,
         "pid_filename none",
+        "pinger_enable off",
         "cache deny all",
         "access_log stdio:/dev/stdout",
         "cache_log /dev/stdout",

@@ -281,13 +281,13 @@ describe("hapi mcp verify and pin", () => {
     expect(err.join("\n")).toContain("usage: hapi mcp");
   });
 
-  test("the registered commands fail closed until Task 5 wires the live fetch", async () => {
+  test("the registered commands fail closed until Plan 04 wires the live fetch", async () => {
     const { err } = capture();
     expect(await main(["mcp", "verify"])).toBe(1);
-    expect(err.join("\n")).toMatch(/hapi mcp verify: .*Plan 01 Task 5/);
+    expect(err.join("\n")).toMatch(/hapi mcp verify: .*Plan 04/);
     const lock = lockIn(tempDir(), {});
     expect(await main(["mcp", "pin", "--server", "context7", "--lock", lock])).toBe(1);
-    expect(err.join("\n")).toMatch(/hapi mcp pin: .*Plan 01 Task 5/);
+    expect(err.join("\n")).toMatch(/hapi mcp pin: .*Plan 04/);
     expect(readFileSync(lock, "utf8")).toBe("{}");
   });
 });

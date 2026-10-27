@@ -7,10 +7,11 @@
  * closed when a live surface no longer matches. Re-pinning is a reviewed change:
  * `new_skill_or_mcp` is on the approvals list, so it goes through a planning PR.
  *
- * `fetchSurface(name)` gets a server's live surface. Task 5 wires the real one,
- * which launches the pinned server in a throwaway container on its zone's
- * network. Until then the registered commands fail closed, and the tests
- * inject fakes.
+ * `fetchSurface(name)` gets a server's live surface. Plan 04 wires the real one,
+ * which launches the pinned server's own image (built from a committed
+ * lockfile) in a throwaway container on its zone's network: npx can't fetch
+ * on the internal zone networks. Until then the registered commands fail
+ * closed, and the tests inject fakes.
  *
  * An entry counts only for the pin it was recorded for: after a version bump
  * the server is unpinned until someone pins it again.
@@ -214,11 +215,11 @@ export interface McpDeps {
   fetchSurface: FetchSurface;
 }
 
-/** Until Task 5 wires the live fetch, the commands fail closed: a stub can never pass as a check. */
+/** Until Plan 04 wires the live fetch, the commands fail closed: a stub can never pass as a check. */
 const NOT_WIRED: McpDeps = {
   fetchSurface: async () => {
     throw new Error(
-      "fetching a live MCP surface arrives in Plan 01 Task 5, which runs the pinned server in a throwaway container on its zone's network",
+      "fetching a live MCP surface arrives in Plan 04, which runs the pinned server's own image in a throwaway container on its zone's network",
     );
   },
 };

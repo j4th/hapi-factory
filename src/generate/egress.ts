@@ -38,16 +38,28 @@ const ABOUT: Record<ZoneName, string> = {
   research: "hapi-research, the only role that reaches the open web (spec §10)",
 };
 
-/** Clients allowed to use a proxy: the private container networks, and the proxy's own loopback. */
-const CLIENT_RANGES = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7", "fe80::/10", "127.0.0.0/8", "::1"];
+/**
+ * Clients allowed to use a proxy: the private container networks, and the
+ * proxy's own loopback. `hapi stack up` checks that every zone network Docker
+ * allocates is inside one of these (src/stack/up.ts), or its requests would all
+ * be refused.
+ */
+export const CLIENT_RANGES: readonly string[] = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7", "fe80::/10", "127.0.0.0/8", "::1"];
 
 /**
- * Destinations no zone may reach, whatever a name resolves to.
+ * Destinations no zone may reach, whatever a name resolves to. No entry may
+ * cover another: Squid ignores the covered one with a warning, so ::/96 stands
+ * for :: and ::1 too.
  *
  * IPv4-mapped IPv6 (::ffff:0:0/96) has no entry of its own: Squid holds every
  * IPv4 address in that form, so each IPv4 range below also covers its mapped
  * form, and an ::ffff:0:0/96 entry would match every IPv4 address and refuse
  * all IPv4 egress (checked with Squid 7.6).
+ *
+ * The IPv6 ranges that embed or reach an IPv4 or internal address (::/96,
+ * 2002::/16, 2001::/32, 100::/64, fec0::/10) were added in Plan 01 Task 5: no
+ * public host is reached at any of them, and each could carry a request to an
+ * address the IPv4 ranges refuse. docs/generated-configs.md has the decision.
  */
 const PRIVATE_RANGES: [range: string, what: string][] = [
   ["0.0.0.0/8", "this network"],
@@ -61,12 +73,15 @@ const PRIVATE_RANGES: [range: string, what: string][] = [
   ["198.18.0.0/15", "benchmarking"],
   ["224.0.0.0/4", "multicast"],
   ["240.0.0.0/4", "reserved, and broadcast"],
-  ["::/128", "unspecified: on Linux, connecting to it reaches the local host"],
-  ["::1", "loopback"],
+  ["::/96", "unspecified (on Linux, :: reaches the local host), loopback ::1, IPv4-compatible"],
   ["64:ff9b::/96", "NAT64 well-known prefix: a translator maps it onto IPv4"],
   ["64:ff9b:1::/48", "NAT64 local-use prefix (RFC 8215)"],
+  ["100::/64", "discard-only"],
+  ["2001::/32", "Teredo: embeds an IPv4 server and client"],
+  ["2002::/16", "6to4: a relay reaches the IPv4 address it embeds"],
   ["fc00::/7", "unique local"],
   ["fe80::/10", "link-local"],
+  ["fec0::/10", "site-local (deprecated)"],
   ["ff00::/8", "multicast"],
 ];
 
@@ -142,6 +157,8 @@ function squidConf(p: Policy, zone: ZoneName): string {
     "# The container starts Squid as a non-root user and supervises it, so there is no pid",
     "# file. (Started as root, Squid drops privileges and then can't open /dev/stdout.)",
     "pid_filename none",
+    "# No ICMP pinger: it needs raw sockets (CAP_NET_RAW), which the container drops.",
+    "pinger_enable off",
     "",
     "# This proxy only filters: no caching, and logs go to the container's stdout.",
     "cache deny all",
@@ -161,6 +178,8 @@ function squidConf(p: Policy, zone: ZoneName): string {
     ...PRIVATE_RANGES.map(([range, what]) => `#   ${range.padEnd(16)}${what}`),
     "# IPv4-mapped addresses need no entry: Squid holds IPv4 in that form, so the IPv4",
     "# ranges cover it, and ::ffff:0:0/96 would refuse every IPv4 address.",
+    "# Refusing the NAT64 prefixes also refuses the addresses DNS64 synthesises for",
+    "# IPv4-only sites, so on an IPv6-only host behind DNS64 those sites are unreachable.",
     `acl to_localnet dst ${PRIVATE_RANGES.map(([r]) => r).join(" ")}`,
   ];
   if (open) {

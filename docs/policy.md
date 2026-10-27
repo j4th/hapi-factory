@@ -558,7 +558,7 @@ mise run hapi -- workorder validate .factory/work/0002-search-partners-tool/orde
 
 ## `hapi mcp verify` and `hapi mcp pin`
 
-These two commands keep [`mcp.lock.json`](#mcplockjson) in step with the servers. Both get a server's live surface through `fetchSurface`, which launches the pinned server in a throwaway container on its zone's network. **That arrives in Plan 01 Task 5.** Until then, both commands exit `1` with a message saying so, so they can never pass as a real check.
+These two commands keep [`mcp.lock.json`](#mcplockjson) in step with the servers. Both get a server's live surface through `fetchSurface`, which launches the pinned server in a throwaway container on its zone's network. **That arrives in Plan 04**, with the per-server images (`npx` can't fetch on the internal-only zone networks). Until then, both commands exit `1` with a message saying so, so they can never pass as a real check.
 
 ```bash
 mise run hapi -- mcp verify                       # every catalog server against policy/mcp.lock.json

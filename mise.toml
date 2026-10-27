@@ -37,9 +37,9 @@ description = "Run the unit test suite (no Docker, network or secrets needed)"
 run = "bun test"
 
 [tasks."test:int"]
-description = "Run the integration tests in tests/stack with HAPI_INT=1 (needs Docker; tests arrive in Plan 01 Task 5)"
+description = "Run every integration test (*.int.test.ts: the stack's egress boundary on real Docker and Squid, the real sops + age lifecycle) with HAPI_INT=1; needs Docker, and the internet for some (docs/runbooks/stack.md)"
 env = { HAPI_INT = "1" }
-run = "bun test tests/stack"
+run = "bun test --timeout 1200000 .int.test.ts"
 
 [tasks.lint]
 description = "Type-check the project with tsc (strict, no emit)"
@@ -95,9 +95,9 @@ description = "Check deployed config, pins and settings against policy (arrives 
 run = "echo 'audit is not implemented yet (arrives in Plan 01 Task 6)' >&2; exit 1"
 
 [tasks.up]
-description = "Build policy, resolve secrets and start the stack (arrives in Plan 01 Task 5)"
-run = "echo 'up is not implemented yet (arrives in Plan 01 Task 5)' >&2; exit 1"
+description = "Build policy, resolve secrets, then start the stack and wait until it is healthy, as the hapi user (re-execs with sudo -iu hapi; HAPI_ALLOW_CURRENT_USER=1 is a dev-only bypass). Flags after --, e.g. `mise run up -- --roster budget` (docs/runbooks/stack.md)"
+run = "bun run src/cli.ts stack up"
 
 [tasks.down]
-description = "Stop the stack (arrives in Plan 01 Task 5)"
-run = "echo 'down is not implemented yet (arrives in Plan 01 Task 5)' >&2; exit 1"
+description = "Stop the stack and remove its containers and networks, keeping its volumes, as the hapi user: kill switch 3 (docs/runbooks/stack.md)"
+run = "bun run src/cli.ts stack down"

@@ -34,16 +34,16 @@ It prints each path it wrote, one per line, and exits 0. A usage error (an unkno
 
 ## The files
 
-| File | What it is | From | Used by (Plan 01 Task 5) |
+| File | What it is | From | Used by (`stack/compose.yaml`) |
 |---|---|---|---|
-| `build/hermes/config.yaml` | Hermes's `config.yaml` (Hermes v0.22.5 keys) | `budgets.yaml`, `flags.yaml`, `mcp.yaml`, `protected_paths.yaml`, `roles.yaml`, `rosters/anthropic.yaml` | Mounted as the Hermes container's config |
-| `build/archon/config.yaml` | Archon's global config, `~/.archon/config.yaml` (Archon v0.12.1): model tiers and aliases | `roles.yaml`, `rosters/<roster>.yaml` | The Archon container |
-| `build/archon/archon.env` | The Archon container's environment | Spec §9.2 and §9.3 (no policy file) | The Archon container's `env_file` |
+| `build/hermes/config.yaml` | Hermes's `config.yaml` (Hermes v0.22.5 keys) | `budgets.yaml`, `flags.yaml`, `mcp.yaml`, `protected_paths.yaml`, `roles.yaml`, `rosters/anthropic.yaml` | Mounted read-only at `/opt/data/config.yaml` (`$HERMES_HOME`) in the `hermes` container |
+| `build/archon/config.yaml` | Archon's global config, `~/.archon/config.yaml` (Archon v0.12.1): model tiers and aliases | `roles.yaml`, `rosters/<roster>.yaml` | Mounted read-only at `/.archon/config.yaml` (Archon's home in its container) in `archon` |
+| `build/archon/archon.env` | The Archon container's environment | Spec §9.2 and §9.3 (no policy file) | The `archon` container's first `env_file`, before the zone's secrets |
 | `build/pi/models.json` | Pi 1.3.0's model registry: `maxTokens` caps | `rosters/<roster>.yaml` | Mounted read-only at `PI_CODING_AGENT_DIR` |
 | `build/pi/hapi-guard.json` | Settings for Plan 02's hapi-guard Pi extension | `protected_paths.yaml`, `budgets.yaml` | Mounted read-only at `PI_CODING_AGENT_DIR` |
-| `build/egress/hermes.squid.conf` | Squid config for the `hermes` zone's egress proxy | `trusted_sources.yaml` | The `egress-hermes` container |
-| `build/egress/archon.squid.conf` | Squid config for the `archon` zone's egress proxy | `trusted_sources.yaml` | The `egress-archon` container |
-| `build/egress/research.squid.conf` | Squid config for the `research` zone's egress proxy | `trusted_sources.yaml` | The research proxy (a later plan) |
+| `build/egress/hermes.squid.conf` | Squid config for the `hermes` zone's egress proxy | `trusted_sources.yaml` | The `egress-hermes` container, read-only |
+| `build/egress/archon.squid.conf` | Squid config for the `archon` zone's egress proxy | `trusted_sources.yaml` | The `egress-archon` container, read-only |
+| `build/egress/research.squid.conf` | Squid config for the `research` zone's egress proxy | `trusted_sources.yaml` | The `egress-research` container, read-only (the research zone's own service arrives in Plan 04) |
 | `build/mcp/hermes.mcp.json` | A standard `mcp.json` with the `hermes` zone's whole MCP catalog | `mcp.yaml` | The CI scanners (Plan 05) |
 | `build/mcp/research.mcp.json` | A standard `mcp.json` with the `research` zone's whole MCP catalog | `mcp.yaml` | The CI scanners (Plan 05) |
 
@@ -202,17 +202,19 @@ The settings Plan 02's hapi-guard extension enforces inside every Pi worker (spe
 
 ## `build/egress/*.squid.conf`
 
-One Squid config per egress zone (spec §10, §11.4). Each zone's containers sit on an internal-only network whose one way out is this proxy (Task 5), so **the proxy is the real network boundary**; the agents' own settings are a second layer.
+One Squid config per egress zone (spec §10, §11.4). Each zone's containers sit on an internal-only network whose one way out is this proxy (`stack/compose.yaml`, [docs/runbooks/stack.md](runbooks/stack.md)), so **the proxy is the real network boundary**; the agents' own settings are a second layer.
 
 **Every zone's proxy:**
 - listens on port `3128`;
 - serves only clients on the private container networks (`zone_clients`);
 - refuses private, loopback, link-local, carrier-grade NAT, multicast and reserved addresses (`to_localnet`). Squid checks what a name **resolves to**, so a public name that points inside the network is refused too. The list includes:
-  - the IPv6 unspecified address `::/128`: on Linux, connecting to `::` reaches the local host;
-  - the NAT64 prefixes `64:ff9b::/96` and `64:ff9b:1::/48`, which a translator maps onto IPv4 addresses, private ones included;
+  - `::/96`: the IPv6 unspecified address `::` (on Linux, connecting to it reaches the local host), the loopback `::1`, and the deprecated IPv4-compatible addresses `::a.b.c.d`. It stands for all three because no entry may cover another: Squid ignores a covered entry with a warning (`Ignoring ::1 because it is already covered by ::/96`), and a test keeps the list free of overlaps;
+  - the NAT64 prefixes `64:ff9b::/96` and `64:ff9b:1::/48`, which a translator maps onto IPv4 addresses, private ones included. **The trade-off:** DNS64 synthesises addresses in `64:ff9b::/96` for IPv4-only sites, so on an IPv6-only host behind DNS64, every IPv4-only site is unreachable through every zone's proxy. Today's Docker networks are IPv4, so it has no effect here; the generated file says so too;
+  - `2002::/16` (6to4: a relay reaches the IPv4 address embedded in it), `2001::/32` (Teredo, which embeds an IPv4 server and client), `100::/64` (discard-only) and `fec0::/10` (site-local, deprecated). See [the decision](#ranges-added-in-plan-01-task-5) below;
   - no `::ffff:0:0/96` entry for IPv4-mapped addresses. Squid holds every IPv4 address in its IPv4-mapped form, so the IPv4 ranges already cover `::ffff:10.0.0.1` and the rest. An `::ffff:0:0/96` entry would match **every** IPv4 address and refuse all IPv4 egress, as Squid 7.6 does when given one;
 - tunnels (`CONNECT`) only to port 443;
 - caches nothing (`cache deny all`) and logs to stdout;
+- runs no ICMP pinger (`pinger_enable off`): it needs raw sockets (`CAP_NET_RAW`), which the container drops, and it only measures network distances for cache peers;
 - strips `X-Forwarded-For` and hides its version;
 - ends with `http_access deny all`.
 
@@ -241,7 +243,16 @@ One Squid config per egress zone (spec §10, §11.4). Each zone's containers sit
 | `hermes` | `api.anthropic.com`, `files.pythonhosted.org`, `github.com` (covers `api.github.com`), `openrouter.ai`, `pypi.org`, `registry.npmjs.org`, `slack.com`. No T2 hosts (`context7.com`, `deepwiki.com`): spec §10.1 made them research-only. |
 | `research` | Open web, minus the private ranges |
 
-**Running it (Task 5).** Start Squid **as a non-root user** (e.g. compose `user: squid`) in the foreground (`squid -N -f <conf>`). The config sets `pid_filename none`, because the container supervises the process. Started as root, Squid drops privileges and then can't open `/dev/stdout` for its access log, and exits.
+**Running it.** `stack/compose.yaml` starts Squid **as a non-root user** (`user: "584792:584792"`, the Ubuntu rock's own `_daemon_`) in the foreground (`/usr/sbin/squid-gnutls -N -f /etc/squid/hapi.conf`), with this file mounted read-only at `/etc/squid/hapi.conf`, on a read-only root with no capabilities. The config sets `pid_filename none`, because the container supervises the process, so a reload is a container restart (`mise run up` restarts the proxies when `build/` changes). Started as root, Squid drops privileges and then can't open `/dev/stdout` for its access log, and exits.
+
+#### Ranges added in Plan 01 Task 5
+
+The decision (H-009): **add** `::/96`, `2002::/16`, `2001::/32`, `100::/64` and `fec0::/10` to `to_localnet`. None of them reaches a public host a zone needs. Each can carry a request to an address the IPv4 ranges refuse, or is internal or unrouted: IPv4-compatible and 6to4 addresses embed an IPv4 address, Teredo embeds two, and site-local is internal. `2001::/32` is Teredo only: the documentation prefix `2001:db8::/32` and the rest of `2001:` are outside it. The documentation ranges (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`, `2001:db8::/32`) were considered and left out. They reach nothing inside the host, and the allowlisted zones refuse every IP literal anyway. The integration tests check every new range in a real Squid. Each is refused as a literal in the research zone, where only `to_localnet` can refuse it, and as a name resolving into it. A public IPv6 address outside the ranges is not refused.
+
+**Kept out on purpose** (Task 3's evidence, so a later change doesn't undo them):
+- **`::ffff:0:0/96`** (IPv4-mapped). Squid holds every IPv4 address in that form, so this entry matched every IPv4 address and refused all IPv4 egress in Squid 7.6. The IPv4 ranges already cover the mapped forms.
+- **The `ip_literal` regex `^\[?[0-9a-f:.]+\]?$`**. It refuses real host names spelled only with hex digits and dots, such as `cafe.de` or `bad.cafe`. The two patterns in use (`^[0-9.]+$` and `:`) cover every IP literal without that.
+- **`acl ... dst -n ::/0`**, as an "any IPv6" entry. Squid parses `::/0` as `::/128`, so it would match one address, not all of IPv6.
 
 **Checked against a real Squid** (7.6, Alpine, 2026-10-26). `squid -k parse` is clean for all three files. Running each as a non-root user:
 - `archon`: tunnels to `api.anthropic.com` (also written `API.Anthropic.COM`) and `registry.npmjs.org` worked. These were refused: `github.com`, `api.github.com`, plain `http://`, port 8443, and `pypi.org` when it resolved to `10.9.9.9`.
@@ -249,7 +260,7 @@ One Squid config per egress zone (spec §10, §11.4). Each zone's containers sit
 - In **both**, with a reverse name planted so that `203.0.113.7` → `api.anthropic.com`, these were refused: `203.0.113.7`, `1.2.3.4`, `[2001:db8::1]`, `[::ffff:1.2.3.4]`, `[::ffff:203.0.113.7]`, `[::]`, `[64:ff9b::1.2.3.4]` and `2130706433`.
 - `research`: public HTTPS and HTTP worked. These were refused: `169.254.169.254`, a name resolving to `10.9.9.9`, `[::ffff:10.0.0.1]`, a name resolving to `::ffff:10.9.9.9`, `[::]` and a name resolving to `::`, `[64:ff9b::a00:1]` and a name resolving into `64:ff9b::/96`, `ftp://example.com:80/`, `https://example.com:80/`, and port 8080.
 
-Task 5's integration tests repeat these checks on the real stack.
+**On the stack, every run** (Plan 01 Task 5): `tests/stack/egress.int.test.ts` repeats these checks on the pinned image (Squid 7.7), on the real zone networks, with the names planted through the proxies' `/etc/hosts`. It also checks the PTR bypass against a control proxy with both defences removed. [What each test proves](runbooks/stack.md#what-the-tests-prove).
 
 ## `build/mcp/*.mcp.json`
 

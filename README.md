@@ -2,7 +2,7 @@
 
 hapi-factory is a public, best-practices reference stack for an end-to-end agentic software factory. **HAPi** stands for **H**ermes + **A**rchon + **Pi**: Hermes is the coordinator you talk to, Archon is the run engine and Pi is the worker. The stack puts existing tools together into one working system. It also covers the steps most factories skip: discovery research, architecture, threat modeling and breaking work into tasks. Security is designed in from the start: one policy compiled into every tool's config, rootless containers behind default-deny egress, secrets from a pluggable secret provider (sops + age by default), short-lived GitHub App tokens, and an audit that catches drift. Read the design in [docs/superpowers/specs/2026-10-26-hapi-factory-design.md](docs/superpowers/specs/2026-10-26-hapi-factory-design.md). It is the binding reference for everything here.
 
-> **Status: Plan 01 (Phase 0 foundations) is in progress.** Today the repo has the pinned toolchain, the `hapi` CLI skeleton, CI, `policy/` with its JSON Schemas, loader, tighten-only repo overlay and work-order validator, the generators that compile policy into Hermes, Archon, Pi and egress-proxy configs (`mise run policy:build`), the pinned per-zone MCP catalog with its tool-description lock, fail-closed secrets from a pluggable provider, sops + age by default (`mise run secrets:init`, `hapi secrets resolve`) with per-machine keys and a 10-word recovery key, scoped GitHub App token minting (`hapi token mint`), and the setup runbooks. Anything marked *arrives in Plan 01 Task N* is not built yet. The plan is [docs/superpowers/plans/2026-10-26-hapi-factory-01-foundations.md](docs/superpowers/plans/2026-10-26-hapi-factory-01-foundations.md).
+> **Status: Plan 01 (Phase 0 foundations) is in progress.** Today the repo has the pinned toolchain, the `hapi` CLI skeleton, CI, `policy/` with its JSON Schemas, loader, tighten-only repo overlay and work-order validator, the generators that compile policy into Hermes, Archon, Pi and egress-proxy configs (`mise run policy:build`), the pinned per-zone MCP catalog with its tool-description lock, fail-closed secrets from a pluggable provider, sops + age by default (`mise run secrets:init`, `hapi secrets resolve`) with per-machine keys and a 10-word recovery key, scoped GitHub App token minting (`hapi token mint`), the stack itself (`stack/compose.yaml`: Hermes and Archon on internal-only networks behind per-zone Squid egress proxies, started by `mise run up` as the `hapi` user, with `scripts/host-setup.sh` for the one-time host setup and integration tests that prove the egress boundary on real Docker), and the setup runbooks. Anything marked *arrives in Plan 01 Task N* is not built yet. The plan is [docs/superpowers/plans/2026-10-26-hapi-factory-01-foundations.md](docs/superpowers/plans/2026-10-26-hapi-factory-01-foundations.md).
 
 ## Contents
 
@@ -21,7 +21,7 @@ hapi-factory is a public, best-practices reference stack for an end-to-end agent
 
 - **Linux.** It is the only supported OS (spec §3).
 - **[mise](https://mise.jdx.dev/getting-started.html) 2026.10.3 or newer.** It installs every other tool at a pinned version. `mise.toml` enforces the minimum with `min_version`.
-- **Docker Engine with Compose v2.** You need it only for the stack and the integration tests (*arrives in Plan 01 Task 5*). Linting and unit tests don't need Docker. The stack runs on rootless Docker as a dedicated `hapi` user, which `scripts/host-setup.sh` creates (*arrives in Plan 01 Task 5*).
+- **Docker Engine with Compose v2.** You need it only for the stack and the integration tests. Linting and unit tests don't need Docker. The stack runs on rootless Docker as a dedicated `hapi` user, which `scripts/host-setup.sh` creates ([docs/runbooks/stack.md](docs/runbooks/stack.md)).
 - **git.**
 
 You don't need to install Bun, Node, Python, uv, gh, gitleaks, sops or age yourself. `mise install` installs them all.
@@ -50,6 +50,8 @@ mise run secrets:check       # every secret should say found
 
 Another machine or user gets its own key, never a copy: `secrets:join` there, then `secrets:add-machine` where the store already opens ([docs/secrets.md](docs/secrets.md#keys-and-recovery)).
 
+The stack runs as a dedicated `hapi` user on rootless Docker. Set the host up once with `sudo scripts/host-setup.sh`, give `hapi` its own key to the store, then `mise run up` from any account ([docs/runbooks/stack.md](docs/runbooks/stack.md)).
+
 ## Repo layout
 
 What exists now:
@@ -72,13 +74,17 @@ What exists now:
 | `src/forge/` | Every forge call goes through here (spec §16). `github/app-token.ts`: `appJwt`, `findInstallationId`, `mintInstallationToken` (one repo, checked scope, a broader token revoked) and `hapi token mint` |
 | `src/generate/` | The config generators and `hapi policy build`: one pure emitter per tool (`hermes.ts`, `archon.ts`, `pi.ts`, `egress.ts`, and `mcp.ts` for the MCP servers) and `buildAll` (`index.ts`). See [docs/generated-configs.md](docs/generated-configs.md). |
 | `build/` | Generated by `mise run policy:build`, and gitignored: `hermes/config.yaml`, `archon/config.yaml` and `archon.env`, `pi/models.json` and `hapi-guard.json`, `egress/{hermes,archon,research}.squid.conf`, `mcp/{hermes,research}.mcp.json`. Never edit it by hand. |
-| `tests/` | Unit tests for `bun test`. `tests/fixtures/` holds example work orders, overlays, a broken policy directory, and `command-vectors.json`, the command-allowlist cases that Plan 04's Python hook must also pass. `tests/docs/` checks the GitHub ruleset JSON in this README and the GitHub Apps runbook. |
+| `stack/compose.yaml` | The stack: `hermes`, `archon` and one Squid egress proxy per zone (`egress-hermes`, `egress-archon`, `egress-research`), on internal-only zone networks whose one way out is the zone's proxy. Every service hardened (no capabilities, non-root, read-only, limits, no published ports), every image pinned by digest. See [docs/runbooks/stack.md](docs/runbooks/stack.md). |
+| `stack/hermes/Dockerfile`, `stack/archon/Dockerfile` | The Hermes (v0.22.5) and Archon (0.12.1, with Pi 1.3.0 and baked Node, uv and Python toolchains) images, each `FROM` pinned by digest |
+| `scripts/host-setup.sh` | The one-time host setup, run by the host admin with `sudo`: the `hapi` user, rootless Docker with lingering, a pinned mise and hapi's own checkout. Idempotent. |
+| `src/stack/` | `hapi stack up` and `hapi stack down` (`up.ts`): the re-exec as `hapi`, the dev bypass (`currentUserOverride`), the policy build, secrets and Compose steps, and the zone-network check; `cidr.ts`, the CIDR maths it shares with the egress tests |
+| `tests/` | Unit tests for `bun test`. `tests/fixtures/` holds example work orders, overlays, a broken policy directory, and `command-vectors.json`, the command-allowlist cases that Plan 04's Python hook must also pass. `tests/docs/` checks the GitHub ruleset JSON in this README and the GitHub Apps runbook. Integration tests are `*.int.test.ts` (`tests/stack/` for the stack's egress boundary on real Docker and Squid), run by `mise run test:int`. |
 | `.github/workflows/ci.yml` | [CI](#ci) for this repo. |
 | `docs/policy.md` | The policy files (the MCP catalog and its lock included), the command-allowlist semantics, the overlay rule, the work-order format and the `hapi mcp` commands |
 | `docs/generated-configs.md` | Every file under `build/`: what it is, which policy files feed it, what each hardening setting does and why, and how to regenerate it |
 | `docs/mcp.md` | The MCP layer: which zone gets which server, how to add or upgrade one, the release cooldown, advisory floors, the tool-description lock and the CI scanners |
 | `docs/secrets.md` | Secrets: manifest, config and store; the zones and their keys; sops + age onboarding; keys and recovery (per-machine keys, the 10 recovery words, post-quantum keys and the lifecycle commands); `hapi secrets init`, `edit`, `check` and `resolve`; the env files; rotation; optional bws; the env-file downgrade; `hapi token mint`; threat notes |
-| `docs/runbooks/` | Manual setup runbooks: [GitHub Apps and rulesets](docs/runbooks/github-apps.md), [provider keys and spend caps](docs/runbooks/provider-keys.md), [Slack](docs/runbooks/slack.md) |
+| `docs/runbooks/` | Runbooks: [the stack](docs/runbooks/stack.md) (host setup, the `hapi` user's secrets, `up`/`down`, the kill switches, troubleshooting, what each test proves), [GitHub Apps and rulesets](docs/runbooks/github-apps.md), [provider keys and spend caps](docs/runbooks/provider-keys.md), [Slack](docs/runbooks/slack.md) |
 | `docs/superpowers/specs/` | The design spec. It is the binding authority. |
 | `docs/superpowers/plans/` | Implementation plans. Plan 01 is the current one. |
 | `reports/`, `research_notes/` | The evidence the design rests on: the recon report and the research notes. |
@@ -88,8 +94,6 @@ Still to come in Plan 01:
 | Path | What it will be | Arrives in |
 |---|---|---|
 | `docs/runbooks/` | The kill-switch runbook | Task 7 |
-| `scripts/host-setup.sh`, `stack/compose.yaml` and the Dockerfiles, `src/stack/` | The one-time host setup (the `hapi` user and rootless Docker), the Compose stack and Squid egress | Task 5 |
-| `tests/stack/` | Integration tests (`*.int.test.ts`), run by `mise run test:int` | Task 5 |
 | `src/audit/` | `hapi audit`, the drift and settings checks | Task 6 |
 | `docs/security/threat-model.md` | Threat model v0 | Task 7 |
 | `docs/spikes/` | Results of the verify-early spikes. `spikes/scratch/` holds throwaway spike work and is gitignored. | Tasks 8–14 |
@@ -103,7 +107,7 @@ Run `mise tasks` to list them with descriptions. Run any of them with `mise run 
 | `setup` | `bun install --frozen-lockfile`: installs the JS dependencies exactly as `bun.lock` records them. It fails if `package.json` and `bun.lock` disagree. | Works |
 | `lint` | Runs `setup`, then type-checks the whole project with `bunx tsc --noEmit` (strict). | Works |
 | `test` | `bun test`: the unit suite. It needs no Docker, network or secrets. Integration tests are skipped unless `HAPI_INT` is set. | Works |
-| `test:int` | `bun test tests/stack` with `HAPI_INT=1`: the integration tests. They need Docker. | The task exists. Its tests arrive in Plan 01 Task 5, and until then it fails with "did not match any test files". |
+| `test:int` | `bun test .int.test.ts` with `HAPI_INT=1`: every integration test. The stack's egress boundary on real Docker and Squid, in a throwaway Compose project it removes afterwards; the real sops + age lifecycle; `policy:build`'s flags through mise. They need Docker, and the internet for the tests named so (skipped with a warning offline). See [docs/runbooks/stack.md](docs/runbooks/stack.md#what-the-tests-prove). | Works |
 | `hapi` | `bun run src/cli.ts`: runs the [`hapi` CLI](#the-hapi-cli). Put `--` before the CLI's arguments: `mise run hapi -- --help`. | Works |
 | `secrets:init` | `hapi secrets init`: sets up the default sops + age store: this machine's key, a recovery key wrapped with 10 words it shows once and checks you kept, an encrypted file of every name in `stack/secrets.yaml` (all empty), its recipients file, `recovery.age` and the config. It never overwrites anything. Flags after `--`, e.g. `mise run secrets:init -- --file private/secrets.enc.yaml`. See [docs/secrets.md](docs/secrets.md#hapi-secrets-init). | Works |
 | `secrets:edit` | `hapi secrets edit`: opens your sops store in `$EDITOR` (`sops edit`), with the plaintext temp file on your tmpfs. | Works |
@@ -113,8 +117,8 @@ Run `mise tasks` to list them with descriptions. Run any of them with `mise run 
 | `secrets:recover`, `secrets:revoke`, `secrets:new-recovery` | Give a box its own key with the 10 words; remove a recipient; replace lost or exposed words. Each recipient change makes a new data key. See [docs/secrets.md](docs/secrets.md#keys-and-recovery). | Works |
 | `policy:build` | `hapi policy build`: compiles `policy/` into the Hermes, Archon, Pi, egress and MCP configs under `build/`. Pass CLI flags after `--`, e.g. `mise run policy:build -- --roster budget`. See [docs/generated-configs.md](docs/generated-configs.md). | Works |
 | `audit` | Checks deployed config, pins and settings against policy, and exits non-zero on drift. | Stub. Arrives in Plan 01 Task 6. |
-| `up` | Builds policy, resolves secrets, then starts the stack. | Stub. Arrives in Plan 01 Task 5. |
-| `down` | Stops the stack. It is also a kill switch. | Stub. Arrives in Plan 01 Task 5. |
+| `up` | `hapi stack up`: as the `hapi` user (it re-execs with `sudo -iu hapi`), builds policy, resolves secrets, then starts the stack and waits until every service is healthy. Nothing starts if a step before Compose fails. Flags after `--`, e.g. `mise run up -- --roster budget`. See [docs/runbooks/stack.md](docs/runbooks/stack.md#4-mise-run-up-and-mise-run-down). | Works |
+| `down` | `hapi stack down`: stops the stack and removes its containers and networks, keeping its volumes. It is kill switch 3. | Works |
 
 The stubs print which task implements them and **exit 1**. That is on purpose: a stub can never pass as a real check. This matters most for `audit`.
 
@@ -145,8 +149,8 @@ You can run it two ways:
 | `--help`, `-h` | Prints usage and the registered commands | Works |
 | `workorder validate <path>` | Validates a work order (`order.yaml`) against `policy/schemas/work-order.schema.json`. Valid: prints its `id` and exits 0. Invalid: prints one `path: message` line per problem to stderr (e.g. `/trace/traceparent: must match pattern ...`) and exits 1. See [docs/policy.md](docs/policy.md#work-orders). | Works |
 | `policy build [--policy dir] [--out dir] [--roster name]` | Loads and checks `--policy` (default `policy`), writes the generated configs under `--out` (default `build`) and prints each path. `--roster` (`budget`, `anthropic` or `portable`; default `anthropic`) picks Archon's tiers and Pi's models; Hermes always uses `anthropic`. A usage error exits 2; a bad policy file exits 1 and names the file. See [docs/generated-configs.md](docs/generated-configs.md). | Works |
-| `mcp verify [--policy dir] [--lock file]` | Checks every MCP server's live tool surface against `policy/mcp.lock.json`. Prints `ok`, `changed` or `unpinned` per server, and `orphaned` for a lock entry whose server left the catalog, and exits 1 unless all are `ok`. Until the live fetch is wired it exits 1. See [docs/policy.md](docs/policy.md#hapi-mcp-verify-and-hapi-mcp-pin). | The command works now; the live fetch arrives in Plan 01 Task 5 |
-| `mcp pin --server name [--policy dir] [--lock file]` | Records one MCP server's live tool surface and its hash in `policy/mcp.lock.json`. A re-pin is a reviewed change ([docs/mcp.md](docs/mcp.md#adding-or-upgrading-a-server)). | The command works now; the live fetch arrives in Plan 01 Task 5 |
+| `mcp verify [--policy dir] [--lock file]` | Checks every MCP server's live tool surface against `policy/mcp.lock.json`. Prints `ok`, `changed` or `unpinned` per server, and `orphaned` for a lock entry whose server left the catalog, and exits 1 unless all are `ok`. Until the live fetch is wired it exits 1. See [docs/policy.md](docs/policy.md#hapi-mcp-verify-and-hapi-mcp-pin). | The command works now; the live fetch arrives in Plan 04 |
+| `mcp pin --server name [--policy dir] [--lock file]` | Records one MCP server's live tool surface and its hash in `policy/mcp.lock.json`. A re-pin is a reviewed change ([docs/mcp.md](docs/mcp.md#adding-or-upgrading-a-server)). | The command works now; the live fetch arrives in Plan 04 |
 | `secrets init [--config file] [--file file] [--age-key file] [--name name] [--classic] [--no-confirm]` | Sets up the default sops + age store: reuses or makes this machine's post-quantum age key (outside the checkout, `0600`), makes a recovery key and 10 words, shows the words once on the terminal and asks for 2 of them back, then encrypts every manifest name with an empty value to both keys by piping it to `sops encrypt` (plaintext never touches disk), and writes the store, `recovery.age`, the recipients file and the config, each no-replace. It never overwrites anything, and an abort writes nothing. See [docs/secrets.md](docs/secrets.md#hapi-secrets-init). | Works |
 | `secrets join --store file [--name name] [--config file] [--age-key file]` | On a new machine or user: makes its own key and config for a copy of the store, without touching the store, and prints the `add-machine` command to run where the store already opens. See [docs/secrets.md](docs/secrets.md#hapi-secrets-join). | Works |
 | `secrets add-machine --name name --recipient age1... [--config file]` | Adds a machine's public key (`sops rotate -i --add-age`, a new data key) and its recipients-file entry. Refuses a duplicate, a malformed key or a post-quantum/classic mix. See [docs/secrets.md](docs/secrets.md#hapi-secrets-add-machine). | Works |
@@ -158,6 +162,8 @@ You can run it two ways:
 | `secrets check [--config file]` | Reads the configured store and prints `found`, `missing`, `empty` or `invalid` for every env var of `stack/secrets.yaml`, `missing` for an MCP reference it doesn't map, and `unknown` for store names it doesn't list; for sops, also the store's recipients. Never a value; writes nothing; exits 1 if anything is missing, empty or invalid, or the recipients file disagrees with the store, mixes post-quantum and classic keys, or records another `recovery.age` than the one beside the store. It warns when there is no recovery recipient or `recovery.age`. See [docs/secrets.md](docs/secrets.md#hapi-secrets-check). | Works |
 | `secrets resolve [--config file] [--dry-run]` | Resolves `stack/secrets.yaml` from the configured provider (the config at `--config`, `$HAPI_SECRETS_CONFIG` or `~/.config/hapi/secrets.yaml`), all into memory first, then writes `$XDG_RUNTIME_DIR/hapi/env/<zone>.env` (mode `0600`) as one set, by symlink swap, and prints each path. A provider failure, or any missing or empty secret, fails, naming it, and nothing is written; there is no fallback to another provider. It fails if `XDG_RUNTIME_DIR` is unset or isn't yours and `0700` (no `/tmp` fallback). `--dry-run` is `secrets check`. See [docs/secrets.md](docs/secrets.md#hapi-secrets-resolve). | Works |
 | `token mint --app planner\|factory --repo owner/name` | Mints a 1-hour GitHub App installation token for that one repo, with the App's fixed permissions. It reads the App's id and key from `$XDG_RUNTIME_DIR/hapi/env/host.env`, rejects (and revokes) a token broader than requested or without a valid expiry, deletes token files more than an hour old, and writes the token to `$XDG_RUNTIME_DIR/hapi/tokens/<app>.<owner>.<repo>.token` (mode `0600`). It prints the path and expiry, never the token. See [docs/secrets.md](docs/secrets.md#hapi-token-mint). | Works |
+| `stack up [--roster name] [--config file]` | Starts the stack ([docs/runbooks/stack.md](docs/runbooks/stack.md#4-mise-run-up-and-mise-run-down)). As any user but `hapi` it re-execs `mise run up` as `hapi` with `sudo -iu hapi`, in hapi's checkout; `HAPI_ALLOW_CURRENT_USER=1` skips that, a dev-only downgrade it warns about and labels. Then `hapi policy build`, `hapi secrets resolve`, `docker compose up --no-start --build`, a check that every zone network is internal and private, and `docker compose up -d --wait`. Any failure before Compose starts nothing, and is printed with exit 1. | Works |
+| `stack down` | `docker compose -p hapi down`: removes the stack's containers and networks, keeping its volumes. It needs no compose file or `XDG_RUNTIME_DIR`, and re-execs as `hapi` like `up`. | Works |
 | `audit [--repo owner/name ...]` | Runs the audit checks, and exits 1 if any check fails | Plan 01 Task 6 |
 
 **Adding a command (for contributors).** Write the handler in its own module, as `policyBuild` is in `src/generate/index.ts`. Then register it in the *Commands* section at the bottom of `src/cli.ts`:
@@ -229,7 +235,7 @@ Plan 05 builds the template and `mise run new-repo`. This section will become th
 
 ## Manual setup steps (the operator)
 
-These steps are outward-facing or privileged, so agents never do them; the operator does them by hand. Later tasks add their own steps here (`sudo scripts/host-setup.sh` in Task 5).
+These steps are outward-facing or privileged, so agents never do them; the operator does them by hand. Later tasks add their own steps here.
 
 ### Plan 01 Task 1: the GitHub remote and the `main` rulesets
 
@@ -304,7 +310,7 @@ These steps are outward-facing or privileged, so agents never do them; the opera
 
    These commands follow GitHub's REST docs, but nobody has run them yet. If GitHub rejects a field, set up the same two rulesets in the UI. Keep the rules split the same way: never put the `ci` check in a ruleset that has a bypass actor, and never put Restrict updates in one that has none. `tests/docs/rulesets.test.ts` holds this JSON to those rules.
 
-4. **Task 5 needs this remote.** Task 5's `scripts/host-setup.sh` clones hapi-factory from `github.com/j4th/hapi-factory` into `/home/hapi/hapi-factory`.
+4. **Task 5's host setup clones from this remote** once it exists: `scripts/host-setup.sh` defaults to your checkout's `origin`. Until then, give it your checkout's path ([Plan 01 Task 5](#plan-01-task-5-the-host-and-the-stack-stage-b)).
 
 ### Plan 01 Task 3b: MCP server keys
 
@@ -327,6 +333,15 @@ Do these in order. Each runbook gives the logical name each secret goes under in
 4. **GitHub Apps and rulesets:** `hapi-planner` and `hapi-factory` with exactly their permissions, their keys in your store, and the rulesets: Restrict updates on `main-review`, so that no App can merge, and code-owner review ([GitHub Apps](docs/runbooks/github-apps.md)). The rulesets need the repo to be public. Then check that an App's merge call is refused.
 5. **Check:** `mise run secrets:check`. Expected until Task 13: every secret `found` except the three Slack values (`hapi-hermes-slack-bot-token`, `hapi-hermes-slack-app-token`, `hapi-hermes-slack-allowed-users`), which stay `empty`, so it exits 1 naming just those three; the recipients listed (this machine and `recovery`), and no value printed. Once the Slack values are in (Task 13), every line says `found` and it exits 0.
 
+### Plan 01 Task 5: the host and the stack (stage b)
+
+Task 5 wrote the stack and proved its egress boundary on the build host's own Docker, with fake secrets (stage a). What remains is the real host, as the operator, following [docs/runbooks/stack.md](docs/runbooks/stack.md):
+
+1. **Host setup, once:** `sudo scripts/host-setup.sh "$PWD"` from your checkout (or with no argument once the GitHub remote exists). It creates the `hapi` user, rootless Docker with lingering, a pinned mise and hapi's checkout, then prints the next steps. Check: `sudo -iu hapi docker info --format '{{.SecurityOptions}}'` contains `rootless`.
+2. **hapi's toolchain:** as `hapi`, `export XDG_RUNTIME_DIR=/run/user/$(id -u)`, then `cd ~/hapi-factory && mise trust && mise install && mise run setup`.
+3. **hapi's secrets:** copy your store, its recipients file and `recovery.age` into `/home/hapi/.config/hapi/` with `sudo install -o hapi -g hapi -m 0600`; as `hapi`, `mise run secrets:join -- --store ~/.config/hapi/secrets.enc.yaml --name hapi`; run the `add-machine` command it prints in your checkout; copy the three files again; as `hapi`, `mise run secrets:check`.
+4. **Start and test:** `mise run up`, then as `hapi`, `mise run test:int`, and `docker compose -p hapi ps` shows all five services healthy. Until the Slack values exist (Task 13), `up` stops at the secrets step ([the open item](docs/runbooks/stack.md#open-items)).
+
 ## Documentation map
 
 | Document | What's in it |
@@ -335,6 +350,7 @@ Do these in order. Each runbook gives the logical name each secret goes under in
 | [Policy](docs/policy.md) | Each policy file and its schema (the MCP catalog `mcp.yaml` and its lockfile included), how Hermes's command rules match (and what the Plan 04 hook must do first), the tighten-only overlay rule with examples, the work-order format, `hapi workorder validate`, and `hapi mcp verify` and `hapi mcp pin` |
 | [Generated configs](docs/generated-configs.md) | Each file `hapi policy build` writes under `build/`, its policy sources, every hardening setting and why, how protected paths stay strictest-wins, and how to regenerate |
 | [Secrets](docs/secrets.md) | Manifest, config and store; the zones and their keys; sops + age onboarding and adding a secret; keys and recovery: per-machine keys, the 10 recovery words, post-quantum keys, `join`, `add-machine`, `recover`, `drill`, `revoke` and `new-recovery`, with a worked example; `hapi secrets init`, `edit`, `check` and `resolve` and the env files; rotating a secret or replacing a machine's key; optional bws; the env-file downgrade; `hapi token mint`; the "keys, never values" rule; threat notes |
+| [Runbook: the stack](docs/runbooks/stack.md) | What runs where, host setup (`scripts/host-setup.sh`), the `hapi` user's toolchain and secrets (join, add-machine, re-syncing), `mise run up` and `down`, the dev bypass, the kill switches, the pinned images and their digests, the hardening and its exceptions, troubleshooting, and what each test proves |
 | [Runbook: GitHub Apps](docs/runbooks/github-apps.md) | Creating `hapi-planner` and `hapi-factory` with exact permissions, the rulesets (both on `main`, Restrict updates so no App can merge, code owners, branch and tag scope), checks (including that an App's merge call is refused), suspending an installation, rotating a key |
 | [Runbook: provider keys](docs/runbooks/provider-keys.md) | The Console workspaces and their limits, OpenCode Go settings, the OpenRouter keys (daily-reset limits, ZDR guardrails, the Jev exception if it has no ZDR endpoint), the Brave, Exa and Context7 search keys, and where each goes |
 | [Runbook: Slack](docs/runbooks/slack.md) | The workspace and channels, creating the app from Hermes's manifest, the three Slack secrets, Hermes's Slack settings |

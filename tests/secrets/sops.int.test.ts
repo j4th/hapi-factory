@@ -17,8 +17,16 @@
  * scanned: no recovery identity is in any file, each machine identity is only
  * in its own key file, and no passphrase is in any file, argv or env (a
  * recovery identity is in a sops child's env only as SOPS_AGE_KEY).
+ *
+ * Also checked on the real binaries: every sops rotate (add-machine, revoke,
+ * recover) leaves the store at mode 0600; decoy gpg-agent sockets in each
+ * machine's HOME and XDG_RUNTIME_DIR are never dialled; and the two sops
+ * 3.13.3 behaviours hapi relies on (it reads its own default key file as well
+ * as SOPS_AGE_KEY_FILE, which `checkSopsKeys` checks for that reason, and it
+ * leaves "" unencrypted, which `sopsFileProblem` allows).
  */
 import { afterEach, describe, expect, test } from "bun:test";
+import type { UnixSocketListener } from "bun";
 import { chmodSync, cpSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { parse, stringify } from "yaml";
@@ -27,7 +35,7 @@ import { parseEnvFile } from "../../src/secrets/files";
 import { recoveryDigest } from "../../src/secrets/recipients";
 import { passphraseOf, unwrapIdentity } from "../../src/secrets/recovery";
 import { ageEnv, commandRunner, pinnedAgeDir, runSops, type SopsRunner } from "../../src/secrets/providers/sops";
-import { capture, cleanup, fakeTty, fullStore, tempDir, tree } from "./helpers";
+import { capture, cleanup, fakeTty, fullStore, mode, tempDir, tree } from "./helpers";
 
 afterEach(cleanup);
 
@@ -56,12 +64,21 @@ describe.skipIf(!process.env.HAPI_INT)("sops + age key lifecycle (real binaries,
       const realKeygen = commandRunner(join(ageDir, "age-keygen"));
       const tools = { sops: recorded("sops", runSops), age: recorded("age", realAge), ageKeygen: recorded("age-keygen", realKeygen) };
 
+      // A decoy gpg-agent in each machine's HOME and XDG_RUNTIME_DIR, where a gpg client would look: never dialled.
+      const decoys: UnixSocketListener<undefined>[] = [];
+      let dialled = 0;
+      const decoy = (path: string) => {
+        mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+        decoys.push(Bun.listen({ unix: path, socket: { open: () => void dialled++, data: () => {} } }));
+      };
       const host = (name: string, typed: string[] = []) => {
         const home = join(root, name, "home");
         const xdg = join(root, name, "run");
         mkdirSync(home, { recursive: true, mode: 0o700 });
         mkdirSync(xdg, { recursive: true, mode: 0o700 });
         chmodSync(xdg, 0o700);
+        decoy(join(home, ".gnupg", "S.gpg-agent"));
+        decoy(join(xdg, "gnupg", "S.gpg-agent"));
         const t = fakeTty({ typed });
         const env = { HOME: home, XDG_RUNTIME_DIR: xdg, PATH: [sopsDir, "/usr/bin", "/bin"].join(":") };
         return {
@@ -120,6 +137,8 @@ describe.skipIf(!process.env.HAPI_INT)("sops + age key lifecycle (real binaries,
       const rB = /^this machine's public key \(machine-b\): (age1pq1[0-9a-z]+)$/m.exec(out.join("\n"))![1]!;
       expect(out.join("\n")).toContain(`mise run secrets:add-machine -- --name machine-b --recipient ${rB}`);
       expect(await secretsAddMachine(["--name", "machine-b", "--recipient", rB], a.deps)).toBe(0);
+      // sops rotate -i ran on a copy beside the store, renamed over it: the store keeps mode 0600.
+      expect(mode(a.store)).toBe(0o600);
 
       // b resolves with its own key.
       copyPrivate(a, b);
@@ -131,6 +150,7 @@ describe.skipIf(!process.env.HAPI_INT)("sops + age key lifecycle (real binaries,
 
       // b revokes a: a's key no longer opens the store.
       expect(await secretsRevoke(["--name", "machine-a"], b.deps)).toBe(0);
+      expect(mode(b.store)).toBe(0o600);
       expect(recipients(b).map((r) => r.name)).toEqual(["recovery", "machine-b"]);
       copyPrivate(b, a);
       await expect(secretsCheck([], a.deps)).rejects.toThrow(/^sops could not decrypt .*secrets\.enc\.yaml \(exit 128\): Failed to get the data key required to decrypt the SOPS file\.$/);
@@ -139,6 +159,7 @@ describe.skipIf(!process.env.HAPI_INT)("sops + age key lifecycle (real binaries,
       const c = host("machine-c", [words.join(" ")]);
       copyPrivate(b, c);
       expect(await secretsRecover(["--store", c.store], c.deps)).toBe(0);
+      expect(mode(c.store)).toBe(0o600);
       expect(recipients(c).map((r) => r.name)).toEqual(["recovery", "machine-b", "machine-c"]);
       expect(await secretsCheck([], { ...c.deps, tty: null })).toBe(0);
 
@@ -156,6 +177,10 @@ describe.skipIf(!process.env.HAPI_INT)("sops + age key lifecycle (real binaries,
         expect(readdirSync(join(h.xdg, "hapi", "locks"))).toEqual([]);
         expect(readdirSync(dirname(h.store)).filter((f) => f.includes("lock") || f.endsWith(".tmp"))).toEqual([]);
       }
+
+      // No sops child, nor anything else, dialled a decoy gpg-agent.
+      for (const d of decoys) d.stop(true);
+      expect(dialled).toBe(0);
 
       // Nothing printed a value, a word or a key.
       const printed = [...out, ...err].join("\n");
@@ -181,7 +206,7 @@ describe.skipIf(!process.env.HAPI_INT)("sops + age key lifecycle (real binaries,
 
       // Every file under the temp root (each HOME, XDG_RUNTIME_DIR and private/); the env symlink's target is scanned as itself.
       const files = tree(root)
-        .filter((f) => !lstatSync(join(root, f)).isSymbolicLink())
+        .filter((f) => !lstatSync(join(root, f)).isSymbolicLink() && !lstatSync(join(root, f)).isSocket())
         .map((f) => [join(root, f), readFileSync(join(root, f), "utf8")] as const);
       expect(files.length).toBeGreaterThan(10);
       for (const [path, text] of files) {
@@ -208,4 +233,44 @@ describe.skipIf(!process.env.HAPI_INT)("sops + age key lifecycle (real binaries,
     },
     120_000,
   );
+
+  test("sops 3.13.3 reads its default age key file as well as SOPS_AGE_KEY_FILE, and leaves \"\" unencrypted", async () => {
+    const root = tempDir("hapi-sops-behaviour-int-");
+    const sops = join(pinnedDir("sops"), "sops");
+    const ageDir = await pinnedAgeDir();
+    const keygen = async (file: string) => {
+      const r = Bun.spawnSync([join(ageDir, "age-keygen"), "-o", file], { stderr: "pipe" });
+      expect(r.exitCode).toBe(0);
+      return /age1[0-9a-z]+/.exec(readFileSync(file, "utf8"))![0];
+    };
+    const home = join(root, "home");
+    const defaultKey = join(home, ".config", "sops", "age", "keys.txt");
+    mkdirSync(dirname(defaultKey), { recursive: true, mode: 0o700 });
+    const recipient = await keygen(defaultKey);
+    const other = join(root, "other.txt");
+    await keygen(other);
+    const env = (extra: Record<string, string>) => ({ PATH: `${ageDir}:/usr/bin:/bin`, HOME: home, SOPS_DISABLE_VERSION_CHECK: "1", GPG_AGENT_INFO: "", ...extra });
+    const store = join(root, "store.yaml");
+    const real = commandRunner(sops);
+    const enc = await real(["--config", "/dev/null", "encrypt", "--age", recipient, "--input-type", "yaml", "--output-type", "yaml", "--filename-override", store], {
+      env: env({}),
+      stdin: stringify({ "hapi-empty": "", "hapi-full": "fake-value" }),
+    });
+    expect(enc.code).toBe(0);
+    // "" stays "": sops encrypts no empty string, so sopsFileProblem must allow it.
+    const doc = parse(enc.stdout) as Record<string, unknown>;
+    expect(doc["hapi-empty"]).toBe("");
+    expect(String(doc["hapi-full"])).toStartWith("ENC[AES256_GCM,");
+    writeFileSync(store, enc.stdout, { mode: 0o600 });
+
+    // SOPS_AGE_KEY_FILE names a key that can't open the store, yet it decrypts: sops also read
+    // $HOME/.config/sops/age/keys.txt, which is why checkSopsKeys checks that file too.
+    const both = await real(["--config", "/dev/null", "decrypt", "--output-type", "json", store], { env: env({ SOPS_AGE_KEY_FILE: other }) });
+    expect(both.code).toBe(0);
+    expect(JSON.parse(both.stdout)).toEqual({ "hapi-empty": "", "hapi-full": "fake-value" });
+    // The control: without the default file, the same call fails.
+    rmSync(defaultKey);
+    const only = await real(["--config", "/dev/null", "decrypt", "--output-type", "json", store], { env: env({ SOPS_AGE_KEY_FILE: other }) });
+    expect(only.code).not.toBe(0);
+  }, 60_000);
 });
