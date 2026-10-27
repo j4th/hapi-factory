@@ -38,12 +38,14 @@ This is Plan 01 of 07. Each later plan is written after the plans before it fini
 | **01 Foundations** (this) | Toolchain, policy plus schemas (including work order), generators, secrets, App tokens, stack, egress, audit, threat model v0, spikes | `hapi` CLI; `loadPolicy`, `applyOverlay`, `validateWorkOrder`; `buildAll`; `mintInstallationToken`; `resolveSecrets`; `runAudit`; the running stack; `docs/spikes/*` |
 | 02 Worker | `decide()` with the vendored ten-levels Jev client, mock and decision files; the `hapi decide` CLI; the `hapi-guard` Pi extension (protected paths, budgets, request clamps, trace, Jev level-6 gates) | `decide(name, state)`; the hapi-guard package baked into the Archon image |
 | 03 Run engine | Archon `factory-task` workflow pack (prepare / strip / scout / implement / retry / gates / review / commit); the forge interface; poller (merge + `hapi:rework`); mirror; harvester; `metrics.json`; commit trailers | The end-to-end run from a merged work order to a delivery PR |
-| 04 Coordinator | Hermes plugins `hapi-path-guard` and `hapi-cmd-allow`; skills `hapi-planning`, `new-work-order` and `hapi-research-note` (with citation check); the `hapi-research` profile and **its own container** (native Brave and Exa web backends, Context7 MCP from the Task 3b catalog); freshness job; the `hapi-status` tool; Slack gateway; PR-comment queue plus the injection screen | Planning PRs from a Slack conversation |
+| 04 Coordinator | Hermes plugins `hapi-path-guard` and `hapi-cmd-allow`; skills `hapi-planning`, `new-work-order` and `hapi-research-note` (with citation check); the `hapi-research` profile and **its own container** (native Brave and Exa web backends, Context7 MCP from the Task 3b catalog); freshness job; the `hapi-status` tool; Slack gateway; PR-comment queue plus the injection screen; the three skill tiers and `hapi skill fork|diff|promote|drop` (handoffs H-104–H-109) | Planning PRs from a Slack conversation |
 | 05 Repo contract | `templates/repo-contract/`, `mise run new-repo`, the reusable CI workflow (gates, schema, trailers, protected-path diff), `.coderabbit.yaml`, ruleset application | New repos born compliant |
 | 06 Evals & metrics | Eval case format and runner, planning eval, `metrics.jsonl`, flags and thresholds, Jev/CodeRabbit calibration records | `mise run eval` |
 | 07 v1 acceptance | The Odoo MCP run-through against the spec's v1 definition of done (§15), plus the budget, portable and jev-off runs | v1 done |
 
 Phases 2–5 (mtg brownfield; showcase depth plus VM; more lanes; GitLab) get their own plans after v1.
+
+**Deferred work** lives in [handoffs.md](handoffs.md): every fix, handoff, accepted residual risk, unverified claim and manual step a task pushes to a later task, plan or person, numbered `H-NNN` and grouped by destination. Each task and plan starts by pulling its section into its own steps. Where a section there differs from a task's steps below, the handoff wins.
 
 ## Global Constraints
 
@@ -86,6 +88,9 @@ Phases 2–5 (mtg brownfield; showcase depth plus VM; more lanes; GitLab) get th
 - Secrets come from the configured provider (sops + age by default; Task 4b) at start, into `0600` files under `$XDG_RUNTIME_DIR/hapi/env/`. The repo holds logical names only. Never values in the repo, never in a repo `.env`.
 - All forge calls go through `src/forge/` modules. No raw `gh` in scripts, skills or workflows.
 - Agents never create repos or merge. GitHub App tokens are 1-hour installation tokens minted outside the agents.
+- Agents never do outward-facing or privileged actions: sudo, creating users, repos or Apps, pushing, publishing, or handling real secrets. Each one is written up as an operator step (README "Manual setup steps", a runbook, and the manual-checkpoint section of [handoffs.md](handoffs.md)).
+- Every task documents the user-facing surface it adds (commands, config files, generated files, manual steps) in README.md or the relevant `docs/` page, and its reviewer checks that the docs match the code.
+- Every deferral lands in [handoffs.md](handoffs.md) in the same commit that defers it. The SDD ledger under `.superpowers/` is scratch: it is gitignored and deleted when the plan finishes.
 - Models:
   - `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5` (Anthropic);
   - portable: OpenCode Go zero-retention models only.
@@ -783,6 +788,8 @@ test("writeSecretFiles removes Task 4-era zone files and orphaned generations", 
 
 ### Task 5: Host setup and the stack (rootless Docker, internal networks, Squid egress, Hermes, Archon)
 
+**Binding amendments:** [handoffs.md § Plan 01 Task 5](handoffs.md#plan-01-task-5) (H-003–H-022, H-134, H-135) supersedes the steps below where they differ. In short: this task is stage a (proxies, networks and integration tests on the current Docker; no real secrets); five services with `egress-research` and `research-net`; env files at `$XDG_RUNTIME_DIR/hapi/env/<zone>.env`; the `secrets:join` / `add-machine` flow for the `hapi` user.
+
 **Files:**
 - Create:
   - `scripts/host-setup.sh`
@@ -833,6 +840,8 @@ test("archon listens on loopback only", () => { /* from another container on arc
 ---
 
 ### Task 6: `mise run audit`
+
+**Binding amendments:** [handoffs.md § Plan 01 Task 6](handoffs.md#plan-01-task-6) (H-023–H-037) supersedes the check list below where they differ: two rulesets on `main`, `runtime.dev-override`, `mcp.tool-hashes`, the secrets-provider downgrade and recipients checks, and `docs/audit.md`.
 
 **Files:**
 - Create: `src/audit/{index,types}.ts`, `src/audit/checks/{generated,runtime,pins,github,tools}.ts`
@@ -922,7 +931,8 @@ Spike 2 of spec §19 (Pi config skew) is **resolved by design**: Archon's Pi use
 - [ ] **Step 2:** Test three surfaces:
   - (a) an interactive CLI session writing `.factory/x`: expected to prompt;
   - (b) a cron job doing the same: expected to deny;
-  - (c) an interactive `echo hi > .factory/y` via the terminal tool: record whether it's caught (#143266).
+  - (c) an interactive `echo hi > .factory/y` via the terminal tool: record whether it's caught (#143266);
+  - (d) with `skills.write_approval: true`, whether `write_file`, `patch` or the terminal tool can edit a skill file directly and so skip the approval (an open upstream issue says the generic write tools aren't covered). If they can, Plan 04's hapi-path-guard also protects the skills directories (handoffs H-064, H-093).
 - [ ] **Step 3:** Record the result in `docs/spikes/02-hermes-path-guard.md`. If (c) isn't caught, record the fallback for Plan 04: `hapi-cmd-allow` denies shell redirection into protected paths. Commit.
 
 ### Task 10: Spike: Archon budget, trigger inputs, env propagation (for Plan 03)
@@ -965,8 +975,9 @@ Spike 2 of spec §19 (Pi config skew) is **resolved by design**: Archon's Pi use
 
 ## Phase 0 done when
 
-- `sudo -iu hapi mise run up` brings up all four services healthy.
+- `sudo -iu hapi mise run up` brings up all five services healthy.
 - `mise run test` and `mise run test:int` pass.
 - `mise run audit` exits 0.
 - `docs/security/threat-model.md` exists.
 - All seven spike notes are committed, each with a decision and its consequence for the next plans.
+- [handoffs.md](handoffs.md) is current: diffed against the SDD ledger before the plan's workspace is deleted, with every open item assigned to a later task, plan or the operator.
