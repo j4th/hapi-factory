@@ -6,7 +6,7 @@
 - pinned toolchain;
 - `policy/` as the single source of truth, compiled into Hermes, Archon, Pi and egress configs;
 - Hermes and Archon running in rootless containers under a dedicated `hapi` user, behind default-deny egress;
-- secrets from Bitwarden;
+- secrets from a pluggable provider (sops + age by default);
 - GitHub App token minting;
 - `mise run audit`;
 - threat model v0.
@@ -22,7 +22,7 @@ It also runs the design's "verify early" spikes, whose results shape Plans 02–
 - `yaml`
 - Docker Engine rootless + Compose v2
 - Squid
-- Bitwarden Secrets Manager CLI (`bws`)
+- sops + age (the default secret provider; Bitwarden `bws` optional)
 - GitHub REST API
 - Hermes Agent v0.22.5 (official image)
 - Archon v0.12.1 (official image + Pi provider)
@@ -83,7 +83,7 @@ Phases 2–5 (mtg brownfield; showcase depth plus VM; more lanes; GitLab) get th
   - `AGENTS.md`, `.factory/**`, `.github/**`, `mise.toml`, `.agents/**`: `{interactive: ask, unattended: deny, workers: deny}`
   - `.pi/**`, `.archon/**`: `{interactive: deny, unattended: deny, workers: deny}`
 - Repo overlays may only **tighten** policy, except for `egress_extra` additions.
-- Secrets come from Bitwarden Secrets Manager (`bws`) at start, into `0600` files under `$XDG_RUNTIME_DIR/hapi/`. Never in the repo, never in `.env` files on disk.
+- Secrets come from the configured provider (sops + age by default; Task 4b) at start, into `0600` files under `$XDG_RUNTIME_DIR/hapi/env/`. The repo holds logical names only. Never values in the repo, never in a repo `.env`.
 - All forge calls go through `src/forge/` modules. No raw `gh` in scripts, skills or workflows.
 - Agents never create repos or merge. GitHub App tokens are 1-hour installation tokens minted outside the agents.
 - Models:
@@ -93,7 +93,7 @@ Phases 2–5 (mtg brownfield; showcase depth plus VM; more lanes; GitLab) get th
 ## Review Focus
 
 1. **Loosening overlays.** A repo's `.factory/config.yaml` that tries to loosen policy (e.g. `AGENTS.md: {interactive: allow}`, or removing a protected path) must be rejected with an error naming the path. It must never be silently merged. Test: Task 2, `applyOverlay rejects loosening`.
-2. **A missing secret.** If a secret is missing or `bws` fails at `mise run up`, nothing starts, and the error names the missing secret key. Containers never start with an empty variable. Test: Task 4, `resolveSecrets fails closed on missing secret`.
+2. **A missing secret.** If a secret is missing or the secret provider fails at `mise run up`, nothing starts, and the error names the missing secret key. Containers never start with an empty variable. Test: Task 4, `resolveSecrets fails closed on missing secret`.
 3. **The proxy is down or misconfigured.** Zone containers have no direct route out: requests fail, they don't bypass. Test: Task 5, `egress: direct connection is blocked even when proxy is stopped`.
 4. **Drift in deployed config.** A hand edit to deployed config (e.g. `approvals.mode: off`, or `HOST=0.0.0.0`) is detected by `mise run audit`, which exits non-zero. Test: Task 6, `audit detects drift from generated config`.
 5. **Upstream ignores a generated key** after an upgrade (a renamed key, an Archon parse warning). Audit checks each tool's own validation output, not only our files. Test: Task 6, `audit fails on archon parseWarnings`.
@@ -440,6 +440,186 @@ test("mintInstallationToken rejects broader permissions", async () => {
 - [ ] **Step 5: Manual (the operator).** Follow both runbooks. Confirm with `hapi secrets resolve --dry-run`, which lists every key as found without printing values. Expected: all found.
 
 - [ ] **Step 6: Commit** `git commit -am "feat: fail-closed bws secrets, scoped GitHub App token minting, setup runbooks"`
+
+---
+
+### Task 4b: Pluggable secret providers, with sops + age as the default
+
+The spec is §11.5 (as amended for 4b). the operator's call: "portable across secret managers"; "we might as well do sops and age to start; greatly simplifies onboarding and is industry standard now".
+
+**Why:** Task 4 tied the stack to Bitwarden and put per-deployment ids in a file shaped like the repo's template. This task splits secrets into three parts:
+- **The manifest:** a committed, public, provider-neutral list of logical names per zone. It holds no ids and no values.
+- **The local config:** outside the repo. It picks a provider and binds it.
+- **The store:** the provider's data.
+
+**sops + age is the default for everyone.** `bws` stays an optional provider. `env-file` is an explicit, audited downgrade. There is **no automatic fallback**: if the configured provider fails, or any name is missing or empty, nothing is written and nothing starts.
+
+**Files:**
+- Create:
+  - `stack/secrets.yaml` (the manifest; replaces `stack/secrets.map.yaml`)
+  - `policy/schemas/secrets-manifest.schema.json`, `policy/schemas/secrets-config.schema.json` (replace `secrets-map.schema.json`)
+  - `src/secrets/manifest.ts`: load and validate the manifest, plus `mcpSecretGaps`, now checked against the manifest
+  - `src/secrets/provider.ts`: the `SecretProvider` interface, `SecretError`, `loadSecretsConfig`, `providerFor`, `resolveSecrets`, `checkSecrets`
+  - `src/secrets/providers/sops.ts`, `src/secrets/providers/bws.ts` (the Task 4 bws code, moved behind the interface), `src/secrets/providers/env-file.ts`
+  - `src/secrets/init.ts`: `hapi secrets init`
+  - tests under `tests/secrets/`
+- Delete: `src/secrets/bws.ts` (split up as above), `stack/secrets.map.yaml`, `policy/schemas/secrets-map.schema.json`
+- Modify:
+  - `src/secrets/files.ts`: whole-set swap, stale-file removal, an `XDG_RUNTIME_DIR` check
+  - `src/forge/github/app-token.ts`: the new env path, and a revoke fix
+  - `src/cli.ts`
+  - `src/policy/mcp.ts`, `src/policy/types.ts`, `policy/mcp.yaml`, `policy/schemas/policy-mcp.schema.json`, `src/generate/mcp.ts` and their tests (rename the `bws:` reference prefix to `secret:`)
+  - `src/policy/schema.ts` (schema registry)
+  - `mise.toml` (controller-authorized: pin sops and age, drop `bitwarden-secrets-manager`, add tasks)
+  - `.gitignore`
+  - docs: `docs/secrets.md`, `README.md`, the runbooks (`github-apps.md`, `provider-keys.md`, `slack.md`), `docs/mcp.md`, `docs/policy.md`, `docs/generated-configs.md`
+
+**Interfaces:**
+- **Manifest** (`stack/secrets.yaml`):
+  - Shape: `{<zone>: {<ENV_NAME>: <logical-name>}}`.
+  - Zones are exactly `hermes`, `archon`, `research` and `host`.
+  - ENV_NAME matches `^[A-Z_][A-Z0-9_]*$`.
+  - A logical name matches `^hapi-[a-z0-9]+(-[a-z0-9]+)*$`. One logical name may fill several env vars (archon `ANTHROPIC_API_KEY` and `CLAUDE_API_KEY`).
+  - Carry over every Task 4 entry with its current bws key name as the logical name: `hapi-hermes-anthropic-api-key`, …, `hapi-host-factory-app-private-key`. Keep the comments that say where each one comes from.
+  - The manifest is the single list of what must exist. A store that lacks a manifest name fails `resolve`, and `check` names it. This replaces Task 4's "keep your copy in sync" step.
+- **MCP references:** `bws:<name>` becomes **`secret:<name>`** everywhere: `policy/mcp.yaml`, the schema, `src/policy/mcp.ts`, the emitters, tests and docs. `secretEnvName` is unchanged. `mcpSecretGaps(p, manifest)` checks that the manifest fills every `secret:` reference of the servers each zone loads.
+- **Local config:**
+  - Path: `--config <path>`, else `$HAPI_SECRETS_CONFIG`, else `${XDG_CONFIG_HOME:-$HOME/.config}/hapi/secrets.yaml`. A missing config fails with "no secrets config at <path>: run `mise run secrets:init`".
+  - Schema-validated:
+    ```yaml
+    provider: sops            # sops | bws | env-file
+    sops:     { file: <path to secrets.enc.yaml>, age_key_file: <path, optional> }
+    bws:      { ids: { <logical-name>: <uuid> } }
+    env_file: { file: <path> }
+    ```
+  - Exactly the selected provider's block is required. A `~` at the start of a path expands to `$HOME`. Relative paths resolve against the config file's directory.
+- **`interface SecretProvider { readonly name: "sops"|"bws"|"env-file"; readonly downgrade: boolean; fetch(names: string[]): Promise<Map<string, string>> }`:**
+  - Every name asked for is returned, or `fetch` throws `SecretError`.
+  - Errors name logical names, files and exit codes, never values. Unknown store entries are ignored by `fetch` and reported by `check`.
+- **`resolveSecrets(manifest, provider, opts: {outDir})`:**
+  - Fetches the de-duplicated logical names once, then fills every zone's env vars.
+  - An empty string counts as missing ("<zone>/<ENV> (<name>) is empty: fill it in with `mise run secrets:edit`").
+  - Value validation (`envValueProblem`) is unchanged.
+  - Writes the set with `writeSecretFiles` only after every value is good.
+- **`checkSecrets(manifest, provider)`:** returns `[{zone, key, name, status: "found"|"missing"|"empty"}]` plus `unknown: string[]` (store names not in the manifest). It never returns values.
+- **`describeSecretsConfig(cfg)`:** returns `{provider, downgrade, files: string[]}`. Task 6's audit uses it: `env-file` is reported as a downgrade.
+- **CLI:**
+  - `hapi secrets resolve [--config <p>] [--dry-run]`. `--dry-run` is the same as `check`.
+  - `hapi secrets check [--config <p>]`: exits 1 if anything is missing or empty.
+  - `hapi secrets init [--config <p>] [--file <p>] [--age-key <p>]`.
+  - `hapi secrets edit [--config <p>]`: sops only; execs `sops edit` on the configured file with stdio inherited and the age key env set.
+  - `--map` is removed.
+- **mise tasks:** `secrets:init`, `secrets:edit` and `secrets:check`, each a thin wrapper over `hapi secrets …`.
+
+**Provider rules:**
+- **sops** (default):
+  - Runs `sops decrypt --output-type json <file>` through an injectable `SopsRunner = (args: string[], o: {env: Record<string,string>; stdin?: string}) => Promise<{code: number; stdout: string; stderr: string}>`.
+  - The child gets a **minimal env**: `PATH`, `HOME`, `SOPS_AGE_KEY_FILE` when configured, and **`SOPS_DISABLE_VERSION_CHECK=1`** (sops otherwise phones home for a version check). Nothing else is inherited.
+  - No value ever goes through argv.
+  - The child's stderr is never echoed raw. Report "sops could not decrypt <file> (exit N)" plus the first stderr line, scrubbed of anything after `:` that isn't a path. Follow the bws scrub pattern.
+  - **Before decrypting,** parse the raw file as YAML and check that:
+    - it has a `sops` metadata block with at least one `age` recipient;
+    - every top-level value other than `sops` is a string matching `^ENC\[AES256_GCM,`.
+
+    This refuses a file in which `unencrypted_suffix` or `unencrypted_regex` left a value in plaintext.
+  - The decrypted JSON must be a flat object of logical name → string.
+- **age key file** (the configured one, else sops's default `${XDG_CONFIG_HOME:-$HOME/.config}/sops/age/keys.txt`):
+  - It must exist, be owned by the current uid and have no group or other permission bits.
+  - It must **not** sit inside the hapi-factory checkout, `private/` included: `private/` is pushed to hapi-factory-private next to the encrypted file, and the two together are the plaintext. Find the checkout through an injectable `repoRoot`; the default is `git rev-parse --show-toplevel` from the module's directory.
+- **The sops file** may live anywhere, `private/` included (the operator's choice: it's backed up to hapi-factory-private there).
+- **bws:**
+  - The Task 4 behaviour, unchanged, with ids from `bws.ids`. Placeholder ids are refused, as before.
+  - `BWS_ACCESS_TOKEN` comes from the environment only.
+  - Document what state bws keeps on disk (check `bws --help` / `bws config --help` for a state-file option). Never run a bws command that touches real secrets.
+- **env-file** (downgrade):
+  - The file holds `NAME_IN_ENV_FORM=value` lines, where the name is `secretEnvName(logical-name)`. Use `parseEnvFile`.
+  - It must be mode 0600, owned by the current uid, and **outside the hapi-factory checkout**, `private/` included, because plaintext would be pushed to the private remote.
+  - `downgrade: true`.
+
+**`hapi secrets init`:**
+- **Never overwrites anything.** If the config or the sops file exists, stop and point at `hapi secrets check`. Write each file atomically with mode 0600, in directories with mode 0700.
+- **The age key:**
+  - Reuse the key at the age-key path if it exists, after the checks above; its public key comes from `age-keygen -y <file>`.
+  - Otherwise run `age-keygen -o <path>` with the parent directory at 0700. The file must end up 0600.
+- **The sops file:**
+  - Path: `--file`, default `${XDG_CONFIG_HOME:-$HOME/.config}/hapi/secrets.enc.yaml`.
+  - Content: every manifest logical name with the value `""`, built **in memory**, encrypted by piping it through stdin to `sops encrypt --age <recipient> --input-type yaml --output-type yaml …`. Verify the exact stdin and filename flags with the pinned sops's `--help`.
+  - **Plaintext never touches disk.**
+- **The config:** write `{provider: sops, sops: {file, age_key_file}}`.
+- **Then print:**
+  - the age public key;
+  - "back up <age key path> offline (e.g. in your password manager): without it the encrypted file can't be opened";
+  - the next step, `mise run secrets:edit`.
+
+**`src/secrets/files.ts`** (Task 4 security minors):
+- Write zone files into a fresh `$XDG_RUNTIME_DIR/hapi/env.<random>/` (0700). Then **swap the whole set at once:**
+  1. create a temporary symlink;
+  2. `rename` it over `$XDG_RUNTIME_DIR/hapi/env`;
+  3. then delete the old generation directory.
+
+  Readers see either the old set or the new one, never a mix. Zone files dropped from the manifest disappear with the old generation.
+- Consumers use **`$XDG_RUNTIME_DIR/hapi/env/<zone>.env`**. Update `app-token.ts`'s host.env path and the docs.
+- `secureDir` also checks that `XDG_RUNTIME_DIR` itself is a directory owned by the current uid with mode 0700, as systemd creates it.
+- `hapi token mint` deletes token files in `hapi/tokens/` older than 1 hour.
+
+**Other folded fixes:**
+- `app-token.ts`: a 201 response with a non-empty `token` but no valid `expires_at` revokes the token before throwing, like every other rejected 201.
+- Manifest and config errors show a zone segment only if it is one of `SECRET_ZONES`; otherwise `<zone>`. This applies to JSON Pointers and to messages, so a pasted secret is never echoed.
+- `docs/secrets.md` describes each step's error accurately: `PolicyError` for schema problems, plain `Error` for `XDG_RUNTIME_DIR`, `SecretError` for provider and store problems.
+- `README.md` and `provider-keys.md` summaries say "ZDR enforced unless the documented Jev exception applies".
+- `docs/policy.md` stops citing §11.5 for the "monthly cap / 31" rule; it's the runbook's rule.
+
+**Toolchain:**
+- Pin `sops` and `age` in `mise.toml`: the newest release of each that is **at least 14 days old** (check release dates with `gh release view` / `gh api repos/getsops/sops/releases` and `FiloSottile/age`). Record versions and dates in the report.
+- Remove `bitwarden-secrets-manager` from `[tools]`. The bws section of `docs/secrets.md` shows bws users how to add it in their own gitignored `mise.local.toml`.
+- `.gitignore` adds `private/`, `mise.local.toml`, `*.agekey`, `keys.txt` and `secrets.env`.
+
+**Docs:**
+- **`docs/secrets.md`** is rewritten around manifest → config → store. It covers:
+  - sops onboarding, step by step;
+  - backing up the age key;
+  - adding a secret: `mise run secrets:edit`, add `<logical-name>: <value>`;
+  - adding a new name to the manifest (a PR) and what `check` then reports;
+  - rotating the age key: `sops updatekeys` / `sops rotate`;
+  - optional bws;
+  - the env-file downgrade and why it's audited;
+  - the threat notes:
+    - the age key is the master key;
+    - decrypted values exist only in memory and in the 0600 tmpfs files;
+    - each container sees its own zone's values.
+- **Runbooks:** every "store it in bws" becomes "add it to your secrets store (`mise run secrets:edit`) as `<logical-name>`".
+- **`README.md`:** the setup section gains `mise run secrets:init` / `secrets:edit` / `secrets:check`.
+- No personal identifiers anywhere.
+
+- [ ] **Step 1: Write the failing tests:**
+
+```ts
+test("the manifest holds logical names only, and covers every MCP secret: reference", () => { /* loadManifest("stack/secrets.yaml"); every value matches the name pattern; mcpSecretGaps(loadPolicy("policy"), m) is [] */ });
+test("resolve fails closed when the store lacks a manifest name, and writes nothing", async () => { /* fake provider missing one name → rejects naming zone/ENV and the logical name; no env dir created */ });
+test("an empty value counts as missing", async () => {});
+test("a value never appears in an error or in stderr", async () => { /* fake store returns 'sk-SECRET-123' with a newline → error lacks the value */ });
+test("sops provider: minimal env with SOPS_DISABLE_VERSION_CHECK=1, no value in argv", async () => { /* fake SopsRunner records args/env */ });
+test("sops provider refuses a file with a plaintext value or no age recipient", async () => {});
+test("age key file: refuses group/other bits, wrong owner, or a path inside the checkout (private/ included)", async () => {});
+test("env-file provider: downgrade, refuses a file inside the checkout or not 0600", async () => {});
+test("init never overwrites an existing config or sops file", async () => {});
+test("init builds the template in memory and pipes it to sops (no plaintext file written)", async () => { /* fake runners; assert stdin carries every manifest name with "" */ });
+test("writeSecretFiles swaps the whole set and drops stale zone files", async () => {});
+test("secureDir refuses an XDG_RUNTIME_DIR not owned by us or not 0700", async () => {});
+test("mint revokes a 201 token that lacks expires_at", async () => {});
+test("no automatic fallback: a failing configured provider is the error", async () => {});
+// HAPI_INT=1 only: real sops + age round-trip in a temp dir with a throwaway key and a temp HOME
+```
+
+- [ ] **Step 2: Run** `bun test tests/secrets tests/forge tests/policy tests/generate`. Expected: FAIL.
+- [ ] **Step 3: Implement.** **Safety:**
+  - Tests and the implementer **never** read the real `~/.config/sops/age/keys.txt` or `~/.config/hapi/`.
+  - Every test injects temp paths, a temp HOME and an empty-ish env.
+  - Never run `hapi secrets init`, `edit` or `resolve` against the real HOME.
+  - You may run `sops --help`, `age --help`, `age-keygen --help` and `bws … --help`.
+- [ ] **Step 4: Run** `mise install`, then `mise run lint && mise run test && HAPI_INT=1 bun test tests/secrets` (the integration round-trip uses throwaway keys only). Expected: PASS, with output free of any test secret value.
+- [ ] **Step 5: Manual (the operator, at the checkpoint).** `mise run secrets:init -- --file private/secrets.enc.yaml`, then `mise run secrets:edit`, then `mise run secrets:check`. Expected: all found.
+- [ ] **Step 6: Commit** `git commit -m "feat(secrets): pluggable providers with sops+age default, provider-neutral manifest, whole-set env swap"`
 
 ---
 

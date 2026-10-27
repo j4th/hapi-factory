@@ -588,7 +588,7 @@ MCP servers are packages that put text into an agent's context. Each one is ther
   - an **exact pin** (version + registry integrity, or OCI digest);
   - an advisory **version floor** our own check enforces, because some advisories, like Context7's, have no OSV record and scanners stay silent;
   - a `tools.include` allowlist (read-only tools only);
-  - `env`, by `bws` key name: each server gets only its own key;
+  - `env`, by secret name (`secret:<name>`, resolved by the secret provider, §11.5): each server gets only its own key;
   - its allowed egress hosts;
   - `trust: untrusted`;
   - elicitation `deny`.
@@ -692,7 +692,12 @@ Default-deny proxy per container, generated from policy.
   - Both use 1-hour installation tokens minted outside the agents. Neither can merge or bypass rulesets.
 - **Console workspaces with spend limits:** `hapi-hermes`, `hapi-factory`, `hapi-evals`. The default workspace can't be capped, so it's unused.
 - **OpenRouter:** one key per role and environment, with a daily `limit`. Zero-data-retention is enforced (`zdr`) for every non-Anthropic model.
-- **Secrets** live in a vault, injected at start. That's **Bitwarden Secrets Manager**: `bws` is already installed, and Hermes supports it in core [call]. Never in `.env` once the vault works (Hermes's 1Password integration falls back to `.env`, which fails open).
+- **Secrets** come from a pluggable **secret provider** at start, injected per zone as `0600` env files on the host's tmpfs [user: "portable across secret managers"; "sops and age to start", 2026-10-26]. **Fail closed:** if the configured provider fails or any name is missing or empty, nothing starts. There is no automatic fallback.
+  - The repo ships **logical names only** (`stack/secrets.yaml`: zone → env var → name). Provider bindings and values live outside the public repo.
+  - **Default: sops + age.** One encrypted file (`secrets.enc.yaml`) and an age key in the standard place for the user that runs the stack. No service; encrypted at rest; the encrypted file can be backed up in a private repo, the key never. Onboarding is `mise run secrets:init`.
+  - **Optional: Bitwarden Secrets Manager** (`bws`), bound by name → id in the local config.
+  - **Explicit downgrade: `env-file`** (plaintext, `0600`, outside every checkout). `hapi audit` reports it.
+  - Never in a repo `.env` (Hermes's 1Password integration falls back to `.env`, which fails open).
 - **Residual risk:** model keys are visible inside their containers, bounded by spend caps and egress. **Next level:** a credential-injecting proxy.
 
 ### 11.6 Supply chain
