@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { loadPolicy, PolicyError } from "../../src/policy/load";
 import { LOGICAL_NAME, loadManifest, MANIFEST_FILE, manifestEntries, manifestNames, mcpSecretGaps, SECRET_ZONES } from "../../src/secrets/manifest";
 import { resolveSecrets, type SecretProvider } from "../../src/secrets/provider";
-import { RESERVED_ENV_NAMES, serviceEnvironment, ZONE_SERVICES } from "../../src/stack/env";
+import { CONTROL_ENV_NAMES, CONTROL_ENV_PREFIXES, RESERVED_ENV_NAMES, reservedEnvRule, serviceEnvironment, ZONE_SERVICES } from "../../src/stack/env";
 
 // Obviously fake: not, and not like, a real credential.
 const FAKE = "fake-secret-value-7f3a";
@@ -186,6 +186,76 @@ describe("loadManifest", () => {
       "https_proxy",
       "no_proxy",
     ]);
+  });
+
+  test("a process-control or trust-store env name is refused in any zone, by exact name or by prefix, naming the rule", () => {
+    // LD_PRELOAD would load a library into every process, NODE_OPTIONS add --require, SSL_CERT_FILE swap the CA bundle.
+    const e = policyError(() =>
+      loadManifest(
+        manifestFile(
+          full()
+            .replace("  A: hapi-a", "  A: hapi-a\n  LD_PRELOAD: hapi-a")
+            .replace("  B: hapi-b", "  B: hapi-b\n  NODE_OPTIONS: hapi-b\n  SSL_CERT_FILE: hapi-b")
+            .replace("  C: hapi-c", "  C: hapi-c\n  GIT_SSH_COMMAND: hapi-c")
+            .replace("  D: hapi-a", "  D: hapi-a\n  PATH: hapi-a"),
+        ),
+      ),
+    );
+    expect(e.issues.map((i) => i.path)).toEqual(["/hermes/LD_PRELOAD", "/archon/NODE_OPTIONS", "/archon/SSL_CERT_FILE", "/research/GIT_SSH_COMMAND", "/host/PATH"]);
+    expect(e.message).toContain(
+      "/hermes/LD_PRELOAD: LD_PRELOAD is reserved: env names starting LD_ configure a runtime, the loader or a tool in the containers (CONTROL_ENV_PREFIXES, src/stack/env.ts), so a secret may not use one. Give the secret another env name",
+    );
+    expect(e.message).toContain(
+      "/archon/SSL_CERT_FILE: SSL_CERT_FILE is reserved: it can change how a process runs, which code it loads or which TLS certificates it trusts (CONTROL_ENV_NAMES, src/stack/env.ts), so a secret may not set it. Give the secret another env name",
+    );
+  });
+
+  test("every name the ruling lists is refused, each exact name and each prefix too, and a name hapi sets keeps its own reason", () => {
+    const ruling = [
+      ...["PATH", "HOME", "SHELL", "ENV", "BASH_ENV", "IFS", "PS4", "NODE_OPTIONS", "NODE_PATH", "NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED"],
+      ...["SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_ASKPASS", "GIT_EXEC_PATH", "GIT_CONFIG_GLOBAL"],
+      ...["GIT_CONFIG_SYSTEM", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME", "PERL5OPT", "RUBYOPT", "JAVA_TOOL_OPTIONS"],
+      ...["OPENSSL_CONF", "SSLKEYLOGFILE", "XDG_CONFIG_HOME", "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "BUN_OPTIONS", "MISE_DATA_DIR", "UV_INDEX_URL"],
+      ...["NPM_CONFIG_REGISTRY", "HERMES_CONFIG", "ARCHON_HOME"],
+    ];
+    for (const name of [...ruling, ...CONTROL_ENV_NAMES, ...CONTROL_ENV_PREFIXES.map((p) => `${p}X`)]) {
+      expect([name, reservedEnvRule(name)?.startsWith(`${name} is reserved: `)]).toEqual([name, true]);
+      const e = policyError(() => loadManifest(manifestFile(full(`  ${name}: hapi-x\n`))));
+      expect([name, e.issues.map((i) => i.path)]).toEqual([name, [`/host/${name}`]]);
+    }
+    for (const name of ["HERMES_HOME", "ARCHON_DOCKER", "PI_OFFLINE"]) expect(reservedEnvRule(name)).toContain("hapi sets it in the containers itself");
+  });
+
+  test("a lookalike that is neither an exact name nor under a prefix is allowed, as is every name the committed manifest uses", () => {
+    for (const name of ["LDAP_PASSWORD", "NODEPING_API_KEY", "BUNNY_API_KEY", "MISER_TOKEN", "UVX_TOKEN", "PIPELINE_KEY", "PINECONE_API_KEY", "GIT_TOKEN", "GITHUB_TOKEN"]) {
+      expect([name, reservedEnvRule(name)]).toEqual([name, undefined]);
+    }
+    for (const name of ["PATH_TOKEN", "MY_PATH", "SSL_CERT_FILE_ID", "HERMESAPI_KEY", "ARCHONS_KEY", "HOMEPAGE_KEY", "XDG_TOKEN"]) {
+      expect([name, reservedEnvRule(name)]).toEqual([name, undefined]);
+    }
+    expect(Object.keys(loadManifest(manifestFile(full("  LDAP_PASSWORD: hapi-x\n  NODEPING_API_KEY: hapi-y\n"))).host!)).toEqual(["D", "LDAP_PASSWORD", "NODEPING_API_KEY"]);
+    const committed = loadManifest(MANIFEST_FILE);
+    for (const zone of SECRET_ZONES) for (const key of Object.keys(committed[zone]!)) expect([zone, key, reservedEnvRule(key)]).toEqual([zone, key, undefined]);
+  });
+
+  test("a manifest built in code with a process-control name is refused before resolve fetches or writes anything", async () => {
+    const m = { archon: { ANTHROPIC_API_KEY: "hapi-a", NODE_OPTIONS: "hapi-b" } };
+    expect(() => manifestEntries(m)).toThrow("archon/NODE_OPTIONS: NODE_OPTIONS is reserved: env names starting NODE_");
+    let fetched = false;
+    const provider: SecretProvider = { name: "sops", downgrade: false, list: async () => [], fetch: async () => ((fetched = true), new Map()) };
+    const dir = mkdtempSync(join(tmpdir(), "hapi-manifest-"));
+    temps.push(dir);
+    await expect(resolveSecrets(m, provider, { outDir: join(dir, "hapi") })).rejects.toThrow("archon/NODE_OPTIONS: NODE_OPTIONS is reserved");
+    expect(fetched).toBe(false);
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  test("the control lists: sorted, env-name shaped, and no exact name is already under a prefix", () => {
+    expect(CONTROL_ENV_NAMES).toEqual([...CONTROL_ENV_NAMES].sort());
+    expect(CONTROL_ENV_PREFIXES).toEqual([...CONTROL_ENV_PREFIXES].sort());
+    for (const name of [...CONTROL_ENV_NAMES, ...CONTROL_ENV_PREFIXES]) expect(name).toMatch(/^[A-Z_][A-Z0-9_]*$/);
+    for (const name of CONTROL_ENV_NAMES) expect([name, CONTROL_ENV_PREFIXES.filter((p) => name.startsWith(p))]).toEqual([name, []]);
+    expect(CONTROL_ENV_PREFIXES).toEqual(["ARCHON_", "BUN_", "CLAUDE_CODE_", "DYLD_", "GIT_CONFIG_", "HERMES_", "LD_", "MISE_", "NODE_", "NPM_CONFIG_", "PIP_", "PI_", "PYTHON", "UV_"]);
   });
 
   test("the logical-name pattern", () => {

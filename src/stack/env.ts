@@ -12,6 +12,12 @@
  * all (`RESERVED_ENV_NAMES`, enforced by src/secrets/manifest.ts), so a secret
  * called HOST or HTTPS_PROXY is refused when the manifest loads, before it can
  * mean anything.
+ *
+ * Nor may it name an env var that changes how a process in the container runs,
+ * loads code or trusts TLS (`CONTROL_ENV_NAMES`, `CONTROL_ENV_PREFIXES`:
+ * LD_PRELOAD, NODE_OPTIONS, SSL_CERT_FILE, GIT_SSH_COMMAND and the like), which
+ * hapi doesn't set and so `environment:` can't shadow. `reservedEnvRule` is the
+ * one check, for both lists.
  */
 import { ARCHON_ENV } from "../generate/archon";
 import { PROXY_PORT } from "../generate/egress";
@@ -57,3 +63,128 @@ export function serviceEnvironment(service: ZoneService): Record<string, string>
 export const RESERVED_ENV_NAMES: readonly string[] = [
   ...new Set([...ZONE_SERVICES.flatMap((s) => Object.keys(serviceEnvironment(s))), ...Object.keys(proxyEnv("research")), "ALL_PROXY", "all_proxy"]),
 ].sort();
+
+/**
+ * Exact env names that change how a process runs, which code it loads, or
+ * which TLS certificates it trusts, that no prefix in `CONTROL_ENV_PREFIXES`
+ * covers. hapi sets none of them, so a secret of that name would reach the
+ * container's processes as is. Sorted.
+ */
+export const CONTROL_ENV_NAMES: readonly string[] = [
+  // The shell and the process: where programs are found, what a shell runs first, scratch space, programs run for you.
+  "BASHOPTS",
+  "BASH_ENV",
+  "CDPATH",
+  "EDITOR",
+  "ENV",
+  "HOME",
+  "IFS",
+  "PAGER",
+  "PATH",
+  "PS4",
+  "SHELL",
+  "SHELLOPTS",
+  "TMPDIR",
+  "VISUAL",
+  // glibc: loadable charset converters and locales, and allocator tunables.
+  "GCONV_PATH",
+  "GLIBC_TUNABLES",
+  "LOCPATH",
+  // TLS trust and key logging.
+  "CURL_CA_BUNDLE",
+  "CURL_HOME",
+  "OPENSSL_CONF",
+  "OPENSSL_ENGINES",
+  "OPENSSL_MODULES",
+  "REQUESTS_CA_BUNDLE",
+  "SSLKEYLOGFILE",
+  "SSL_CERT_DIR",
+  "SSL_CERT_FILE",
+  // Git: programs it runs, where it looks, and TLS (GIT_CONFIG_* is a prefix).
+  "GIT_ASKPASS",
+  "GIT_CONFIG",
+  "GIT_DIR",
+  "GIT_EDITOR",
+  "GIT_EXEC_PATH",
+  "GIT_EXTERNAL_DIFF",
+  "GIT_PAGER",
+  "GIT_PROXY_COMMAND",
+  "GIT_SSH",
+  "GIT_SSH_COMMAND",
+  "GIT_SSL_CAINFO",
+  "GIT_SSL_CAPATH",
+  "GIT_SSL_NO_VERIFY",
+  "GIT_TEMPLATE_DIR",
+  "GIT_WORK_TREE",
+  "SSH_ASKPASS",
+  // Other runtimes' code-loading switches (Python's are the PYTHON prefix, Node's NODE_).
+  "CLASSPATH",
+  "JAVA_TOOL_OPTIONS",
+  "JDK_JAVA_OPTIONS",
+  "PERL5LIB",
+  "PERL5OPT",
+  "PERLLIB",
+  "RUBYLIB",
+  "RUBYOPT",
+  "VIRTUAL_ENV",
+  "_JAVA_OPTIONS",
+  // Where tools read their config and data.
+  "XDG_CACHE_HOME",
+  "XDG_CONFIG_DIRS",
+  "XDG_CONFIG_HOME",
+  "XDG_DATA_DIRS",
+  "XDG_DATA_HOME",
+  "XDG_RUNTIME_DIR",
+  "XDG_STATE_HOME",
+].sort();
+
+/**
+ * Env name prefixes no secret may start with: the dynamic loader (LD_, and
+ * macOS's DYLD_), git's config injection (GIT_CONFIG_COUNT/KEY_n/VALUE_n,
+ * GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM), and the runtimes, package managers
+ * and tools in the containers, each of which reads its own settings from its
+ * prefix (NODE_OPTIONS, NODE_EXTRA_CA_CERTS, PYTHONPATH, BUN_OPTIONS,
+ * UV_INDEX_URL, PIP_INDEX_URL, NPM_CONFIG_REGISTRY, HERMES_HOME, ARCHON_*,
+ * PI_*, CLAUDE_CODE_*). No entry of the committed stack/secrets.yaml starts
+ * with one (a unit test checks). `PYTHON` has no underscore: Python's own
+ * variables are PYTHONPATH, PYTHONHOME, PYTHONSTARTUP and the rest.
+ */
+export const CONTROL_ENV_PREFIXES: readonly string[] = [
+  "ARCHON_",
+  "BUN_",
+  "CLAUDE_CODE_",
+  "DYLD_",
+  "GIT_CONFIG_",
+  "HERMES_",
+  "LD_",
+  "MISE_",
+  "NODE_",
+  "NPM_CONFIG_",
+  "PIP_",
+  "PI_",
+  "PYTHON",
+  "UV_",
+];
+
+/**
+ * Why no secret may have the env name `name`, or undefined when one may: a
+ * name hapi sets itself (`RESERVED_ENV_NAMES`), an exact process-control or
+ * trust-store name (`CONTROL_ENV_NAMES`), or one that starts with a prefix of
+ * `CONTROL_ENV_PREFIXES`. The reason names the rule and the env name (which
+ * the manifest's errors already show for any key of env-name form), never a
+ * value. src/secrets/manifest.ts calls it for every env name of the manifest,
+ * in every zone.
+ */
+export function reservedEnvRule(name: string): string | undefined {
+  if (RESERVED_ENV_NAMES.includes(name)) {
+    return `${name} is reserved: hapi sets it in the containers itself (src/stack/env.ts, stack/compose.yaml's environment:), and a secret must never override it`;
+  }
+  if (CONTROL_ENV_NAMES.includes(name)) {
+    return `${name} is reserved: it can change how a process runs, which code it loads or which TLS certificates it trusts (CONTROL_ENV_NAMES, src/stack/env.ts), so a secret may not set it`;
+  }
+  const prefix = CONTROL_ENV_PREFIXES.find((p) => name.startsWith(p));
+  if (prefix !== undefined) {
+    return `${name} is reserved: env names starting ${prefix} configure a runtime, the loader or a tool in the containers (CONTROL_ENV_PREFIXES, src/stack/env.ts), so a secret may not use one`;
+  }
+  return undefined;
+}

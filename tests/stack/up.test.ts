@@ -5,12 +5,12 @@
  * started if an earlier step fails.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { SecretError } from "../../src/secrets/provider";
 import { secretsResolve } from "../../src/secrets/cli";
 import { resolveAgeDir } from "../../src/secrets/providers/sops";
-import { buildDigest, currentUserOverride, networkProblems, type StackDeps, stackDown, stackUp } from "../../src/stack/up";
+import { buildDigest, currentUserOverride, networkProblems, reexecScript, type StackDeps, stackDown, stackUp } from "../../src/stack/up";
 import { capture, caught, cleanup, fullStore, sopsConfig, sopsStore, tempDir } from "../secrets/helpers";
 
 afterEach(cleanup);
@@ -57,6 +57,32 @@ function fakes(
 }
 
 const COMPOSE = ["docker", "compose", "-f", "stack/compose.yaml", "-p", "hapi"];
+
+/** The whole script the re-exec hands `sh -c` as hapi, for `up`: fixed text, no argument in it. */
+const UP_SCRIPT = `: "\${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; export XDG_RUNTIME_DIR; export PATH="$HOME/.local/bin:$PATH"; cd "$HOME/hapi-factory" && exec "$HOME/.local/bin/mise" run up -- "$@"`;
+
+/** A config path no shell may parse: a parameter, a command substitution, backticks, both quotes, spaces and a newline. */
+const HOSTILE = "/srv/a$b ${HOME} $(touch x) `touch y` it's \"q\" two  spaces\nline2.yaml";
+
+/** A temp home laid out as hapi's: ~/hapi-factory, and a stand-in ~/.local/bin/mise that records its argv (NUL-separated), cwd, XDG_RUNTIME_DIR and PATH. */
+function fakeHapiHome(): string {
+  const home = tempDir("hapi-stack-reexec-");
+  mkdirSync(join(home, "hapi-factory"));
+  mkdirSync(join(home, ".local/bin"), { recursive: true });
+  const mise = join(home, ".local/bin/mise");
+  writeFileSync(
+    mise,
+    '#!/bin/sh\nprintf \'%s\\0\' "$@" >"$HOME/seen.argv"\nprintf \'%s\\n\' "$PWD" "$XDG_RUNTIME_DIR" "$PATH" >"$HOME/seen"\n',
+  );
+  chmodSync(mise, 0o755);
+  return home;
+}
+
+/** What the stand-in mise recorded. */
+function readFakeMise(home: string) {
+  const [pwd, xdg, path] = readFileSync(join(home, "seen"), "utf8").split("\n");
+  return { argv: readFileSync(join(home, "seen.argv"), "utf8").split("\0").slice(0, -1), pwd: pwd!, xdg: xdg!, path: path! };
+}
 
 describe("currentUserOverride (the dev bypass, for Task 6's audit)", () => {
   test("the hapi user runs the stack itself; anyone else re-execs as hapi unless HAPI_ALLOW_CURRENT_USER=1", () => {
@@ -117,19 +143,78 @@ describe("hapi stack up", () => {
     expect(f.steps.slice(0, 2)).toEqual(["build anthropic", "resolve --config /home/hapi/.config/hapi/other.yaml"]);
   });
 
-  test("as another user: re-execs `mise run up` as hapi through sudo -iu, in hapi's checkout, with hapi's XDG_RUNTIME_DIR", async () => {
+  test("as another user: re-execs `mise run up` as hapi through sudo -u hapi -H (never -i), in hapi's checkout, with hapi's XDG_RUNTIME_DIR and mise", async () => {
     const { err } = capture();
     const f = fakes({ user: "dev" });
     expect(await stackUp(["--roster", "budget", "--config", "/srv/it's.yaml"], f.deps)).toBe(0);
     expect(f.steps).toHaveLength(1);
     const [sudo] = f.calls;
-    expect(sudo!.cmd.slice(0, 5)).toEqual(["sudo", "-iu", "hapi", "--", "sh"]);
-    expect(sudo!.cmd[5]).toBe("-c");
-    expect(sudo!.cmd[6]).toBe(
-      `: "\${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; export XDG_RUNTIME_DIR; cd "$HOME/hapi-factory" && exec mise run up -- '--roster' 'budget' '--config' '/srv/it'\\''s.yaml'`,
-    );
+    expect(sudo!.cmd).toEqual(["sudo", "-u", "hapi", "-H", "--", "sh", "-c", UP_SCRIPT, "hapi-stack", "--roster", "budget", "--config", "/srv/it's.yaml"]);
+    expect(reexecScript("up")).toBe(UP_SCRIPT);
     expect(sudo!.inherit).toBe(true);
+    expect(err.join("\n")).toContain("running as hapi (sudo -u hapi -H), not dev");
     expect(err.join("\n")).toContain("HAPI_ALLOW_CURRENT_USER=1");
+  });
+
+  test("the re-exec never hands sudo a login shell (-i) or a shell (-s), and its script holds none of the forwarded arguments (H-148)", async () => {
+    capture();
+    const scripts = new Set<string>();
+    for (const args of [[], ["--roster", "budget"], ["--config", HOSTILE], ["--roster", "portable", "--config", "/srv/x.yaml"]]) {
+      const f = fakes({ user: "dev" });
+      await stackUp(args, f.deps);
+      const cmd = f.calls[0]!.cmd;
+      // sudo's own options are everything before its "--": exactly -u hapi -H.
+      expect(cmd.slice(0, cmd.indexOf("--"))).toEqual(["sudo", "-u", "hapi", "-H"]);
+      // The script is fixed text, the same whatever the arguments, and none of them is in it.
+      const script = cmd[7]!;
+      scripts.add(script);
+      for (const a of args) expect([a, script.includes(a)]).toEqual([a, false]);
+      expect(cmd.slice(8)).toEqual(["hapi-stack", ...args]);
+    }
+    expect([...scripts]).toEqual([UP_SCRIPT]);
+  });
+
+  test("run as sh would run it, the re-exec delivers `$b`, `$(touch x)`, backticks, quotes, spaces and newlines to mise verbatim, one argv entry each, expanding nothing", async () => {
+    capture();
+    const f = fakes({ user: "dev" });
+    // The config path is the only free-form argument up takes; parseUp accepts any value that doesn't start with "-".
+    const args = ["--config", HOSTILE];
+    await stackUp(args, f.deps);
+    const cmd = f.calls[0]!.cmd;
+    // What sudo would exec as hapi: everything after its "--". HOME stands in for hapi's (sudo -H), with no XDG_RUNTIME_DIR (sudo clears it).
+    const home = fakeHapiHome();
+    const r = Bun.spawnSync(cmd.slice(cmd.indexOf("--") + 1), { cwd: home, env: { HOME: home, PATH: "/usr/bin:/bin" }, stdout: "pipe", stderr: "pipe" });
+    expect([r.exitCode, r.stderr.toString()]).toEqual([0, ""]);
+    const seen = readFakeMise(home);
+    expect(seen.argv).toEqual(["run", "up", "--", "--config", HOSTILE]);
+    expect(seen.pwd).toBe(join(home, "hapi-factory"));
+    expect(seen.xdg).toBe(`/run/user/${process.getuid!()}`);
+    expect(seen.path.split(":")[0]).toBe(join(home, ".local/bin"));
+    // Nothing in the argument ran: no file from $(touch x) or `touch y`, anywhere it could have landed.
+    for (const dir of [home, join(home, "hapi-factory"), join(home, ".local/bin")]) {
+      expect([dir, readdirSync(dir).filter((n) => n === "x" || n === "y")]).toEqual([dir, []]);
+    }
+  });
+
+  test("the re-exec keeps an XDG_RUNTIME_DIR that sudo passes through (lingering), and passes down's empty argument list as nothing", async () => {
+    capture();
+    const f = fakes({ user: "dev" });
+    await stackDown([], f.deps);
+    const cmd = f.calls[0]!.cmd;
+    const home = fakeHapiHome();
+    const r = Bun.spawnSync(cmd.slice(cmd.indexOf("--") + 1), { cwd: home, env: { HOME: home, PATH: "/usr/bin:/bin", XDG_RUNTIME_DIR: "/run/user/4242" }, stdout: "pipe", stderr: "pipe" });
+    expect(r.exitCode).toBe(0);
+    const seen = readFakeMise(home);
+    expect(seen.argv).toEqual(["run", "down", "--"]);
+    expect(seen.xdg).toBe("/run/user/4242");
+  });
+
+  test("the re-exec fails, running nothing, when hapi's checkout is missing", () => {
+    const home = fakeHapiHome();
+    rmSync(join(home, "hapi-factory"), { recursive: true });
+    const r = Bun.spawnSync(["sh", "-c", UP_SCRIPT, "hapi-stack"], { cwd: home, env: { HOME: home, PATH: "/usr/bin:/bin" }, stdout: "pipe", stderr: "pipe" });
+    expect(r.exitCode).not.toBe(0);
+    expect(existsSync(join(home, "seen"))).toBe(false);
   });
 
   test("the re-exec's exit code is up's", async () => {
@@ -299,7 +384,8 @@ describe("hapi stack down", () => {
     capture();
     const f = fakes({ user: "dev" });
     expect(await stackDown([], f.deps)).toBe(0);
-    expect(f.calls[0]!.cmd).toEqual(["sudo", "-iu", "hapi", "--", "sh", "-c", `: "\${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; export XDG_RUNTIME_DIR; cd "$HOME/hapi-factory" && exec mise run down`]);
+    expect(f.calls[0]!.cmd).toEqual(["sudo", "-u", "hapi", "-H", "--", "sh", "-c", UP_SCRIPT.replace("run up --", "run down --"), "hapi-stack"]);
+    expect(reexecScript("down")).toBe(UP_SCRIPT.replace("run up --", "run down --"));
   });
 
   test("down takes no arguments", async () => {

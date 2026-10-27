@@ -5,11 +5,14 @@
  *
  * `up`, in order, aborting at the first failure:
  * 1. Run as the `hapi` user. Anyone else re-execs `mise run up` as hapi with
- *    `sudo -iu hapi`, in hapi's own checkout (~hapi/hapi-factory), with hapi's
- *    XDG_RUNTIME_DIR. HAPI_ALLOW_CURRENT_USER=1 skips that, for development
- *    and the stage-a tests only: a downgrade (no dedicated user, no rootless
- *    Docker) that it warns about, labels on every container
- *    (org.hapi.dev-override), and Task 6's audit reports (currentUserOverride).
+ *    `sudo -u hapi -H -- sh -c '<fixed script>' hapi-stack <args>`, in hapi's
+ *    own checkout (~hapi/hapi-factory), with hapi's XDG_RUNTIME_DIR and mise
+ *    (`reexecScript`). There is no login shell, so each forwarded argument
+ *    stays an argv entry of its own, and no shell ever parses it.
+ *    HAPI_ALLOW_CURRENT_USER=1 skips the re-exec, for development and the
+ *    stage-a tests only: a downgrade (no dedicated user, no rootless Docker)
+ *    that it warns about, labels on every container (org.hapi.dev-override),
+ *    and Task 6's audit reports (currentUserOverride).
  * 2. `buildAll`: policy/ into build/ (the configs the containers mount), and
  *    its digest (`buildDigest`), a label on every container: Compose recreates
  *    a container whose config changed, not one whose bind-mounted file did, so
@@ -54,6 +57,10 @@ export const COMPOSE_FILE = "stack/compose.yaml";
 export const ZONE_NETWORKS = ["hermes-net", "archon-net", "research-net"] as const;
 /** hapi's checkout, relative to its home (scripts/host-setup.sh clones it there). */
 export const HAPI_CHECKOUT = "hapi-factory";
+/** hapi's own bin directory, relative to its home; scripts/host-setup.sh installs the pinned mise there. */
+export const HAPI_BIN = ".local/bin";
+/** hapi's mise, relative to its home (scripts/host-setup.sh's install target; tests/scripts/host-setup.test.ts checks it). */
+export const HAPI_MISE = `${HAPI_BIN}/mise`;
 
 /** Who is running hapi, and whether the dev bypass is on. */
 export interface UserCheck {
@@ -168,21 +175,34 @@ const runCommand: Runner = async (cmd, o) => {
 
 const definedEnv = (env: Env): Record<string, string> => Object.fromEntries(Object.entries(env).filter((e): e is [string, string] => e[1] !== undefined));
 
-/** A shell word: single-quoted, with any single quote written as '\''. */
-const shellQuote = (s: string) => `'${s.replaceAll("'", `'\\''`)}'`;
+/**
+ * The script `sh -c` runs as hapi to re-exec `mise run <task>`. It is fixed text: nothing the caller passes is
+ * ever in it. The forwarded arguments follow it on sudo's command line as argv entries of their own, and reach
+ * mise as "$@", so no shell parses them: a `$`, a `$(...)`, a backtick, a quote or a space in one arrives as it
+ * was typed.
+ *
+ * It sets up what hapi's login shell used to give `sudo -iu` (H-148), and nothing else:
+ * - XDG_RUNTIME_DIR, defaulting to hapi's /run/user/<uid> when sudo has cleared it (lingering keeps that, H-004);
+ * - hapi's ~/.local/bin first on PATH, as /etc/skel's ~/.profile put it: up's secrets step runs `mise where age`
+ *   by name (src/secrets/providers/sops.ts), so hapi's mise must be on PATH, whatever `mise run` adds itself;
+ * - the working directory, hapi's checkout;
+ * - mise by its absolute path, where scripts/host-setup.sh installs it.
+ * `mise run` puts the pinned tools (bun) on the task's PATH itself, from the checkout's mise.toml.
+ */
+export function reexecScript(task: "up" | "down"): string {
+  return `: "\${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; export XDG_RUNTIME_DIR; export PATH="$HOME/${HAPI_BIN}:$PATH"; cd "$HOME/${HAPI_CHECKOUT}" && exec "$HOME/${HAPI_MISE}" run ${task} -- "$@"`;
+}
 
 /**
- * Re-run `mise run <task> [-- args]` as hapi: `sudo -iu hapi` (a login shell,
- * so hapi's own mise and PATH), in hapi's checkout, with XDG_RUNTIME_DIR set to
- * hapi's runtime dir when sudo has cleared it (lingering keeps it, H-004).
+ * Re-run `mise run <task> -- <args>` as hapi: `sudo -u hapi -H` (HOME is hapi's), never `sudo -i`, whose login
+ * shell re-parses the command's words and leaves `$` unescaped (sudo(8)). `reexecScript` is the whole script,
+ * and the arguments are its "$@".
  */
 async function reexec(task: "up" | "down", args: string[], run: Runner, env: Env, user: string): Promise<number> {
   console.error(
-    `hapi stack ${task}: running as ${HAPI_USER} (sudo -iu ${HAPI_USER}), not ${user}. For development only, HAPI_ALLOW_CURRENT_USER=1 runs it as ${user} instead (docs/runbooks/stack.md).`,
+    `hapi stack ${task}: running as ${HAPI_USER} (sudo -u ${HAPI_USER} -H), not ${user}. For development only, HAPI_ALLOW_CURRENT_USER=1 runs it as ${user} instead (docs/runbooks/stack.md).`,
   );
-  const tail = args.length > 0 ? ` -- ${args.map(shellQuote).join(" ")}` : "";
-  const script = `: "\${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; export XDG_RUNTIME_DIR; cd "$HOME/${HAPI_CHECKOUT}" && exec mise run ${task}${tail}`;
-  const r = await run(["sudo", "-iu", HAPI_USER, "--", "sh", "-c", script], { env: definedEnv(env), inherit: true });
+  const r = await run(["sudo", "-u", HAPI_USER, "-H", "--", "sh", "-c", reexecScript(task), "hapi-stack", ...args], { env: definedEnv(env), inherit: true });
   return r.code;
 }
 

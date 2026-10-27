@@ -7,7 +7,7 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { HAPI_CHECKOUT, HAPI_USER } from "../../src/stack/up";
+import { HAPI_BIN, HAPI_CHECKOUT, HAPI_MISE, HAPI_USER } from "../../src/stack/up";
 
 const REPO = resolve(import.meta.dir, "../..");
 const SCRIPT = join(REPO, "scripts", "host-setup.sh");
@@ -96,6 +96,9 @@ test("mise reaches hapi on stdin: root verifies its own download, hapi writes a 
   expect(text).toContain(`exit 1' <"$mise_tmp"`);
   // Checked again, as hapi, after the install.
   expect(text.match(/hapi_mise_version \| grep -q "\^\$MISE_VERSION "/g)?.length).toBe(2);
+  // Where `up`'s re-exec runs it by absolute path (reexecScript), with its directory on PATH.
+  expect(text).toContain(`mv -fT "$tmp" ${HAPI_MISE}; then`);
+  expect(text).toContain(`mkdir -p ${HAPI_BIN}`);
 });
 
 test("prints the next steps: the rootless check, mise trust and install as hapi with its XDG_RUNTIME_DIR, the secrets join and add-machine, then up", () => {
