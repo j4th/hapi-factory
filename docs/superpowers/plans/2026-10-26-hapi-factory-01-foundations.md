@@ -923,7 +923,7 @@ The repo stays private until this task is done. Its requirements are this text p
 
 - [ ] **Step 1: Private split (H-054).** `git init private` (if it isn't a repo yet). Move `research_notes/` and `reports/` into it and commit there, locally (no remote yet). In hapi-factory, `git rm -r --cached research_notes reports`. Write `docs/research/README.md`: what research exists, the conclusions that shaped the spec (with spec section numbers), and that the sources are private. No personal data. Point the spec's and this plan's "Supporting evidence is in `reports/` and `research_notes/`" at it.
 
-- [ ] **Step 2: Sanitize (H-055).** The operator's first name becomes "the operator", the GitHub login becomes `$OWNER` or `<owner>` (as the runbooks and `example-owner` tests already do), and the spec's Owner line loses the full name. List every personal string once in `private/personal-strings.txt`, and the replacement for each in `private/replacements.txt` (filter-repo's `--replace-text` format, used in Step 7). Then `grep -rnF -f private/personal-strings.txt` over the tracked tree must find nothing. The `mise.toml` comment lines are **[operator]**.
+- [ ] **Step 2: Sanitize (H-055).** The operator's first name becomes "the operator", the GitHub login becomes `$OWNER` or `<owner>` (as the runbooks and `example-owner` tests already do), and the spec's Owner line loses the full name. List every personal string once in `private/personal-strings.txt`, and the replacement for each in `private/replacements.txt` (filter-repo's `--replace-text` format, used in Step 7). Then `git grep -n -i -w -F -f private/personal-strings.txt` (the tracked tree, any case, whole words, as the hooks match) must find nothing. The `mise.toml` comment lines are **[operator]**.
 
 - [ ] **Step 3: Publish instructions (H-059).** Rewrite README's manual setup steps for the real sequence: both repos already exist, private and empty; nothing is pushed until this task is done; then push, make hapi-factory public, and apply the two rulesets (`main-protect`, `main-review`; H-075). Point this plan's Task 1 Step 6 at H-074.
 
@@ -941,7 +941,7 @@ The repo stays private until this task is done. Its requirements are this text p
   2. With the operator's go-ahead, run `git filter-repo --invert-paths --path research_notes --path reports --replace-text private/replacements.txt --replace-message private/replacements.txt` (add `--mailmap private/mailmap` if the operator wants the author and committer email changed, e.g. to their GitHub noreply address) (run from a pinned version, e.g. `uvx git-filter-repo==<version>`; adding it to mise.toml is **[operator]**).
   3. Verify:
      - `gitleaks git --redact` over the whole rewritten history finds nothing;
-     - `git log -p --all | grep -nF -f private/personal-strings.txt` finds nothing;
+     - `git log -p --all | grep -n -i -w -F -f private/personal-strings.txt` finds nothing;
      - `git log --all -- research_notes reports` is empty;
      - `mise run lint && mise run test` pass.
   4. Remap the SHAs in the register's Closed table from `.git/filter-repo/commit-map`.

@@ -87,8 +87,9 @@ function sandbox(personal: string | null = `# names\n${NAME}\n\n${LOGIN}\n`, mis
   if (personal !== null) {
     mkdirSync(join(root, "private"));
     writeFileSync(join(root, "private", "personal-strings.txt"), personal);
-    writeFileSync(join(root, ".gitignore"), "private/\n");
   }
+  // The hooks run from the working tree (core.hooksPath); they are never staged here.
+  writeFileSync(join(root, ".gitignore"), personal === null ? ".githooks/\n" : "private/\n.githooks/\n");
   const write = (path: string, text: string) => {
     mkdirSync(join(root, path, ".."), { recursive: true });
     writeFileSync(join(root, path), text);
@@ -139,6 +140,14 @@ describe.skipIf(gitleaks === undefined)("committing with the hooks", () => {
     const r = s.commit({ "b.txt": `one\ntwo\nthree\nfour ${LOGIN}\n` }, "change b");
     expect(r.code).not.toBe(0);
     expect(r.out).toContain("at b.txt:4");
+  });
+
+  test("a personal string matches whole words only, so \"Ash\" doesn't stop \"washing\"", () => {
+    const s = sandbox("ash\n");
+    expect(s.commit({ "j.md": "Washing the dishes; a cashier; an ashtray.\n" }).code).toBe(0);
+    const r = s.commit({ "k.md": "Written by Ash.\n" }, "add k");
+    expect(r.code).not.toBe(0);
+    expect(r.out).toContain("at k.md:1");
   });
 
   test("blank lines and comments in personal-strings.txt match nothing", () => {

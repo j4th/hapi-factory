@@ -21,7 +21,7 @@ trap 'rm -f "$patterns"' EXIT
 # Every line up to git's scissors line (`commit -v` puts the diff below it, and git
 # always cuts there). "#" lines count too: git strips them only when it cleans up an
 # edited message, and `commit -m` keeps them.
-hits="$(sed '/^# -\{24\} >8 -\{24\}$/,$d' "$1" | grep -n -F -i -f "$patterns" | cut -d: -f1 || true)"
+hits="$(sed '/^# -\{24\} >8 -\{24\}$/,$d' "$1" | grep -n -F -i -w -f "$patterns" | cut -d: -f1 || true)"
 if [[ -n "$hits" ]]; then
   echo "commit-msg: the commit message holds a personal string from $PERSONAL_STRINGS, on line $(echo "$hits" | paste -sd, -)." >&2
   echo "Replace it (\"the operator\", \$OWNER or <owner>) and commit again; your message is in .git/COMMIT_EDITMSG." >&2

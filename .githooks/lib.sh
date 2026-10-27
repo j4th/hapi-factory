@@ -4,8 +4,9 @@
 # The operator's personal strings (their name, logins and the like) live one
 # per line in private/personal-strings.txt, which only the operator's clone
 # has (Task 7b Step 2, H-055). They are matched as fixed strings, ignoring
-# case. Blank lines and lines starting with # are skipped: a blank pattern
-# would match every line.
+# case, as whole words (grep -w): a short name must not match inside a
+# longer word, as "Ash" would inside "washing". Blank lines and lines starting with # are skipped: a blank
+# pattern would match every line.
 
 PERSONAL_STRINGS="private/personal-strings.txt"
 
