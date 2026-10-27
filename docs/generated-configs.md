@@ -69,7 +69,7 @@ Hermes runs as the coordinator (spec §9.1). These are the "defaults to flip on 
 | `skills.guard_agent_created` | `true` | Scans skills the agent writes. A scanner, not a boundary (spec §9.1). |
 | `memory.write_approval` | `true` | Memory writes need approval: the same persistence risk as skills (spec §9.1). |
 | `security.protected_instruction_files` | `true` | Writes to instruction files (AGENTS.md, CLAUDE.md, SOUL.md and more) ask for approval, even under yolo, and are refused when nobody can answer (spec §8.2, §9.1). |
-| `security.protected_instruction_extra_patterns` | `[AGENTS.md, mise.toml]` | The protected-path globs Hermes's gate can express. See [protected paths](#protected-paths-stay-strictest-wins). |
+| `security.protected_instruction_extra_patterns` | `[.coderabbit.config.ts, .coderabbit.yaml, .coderabbit.yml, AGENTS.md, mise.toml]` | The protected-path globs Hermes's gate can express. See [protected paths](#protected-paths-stay-strictest-wins). |
 | `security.allow_lazy_installs` | `false` | No installing packages from PyPI at runtime when a backend is first used (spec §9.1, §11.6). |
 | `plugins.isolation` | `host` | Third-party plugins run in a separate host process that reaches Hermes only through its plugin API (spec §9.1). |
 | `auth.adopt_external_logins` | `false` | Hermes never borrows Claude Code or Codex CLI logins (spec §9.1). |
@@ -188,7 +188,7 @@ The settings Plan 02's hapi-guard extension enforces inside every Pi worker (spe
   "$comment": "...",
   "session": "workers",
   "combine": "strictest",
-  "protected_paths": { ".agents/**": "deny", ".archon/**": "deny", ".factory/**": "deny", ".github/**": "deny", ".pi/**": "deny", "AGENTS.md": "deny", "mise.toml": "deny" },
+  "protected_paths": { ".agents/**": "deny", ".archon/**": "deny", ".coderabbit.config.ts": "deny", ".coderabbit.yaml": "deny", ".coderabbit.yml": "deny", ".factory/**": "deny", ".github/**": "deny", ".pi/**": "deny", "AGENTS.md": "deny", "mise.toml": "deny" },
   "budgets": { "run_usd": 3 },
   "max_tokens": 64000
 }

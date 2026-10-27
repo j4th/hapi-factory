@@ -34,7 +34,7 @@ The schemas are in `policy/schemas/`, named `<schema>.schema.json`. `policy-defs
 protected_paths:
   "AGENTS.md":   { interactive: ask, unattended: deny, workers: deny }
   ".pi/**":      { interactive: deny, unattended: deny, workers: deny }
-  # ... and .factory/**, .github/**, mise.toml, .agents/**, .archon/** (exactly spec §8.2)
+  # ... and .factory/**, .github/**, mise.toml, .agents/**, .archon/**, .coderabbit.yaml, .coderabbit.yml, .coderabbit.config.ts (exactly spec §8.2)
 ```
 
 Keys are globs relative to a repo's root. Each entry sets all three modes:

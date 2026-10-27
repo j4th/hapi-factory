@@ -28,3 +28,6 @@ protected_paths:
   ".pi/**":      { interactive: deny, unattended: deny, workers: deny }
   ".agents/**":  { interactive: ask, unattended: deny, workers: deny }
   ".archon/**":  { interactive: deny, unattended: deny, workers: deny }
+  ".coderabbit.yaml":      { interactive: ask, unattended: deny, workers: deny }
+  ".coderabbit.yml":       { interactive: ask, unattended: deny, workers: deny }
+  ".coderabbit.config.ts": { interactive: ask, unattended: deny, workers: deny }

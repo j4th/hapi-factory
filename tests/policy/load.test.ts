@@ -65,6 +65,9 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
       ".pi/**": deny,
       ".agents/**": ask,
       ".archon/**": deny,
+      ".coderabbit.yaml": ask,
+      ".coderabbit.yml": ask,
+      ".coderabbit.config.ts": ask,
     });
   });
 

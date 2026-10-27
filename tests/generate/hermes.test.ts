@@ -94,7 +94,7 @@ describe("protected instruction files", () => {
   test("hermes protected_instruction_files lists filename rules", () => {
     const c = config();
     expect(c.security.protected_instruction_files).toBe(true);
-    expect(c.security.protected_instruction_extra_patterns).toEqual(["AGENTS.md", "mise.toml"]);
+    expect(c.security.protected_instruction_extra_patterns).toEqual([".coderabbit.config.ts", ".coderabbit.yaml", ".coderabbit.yml", "AGENTS.md", "mise.toml"]);
   });
 
   test("directory globs Hermes can't express are named in a comment pointing at hapi-path-guard", () => {

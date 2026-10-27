@@ -302,7 +302,7 @@ A target repo needs only these files [user: central engine, small contract]:
 | `.factory/work/<id>/` | Work orders (§6) |
 | `docs/research/`, `docs/design/` | Hermes's dated research notes, designs and threat models |
 | `.github/workflows/hapi-gates.yml` | A thin wrapper calling hapi-factory's **reusable workflow, pinned by tag**: runs `mise run check` and the secret, SAST and dependency scans, validates work-order schemas, enforces commit trailers |
-| `.github/CODEOWNERS` | the operator owns `AGENTS.md`, `.factory/**`, `.github/**`, `mise.toml` |
+| `.github/CODEOWNERS` | the operator owns `AGENTS.md`, `.factory/**`, `.github/**`, `mise.toml`, `.coderabbit.yaml` |
 | Ruleset (forge setting, not a file) | `main` protected; one approving review required, and the PR author can't approve; required checks; no bypass for the Apps |
 
 **New repos (v1):** `mise run new-repo -- <name>`, run by the operator with his own credentials, creates the repo from `templates/repo-contract/` [call]. That template holds:
@@ -347,6 +347,9 @@ protected_paths:
   ".pi/**":      { interactive: deny, unattended: deny, workers: deny }
   ".agents/**":  { interactive: ask, unattended: deny, workers: deny }
   ".archon/**":  { interactive: deny, unattended: deny, workers: deny }
+  ".coderabbit.yaml":      { interactive: ask, unattended: deny, workers: deny }
+  ".coderabbit.yml":       { interactive: ask, unattended: deny, workers: deny }
+  ".coderabbit.config.ts": { interactive: ask, unattended: deny, workers: deny }
 ```
 
 - **interactive** means the operator is in a Hermes session (or later a direct-lane Pi session).
@@ -355,6 +358,7 @@ protected_paths:
   - hapi-path-guard extends it to globs.
 - **unattended** covers Hermes cron, webhook and API surfaces. Always deny.
 - **workers** covers Pi or Claude Code inside Archon. Always deny.
+- **`.coderabbit.*`** (added 2026-10-27, the operator's ruling): CodeRabbit reviews a same-repo PR with that PR branch's own config, so a PR that edits it could weaken its own review (§9.6).
 - **Backstop:** CODEOWNERS plus the ruleset. A guard failing locally can't land a change.
 
 ---
