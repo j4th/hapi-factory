@@ -13,7 +13,8 @@
 import { tokenMint } from "./forge/github/app-token";
 import { policyBuild } from "./generate/index";
 import { mcpPin, mcpVerify } from "./mcp/lock";
-import { secretsResolve } from "./secrets/bws";
+import { secretsInit } from "./secrets/init";
+import { secretsCheck, secretsEdit, secretsResolve } from "./secrets/provider";
 import { HAPI_VERSION } from "./version";
 import { workorderValidate } from "./workorder/validate";
 
@@ -114,7 +115,10 @@ register("workorder validate", workorderValidate, "Validate a work order (order.
 register("policy build", policyBuild, "Compile policy/ into Hermes, Archon, Pi, egress and MCP configs under build/");
 register("mcp verify", mcpVerify, "Check every MCP server's live tool surface against policy/mcp.lock.json");
 register("mcp pin", mcpPin, "Record one MCP server's live tool surface in policy/mcp.lock.json");
-register("secrets resolve", secretsResolve, "Resolve a secrets map (--map: your copy) from Bitwarden into $XDG_RUNTIME_DIR/hapi/<zone>.env (--dry-run: check only)");
+register("secrets init", secretsInit, "Set up the default sops + age store: an age key, an encrypted file of every manifest name (empty), and the config");
+register("secrets edit", secretsEdit, "Edit the sops store with `sops edit` (sops provider only)");
+register("secrets check", secretsCheck, "List every secret in stack/secrets.yaml as found, missing or empty in the configured store, never a value");
+register("secrets resolve", secretsResolve, "Resolve stack/secrets.yaml from the configured provider into $XDG_RUNTIME_DIR/hapi/env/<zone>.env (--dry-run: check)");
 register("token mint", tokenMint, "Mint a 1-hour GitHub App token for one repo into a 0600 file under $XDG_RUNTIME_DIR/hapi/tokens/");
 
 if (import.meta.main) {

@@ -3,7 +3,7 @@
 # The MCP catalog (spec §10.1): every MCP server a zone may load. An MCP server
 # is two risks at once: code we run (supply chain) and text the model reads
 # (untrusted input). So each entry is pinned exactly, allowlists read-only
-# tools only, gets only its own bws key, and is untrusted with elicitation
+# tools only, gets only its own secret, and is untrusted with elicitation
 # denied. The archon zone (Pi workers, Claude review nodes) gets none.
 #
 # Adding or upgrading a server is `new_skill_or_mcp`: a planning PR, then
@@ -13,9 +13,11 @@
 # docs/policy.md.
 #
 # A server's env names must be on its package's env allowlist (PACKAGE_ENV in
-# src/policy/mcp.ts), so an entry can't widen it. A secret is always a bws:
-# reference, never a literal; a literal is only a flag value or an endpoint
-# whose host is one of the entry's egress hosts.
+# src/policy/mcp.ts), so an entry can't widen it. A secret is always a
+# secret:<name> reference, resolved by the secret provider from the logical
+# name stack/secrets.yaml maps to HAPI_MCP_<NAME> (docs/secrets.md), never a
+# literal; a literal is only a flag value or an endpoint whose host is one of
+# the entry's egress hosts.
 servers:
   # Library docs, version-addressed (T2). Research zone only: library-owner and
   # teamspace "rules" can't be switched off client-side, so it is quarantined.
@@ -37,7 +39,7 @@ servers:
       include: [resolve-library-id, query-docs]   # both annotated read-only
       deny: []
     env:
-      CONTEXT7_API_KEY: bws:hapi-mcp-context7-api-key   # always keyed: anonymous callers can get a setup elicitation
+      CONTEXT7_API_KEY: secret:hapi-mcp-context7-api-key   # always keyed: anonymous callers can get a setup elicitation
       OTEL_SDK_DISABLED: "true"
     egress: [context7.com]
     trust: untrusted
@@ -90,7 +92,7 @@ servers:
         - list-readmes             # read local files; registered only with DANGEROUSLY_READ_README_FILES
         - get-readme
     env:
-      PHOENIX_API_KEY: bws:hapi-mcp-phoenix-viewer-key   # minted by a VIEWER-role user
+      PHOENIX_API_KEY: secret:hapi-mcp-phoenix-viewer-key   # minted by a VIEWER-role user
       PHOENIX_DISCOVER_CONFIG: "false"                   # no .env.phoenix discovery up the directory tree
       # Explicit, so a planted .env.phoenix can't redirect it. The o11y profile
       # serves Phoenix under this name on the hermes network.

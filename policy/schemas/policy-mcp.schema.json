@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "policy-mcp.schema.json",
   "title": "policy/mcp.yaml",
-  "description": "The MCP catalog (spec §10.1): every MCP server a zone may load, with an exact pin, the zones that may load it, a read-only tool allowlist, its env by bws key name and its egress hosts, plus a blocklist of package names. The archon zone gets no MCP server. src/policy/mcp.ts adds the checks a schema can't express: the advisory floors, the blocklist, tools.deny, the transport's fields, the env allowlist per package (PACKAGE_ENV), secret-looking names as bws references only, the hard env denylist, and one server per bws key. docs/policy.md describes every field.",
+  "description": "The MCP catalog (spec §10.1): every MCP server a zone may load, with an exact pin, the zones that may load it, a read-only tool allowlist, its env by secret name and its egress hosts, plus a blocklist of package names. The archon zone gets no MCP server. src/policy/mcp.ts adds the checks a schema can't express: the advisory floors, the blocklist, tools.deny, the transport's fields, the env allowlist per package (PACKAGE_ENV), secret-looking names as secret references only, the hard env denylist, and one server per secret. docs/policy.md describes every field.",
   "type": "object",
   "properties": {
     "servers": {
@@ -86,7 +86,7 @@
           "additionalProperties": false
         },
         "env": {
-          "description": "The server's whole environment: Hermes passes only these (plus a safe baseline) to a stdio server. A value is either bws:hapi-mcp-<name>, the bws key whose secret it gets, or a literal. The names must be on the package's env allowlist (PACKAGE_ENV in src/policy/mcp.ts), in the form it says: a secret as a bws reference, a flag as one of its values, an endpoint as an http(s) URL whose host is an egress host. A name ending in _KEY, _TOKEN, _SECRET, _PASSWORD or _CREDENTIAL(S) is always a bws reference, and the hard denylist (launch hijacks such as NODE_OPTIONS, NPM_CONFIG_*, LD_* and PATH; proxies; URL overrides) applies to every server.",
+          "description": "The server's whole environment: Hermes passes only these (plus a safe baseline) to a stdio server. A value is either secret:hapi-mcp-<name>, the logical name of the secret it gets (resolved by the secret provider), or a literal. The names must be on the package's env allowlist (PACKAGE_ENV in src/policy/mcp.ts), in the form it says: a secret as a secret reference, a flag as one of its values, an endpoint as an http(s) URL whose host is an egress host. A name ending in _KEY, _TOKEN, _SECRET, _PASSWORD or _CREDENTIAL(S) is always a secret reference, and the hard denylist (launch hijacks such as NODE_OPTIONS, NPM_CONFIG_*, LD_* and PATH; proxies; URL overrides) applies to every server.",
           "type": "object",
           "propertyNames": {
             "type": "string",
@@ -131,9 +131,9 @@
       "pattern": "^[A-Za-z0-9_.-]{1,128}$"
     },
     "envValue": {
-      "description": "bws:hapi-mcp-<name> names a bws key, which the generated configs reference as ${HAPI_MCP_<NAME>}. Anything else is a literal, which may not start with bws: or contain $ (Hermes would expand ${...} in it) or a control character.",
+      "description": "secret:hapi-mcp-<name> names a secret by its logical name, which the generated configs reference as ${HAPI_MCP_<NAME>}. Anything else is a literal, which may not start with secret: or contain $ (Hermes would expand ${...} in it) or a control character.",
       "type": "string",
-      "pattern": "^(?:bws:hapi-mcp-[a-z0-9]+(?:-[a-z0-9]+)*|(?!bws:)[^$\\u0000-\\u001f\\u007f]+)$",
+      "pattern": "^(?:secret:hapi-mcp-[a-z0-9]+(?:-[a-z0-9]+)*|(?!secret:)[^$\\u0000-\\u001f\\u007f]+)$",
       "maxLength": 2048
     }
   }

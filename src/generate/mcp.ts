@@ -11,9 +11,10 @@
  *   the scanners vet what may run, not what runs today. The archon zone has no
  *   MCP servers and no file.
  *
- * No secret is ever in either. A `bws:<key>` env value becomes `${NAME}`, with
- * NAME from `secretEnvName` (HAPI_MCP_...): Hermes resolves it from its env,
- * which the stack fills from bws, and the scanners see only the reference.
+ * No secret is ever in either. A `secret:<name>` env value becomes `${NAME}`,
+ * with NAME from `secretEnvName` (HAPI_MCP_...): Hermes resolves it from its
+ * env, which `hapi secrets resolve` fills from the secret provider, and the
+ * scanners see only the reference.
  *
  * A stdio server's command is `npx --yes <name>@<version>`. That pins the
  * package's version, but not its dependency tree, and nothing checks
@@ -62,7 +63,7 @@ function launch(name: string, s: McpServer): { command: string; args: string[] }
   return { command: "npx", args: ["--yes", `${s.package.name}@${s.package.version}`] };
 }
 
-/** The server's env with every bws reference as `${HAPI_MCP_...}`, keys sorted. */
+/** The server's env with every secret reference as `${HAPI_MCP_...}`, keys sorted. */
 function envRefs(s: McpServer): Record<string, string> {
   return Object.fromEntries(
     Object.keys(s.env)
@@ -97,7 +98,7 @@ export function checkOwnRefs<T extends object>(name: string, s: Pick<McpServer, 
       const ownRef = path.length === 2 && path[0] === "env" && own.has(value);
       if (value.includes("$") && !ownRef) {
         throw new Error(
-          `${where()} is ${JSON.stringify(value)}: Hermes expands \${...} there, and a server may reference only its own bws keys, as env values (spec §10.1)`,
+          `${where()} is ${JSON.stringify(value)}: Hermes expands \${...} there, and a server may reference only its own secrets, as env values (spec §10.1)`,
         );
       }
     } else if (value !== null && typeof value === "object") {

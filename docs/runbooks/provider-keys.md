@@ -4,18 +4,18 @@ Every model and search key hapi uses, where to get it, the cap to set on it, and
 
 These are outward-facing steps, so the operator does them by hand. For each key:
 1. Create it as below, with its cap.
-2. Store it in Bitwarden under the bws key named here, and put its id in your copy of the secrets map, outside the repo ([docs/secrets.md](../secrets.md#filling-in-the-map-the operator)).
+2. Add it to your secrets store (`mise run secrets:edit`) as the logical name given here ([docs/secrets.md](../secrets.md#adding-a-secret)).
 3. Never paste a key into a chat, an issue or a file in the repo.
 
-When every key is stored, run `hapi secrets resolve --dry-run --map <your copy>` ([docs/secrets.md](../secrets.md#filling-in-the-map-the operator)). Every key should say `found`.
+When every key is stored, run `mise run secrets:check` ([docs/secrets.md](../secrets.md#hapi-secrets-check)). Every key should say `found`.
 
-| Key | Cap | Zone / env var | bws key |
+| Key | Cap | Zone / env var | Logical name |
 |---|---|---|---|
 | Anthropic, workspace `hapi-hermes` | $60/month | `hermes` / `ANTHROPIC_API_KEY` | `hapi-hermes-anthropic-api-key` |
 | Anthropic, workspace `hapi-factory` | $100/month | `archon` / `ANTHROPIC_API_KEY` and `CLAUDE_API_KEY` | `hapi-archon-anthropic-api-key` |
-| Anthropic, workspace `hapi-evals` | $40/month | Not in the map yet: the evals plan adds it | |
+| Anthropic, workspace `hapi-evals` | $40/month | Not in the manifest yet: the evals plan adds it | |
 | OpenCode Go | The plan's monthly limits, Extra Usage off | `archon` / `OPENCODE_API_KEY` | `hapi-archon-opencode-api-key` |
-| OpenRouter `hapi-jev` | $0.06/day, reset daily (at most $1.86 a month, under the $2 cap); ZDR enforced | `archon` / `HAPI_JEV_OPENROUTER_API_KEY` | `hapi-archon-jev-openrouter-api-key` |
+| OpenRouter `hapi-jev` | $0.06/day, reset daily (at most $1.86 a month, under the $2 cap); ZDR enforced unless the documented Jev exception applies ([below](#hapi-jev-2month)) | `archon` / `HAPI_JEV_OPENROUTER_API_KEY` | `hapi-archon-jev-openrouter-api-key` |
 | OpenRouter `hapi-portable` | $0.64/day, reset daily (at most $19.84 a month, under the $20 cap); ZDR enforced | Not needed in v1 ([below](#hapi-portable-20month-not-needed-in-v1)) | |
 | Brave Search | A spend cap, if your plan has one | `research` / `BRAVE_SEARCH_API_KEY` | `hapi-research-brave-search-api-key` |
 | Exa | A spend cap, if offered | `research` / `EXA_API_KEY` | `hapi-research-exa-api-key` |
@@ -37,8 +37,8 @@ API keys only. **Never subscription OAuth** in Hermes, Pi or Archon (Global Cons
    That is $200, the monthly credit.
 3. **Leave the default workspace unused.** Its spend can't be capped (spec §11.5), so create no key in it.
 4. Create **one API key in each workspace**, named after it:
-   - the `hapi-hermes` key → bws `hapi-hermes-anthropic-api-key`;
-   - the `hapi-factory` key → bws `hapi-archon-anthropic-api-key`. The map gives this one secret to both `ANTHROPIC_API_KEY` (Pi reads it) and `CLAUDE_API_KEY` (Archon's `claude` nodes read it).
+   - the `hapi-hermes` key → `hapi-hermes-anthropic-api-key`;
+   - the `hapi-factory` key → `hapi-archon-anthropic-api-key`. The manifest gives this one secret to both `ANTHROPIC_API_KEY` (Pi reads it) and `CLAUDE_API_KEY` (Archon's `claude` nodes read it).
    - Create the `hapi-evals` key when evals arrive.
 
 When a workspace hits its limit, Anthropic answers 429 `enforced_spend_limit_reached`. hapi treats that as terminal and never retries it (spec §12).
@@ -53,7 +53,7 @@ OpenCode Go serves the `portable` roster (spec §12; `policy/rosters/portable.ya
    - **keep the allowed regions to the EU and the US** (the default).
    - **turn Extra Usage off**, so the plan's monthly limit is a hard cap.
 3. **Use only zero-retention models.** The `portable` roster lists GLM-5.3 Flash, GLM-5.3 and Kimi K3.1 Pro: 0-day retention and no training, checked against https://opencode.ai/docs/go/ on 2026-10-26. Don't add the GPT, Grok or Claude Haiku endpoints (30-day retention), or DeepSeek (its zero-retention agreement is renewed monthly).
-4. Create an **API key** → bws `hapi-archon-opencode-api-key`.
+4. Create an **API key** → `hapi-archon-opencode-api-key`.
 
 The plan's 5-hour (20%) and weekly (50%) allowances can run out. Then fall back to the `budget` roster (`mise run policy:build -- --roster budget`).
 
@@ -76,24 +76,24 @@ The Jev decision model (spec §9.5) is reached through OpenRouter, on its own ke
 4. **Check that Jev has a ZDR endpoint.** Open the Jev model's page on OpenRouter and check its providers' data policies: does any endpoint have zero data retention? (OpenRouter's ZDR preview, `GET /api/v1/endpoints/zdr`, lists every endpoint left under ZDR, but it needs a management key; if you use it, don't put the key on a command line.)
    - **If a Jev endpoint is zero-retention,** you're done: with ZDR enforced, Jev calls go only there.
    - **If none is,** ZDR fails every Jev call. Then Jev is a **documented exception** to the ZDR rule: turn off ZDR enforcement in the `hapi-jev` guardrail only, keep its model allowlist and the daily limit, and record the exception in the threat model (`docs/security/threat-model.md`, Plan 01 Task 7). The exception rests on spec §9.5's data boundary: Jev sees decision state (comment text, diff summaries, file contents for the scout pass, failure logs), and in v1 it runs **on public repos only**, whose content is public anyway.
-5. Store the key → bws `hapi-archon-jev-openrouter-api-key`. The map names it `HAPI_JEV_OPENROUTER_API_KEY`, not `OPENROUTER_API_KEY`, so Pi never uses it for model calls ([docs/secrets.md](../secrets.md#the-zones-and-their-keys)).
+5. Add the key to your secrets store → `hapi-archon-jev-openrouter-api-key`. The manifest puts it in `HAPI_JEV_OPENROUTER_API_KEY`, not `OPENROUTER_API_KEY`, so Pi never uses it for model calls ([docs/secrets.md](../secrets.md#the-zones-and-their-keys)).
 
 Either way, Jev's retention terms (TypeSafe's and OpenRouter's) must be verified before Jev is enabled on a private repo (spec §9.5).
 
 ### `hapi-portable` ($20/month): not needed in v1
 
-`policy/budgets.yaml` keeps `openrouter_monthly_usd: 20` for an OpenRouter-backed roster. In v1 the `portable` roster runs on OpenCode Go instead, so this key isn't in the map. If a roster ever uses `openrouter/` models:
+`policy/budgets.yaml` keeps `openrouter_monthly_usd: 20` for an OpenRouter-backed roster. In v1 the `portable` roster runs on OpenCode Go instead, so this key isn't in the manifest. If a roster ever uses `openrouter/` models:
 1. create a key named **`hapi-portable`** with a **$0.64** credit limit, resetting **daily** (at most $19.84 in a 31-day month, under the $20 cap);
 2. create a guardrail named **`hapi-portable`** that enforces zero data retention for every provider group, allows only the roster's models, and doesn't allow training on prompts, and assign it to the key (spec §11.5: ZDR for every non-Anthropic model). No exception applies to this key;
-3. add `OPENROUTER_API_KEY` to the `archon` zone of the map.
+3. add `OPENROUTER_API_KEY` to the `archon` zone of `stack/secrets.yaml` (a PR), with a logical name such as `hapi-archon-openrouter-api-key`, and add that name to your store.
 
 ## Search keys: Brave, Exa, Context7
 
 All three go to the research zone only (spec §10.1): **spend-capped, search-only** keys, with no repo or forge access. Use an account that is for hapi only, not a personal one, and give each key only search and read scopes where the vendor offers scopes.
 
-- **Brave Search API** (Hermes's search backend). In the Brave Search API dashboard, subscribe to a search plan, create an API key, and set a monthly spending limit if your plan offers one. → bws `hapi-research-brave-search-api-key`.
-- **Exa** (Hermes's contents, or extract, backend). In the Exa dashboard, create an API key. Exa is pay-as-you-go with monthly free credits. Set a usage limit if the dashboard offers one; otherwise check the usage page after the first runs. → bws `hapi-research-exa-api-key`.
-- **Context7** (the `context7` MCP server in `policy/mcp.yaml`). In the Context7 dashboard, create an API key, with a spend cap if your plan has one. The server always runs with a key, because anonymous callers can be sent a setup elicitation. → bws `hapi-mcp-context7-api-key`. The bws key name is fixed by `policy/mcp.yaml`, and its env var is `HAPI_MCP_CONTEXT7_API_KEY`.
+- **Brave Search API** (Hermes's search backend). In the Brave Search API dashboard, subscribe to a search plan, create an API key, and set a monthly spending limit if your plan offers one. → `hapi-research-brave-search-api-key`.
+- **Exa** (Hermes's contents, or extract, backend). In the Exa dashboard, create an API key. Exa is pay-as-you-go with monthly free credits. Set a usage limit if the dashboard offers one; otherwise check the usage page after the first runs. → `hapi-research-exa-api-key`.
+- **Context7** (the `context7` MCP server in `policy/mcp.yaml`). In the Context7 dashboard, create an API key, with a spend cap if your plan has one. The server always runs with a key, because anonymous callers can be sent a setup elicitation. → `hapi-mcp-context7-api-key`. That logical name is fixed by `policy/mcp.yaml` (`secret:hapi-mcp-context7-api-key`), and its env var is `HAPI_MCP_CONTEXT7_API_KEY`.
 
 ## Kill switch: zero or revoke the keys
 

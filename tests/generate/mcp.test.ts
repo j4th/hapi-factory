@@ -32,10 +32,10 @@ describe("emitMcpJson", () => {
     });
   });
 
-  test("secrets appear only as ${NAME} references to their bws key", () => {
+  test("secrets appear only as ${NAME} references to their secret name", () => {
     for (const zone of ["hermes", "research"] as const) {
       const text = emitMcpJson(p, zone);
-      expect(text).not.toContain("bws:");
+      expect(text).not.toContain("secret:");
       for (const server of Object.values(parsed(zone).mcpServers) as any[]) {
         for (const value of Object.values(server.env) as string[]) {
           expect(value.startsWith("${") ? /^\$\{HAPI_MCP_[A-Z0-9_]+\}$/.test(value) : !value.includes("$")).toBe(true);
@@ -87,7 +87,7 @@ describe("emitMcpJson", () => {
     const literal = structuredClone(p);
     literal.mcp.servers.context7!.env.CONTEXT7_API_KEY = "ctx7sk-FAKE-NOT-A-REAL-KEY";
     expect(() => emitMcpJson(literal, "research")).toThrow(/\/servers\/context7\/env\/CONTEXT7_API_KEY: CONTEXT7_API_KEY names a secret/);
-    expect(() => hermesMcpServers(literal, "research")).toThrow(/must be a bws reference/);
+    expect(() => hermesMcpServers(literal, "research")).toThrow(/must be a secret reference/);
     const hijack = structuredClone(p);
     hijack.mcp.servers.phoenix!.env.NODE_OPTIONS = "--require /tmp/x.js";
     expect(() => emitHermes(hijack, { o11y: true })).toThrow(/\/servers\/phoenix\/env\/NODE_OPTIONS: a server may not set NODE_OPTIONS/);
@@ -159,7 +159,7 @@ describe("hermesMcpServers", () => {
 describe("checkOwnRefs", () => {
   const context7 = p.mcp.servers.context7!;
 
-  test("a server's own bws references, as env values, pass; every real entry passes", () => {
+  test("a server's own secret references, as env values, pass; every real entry passes", () => {
     const entry = { type: "stdio", command: "npx", args: ["--yes", "x@1.0.0"], env: { CONTEXT7_API_KEY: "${HAPI_MCP_CONTEXT7_API_KEY}", OTEL_SDK_DISABLED: "true" } };
     expect(checkOwnRefs("context7", context7, entry)).toBe(entry);
     expect(() => emitMcp(p)).not.toThrow();

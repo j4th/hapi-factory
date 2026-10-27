@@ -1,8 +1,8 @@
 # hapi-factory
 
-hapi-factory is a public, best-practices reference stack for an end-to-end agentic software factory. **HAPi** stands for **H**ermes + **A**rchon + **Pi**: Hermes is the coordinator you talk to, Archon is the run engine and Pi is the worker. The stack puts existing tools together into one working system. It also covers the steps most factories skip: discovery research, architecture, threat modeling and breaking work into tasks. Security is designed in from the start: one policy compiled into every tool's config, rootless containers behind default-deny egress, secrets from a vault, short-lived GitHub App tokens, and an audit that catches drift. Read the design in [docs/superpowers/specs/2026-10-26-hapi-factory-design.md](docs/superpowers/specs/2026-10-26-hapi-factory-design.md). It is the binding reference for everything here.
+hapi-factory is a public, best-practices reference stack for an end-to-end agentic software factory. **HAPi** stands for **H**ermes + **A**rchon + **Pi**: Hermes is the coordinator you talk to, Archon is the run engine and Pi is the worker. The stack puts existing tools together into one working system. It also covers the steps most factories skip: discovery research, architecture, threat modeling and breaking work into tasks. Security is designed in from the start: one policy compiled into every tool's config, rootless containers behind default-deny egress, secrets from a pluggable secret provider (sops + age by default), short-lived GitHub App tokens, and an audit that catches drift. Read the design in [docs/superpowers/specs/2026-10-26-hapi-factory-design.md](docs/superpowers/specs/2026-10-26-hapi-factory-design.md). It is the binding reference for everything here.
 
-> **Status: Plan 01 (Phase 0 foundations) is in progress.** Today the repo has the pinned toolchain, the `hapi` CLI skeleton, CI, `policy/` with its JSON Schemas, loader, tighten-only repo overlay and work-order validator, the generators that compile policy into Hermes, Archon, Pi and egress-proxy configs (`mise run policy:build`), the pinned per-zone MCP catalog with its tool-description lock, fail-closed secrets from Bitwarden (`hapi secrets resolve`), scoped GitHub App token minting (`hapi token mint`), and the setup runbooks. Anything marked *arrives in Plan 01 Task N* is not built yet. The plan is [docs/superpowers/plans/2026-10-26-hapi-factory-01-foundations.md](docs/superpowers/plans/2026-10-26-hapi-factory-01-foundations.md).
+> **Status: Plan 01 (Phase 0 foundations) is in progress.** Today the repo has the pinned toolchain, the `hapi` CLI skeleton, CI, `policy/` with its JSON Schemas, loader, tighten-only repo overlay and work-order validator, the generators that compile policy into Hermes, Archon, Pi and egress-proxy configs (`mise run policy:build`), the pinned per-zone MCP catalog with its tool-description lock, fail-closed secrets from a pluggable provider, sops + age by default (`mise run secrets:init`, `hapi secrets resolve`), scoped GitHub App token minting (`hapi token mint`), and the setup runbooks. Anything marked *arrives in Plan 01 Task N* is not built yet. The plan is [docs/superpowers/plans/2026-10-26-hapi-factory-01-foundations.md](docs/superpowers/plans/2026-10-26-hapi-factory-01-foundations.md).
 
 ## Contents
 
@@ -24,7 +24,7 @@ hapi-factory is a public, best-practices reference stack for an end-to-end agent
 - **Docker Engine with Compose v2.** You need it only for the stack and the integration tests (*arrives in Plan 01 Task 5*). Linting and unit tests don't need Docker. The stack runs on rootless Docker as a dedicated `hapi` user, which `scripts/host-setup.sh` creates (*arrives in Plan 01 Task 5*).
 - **git.**
 
-You don't need to install Bun, Node, Python, uv, gh, gitleaks or `bws` yourself. `mise install` installs them all.
+You don't need to install Bun, Node, Python, uv, gh, gitleaks, sops or age yourself. `mise install` installs them all.
 
 ## Quick start
 
@@ -36,6 +36,14 @@ mise install                 # install the exact tool versions pinned in mise.to
 mise run lint                # install JS deps from bun.lock, then type-check
 mise run test                # run the unit tests
 mise run hapi -- --version   # run the CLI (prints 0.1.0)
+```
+
+The unit tests need no secrets. To run the stack you also need a secrets store ([docs/secrets.md](docs/secrets.md#getting-started-with-sops--age)):
+
+```bash
+mise run secrets:init        # an age key, an encrypted file of every secret name (all empty), and the config
+mise run secrets:edit        # fill in each value in your editor; sops encrypts it again
+mise run secrets:check       # every secret should say found
 ```
 
 ## Repo layout
@@ -51,12 +59,12 @@ What exists now:
 | `src/cli.ts` | The `hapi` CLI: the entry point, the command registry and `main(argv)`. |
 | `src/version.ts` | `HAPI_VERSION`. It must match `version` in `package.json`, and a test checks that it does. |
 | `policy/` | The single source of truth: protected paths, commands, trusted sources, budgets, approvals, roles, flags, the model rosters (`policy/rosters/`), and the MCP catalog (`mcp.yaml`) with its tool-description lock (`mcp.lock.json`). See [docs/policy.md](docs/policy.md) and [docs/mcp.md](docs/mcp.md). |
-| `policy/schemas/` | JSON Schemas (draft 2020-12) for every policy file, the MCP lock, the repo overlay (`.factory/config.yaml`), the work order (`order.yaml`) and the secrets map (`stack/secrets.map.yaml`) |
+| `policy/schemas/` | JSON Schemas (draft 2020-12) for every policy file, the MCP lock, the repo overlay (`.factory/config.yaml`), the work order (`order.yaml`), the secrets manifest (`stack/secrets.yaml`) and the local secrets config |
 | `src/policy/` | `loadPolicy` (load and validate `policy/`), `loadOverlay` and `applyOverlay` (the repo overlay, which may only tighten policy), `effectiveModes` (a file's protected-path modes: the strictest across every matching glob), `matchCommand` (whether Hermes's argv-exact command rules allow a command), `forgeDomain` (forge hosts, which the archon zone may never reach), `isHostname` (a plain domain name, as the schema defines it), `zoneHosts` (an egress zone's allowlist), `serversForZone` (a zone's MCP servers, with the catalog's floor, blocklist and tool checks in `mcp.ts`), the policy types and the shared schema checker |
 | `src/mcp/` | The MCP tool-description lock (`lock.ts`): `hashToolSurface`, `verifyLock`, and the `hapi mcp verify` and `hapi mcp pin` commands |
 | `src/workorder/` | `validateWorkOrder` and the `hapi workorder validate` command |
-| `stack/secrets.map.yaml` | The secrets map template: which Bitwarden secret fills which env var, per zone (`hermes`, `archon`, `research`, `host`). It holds placeholder bws secret ids, never values and never real ids. Each deployment fills in a copy outside the repo and passes it with `--map`. See [docs/secrets.md](docs/secrets.md#filling-in-the-map-the operator). |
-| `src/secrets/` | `bws.ts`: `resolveSecrets` (fail-closed: every key into memory, then the env files), `checkSecrets` (the dry run), `mcpSecretGaps` (the map covers the MCP catalog's bws references), `loadSecretMap` and `hapi secrets resolve`. `files.ts`: secrets on disk: `runtimeDir` (`$XDG_RUNTIME_DIR/hapi`, no fallback), `secureDir` (0700), `writeSecretFiles` (0600, atomic) and the env-file format. |
+| `stack/secrets.yaml` | The secrets manifest: per zone (`hermes`, `archon`, `research`, `host`), which env var gets which logical name (`hapi-hermes-anthropic-api-key`). Public and provider-neutral: no ids, no values. It is the single list of what your store must hold. See [docs/secrets.md](docs/secrets.md#the-manifest-stacksecretsyaml). |
+| `src/secrets/` | `manifest.ts`: `loadManifest` and `mcpSecretGaps` (the manifest covers the MCP catalog's `secret:` references). `provider.ts`: the `SecretProvider` interface, `SecretError`, `loadSecretsConfig` (the local config), `providerFor` (exactly the configured provider, no fallback), `resolveSecrets` (fail-closed: every name into memory, then the env files), `checkSecrets`, `describeSecretsConfig`, and `hapi secrets resolve`, `check` and `edit`. `providers/`: `sops.ts` (the default), `bws.ts` (optional) and `env-file.ts` (a downgrade). `init.ts`: `hapi secrets init`. `files.ts`: secrets on disk: `runtimeDir` (`$XDG_RUNTIME_DIR/hapi`, no fallback), `secureDir` (0700 under a 0700 `XDG_RUNTIME_DIR`), `writeSecretFiles` (the whole set at once, by symlink swap), the env-file format, and the checks that keep keys and plaintext outside the checkout. |
 | `src/forge/` | Every forge call goes through here (spec §16). `github/app-token.ts`: `appJwt`, `findInstallationId`, `mintInstallationToken` (one repo, checked scope, a broader token revoked) and `hapi token mint` |
 | `src/generate/` | The config generators and `hapi policy build`: one pure emitter per tool (`hermes.ts`, `archon.ts`, `pi.ts`, `egress.ts`, and `mcp.ts` for the MCP servers) and `buildAll` (`index.ts`). See [docs/generated-configs.md](docs/generated-configs.md). |
 | `build/` | Generated by `mise run policy:build`, and gitignored: `hermes/config.yaml`, `archon/config.yaml` and `archon.env`, `pi/models.json` and `hapi-guard.json`, `egress/{hermes,archon,research}.squid.conf`, `mcp/{hermes,research}.mcp.json`. Never edit it by hand. |
@@ -65,7 +73,7 @@ What exists now:
 | `docs/policy.md` | The policy files (the MCP catalog and its lock included), the command-allowlist semantics, the overlay rule, the work-order format and the `hapi mcp` commands |
 | `docs/generated-configs.md` | Every file under `build/`: what it is, which policy files feed it, what each hardening setting does and why, and how to regenerate it |
 | `docs/mcp.md` | The MCP layer: which zone gets which server, how to add or upgrade one, the release cooldown, advisory floors, the tool-description lock and the CI scanners |
-| `docs/secrets.md` | Secrets: the zones and their keys, the secrets map, setting up Bitwarden, `hapi secrets resolve`, the env files, `hapi token mint`, rotation |
+| `docs/secrets.md` | Secrets: manifest, config and store; the zones and their keys; sops + age onboarding and key backup; `hapi secrets init`, `edit`, `check` and `resolve`; the env files; rotation; optional bws; the env-file downgrade; `hapi token mint`; threat notes |
 | `docs/runbooks/` | Manual setup runbooks: [GitHub Apps and rulesets](docs/runbooks/github-apps.md), [provider keys and spend caps](docs/runbooks/provider-keys.md), [Slack](docs/runbooks/slack.md) |
 | `docs/superpowers/specs/` | The design spec. It is the binding authority. |
 | `docs/superpowers/plans/` | Implementation plans. Plan 01 is the current one. |
@@ -93,6 +101,9 @@ Run `mise tasks` to list them with descriptions. Run any of them with `mise run 
 | `test` | `bun test`: the unit suite. It needs no Docker, network or secrets. Integration tests are skipped unless `HAPI_INT` is set. | Works |
 | `test:int` | `bun test tests/stack` with `HAPI_INT=1`: the integration tests. They need Docker. | The task exists. Its tests arrive in Plan 01 Task 5, and until then it fails with "did not match any test files". |
 | `hapi` | `bun run src/cli.ts`: runs the [`hapi` CLI](#the-hapi-cli). Put `--` before the CLI's arguments: `mise run hapi -- --help`. | Works |
+| `secrets:init` | `hapi secrets init`: sets up the default sops + age store (an age key, an encrypted file of every name in `stack/secrets.yaml`, all empty, and the config). It never overwrites anything. Flags after `--`, e.g. `mise run secrets:init -- --file private/secrets.enc.yaml`. See [docs/secrets.md](docs/secrets.md#hapi-secrets-init). | Works |
+| `secrets:edit` | `hapi secrets edit`: opens your sops store in `$EDITOR` (`sops edit`), with the plaintext temp file on your tmpfs. | Works |
+| `secrets:check` | `hapi secrets check`: prints `found`, `missing`, `empty` or `invalid` for every secret in the manifest, never a value, and exits 1 unless all are found. | Works |
 | `policy:build` | `hapi policy build`: compiles `policy/` into the Hermes, Archon, Pi, egress and MCP configs under `build/`. Pass CLI flags after `--`, e.g. `mise run policy:build -- --roster budget`. See [docs/generated-configs.md](docs/generated-configs.md). | Works |
 | `audit` | Checks deployed config, pins and settings against policy, and exits non-zero on drift. | Stub. Arrives in Plan 01 Task 6. |
 | `up` | Builds policy, resolves secrets, then starts the stack. | Stub. Arrives in Plan 01 Task 5. |
@@ -129,8 +140,11 @@ You can run it two ways:
 | `policy build [--policy dir] [--out dir] [--roster name]` | Loads and checks `--policy` (default `policy`), writes the generated configs under `--out` (default `build`) and prints each path. `--roster` (`budget`, `anthropic` or `portable`; default `anthropic`) picks Archon's tiers and Pi's models; Hermes always uses `anthropic`. A usage error exits 2; a bad policy file exits 1 and names the file. See [docs/generated-configs.md](docs/generated-configs.md). | Works |
 | `mcp verify [--policy dir] [--lock file]` | Checks every MCP server's live tool surface against `policy/mcp.lock.json`. Prints `ok`, `changed` or `unpinned` per server, and `orphaned` for a lock entry whose server left the catalog, and exits 1 unless all are `ok`. Until the live fetch is wired it exits 1. See [docs/policy.md](docs/policy.md#hapi-mcp-verify-and-hapi-mcp-pin). | The command works now; the live fetch arrives in Plan 01 Task 5 |
 | `mcp pin --server name [--policy dir] [--lock file]` | Records one MCP server's live tool surface and its hash in `policy/mcp.lock.json`. A re-pin is a reviewed change ([docs/mcp.md](docs/mcp.md#adding-or-upgrading-a-server)). | The command works now; the live fetch arrives in Plan 01 Task 5 |
-| `secrets resolve [--dry-run] [--map file] [--policy dir]` | Resolves the secrets map given with `--map` (your filled-in copy, outside the repo; the default, `stack/secrets.map.yaml`, is the placeholder template and is refused) from Bitwarden, all into memory first, then writes `$XDG_RUNTIME_DIR/hapi/<zone>.env` (mode `0600`, directory `0700`, atomically) and prints each path. Any missing or empty secret fails, naming the key, and nothing is written. It fails if `XDG_RUNTIME_DIR` is unset (no `/tmp` fallback), or if the map misses a bws reference of the MCP catalog in `--policy` (default `policy`). `--dry-run` prints `found`, `missing` or `placeholder` per key, never a value, writes nothing, and exits 1 unless every key is found. See [docs/secrets.md](docs/secrets.md#hapi-secrets-resolve). | Works |
-| `token mint --app planner\|factory --repo owner/name` | Mints a 1-hour GitHub App installation token for that one repo, with the App's fixed permissions. It reads the App's id and key from `$XDG_RUNTIME_DIR/hapi/host.env`, rejects (and revokes) a token broader than requested, and writes the token to `$XDG_RUNTIME_DIR/hapi/tokens/<app>.<owner>.<repo>.token` (mode `0600`). It prints the path and expiry, never the token. See [docs/secrets.md](docs/secrets.md#hapi-token-mint). | Works |
+| `secrets init [--config file] [--file file] [--age-key file]` | Sets up the default sops + age store: reuses or makes the age key (outside the checkout, `0600`), encrypts every manifest name with an empty value by piping it to `sops encrypt` (plaintext never touches disk), and writes the config. It never overwrites an existing config or encrypted file. It prints the age public key and the reminder to back it up. See [docs/secrets.md](docs/secrets.md#hapi-secrets-init). | Works |
+| `secrets edit [--config file]` | Runs `sops edit` on the configured file in your terminal (sops provider only), after checking the age key, with `TMPDIR` on your tmpfs and your shell's `SOPS_*` variables dropped. See [docs/secrets.md](docs/secrets.md#hapi-secrets-edit). | Works |
+| `secrets check [--config file]` | Reads the configured store and prints `found`, `missing`, `empty` or `invalid` for every env var of `stack/secrets.yaml`, `missing` for an MCP reference it doesn't map, and `unknown` for store names it doesn't list. Never a value; writes nothing; exits 1 if anything is missing, empty or invalid. See [docs/secrets.md](docs/secrets.md#hapi-secrets-check). | Works |
+| `secrets resolve [--config file] [--dry-run]` | Resolves `stack/secrets.yaml` from the configured provider (the config at `--config`, `$HAPI_SECRETS_CONFIG` or `~/.config/hapi/secrets.yaml`), all into memory first, then writes `$XDG_RUNTIME_DIR/hapi/env/<zone>.env` (mode `0600`) as one set, by symlink swap, and prints each path. A provider failure, or any missing or empty secret, fails, naming it, and nothing is written; there is no fallback to another provider. It fails if `XDG_RUNTIME_DIR` is unset or isn't yours and `0700` (no `/tmp` fallback). `--dry-run` is `secrets check`. See [docs/secrets.md](docs/secrets.md#hapi-secrets-resolve). | Works |
+| `token mint --app planner\|factory --repo owner/name` | Mints a 1-hour GitHub App installation token for that one repo, with the App's fixed permissions. It reads the App's id and key from `$XDG_RUNTIME_DIR/hapi/env/host.env`, rejects (and revokes) a token broader than requested or without a valid expiry, deletes token files more than an hour old, and writes the token to `$XDG_RUNTIME_DIR/hapi/tokens/<app>.<owner>.<repo>.token` (mode `0600`). It prints the path and expiry, never the token. See [docs/secrets.md](docs/secrets.md#hapi-token-mint). | Works |
 | `audit [--repo owner/name ...]` | Runs the audit checks, and exits 1 if any check fails | Plan 01 Task 6 |
 
 **Adding a command (for contributors).** Write the handler in its own module, as `policyBuild` is in `src/generate/index.ts`. Then register it in the *Commands* section at the bottom of `src/cli.ts`:
@@ -159,14 +173,17 @@ Here is how commands work:
 | `uv`, `python` | Python tooling on the Hermes side |
 | `gh` | GitHub CLI, used only for the operator's manual setup steps. Factory code calls GitHub through `src/forge/`, never raw `gh` (spec §11). |
 | `gitleaks` | Secret scanning |
-| `bitwarden-secrets-manager` | Provides `bws`. Secrets come from Bitwarden Secrets Manager when the stack starts, never from `.env` files (spec §11.5). |
+| `sops` | The default secret provider: one age-encrypted file, decrypted into memory when the stack starts (spec §11.5, [docs/secrets.md](docs/secrets.md)) |
+| `age` | Provides `age` and `age-keygen`: the key the sops file is encrypted to |
+
+`bws` (Bitwarden Secrets Manager) is an optional provider and isn't pinned here; a bws user pins it in their own gitignored `mise.local.toml` ([docs/secrets.md](docs/secrets.md#optional-bitwarden-secrets-manager-bws)).
 
 **Supply-chain defaults** (spec §11.6–11.7):
 - **Exact versions everywhere.** That covers `mise.toml`, `package.json` (`bunfig.toml` sets `exact = true`, so `bun add` never writes `^`) and the mise version CI uses.
 - **A committed lockfile.** `bun.lock` is in git, and `mise run setup` installs with `--frozen-lockfile`.
 - **A release-age cooldown.** `bunfig.toml` sets `minimumReleaseAge` to 3 days, so Bun won't resolve a package version published less than 3 days ago.
 - **Pinned actions.** CI actions are pinned to full commit SHAs, CI runs with a read-only token, and checkout doesn't persist credentials.
-- **No secrets on disk.** `.env*` files are gitignored. Secrets are written only to `0600` files on the user's tmpfs (`$XDG_RUNTIME_DIR/hapi/`), never to the repo or a `.env` file on disk.
+- **No plaintext secrets on disk.** `.env*`, `private/`, `keys.txt`, `*.agekey`, `secrets.env` and `mise.local.toml` are gitignored. The store is encrypted (sops + age) by default, and resolved secrets are written only to `0600` files on the user's tmpfs (`$XDG_RUNTIME_DIR/hapi/env/`), never to the repo or a `.env` file on disk.
 
 **To upgrade a tool:**
 1. Find the version with `mise ls-remote <tool>` or `mise latest <tool>`.
@@ -278,25 +295,24 @@ These steps are outward-facing or privileged, so agents never do them; the opera
 
 ### Plan 01 Task 3b: MCP server keys
 
-`policy/mcp.yaml` names each MCP server's secret by its Bitwarden (`bws`) key. Store each in Bitwarden Secrets Manager under exactly this name, and put its id under the env var shown in your copy of the secrets map, outside the repo ([docs/secrets.md](docs/secrets.md#filling-in-the-map-the operator)):
+`policy/mcp.yaml` names each MCP server's secret by its logical name (`secret:hapi-mcp-<name>`). Add each to your secrets store under exactly this name (`mise run secrets:edit`, [docs/secrets.md](docs/secrets.md#adding-a-secret)):
 
-| bws key | Map entry | What it is | Needed when |
+| Logical name | Manifest entry | What it is | Needed when |
 |---|---|---|---|
-| `hapi-mcp-context7-api-key` | `research` / `HAPI_MCP_CONTEXT7_API_KEY` (already in the template, as a placeholder) | A Context7 API key, on a spend-capped, search-only account (spec §10.1). Task 4's [provider-keys runbook](docs/runbooks/provider-keys.md#search-keys-brave-exa-context7) covers it. | Now: `hapi secrets resolve` needs every key in the map |
-| `hapi-mcp-phoenix-viewer-key` | `hermes` / `HAPI_MCP_PHOENIX_VIEWER_KEY` (add it then) | A Phoenix API key minted by a **VIEWER**-role user, never an admin or member | Before you turn on the observability profile (`flags.otel.enabled: true`); until it's in the map, `hapi secrets resolve` fails |
+| `hapi-mcp-context7-api-key` | `research` / `HAPI_MCP_CONTEXT7_API_KEY` (already in `stack/secrets.yaml`) | A Context7 API key, on a spend-capped, search-only account (spec §10.1). Task 4's [provider-keys runbook](docs/runbooks/provider-keys.md#search-keys-brave-exa-context7) covers it. | Now: `hapi secrets resolve` needs every name in the manifest |
+| `hapi-mcp-phoenix-viewer-key` | `hermes` / `HAPI_MCP_PHOENIX_VIEWER_KEY` (add it to the manifest then) | A Phoenix API key minted by a **VIEWER**-role user, never an admin or member | Before you turn on the observability profile (`flags.otel.enabled: true`); until it's in the manifest and your store, `hapi secrets resolve` fails |
 
-Each key belongs to one server only. The generated configs reference it as `${HAPI_MCP_<NAME>}` (for example `${HAPI_MCP_CONTEXT7_API_KEY}`), never by value. See [docs/mcp.md](docs/mcp.md) and [docs/secrets.md](docs/secrets.md#the-secrets-map-stacksecretsmapyaml).
+Each key belongs to one server only. The generated configs reference it as `${HAPI_MCP_<NAME>}` (for example `${HAPI_MCP_CONTEXT7_API_KEY}`), never by value. See [docs/mcp.md](docs/mcp.md) and [docs/secrets.md](docs/secrets.md#mcp-secrets).
 
-### Plan 01 Task 4: Bitwarden, provider keys, Slack and the GitHub Apps
+### Plan 01 Tasks 4 and 4b: your secrets store, provider keys, Slack and the GitHub Apps
 
-Do these in order. Each runbook says which bws key each secret goes under.
+Do these in order. Each runbook gives the logical name each secret goes under in your store.
 
-1. **Bitwarden Secrets Manager:** a `hapi` project, a read-only machine account and its access token, kept only in your shell's environment as `BWS_ACCESS_TOKEN` ([docs/secrets.md](docs/secrets.md#setting-up-bitwarden-secrets-manager-the operator)).
-2. **Provider keys:** the Anthropic Console workspaces `hapi-hermes` ($60), `hapi-factory` ($100) and `hapi-evals` ($40), OpenCode Go, the OpenRouter key `hapi-jev` ($2/month, set as a $0.06 limit that resets daily, with ZDR enforced by a guardrail), and the Brave, Exa and Context7 search keys ([provider keys](docs/runbooks/provider-keys.md)).
-3. **Slack:** a dedicated workspace, `#hapi-intake` and `#hapi-alerts`, and the app's tokens ([Slack](docs/runbooks/slack.md)). The app is created from the hapi Hermes container's manifest, so this step waits for Plan 01 Task 13; until then its three keys stay placeholders.
-4. **GitHub Apps and rulesets:** `hapi-planner` and `hapi-factory` with exactly their permissions, their keys in Bitwarden, and the rulesets: Restrict updates on `main-review`, so that no App can merge, and code-owner review ([GitHub Apps](docs/runbooks/github-apps.md)). The rulesets need the repo to be public. Then check that an App's merge call is refused.
-5. **Fill in the map, outside the repo:** copy `stack/secrets.map.yaml` to `~/.config/hapi/secrets.map.yaml` and replace each placeholder in the copy with the secret's id from the Bitwarden web app ([docs/secrets.md](docs/secrets.md#filling-in-the-map-the operator)). Never fill in or commit `stack/secrets.map.yaml` itself: it is the public template, and a unit test fails if it holds anything but placeholders.
-6. **Check:** `mise run hapi -- secrets resolve --dry-run --map ~/.config/hapi/secrets.map.yaml`. Expected: every key `found`, no value printed, exit 0.
+1. **Your secrets store (sops + age, the default):** `mise run secrets:init -- --file private/secrets.enc.yaml` (the encrypted file in `private/`, so it is backed up with your private repo; the age key stays in `~/.config/sops/age/`), then **back up the age key offline** as it says ([docs/secrets.md](docs/secrets.md#getting-started-with-sops--age)). Bitwarden is an optional alternative ([docs/secrets.md](docs/secrets.md#optional-bitwarden-secrets-manager-bws)).
+2. **Provider keys:** the Anthropic Console workspaces `hapi-hermes` ($60), `hapi-factory` ($100) and `hapi-evals` ($40), OpenCode Go, the OpenRouter key `hapi-jev` ($2/month, set as a $0.06 limit that resets daily, with ZDR enforced unless the documented Jev exception applies), and the Brave, Exa and Context7 search keys ([provider keys](docs/runbooks/provider-keys.md)). Add each to your store with `mise run secrets:edit`.
+3. **Slack:** a dedicated workspace, `#hapi-intake` and `#hapi-alerts`, and the app's tokens ([Slack](docs/runbooks/slack.md)). The app is created from the hapi Hermes container's manifest, so this step waits for Plan 01 Task 13; until then its three values stay empty and `check` lists them as `empty`.
+4. **GitHub Apps and rulesets:** `hapi-planner` and `hapi-factory` with exactly their permissions, their keys in your store, and the rulesets: Restrict updates on `main-review`, so that no App can merge, and code-owner review ([GitHub Apps](docs/runbooks/github-apps.md)). The rulesets need the repo to be public. Then check that an App's merge call is refused.
+5. **Check:** `mise run secrets:check`. Expected: every secret `found`, no value printed, exit 0.
 
 ## Documentation map
 
@@ -305,7 +321,7 @@ Do these in order. Each runbook says which bws key each secret goes under.
 | [Design spec](docs/superpowers/specs/2026-10-26-hapi-factory-design.md) | Intent, architecture, policy, security, phases. It is the binding authority. |
 | [Policy](docs/policy.md) | Each policy file and its schema (the MCP catalog `mcp.yaml` and its lockfile included), how Hermes's command rules match (and what the Plan 04 hook must do first), the tighten-only overlay rule with examples, the work-order format, `hapi workorder validate`, and `hapi mcp verify` and `hapi mcp pin` |
 | [Generated configs](docs/generated-configs.md) | Each file `hapi policy build` writes under `build/`, its policy sources, every hardening setting and why, how protected paths stay strictest-wins, and how to regenerate |
-| [Secrets](docs/secrets.md) | The zones and their keys, the secrets map template and its placeholders, filling in your copy outside the repo, setting up Bitwarden, `hapi secrets resolve` and its env files, `hapi token mint`, the "keys, never values" rule, rotation |
+| [Secrets](docs/secrets.md) | Manifest, config and store; the zones and their keys; sops + age onboarding, backing up the age key and adding a secret; `hapi secrets init`, `edit`, `check` and `resolve` and the env files; rotating a secret or the age key; optional bws; the env-file downgrade; `hapi token mint`; the "keys, never values" rule; threat notes |
 | [Runbook: GitHub Apps](docs/runbooks/github-apps.md) | Creating `hapi-planner` and `hapi-factory` with exact permissions, the rulesets (both on `main`, Restrict updates so no App can merge, code owners, branch and tag scope), checks (including that an App's merge call is refused), suspending an installation, rotating a key |
 | [Runbook: provider keys](docs/runbooks/provider-keys.md) | The Console workspaces and their limits, OpenCode Go settings, the OpenRouter keys (daily-reset limits, ZDR guardrails, the Jev exception if it has no ZDR endpoint), the Brave, Exa and Context7 search keys, and where each goes |
 | [Runbook: Slack](docs/runbooks/slack.md) | The workspace and channels, creating the app from Hermes's manifest, the three Slack secrets, Hermes's Slack settings |

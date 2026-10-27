@@ -1,6 +1,7 @@
 /**
  * JSON Schema validation for policy files, repo overlays, work orders, the
- * MCP lock (policy/mcp.lock.json) and the secrets map (stack/secrets.map.yaml).
+ * MCP lock (policy/mcp.lock.json), the secrets manifest (stack/secrets.yaml)
+ * and the local secrets config (docs/secrets.md).
  *
  * Every schema in policy/schemas/ is compiled once into one Ajv instance
  * (draft 2020-12, allErrors, strict mode). `check` returns the problems as
@@ -24,7 +25,8 @@ import mcp from "../../policy/schemas/policy-mcp.schema.json";
 import mcpLock from "../../policy/schemas/mcp-lock.schema.json";
 import workOrder from "../../policy/schemas/work-order.schema.json";
 import repoOverlay from "../../policy/schemas/repo-overlay.schema.json";
-import secretsMap from "../../policy/schemas/secrets-map.schema.json";
+import secretsManifest from "../../policy/schemas/secrets-manifest.schema.json";
+import secretsConfig from "../../policy/schemas/secrets-config.schema.json";
 import { forgeDomain, forgeHostMessage } from "./hosts";
 
 /** One problem found in a file: where (a JSON Pointer) and what. */
@@ -47,7 +49,8 @@ const schemas = {
   "mcp-lock": mcpLock,
   "work-order": workOrder,
   "repo-overlay": repoOverlay,
-  "secrets-map": secretsMap,
+  "secrets-manifest": secretsManifest,
+  "secrets-config": secretsConfig,
 };
 export type SchemaName = keyof typeof schemas;
 

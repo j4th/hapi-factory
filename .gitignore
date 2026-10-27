@@ -5,3 +5,11 @@ build/
 node_modules/
 .env*
 spikes/scratch/
+# Secrets (docs/secrets.md): private/ is its own repo, pushed to the private
+# remote; a bws user's mise.local.toml; and any age key or plaintext store
+# that lands here by mistake (hapi refuses to use one inside the checkout).
+private/
+mise.local.toml
+*.agekey
+keys.txt
+secrets.env

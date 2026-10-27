@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { createPrivateKey, generateKeyPairSync, verify } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -155,6 +155,25 @@ describe("mintInstallationToken", () => {
     await expect(mintInstallationToken({ ...o, fetch: f.fetch })).resolves.toBeDefined();
   });
 
+  test("mint revokes a 201 token that lacks expires_at", async () => {
+    for (const expires_at of [undefined, "", "not a date", 1700000000]) {
+      const body = { token: TOKEN, permissions: { contents: "write", pull_requests: "write" }, repository_selection: "selected", repositories: [{ name: "odoo-mcp" }], expires_at };
+      const f = fakeFetch({ [MINT]: { status: 201, body }, [REVOKE]: { status: 204 } });
+      const e = await caught(mintInstallationToken({ ...o, fetch: f.fetch }));
+      expect(e.message).toBe("GitHub's token response has no valid expires_at. The token was revoked.");
+      expect(f.calls.map((c) => `${c.method} ${c.url}`)).toEqual([MINT, REVOKE]);
+      expect(f.calls[1]!.headers.authorization).toBe(`Bearer ${TOKEN}`);
+    }
+    const f = fakeFetch({ [MINT]: { status: 201, body: { token: TOKEN } }, [REVOKE]: { status: 500 } });
+    const e = await caught(mintInstallationToken({ ...o, fetch: f.fetch }));
+    expect(e.message).toMatch(/could not be revoked, so it may stay valid for up to an hour/);
+    expect(e.message).not.toContain(TOKEN);
+    // With no token at all there is nothing to revoke.
+    const none = fakeFetch({ [MINT]: { status: 201, body: { expires_at: "2023-11-14T23:13:20Z" } } });
+    await expect(mintInstallationToken({ ...o, fetch: none.fetch })).rejects.toThrow("GitHub's token response has no token");
+    expect(none.calls.length).toBe(1);
+  });
+
   test("if the revoke fails, the error says so and when the token expires", async () => {
     const f = fakeFetch({ [MINT]: granted({ administration: "write" }), [REVOKE]: { status: 500 } });
     const e = await caught(mintInstallationToken({ ...o, fetch: f.fetch }));
@@ -232,12 +251,12 @@ describe("hapi token mint", () => {
     restore.push(() => log.mockRestore(), () => error.mockRestore());
     return { out, err };
   }
-  /** A runtime dir holding a host.env with the given values, as `hapi secrets resolve` writes it. */
+  /** A runtime dir holding hapi/env/host.env with the given values, as `hapi secrets resolve` writes it. */
   function xdgWithHostEnv(values: Record<string, string> | null): string {
     const xdg = mkdtempSync(join(tmpdir(), "hapi-token-"));
     temps.push(xdg);
-    mkdirSync(join(xdg, "hapi"), { mode: 0o700 });
-    if (values !== null) writeFileSync(join(xdg, "hapi", "host.env"), envFileText("host", values), { mode: 0o600 });
+    mkdirSync(join(xdg, "hapi", "env"), { mode: 0o700, recursive: true });
+    if (values !== null) writeFileSync(join(xdg, "hapi", "env", "host.env"), envFileText("host", values), { mode: 0o600 });
     return xdg;
   }
   const planner = { HAPI_PLANNER_APP_ID: "123456", HAPI_PLANNER_APP_PRIVATE_KEY: PKCS1_PEM };
@@ -272,6 +291,35 @@ describe("hapi token mint", () => {
     expect(out.join("\n")).not.toContain(TOKEN);
   });
 
+  test("each mint deletes token files in hapi/tokens/ older than one hour", async () => {
+    capture();
+    const xdg = xdgWithHostEnv(planner);
+    const tokens = join(xdg, "hapi", "tokens");
+    mkdirSync(tokens, { mode: 0o700 });
+    const old = join(tokens, "planner.example-owner.old.token");
+    const fresh = join(tokens, "factory.example-owner.fresh.token");
+    const leftover = join(tokens, ".planner.example-owner.x.token.0b1c.tmp");
+    const other = join(tokens, "README");
+    for (const f of [old, fresh, leftover, other]) writeFileSync(f, "fake\n", { mode: 0o600 });
+    for (const f of [old, leftover, other]) utimesSync(f, NOW_S - 3601, NOW_S - 3601);
+    utimesSync(fresh, NOW_S - 3599, NOW_S - 3599);
+    const f = fakeFetch({
+      [`GET ${API}/repos/example-owner/odoo-mcp/installation`]: { status: 200, body: { id: 123, suspended_at: null } },
+      [MINT]: granted({ ...APPS.planner.permissions }),
+    });
+    expect(await tokenMint(["--app", "planner", "--repo", "example-owner/odoo-mcp"], { fetch: f.fetch, env: { XDG_RUNTIME_DIR: xdg }, now: () => NOW_MS })).toBe(0);
+    expect([old, fresh, leftover, other].map(existsSync)).toEqual([false, true, false, true]);
+    expect(existsSync(join(tokens, "planner.example-owner.odoo-mcp.token"))).toBe(true);
+  });
+
+  test("a loose XDG_RUNTIME_DIR is refused before host.env is read", async () => {
+    const xdg = xdgWithHostEnv(planner);
+    chmodSync(xdg, 0o755);
+    const f = fakeFetch({});
+    await expect(tokenMint(["--app", "planner", "--repo", "example-owner/odoo-mcp"], { fetch: f.fetch, env: { XDG_RUNTIME_DIR: xdg } })).rejects.toThrow(/XDG_RUNTIME_DIR .* mode 0755, not 0700/);
+    expect(f.calls).toEqual([]);
+  });
+
   test("usage errors exit 2", async () => {
     const { err } = capture();
     const deps = { fetch: fakeFetch({}).fetch, env: {} };
@@ -285,7 +333,7 @@ describe("hapi token mint", () => {
     const f = fakeFetch({});
     const args = ["--app", "factory", "--repo", "example-owner/odoo-mcp"];
     await expect(tokenMint(args, { fetch: f.fetch, env: {} })).rejects.toThrow(/XDG_RUNTIME_DIR is not set/);
-    await expect(tokenMint(args, { fetch: f.fetch, env: { XDG_RUNTIME_DIR: xdgWithHostEnv(null) } })).rejects.toThrow(/hapi secrets resolve/);
+    await expect(tokenMint(args, { fetch: f.fetch, env: { XDG_RUNTIME_DIR: xdgWithHostEnv(null) } })).rejects.toThrow(/no .*\/hapi\/env\/host\.env: run `hapi secrets resolve` first/);
     await expect(tokenMint(args, { fetch: f.fetch, env: { XDG_RUNTIME_DIR: xdgWithHostEnv(planner) } })).rejects.toThrow(/HAPI_FACTORY_APP_ID/);
     expect(f.calls).toEqual([]);
   });

@@ -1,7 +1,7 @@
 /**
  * The MCP catalog, policy/mcp.yaml (spec §10.1): which MCP servers each zone
  * may load, each pinned exactly, with a read-only tool allowlist, its env by
- * bws key name and its egress hosts.
+ * secret name and its egress hosts.
  *
  * The schema (policy-mcp.schema.json) checks the shapes, including that no
  * server lists the archon zone and that no `url` or env literal holds `$`
@@ -13,11 +13,12 @@
  * - `tools.include` never lists a `tools.deny` tool (write and third-party tools);
  * - each transport's fields: `url` is for http only, and its host is an egress host;
  * - env: a stdio server gets only the names its package's allowlist
- *   (`PACKAGE_ENV`) lists, each in the form its rule says (a secret as a bws
- *   reference, a flag as one of its values, an endpoint as a URL whose host is
- *   an egress host), and any secret-looking name (`SECRET_ENV_NAME`) only as a
- *   bws reference; no server sets a name on the hard denylist (`forbiddenEnv`:
- *   launch hijacks, proxies and URL overrides); and one server per bws key.
+ *   (`PACKAGE_ENV`) lists, each in the form its rule says (a secret as a
+ *   `secret:` reference, a flag as one of its values, an endpoint as a URL
+ *   whose host is an egress host), and any secret-looking name
+ *   (`SECRET_ENV_NAME`) only as a secret reference; no server sets a name on
+ *   the hard denylist (`forbiddenEnv`: launch hijacks, proxies and URL
+ *   overrides); and one server per secret.
  * `loadPolicy` runs both; the emitters run them again for a policy built in code.
  */
 import { type Issue, pointerSegment } from "./schema";
@@ -59,22 +60,24 @@ export function serversForZone(p: Pick<Policy, "mcp" | "flags">, zone: ZoneName,
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
 }
 
-const BWS = "bws:";
+/** The prefix of a secret reference: `secret:<logical name>`, which the secret provider resolves (spec §11.5). */
+export const SECRET_REF = "secret:";
 
-/** The bws key name an env value refers to (`bws:<key>`), or undefined for a literal. */
+/** The secret's logical name an env value refers to (`secret:<name>`), or undefined for a literal. */
 export function secretKey(value: string): string | undefined {
-  return value.startsWith(BWS) ? value.slice(BWS.length) : undefined;
+  return value.startsWith(SECRET_REF) ? value.slice(SECRET_REF.length) : undefined;
 }
 
 /**
- * The env var a bws key's secret is resolved into, which the generated configs
- * reference as `${NAME}`: the key upper-cased with "-" as "_", so
- * hapi-mcp-context7-api-key is HAPI_MCP_CONTEXT7_API_KEY. Key names are
- * `hapi-mcp-` and a lowercase slug, so two keys never share a name, and none
- * clashes with a variable Hermes itself reads.
+ * The env var a secret is resolved into, which the generated configs reference
+ * as `${NAME}`: the logical name upper-cased with "-" as "_", so
+ * hapi-mcp-context7-api-key is HAPI_MCP_CONTEXT7_API_KEY. MCP secret names are
+ * `hapi-mcp-` and a lowercase slug, so two never share an env var, and none
+ * clashes with a variable Hermes itself reads. stack/secrets.yaml maps each
+ * one to its logical name in the server's zone (`mcpSecretGaps`).
  */
-export function secretEnvName(bwsKey: string): string {
-  return bwsKey.toUpperCase().replaceAll("-", "_");
+export function secretEnvName(name: string): string {
+  return name.toUpperCase().replaceAll("-", "_");
 }
 
 /** Compare two exact versions (MAJOR.MINOR.PATCH) numerically: <0, 0 or >0. */
@@ -100,7 +103,7 @@ export function blockedBy(name: string, blocked: readonly string[]): string | un
 
 /**
  * How a server may receive one env name:
- * - `secret`: only as a bws reference (`bws:hapi-mcp-<name>`), never a literal;
+ * - `secret`: only as a secret reference (`secret:hapi-mcp-<name>`), never a literal;
  * - `flag`: only as a literal, one of `values`, so it can't carry a secret;
  * - `endpoint`: only as a literal http(s) URL with no user info, query or
  *   fragment, whose host is one of the server's egress hosts or under one.
@@ -108,7 +111,7 @@ export function blockedBy(name: string, blocked: readonly string[]): string | un
 export type EnvRule = { kind: "secret" } | { kind: "flag"; values: readonly string[] } | { kind: "endpoint" };
 
 /**
- * The env allowlist (spec §10.1: "env, by bws key name"), by npm package: every
+ * The env allowlist (spec §10.1: "env, by secret name"), by npm package: every
  * env name the package may receive, and how (`EnvRule`). A stdio server gets
  * only its package's names, and a package not listed here gets no env. So a
  * name the package would also read, such as NODE_OPTIONS or
@@ -131,14 +134,14 @@ export const PACKAGE_ENV: Readonly<Record<string, Readonly<Record<string, EnvRul
   },
 };
 
-/** An env name that holds a secret, which only a bws reference may fill, whatever `PACKAGE_ENV` says. */
+/** An env name that holds a secret, which only a secret reference may fill, whatever `PACKAGE_ENV` says. */
 export const SECRET_ENV_NAME = /(?:_KEY|_TOKEN|_SECRET|_PASSWORD|_CREDENTIALS?)$/i;
 
 const PROXY = "the zone's proxy settings come from the stack, never from a server entry";
 
 /**
  * The hard denylist, defense in depth behind `PACKAGE_ENV`: env names no server
- * may set, as a literal or a bws reference, for any package. Each one hijacks
+ * may set, as a literal or a secret reference, for any package. Each one hijacks
  * the launched process (npx, node, the dynamic linker, a shell) or redirects
  * its traffic (spec §10.1: "no proxy or URL overrides beyond the zone's own").
  * `*` matches any run of characters; case doesn't count.
@@ -192,13 +195,13 @@ function endpointProblem(value: string, egress: readonly string[]): string | und
   return undefined;
 }
 
-const MUST_BE_BWS = (env: string) =>
-  `${env} names a secret, so its value must be a bws reference (bws:hapi-mcp-<name>), never a literal: a literal is written in plaintext into every generated config (spec §10.1)`;
+const MUST_BE_REF = (env: string) =>
+  `${env} names a secret, so its value must be a secret reference (secret:hapi-mcp-<name>), never a literal: a literal is written in plaintext into every generated config (spec §10.1)`;
 
 /** Why a stdio server may not receive `env` with this value, or undefined if it may. */
 function envProblem(env: string, value: string, s: McpServer): string | undefined {
   const isRef = secretKey(value) !== undefined;
-  if (SECRET_ENV_NAME.test(env) && !isRef) return MUST_BE_BWS(env);
+  if (SECRET_ENV_NAME.test(env) && !isRef) return MUST_BE_REF(env);
   const pkg = s.package?.name ?? "(no package)";
   const names = Object.hasOwn(PACKAGE_ENV, pkg) ? PACKAGE_ENV[pkg]! : undefined;
   if (names === undefined) {
@@ -206,8 +209,8 @@ function envProblem(env: string, value: string, s: McpServer): string | undefine
   }
   const rule = Object.hasOwn(names, env) ? names[env]! : undefined;
   if (rule === undefined) return `${pkg} may not receive ${env}: its env allowlist (PACKAGE_ENV in src/policy/mcp.ts) is ${Object.keys(names).join(", ")}`;
-  if (rule.kind === "secret") return isRef ? undefined : MUST_BE_BWS(env);
-  if (isRef) return `${env} is a ${rule.kind}, not a secret: write its literal value, not a bws reference`;
+  if (rule.kind === "secret") return isRef ? undefined : MUST_BE_REF(env);
+  if (isRef) return `${env} is a ${rule.kind}, not a secret: write its literal value, not a secret reference`;
   if (rule.kind === "flag") {
     return rule.values.includes(value) ? undefined : `${env} is a flag: its value must be ${rule.values.map((v) => JSON.stringify(v)).join(" or ")}`;
   }
@@ -285,7 +288,7 @@ export function mcpIssues(m: McpCatalog): Issue[] {
       if (key === undefined) continue;
       const owner = keyOwner.get(key);
       if (owner !== undefined && owner !== name) {
-        add(at("env", env), `bws key ${JSON.stringify(key)} is already ${owner}'s; each server gets only its own key (spec §10.1)`);
+        add(at("env", env), `secret ${JSON.stringify(key)} is already ${owner}'s; each server gets only its own key (spec §10.1)`);
       } else {
         keyOwner.set(key, name);
       }

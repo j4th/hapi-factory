@@ -168,7 +168,7 @@ export interface McpServer {
   /** `include`: the read-only tools the agent may call. `deny`: write and third-party tools, which `include` may never list. */
   tools: { include: string[]; deny: string[] };
   /**
-   * ENV -> `bws:hapi-mcp-<name>` (a bws key name) or a literal, e.g. OTEL_SDK_DISABLED: "true".
+   * ENV -> `secret:hapi-mcp-<name>` (a secret's logical name, resolved by the secret provider) or a literal, e.g. OTEL_SDK_DISABLED: "true".
    * Only names on the package's env allowlist (`PACKAGE_ENV` in ./mcp.ts), in the form it says.
    */
   env: Record<string, string>;

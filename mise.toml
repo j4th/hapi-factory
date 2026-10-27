@@ -20,7 +20,8 @@ uv = "0.13.5"                         # Python package manager (Hermes-side tool
 python = "3.14.9"                     # the 3.14 line, which Hermes runs
 gh = "2.103.2"                        # GitHub CLI, for the operator's manual setup steps only; factory code uses src/forge/
 gitleaks = "8.30.1"                   # secret scanner
-bitwarden-secrets-manager = "2.1.0"   # provides `bws`; secrets are resolved from Bitwarden at start (spec §11.5)
+sops = "3.13.3"                       # the default secret provider: one age-encrypted file (spec §11.5, docs/secrets.md)
+age = "1.3.2"                         # provides `age` and `age-keygen`: the key sops encrypts to
 
 # ---------------------------------------------------------------------------
 # Tasks. Stubs exit 1 with a message naming the plan task that implements
@@ -48,6 +49,18 @@ run = "bunx tsc --noEmit"
 [tasks.hapi]
 description = "Run the hapi CLI, e.g. `mise run hapi -- --help`"
 run = "bun run src/cli.ts"
+
+[tasks."secrets:init"]
+description = "Set up the default sops + age secrets store: an age key, an encrypted file of every name in stack/secrets.yaml (empty) and the config (never overwrites; e.g. `mise run secrets:init -- --file private/secrets.enc.yaml`)"
+run = "bun run src/cli.ts secrets init"
+
+[tasks."secrets:edit"]
+description = "Edit your sops secrets store in $EDITOR (`sops edit`; the plaintext temp file stays on your tmpfs)"
+run = "bun run src/cli.ts secrets edit"
+
+[tasks."secrets:check"]
+description = "List every secret in stack/secrets.yaml as found, missing or empty in your store, never a value; exits 1 unless all are found"
+run = "bun run src/cli.ts secrets check"
 
 [tasks."policy:build"]
 description = "Compile policy/ into the Hermes, Archon, Pi, egress and MCP configs under build/ (e.g. `mise run policy:build -- --roster budget`)"

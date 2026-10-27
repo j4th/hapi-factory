@@ -13,13 +13,13 @@
  *   `TokenScopeError` and is revoked at once.
  * - `hapi token mint --app planner|factory --repo owner/name`: reads the App's
  *   id and key from the host zone's env file and writes the token to a 0600
- *   file. It never prints the token.
+ *   file, deleting token files more than an hour old. It never prints the token.
  *
  * No error message holds a token, a JWT or key material.
  */
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
-import { parseEnvFile, runtimeDir, secureDir, writeSecretFiles } from "../../secrets/files";
+import { lstat, readdir, readFile, rm } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { ENV_DIR, parseEnvFile, runtimeDir, secureDir, writeSecretFile } from "../../secrets/files";
 import { HAPI_VERSION } from "../../version";
 
 export const GITHUB_API = "https://api.github.com";
@@ -242,8 +242,16 @@ export async function mintInstallationToken(o: MintOptions): Promise<{ token: st
   const { status, json } = await github(f, "POST", `/app/installations/${o.installationId}/access_tokens`, jwt, body);
   if (status !== 201) throw new Error(`GitHub refused the token request: HTTP ${status}${ghMessage(json)}`);
   const r = asRecord(json);
-  if (r === undefined || typeof r.token !== "string" || r.token === "" || typeof r.expires_at !== "string") {
-    throw new Error("GitHub's token response has no token or expires_at");
+  if (r === undefined || typeof r.token !== "string" || r.token === "") throw new Error("GitHub's token response has no token");
+  // A token we won't use is revoked, like every other rejected 201.
+  if (typeof r.expires_at !== "string" || Number.isNaN(Date.parse(r.expires_at))) {
+    const revoked = await revoke(f, r.token);
+    throw new Error(
+      "GitHub's token response has no valid expires_at. " +
+        (revoked
+          ? "The token was revoked."
+          : "The token could not be revoked, so it may stay valid for up to an hour; suspend the App's installation if that is too long (docs/runbooks/github-apps.md)."),
+    );
   }
   const problem = scopeProblem(o, r);
   if (problem !== undefined) {
@@ -282,6 +290,16 @@ export async function findInstallationId(o: {
   return id;
 }
 
+/** Delete token files (and leftover temp files) in `dir` last modified more than an hour before `nowMs`: their tokens have expired. */
+async function removeExpiredTokens(dir: string, nowMs: number): Promise<void> {
+  for (const name of await readdir(dir)) {
+    if (!name.endsWith(".token") && !(name.startsWith(".") && name.endsWith(".tmp"))) continue;
+    const path = join(dir, name);
+    const st = await lstat(path);
+    if (st.isFile() && st.mtimeMs < nowMs - 3_600_000) await rm(path, { force: true });
+  }
+}
+
 const USAGE = "usage: hapi token mint --app planner|factory --repo owner/name";
 /** owner/name: a GitHub login (letters, digits, hyphens) and a repository name. */
 const OWNER_REPO = /^([A-Za-z0-9][A-Za-z0-9-]{0,38})\/([A-Za-z0-9._-]{1,100})$/;
@@ -297,7 +315,10 @@ export interface TokenDeps {
  * token for that one repo with the App's permissions (`APPS`), and write it to
  * `$XDG_RUNTIME_DIR/hapi/tokens/<app>.<owner>.<repo>.token` (mode 0600). Prints
  * the path and expiry, never the token. The App's id and key come from
- * `$XDG_RUNTIME_DIR/hapi/host.env`, which `hapi secrets resolve` writes.
+ * `$XDG_RUNTIME_DIR/hapi/env/host.env`, which `hapi secrets resolve` writes.
+ * XDG_RUNTIME_DIR is checked (ours, 0700) before host.env is read, and each
+ * mint deletes the token files in tokens/ that are more than an hour old
+ * (installation tokens last one hour).
  */
 export async function tokenMint(args: string[], deps: TokenDeps = {}): Promise<number> {
   const flags: Record<string, string> = {};
@@ -321,7 +342,8 @@ export async function tokenMint(args: string[], deps: TokenDeps = {}): Promise<n
   const spec = APPS[app];
 
   const dir = runtimeDir(deps.env ?? process.env);
-  const hostEnv = join(dir, "host.env");
+  await secureDir(dir, dirname(dir));
+  const hostEnv = join(dir, ENV_DIR, "host.env");
   let text: string;
   try {
     text = await readFile(hostEnv, "utf8");
@@ -339,7 +361,7 @@ export async function tokenMint(args: string[], deps: TokenDeps = {}): Promise<n
   const idName = `${spec.envPrefix}_APP_ID`;
   const keyName = `${spec.envPrefix}_APP_PRIVATE_KEY`;
   for (const name of [idName, keyName]) {
-    if (!values[name]) throw new Error(`${hostEnv} has no ${name}: add it to the host zone of the secrets map and run \`hapi secrets resolve\``);
+    if (!values[name]) throw new Error(`${hostEnv} has no ${name}: it is in the host zone of stack/secrets.yaml, so run \`hapi secrets resolve\` to rewrite it`);
   }
   const common = {
     appId: values[idName]!,
@@ -351,10 +373,10 @@ export async function tokenMint(args: string[], deps: TokenDeps = {}): Promise<n
   const { token, expiresAt } = await mintInstallationToken({ ...common, installationId, repositories: [repo], permissions: { ...spec.permissions } });
 
   const tokens = join(dir, "tokens");
-  await secureDir(dir);
-  await secureDir(tokens);
+  await secureDir(tokens, dirname(dir));
+  await removeExpiredTokens(tokens, (deps.now ?? Date.now)());
   const file = join(tokens, `${app}.${owner}.${repo}.token`);
-  await writeSecretFiles({ [file]: `${token}\n` });
+  await writeSecretFile(file, `${token}\n`);
   console.log(`${file} (expires ${expiresAt})`);
   return 0;
 }

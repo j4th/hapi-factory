@@ -44,12 +44,12 @@ Set these permissions **exactly**. Everything not listed is **No access**, inclu
 |---|---|---|
 | Used by | Hermes. A host helper mints a 1-hour token per session, outside the container (spec §9.1, `hapi-gh-token`). | The harvester, a host script run by the `hapi` user (spec §9.4) |
 | Branches | `plan/*` | `factory/*` |
-| Private key | In bws, as `hapi-host-planner-app-private-key` | In bws, as `hapi-host-factory-app-private-key` |
-| App ID | In bws, as `hapi-host-planner-app-id` | In bws, as `hapi-host-factory-app-id` |
+| Private key | In your secrets store, as `hapi-host-planner-app-private-key` | In your secrets store, as `hapi-host-factory-app-private-key` |
+| App ID | In your secrets store, as `hapi-host-planner-app-id` | In your secrets store, as `hapi-host-factory-app-id` |
 
 `hapi token mint` asks for exactly these permissions (`APPS` in `src/forge/github/app-token.ts`), and rejects a token that comes back broader ([docs/secrets.md](../secrets.md#hapi-token-mint)).
 
-Both private keys live only in Bitwarden and in the `host` zone's env file, which no container ever gets ([docs/secrets.md](../secrets.md#the-zones-and-their-keys)).
+Both private keys live only in your secrets store and in the `host` zone's env file, which no container ever gets ([docs/secrets.md](../secrets.md#the-zones-and-their-keys)).
 
 ## Creating each App
 
@@ -64,7 +64,7 @@ Do this twice: once for `hapi-planner`, once for `hapi-factory`.
 7. **Where can this GitHub App be installed?** **Only on this account.**
 8. **Create GitHub App.** Note the **App ID** on the App's General page.
 9. **Private keys → Generate a private key.** Your browser downloads a `.pem` file.
-10. **Store both in Bitwarden** ([docs/secrets.md](../secrets.md#filling-in-the-map-the operator)): the PEM file's whole contents as `hapi-host-planner-app-private-key` (or `hapi-host-factory-...`), and the App ID as `hapi-host-planner-app-id`. Put both ids in the `host` zone of your copy of the secrets map, outside the repo.
+10. **Add both to your secrets store** with `mise run secrets:edit` ([docs/secrets.md](../secrets.md#adding-a-secret)): the PEM file's whole contents as `hapi-host-planner-app-private-key` (or `hapi-host-factory-...`), as a YAML block scalar (`hapi-host-planner-app-private-key: |`, then the PEM's lines indented), and the App ID as `hapi-host-planner-app-id`. `stack/secrets.yaml` already puts both in the `host` zone.
 11. **Delete the downloaded key file:** `shred -u ~/Downloads/<app-name>.*.private-key.pem`. Never commit a key, and never paste one into a chat.
 12. **Install App → your account → Only select repositories.** Pick only the hapi-managed repos (`$OWNER/hapi-factory` now; `odoo-mcp` later). Never **All repositories**.
 
@@ -203,7 +203,7 @@ Kill switch 2 (spec §11.8). Open **GitHub → Settings → Applications → Ins
 ## Rotating a private key
 
 1. On the App's settings page, **Generate a private key**. The old key still works until you delete it.
-2. Put the new PEM in the existing bws secret (`hapi-host-<app>-app-private-key`). Its id doesn't change, so the map doesn't either. Then shred the downloaded file.
+2. Replace the PEM under `hapi-host-<app>-app-private-key` in your secrets store (`mise run secrets:edit`). Then shred the downloaded file.
 3. Run `hapi secrets resolve`, then mint a test token as in [check it](#check-it).
 4. **Delete the old key** on the App's settings page.
 

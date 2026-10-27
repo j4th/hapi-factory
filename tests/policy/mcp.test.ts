@@ -89,7 +89,7 @@ describe("the v1 catalog (spec §10.1)", () => {
       },
       floor: { min: "2.1.3", advisory: "CVE-2026-75130" },
       tools: { include: ["resolve-library-id", "query-docs"], deny: [] },
-      env: { CONTEXT7_API_KEY: "bws:hapi-mcp-context7-api-key", OTEL_SDK_DISABLED: "true" },
+      env: { CONTEXT7_API_KEY: "secret:hapi-mcp-context7-api-key", OTEL_SDK_DISABLED: "true" },
       egress: ["context7.com"],
       trust: "untrusted",
       elicitation: "deny",
@@ -113,7 +113,7 @@ describe("the v1 catalog (spec §10.1)", () => {
       "upsert-prompt", "add-prompt-version-tag", "add-dataset-examples", "phoenix-support", "list-readmes", "get-readme",
     ]);
     expect(phoenix.env).toEqual({
-      PHOENIX_API_KEY: "bws:hapi-mcp-phoenix-viewer-key",
+      PHOENIX_API_KEY: "secret:hapi-mcp-phoenix-viewer-key",
       PHOENIX_DISCOVER_CONFIG: "false",
       PHOENIX_ENDPOINT: "http://phoenix.hapi.internal:6006",
     });
@@ -198,10 +198,10 @@ describe("loadPolicy rejects a bad catalog with the file and path", () => {
     expect(e.path).toBe("/servers/context7/tools/include/1");
   });
 
-  test("env values are bws:hapi-mcp-<name> references or literals with no $ interpolation", () => {
+  test("env values are secret:hapi-mcp-<name> references or literals with no $ interpolation", () => {
     const interp = policyError(edited('OTEL_SDK_DISABLED: "true"', 'OTEL_SDK_DISABLED: "${ANTHROPIC_API_KEY}"'));
     expect(interp.path).toBe("/servers/context7/env/OTEL_SDK_DISABLED");
-    const badRef = policyError(edited("bws:hapi-mcp-context7-api-key", "bws:context7"));
+    const badRef = policyError(edited("secret:hapi-mcp-context7-api-key", "secret:context7"));
     expect(badRef.path).toBe("/servers/context7/env/CONTEXT7_API_KEY");
     const lower = policyError(edited('OTEL_SDK_DISABLED: "true"', 'otel_sdk_disabled: "true"'));
     expect(lower.path).toBe("/servers/context7/env/otel_sdk_disabled");
@@ -214,27 +214,27 @@ describe("loadPolicy rejects a bad catalog with the file and path", () => {
     }
   });
 
-  test("a literal secret-looking value is rejected: a secret's name must hold a bws reference", () => {
+  test("a literal secret-looking value is rejected: a secret's name must hold a secret reference", () => {
     // The reviewer's probe: a real-looking Context7 key as a literal would be emitted in plaintext.
-    const e = policyError(edited("CONTEXT7_API_KEY: bws:hapi-mcp-context7-api-key", "CONTEXT7_API_KEY: ctx7sk-FAKE-NOT-A-REAL-KEY"));
+    const e = policyError(edited("CONTEXT7_API_KEY: secret:hapi-mcp-context7-api-key", "CONTEXT7_API_KEY: ctx7sk-FAKE-NOT-A-REAL-KEY"));
     expect(e.file).toEndWith("mcp.yaml");
     expect(e.issues).toEqual([
       {
         path: "/servers/context7/env/CONTEXT7_API_KEY",
         message:
-          "CONTEXT7_API_KEY names a secret, so its value must be a bws reference (bws:hapi-mcp-<name>), never a literal: a literal is written in plaintext into every generated config (spec §10.1)",
+          "CONTEXT7_API_KEY names a secret, so its value must be a secret reference (secret:hapi-mcp-<name>), never a literal: a literal is written in plaintext into every generated config (spec §10.1)",
       },
     ]);
-    const phoenix = policyError(edited("PHOENIX_API_KEY: bws:hapi-mcp-phoenix-viewer-key", "PHOENIX_API_KEY: phx-FAKE-NOT-A-REAL-KEY"));
+    const phoenix = policyError(edited("PHOENIX_API_KEY: secret:hapi-mcp-phoenix-viewer-key", "PHOENIX_API_KEY: phx-FAKE-NOT-A-REAL-KEY"));
     expect(phoenix.path).toBe("/servers/phoenix/env/PHOENIX_API_KEY");
-    expect(phoenix.message).toContain("must be a bws reference");
+    expect(phoenix.message).toContain("must be a secret reference");
   });
 
-  test("any name ending in _KEY, _TOKEN, _SECRET, _PASSWORD or _CREDENTIAL(S) must be a bws reference", () => {
+  test("any name ending in _KEY, _TOKEN, _SECRET, _PASSWORD or _CREDENTIAL(S) must be a secret reference", () => {
     for (const name of ["CONTEXT7_TOKEN", "SERVICE_SECRET", "DB_PASSWORD", "GCP_CREDENTIALS", "GCP_CREDENTIAL", "X_API_KEY"]) {
       const e = policyError(edited('OTEL_SDK_DISABLED: "true"', `OTEL_SDK_DISABLED: "true"\n      ${name}: s3cr3t-value`));
       expect({ name, path: e.path }).toEqual({ name, path: `/servers/context7/env/${name}` });
-      expect(e.message).toContain("must be a bws reference");
+      expect(e.message).toContain("must be a secret reference");
     }
     expect(SECRET_ENV_NAME.test("api_key")).toBe(true);
     expect(SECRET_ENV_NAME.test("OTEL_SDK_DISABLED")).toBe(false);
@@ -251,8 +251,8 @@ describe("loadPolicy rejects a bad catalog with the file and path", () => {
           "@upstash/context7-mcp may not receive CONTEXT7_AUTH: its env allowlist (PACKAGE_ENV in src/policy/mcp.ts) is CONTEXT7_API_KEY, OTEL_SDK_DISABLED",
       },
     ]);
-    // A bws reference doesn't widen it, and another package's names aren't context7's.
-    expect(policyError(extra("CONTEXT7_AUTH: bws:hapi-mcp-context7-auth")).path).toBe("/servers/context7/env/CONTEXT7_AUTH");
+    // A secret reference doesn't widen it, and another package's names aren't context7's.
+    expect(policyError(extra("CONTEXT7_AUTH: secret:hapi-mcp-context7-auth")).path).toBe("/servers/context7/env/CONTEXT7_AUTH");
     expect(policyError(extra('PHOENIX_DISCOVER_CONFIG: "false"')).path).toBe("/servers/context7/env/PHOENIX_DISCOVER_CONFIG");
     // A package with no allowlist gets no env at all.
     const fork = policyError(edited('name: "@upstash/context7-mcp"', 'name: "@example/context7-fork"'));
@@ -266,9 +266,9 @@ describe("loadPolicy rejects a bad catalog with the file and path", () => {
       expect(e.issues).toEqual([{ path: "/servers/context7/env/OTEL_SDK_DISABLED", message: 'OTEL_SDK_DISABLED is a flag: its value must be "true"' }]);
     }
     expect(policyError(edited('PHOENIX_DISCOVER_CONFIG: "false"', 'PHOENIX_DISCOVER_CONFIG: "true"')).path).toBe("/servers/phoenix/env/PHOENIX_DISCOVER_CONFIG");
-    // A flag or an endpoint is a literal, never a bws reference.
-    const ref = policyError(edited('OTEL_SDK_DISABLED: "true"', "OTEL_SDK_DISABLED: bws:hapi-mcp-context7-otel"));
-    expect(ref.issues).toEqual([{ path: "/servers/context7/env/OTEL_SDK_DISABLED", message: "OTEL_SDK_DISABLED is a flag, not a secret: write its literal value, not a bws reference" }]);
+    // A flag or an endpoint is a literal, never a secret reference.
+    const ref = policyError(edited('OTEL_SDK_DISABLED: "true"', "OTEL_SDK_DISABLED: secret:hapi-mcp-context7-otel"));
+    expect(ref.issues).toEqual([{ path: "/servers/context7/env/OTEL_SDK_DISABLED", message: "OTEL_SDK_DISABLED is a flag, not a secret: write its literal value, not a secret reference" }]);
   });
 
   test("an endpoint literal is an http(s) URL whose host is one of the server's own egress hosts", () => {
@@ -295,7 +295,7 @@ describe("loadPolicy rejects a bad catalog with the file and path", () => {
     expect(() => loadPolicy(withMcp(edited(at, "PHOENIX_ENDPOINT: https://ui.phoenix.hapi.internal/base")))).not.toThrow();
   });
 
-  test("a hard denylist of launch-hijack, proxy and redirect variables, as literals or bws references (defense in depth)", () => {
+  test("a hard denylist of launch-hijack, proxy and redirect variables, as literals or secret references (defense in depth)", () => {
     const names = [
       "NPM_CONFIG_REGISTRY", // npx fetches the package from another registry; nothing checks its integrity at launch
       "NPM_CONFIG_USERCONFIG",
@@ -333,7 +333,7 @@ describe("loadPolicy rejects a bad catalog with the file and path", () => {
     ];
     for (const name of names) {
       expect({ name, denied: forbiddenEnv(name) !== undefined }).toEqual({ name, denied: true });
-      for (const value of ["http://proxy.example.com:3128", "bws:hapi-mcp-context7-extra"]) {
+      for (const value of ["http://proxy.example.com:3128", "secret:hapi-mcp-context7-extra"]) {
         const e = policyError(edited('OTEL_SDK_DISABLED: "true"', `OTEL_SDK_DISABLED: "true"\n      ${name}: ${value}`));
         expect({ name, value, issues: e.issues.map((i) => i.path) }).toEqual({ name, value, issues: [`/servers/context7/env/${name}`] });
         expect(e.message).toContain(`a server may not set ${name}: ${forbiddenEnv(name)} (spec §10.1)`);
@@ -364,10 +364,17 @@ describe("loadPolicy rejects a bad catalog with the file and path", () => {
     });
   });
 
-  test("each bws key belongs to one server", () => {
-    const e = policyError(edited("bws:hapi-mcp-phoenix-viewer-key", "bws:hapi-mcp-context7-api-key"));
+  test("each secret belongs to one server", () => {
+    const e = policyError(edited("secret:hapi-mcp-phoenix-viewer-key", "secret:hapi-mcp-context7-api-key"));
     expect(e.path).toBe("/servers/phoenix/env/PHOENIX_API_KEY");
     expect(e.message).toContain("context7");
+  });
+
+  test("the old bws: prefix is no reference: a secret written with it is refused as a literal", () => {
+    const e = policyError(edited("CONTEXT7_API_KEY: secret:hapi-mcp-context7-api-key", "CONTEXT7_API_KEY: bws:hapi-mcp-context7-api-key"));
+    expect(e.issues).toEqual([
+      { path: "/servers/context7/env/CONTEXT7_API_KEY", message: expect.stringContaining("must be a secret reference (secret:hapi-mcp-<name>)") },
+    ]);
   });
 
   test("stdio needs a package; url is for http, which needs one whose host is in its egress", () => {
@@ -443,7 +450,7 @@ test("blockedBy matches whole names; * matches any run of characters", () => {
   expect(blockedBy("aiXsmithery/x", blocked)).toBeUndefined();
 });
 
-test("secretEnvName turns a bws key name into the env var Hermes resolves it from", () => {
+test("secretEnvName turns a secret name into the env var Hermes resolves it from", () => {
   expect(secretEnvName("hapi-mcp-context7-api-key")).toBe("HAPI_MCP_CONTEXT7_API_KEY");
   expect(secretEnvName("hapi-mcp-phoenix-viewer-key")).toBe("HAPI_MCP_PHOENIX_VIEWER_KEY");
 });

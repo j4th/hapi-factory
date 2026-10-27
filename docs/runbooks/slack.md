@@ -30,15 +30,15 @@ Hermes talks to you through Slack, in Socket Mode, so there is no inbound endpoi
 
 ## The secrets
 
-Store all three in Bitwarden, and put their ids in the `hermes` zone of your copy of the secrets map, outside the repo ([docs/secrets.md](../secrets.md#filling-in-the-map-the operator)):
+Add all three to your secrets store (`mise run secrets:edit`) under these logical names ([docs/secrets.md](../secrets.md#adding-a-secret)). `stack/secrets.yaml` already puts them in the `hermes` zone:
 
-| Env var | bws key | Value |
+| Env var | Logical name | Value |
 |---|---|---|
 | `SLACK_BOT_TOKEN` | `hapi-hermes-slack-bot-token` | The bot token, `xoxb-...` |
 | `SLACK_APP_TOKEN` | `hapi-hermes-slack-app-token` | The app-level token, `xapp-...` |
 | `SLACK_ALLOWED_USERS` | `hapi-hermes-slack-allowed-users` | Your Slack member ID |
 
-Your member ID isn't a secret, but it is a personal identifier, and this repo is public. Keeping it in Bitwarden keeps it out of the repo. Do the same with any channel ID.
+Your member ID isn't a secret, but it is a personal identifier, and this repo is public. Keeping it in your secrets store keeps it out of the repo. Do the same with any channel ID.
 
 ## Hermes settings
 
