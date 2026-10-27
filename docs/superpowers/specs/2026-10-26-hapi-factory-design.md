@@ -341,14 +341,19 @@ The onboarding PR must also **remove or harden any CI workflow that runs an AI a
 ```yaml
 protected_paths:
   "**/AGENTS.md":       { interactive: ask, unattended: deny, workers: deny }
+  "**/AGENTS.override.md": { interactive: ask, unattended: deny, workers: deny }
   "**/AGENT.md":        { interactive: ask, unattended: deny, workers: deny }
   "**/CLAUDE.md":       { interactive: ask, unattended: deny, workers: deny }
   "**/CLAUDE.local.md": { interactive: ask, unattended: deny, workers: deny }
   "**/GEMINI.md":       { interactive: ask, unattended: deny, workers: deny }
+  "**/HERMES.md":       { interactive: ask, unattended: deny, workers: deny }
+  "**/.hermes.md":      { interactive: ask, unattended: deny, workers: deny }
+  "**/SOUL.md":         { interactive: ask, unattended: deny, workers: deny }
   "**/REVIEW.md":       { interactive: ask, unattended: deny, workers: deny }
   "**/.cursorrules":    { interactive: ask, unattended: deny, workers: deny }
   "**/.windsurfrules":  { interactive: ask, unattended: deny, workers: deny }
   "**/.claude/**":      { interactive: ask, unattended: deny, workers: deny }
+  "**/.hermes/**":      { interactive: ask, unattended: deny, workers: deny }
   "**/.cursor/**":      { interactive: ask, unattended: deny, workers: deny }
   "**/.clinerules/**":  { interactive: ask, unattended: deny, workers: deny }
   "**/.rules/**":       { interactive: ask, unattended: deny, workers: deny }
@@ -369,7 +374,7 @@ protected_paths:
   - hapi-path-guard extends it to globs.
 - **unattended** covers Hermes cron, webhook and API surfaces. Always deny.
 - **workers** covers Pi or Claude Code inside Archon. Always deny.
-- **Agent instruction files at any depth** (added 2026-10-27, the operator's ruling; it replaced the root-only `AGENTS.md`): Pi, Hermes, the later Claude Code lane and CodeRabbit read nested `AGENTS.md`, `CLAUDE.md` and the rest as instructions for that subtree, so a write persists into every later session there. Workers read them and never need to write one: a work order that needs one says so in its PR, and the operator adds it.
+- **Agent instruction files at any depth** (added 2026-10-27, the operator's ruling; it replaced the root-only `AGENTS.md`): Pi, Hermes, the later Claude Code lane and CodeRabbit read nested `AGENTS.md`, `CLAUDE.md` and the rest as instructions for that subtree, so a write persists into every later session there. Matching ignores case (Pi also loads `AGENTS.MD` and `CLAUDE.MD`, Hermes's own gate ignores case, and on a case-insensitive filesystem `Agents.md` is `AGENTS.md`). Workers read them and never need to write one: a work order that needs one says so in its PR, and the operator adds it.
 - **`.coderabbit.*`** (added 2026-10-27, the operator's ruling): CodeRabbit reviews a same-repo PR with that PR branch's own config, so a PR that edits it could weaken its own review (§9.6).
 - **Backstop:** CODEOWNERS plus the ruleset. A guard failing locally can't land a change.
 

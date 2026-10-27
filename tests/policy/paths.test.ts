@@ -17,8 +17,12 @@ describe("globMatches", () => {
     ["AGENTS.md", "src/AGENTS.md", false],
     ["AGENTS.md", "AGENTS.md.bak", false],
     ["AGENTS.md", "xAGENTS.md", false],
-    // Matching is case-sensitive (Linux).
-    ["AGENTS.md", "agents.md", false],
+    // Matching ignores case: Pi loads AGENTS.MD, and on macOS or Windows Agents.md is AGENTS.md.
+    ["AGENTS.md", "agents.md", true],
+    ["**/AGENTS.md", "pkg/Agents.MD", true],
+    [".github/**", ".GitHub/workflows/ci.yml", true],
+    // Case folding is Unicode's: the long s (U+017F) folds to "s", so it matches too.
+    ["**/SOUL.md", "\u017FOUL.md", true],
     // Every other character is literal: "." is not a regex wildcard.
     ["mise.toml", "misextoml", false],
     // "dir/**" covers the directory itself and everything under it, dotfiles included.

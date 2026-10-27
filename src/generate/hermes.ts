@@ -82,9 +82,18 @@ function anthropicModel(p: Policy, role: Role): { id: string; effort: Effort } {
  * "**". The last segment means the same in fnmatch (the glob syntax forbids
  * "[", "]" and "!"), and matching it in every directory covers at least every
  * file the anchored glob matches: "mise.toml" protects every mise.toml, and
- * "docs/*.md" becomes "*.md". Globs ending in "**" match whole directories,
- * which a basename can't say; they are returned separately for the comment.
+ * "docs/*.md" becomes "*.md". Our globs ignore case, and fnmatch on Linux
+ * doesn't, so each letter becomes a bracket class: "AGENTS.md" is emitted as
+ * "[aA][gG][eE][nN][tT][sS].[mM][dD]" (fnmatch reads brackets; our glob syntax
+ * forbids them, so no other meaning can sneak in). Globs ending in "**" match
+ * whole directories, which a basename can't say; they are returned separately
+ * for the comment.
  */
+/** An fnmatch pattern that matches `s` in any case: each ASCII letter becomes `[xX]`. */
+function foldCase(s: string): string {
+  return s.replace(/[a-z]/gi, (c) => `[${c.toLowerCase()}${c.toUpperCase()}]`);
+}
+
 function instructionPatterns(p: Policy): { patterns: string[]; directories: string[] } {
   const patterns = new Set<string>();
   const directories = new Set<string>();
@@ -92,7 +101,7 @@ function instructionPatterns(p: Policy): { patterns: string[]; directories: stri
     if (modes.interactive === "allow" && modes.unattended === "allow") continue; // no rule for Hermes
     const last = glob.slice(glob.lastIndexOf("/") + 1);
     if (last === "**") directories.add(glob);
-    else patterns.add(last);
+    else patterns.add(foldCase(last));
   }
   return { patterns: [...patterns].sort(), directories: [...directories].sort() };
 }

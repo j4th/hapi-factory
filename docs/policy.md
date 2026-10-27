@@ -70,7 +70,7 @@ The schema (`pathGlob` in `policy-defs.schema.json`) accepts only this dialect, 
 
 | Glob | Matches |
 |---|---|
-| `AGENTS.md` | Only the root `AGENTS.md`. A glob is anchored at the repo root and matched against the whole path, case-sensitively. Use `**/AGENTS.md` for every one. |
+| `AGENTS.md` | Only the root `AGENTS.md` (in any case: `agents.md`, `AGENTS.MD`). A glob is anchored at the repo root and matched against the whole path, ignoring case, which can only protect more: Pi also loads `AGENTS.MD`, and on a case-insensitive filesystem `Agents.md` *is* `AGENTS.md`. Use `**/AGENTS.md` for every one. |
 | `.github/**` | `.github` itself and everything under it. `**` as a whole segment matches zero or more segments. |
 | `a/**/b` | `a/b`, `a/x/b`, `a/x/y/b` |
 | `*.md`, `docs/?.md` | `*` matches any run of characters within one segment and `?` exactly one. Neither crosses a `/`. Dotfiles aren't special. |

@@ -78,7 +78,7 @@ reviews:
     custom_checks:
       - name: "Protected paths declared"
         mode: warning
-        instructions: "Fail if the PR changes a protected path (an agent instruction file at any depth: AGENTS.md, AGENT.md, CLAUDE.md, CLAUDE.local.md, GEMINI.md, REVIEW.md, .cursorrules, .windsurfrules, or anything under .claude/, .cursor/, .clinerules/ or .rules/; or .factory/**, .github/**, mise.toml, .pi/**, .agents/**, .archon/**, .coderabbit.yaml, .coderabbit.yml, .coderabbit.config.ts) or policy/protected_paths.yaml, and its description has no section titled 'Protected-path change' saying why. Pass otherwise."
+        instructions: "Fail if the PR changes a protected path (an agent instruction file at any depth and in any case: AGENTS.md, AGENTS.override.md, AGENT.md, CLAUDE.md, CLAUDE.local.md, GEMINI.md, HERMES.md, .hermes.md, SOUL.md, REVIEW.md, .cursorrules, .windsurfrules, or anything under .claude/, .hermes/, .cursor/, .clinerules/ or .rules/; or .factory/**, .github/**, mise.toml, .pi/**, .agents/**, .archon/**, .coderabbit.yaml, .coderabbit.yml, .coderabbit.config.ts) or policy/protected_paths.yaml, and its description has no section titled 'Protected-path change' saying why. Pass otherwise."
   tools:
     gitleaks: { enabled: true }
     osvScanner: { enabled: true }

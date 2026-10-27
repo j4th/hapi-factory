@@ -94,7 +94,9 @@ describe("protected instruction files", () => {
   test("hermes protected_instruction_files lists filename rules", () => {
     const c = config();
     expect(c.security.protected_instruction_files).toBe(true);
-    expect(c.security.protected_instruction_extra_patterns).toEqual([".coderabbit.config.ts", ".coderabbit.yaml", ".coderabbit.yml", ".cursorrules", ".windsurfrules", "AGENT.md", "AGENTS.md", "CLAUDE.local.md", "CLAUDE.md", "GEMINI.md", "REVIEW.md", "mise.toml"]);
+    expect(c.security.protected_instruction_extra_patterns).toEqual(
+      [".[cC][oO][dD][eE][rR][aA][bB][bB][iI][tT].[cC][oO][nN][fF][iI][gG].[tT][sS]", ".[cC][oO][dD][eE][rR][aA][bB][bB][iI][tT].[yY][aA][mM][lL]", ".[cC][oO][dD][eE][rR][aA][bB][bB][iI][tT].[yY][mM][lL]", ".[cC][uU][rR][sS][oO][rR][rR][uU][lL][eE][sS]", ".[hH][eE][rR][mM][eE][sS].[mM][dD]", ".[wW][iI][nN][dD][sS][uU][rR][fF][rR][uU][lL][eE][sS]", "[aA][gG][eE][nN][tT].[mM][dD]", "[aA][gG][eE][nN][tT][sS].[mM][dD]", "[aA][gG][eE][nN][tT][sS].[oO][vV][eE][rR][rR][iI][dD][eE].[mM][dD]", "[cC][lL][aA][uU][dD][eE].[lL][oO][cC][aA][lL].[mM][dD]", "[cC][lL][aA][uU][dD][eE].[mM][dD]", "[gG][eE][mM][iI][nN][iI].[mM][dD]", "[hH][eE][rR][mM][eE][sS].[mM][dD]", "[mM][iI][sS][eE].[tT][oO][mM][lL]", "[rR][eE][vV][iI][eE][wW].[mM][dD]", "[sS][oO][uU][lL].[mM][dD]"],
+    );
   });
 
   test("directory globs Hermes can't express are named in a comment pointing at hapi-path-guard", () => {
@@ -116,16 +118,17 @@ describe("protected instruction files", () => {
         "keys/**": DENY,
       }),
     );
-    expect(c.security.protected_instruction_extra_patterns).toEqual(["*.pem", "SECRET.md"]);
+    expect(c.security.protected_instruction_extra_patterns).toEqual(["*.[pP][eE][mM]", "[sS][eE][cC][rR][eE][tT].[mM][dD]"]);
   });
 
   test("the patterns are a superset: every file a Hermes-relevant glob matches, some pattern matches", () => {
     const paths = { "AGENTS.md": ASK, "docs/*.md": ASK, "a/**/key?.txt": DENY, "x/y/z.cfg": ASK };
     const patterns: string[] = config(withPaths(paths)).security.protected_instruction_extra_patterns;
-    // fnmatch on the basename, as Hermes applies it ([] never appears: the glob syntax forbids it).
+    // fnmatch on the basename, as Hermes applies it on Linux: case-sensitive, with [xX] classes
+    // (the only brackets: the glob syntax forbids them, so they come from case folding).
     const fnmatch = (pat: string, name: string) =>
       new RegExp(`^${pat.replace(/[.+^${}()|\\]/g, "\\$&").replaceAll("*", ".*").replaceAll("?", ".")}$`).test(name);
-    const files = ["AGENTS.md", "docs/README.md", "docs/a.md", "a/key1.txt", "a/b/c/keyZ.txt", "x/y/z.cfg"];
+    const files = ["AGENTS.md", "agents.MD", "docs/README.md", "Docs/a.MD", "a/key1.txt", "a/b/c/KEYZ.txt", "x/y/z.cfg", "X/Y/Z.CFG"];
     for (const [glob] of Object.entries(paths)) {
       for (const file of files.filter((f) => globMatches(glob, f))) {
         expect(patterns.some((pat) => fnmatch(pat, basename(file)))).toBe(true);
@@ -137,7 +140,7 @@ describe("protected instruction files", () => {
     const a = emitHermes(withPaths({ "**/SECRET.md": ASK, "docs/SECRET.md": DENY, ".github/**": ASK, ".github/workflows/**": DENY }));
     const b = emitHermes(withPaths({ ".github/workflows/**": DENY, ".github/**": ASK, "docs/SECRET.md": DENY, "**/SECRET.md": ASK }));
     expect(a).toEqual(b);
-    expect(YAML.parse(a["config.yaml"]!).security.protected_instruction_extra_patterns).toEqual(["SECRET.md"]);
+    expect(YAML.parse(a["config.yaml"]!).security.protected_instruction_extra_patterns).toEqual(["[sS][eE][cC][rR][eE][tT].[mM][dD]"]);
   });
 });
 

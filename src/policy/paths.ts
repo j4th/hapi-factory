@@ -13,7 +13,12 @@
  * session", not "permit".
  *
  * Glob syntax (the schema's `pathGlob` enforces it): segments split on "/",
- * anchored at the repo root and matched against the whole path, case-sensitively.
+ * anchored at the repo root and matched against the whole path, ignoring case
+ * (Unicode case folding). Ignoring case only ever matches more files, so it can
+ * only tighten. It closes two gaps: readers that accept other cases (Pi loads
+ * `AGENTS.MD`; Hermes's own gate ignores case), and checkouts on a
+ * case-insensitive filesystem (macOS, Windows), where `pkg/Agents.md` *is*
+ * `pkg/AGENTS.md`.
  * - `**` as a whole segment matches zero or more segments, so ".github/**" also
  *   matches ".github" itself;
  * - `*` matches any run of characters within one segment, `?` exactly one;
@@ -55,7 +60,7 @@ function globRegExp(glob: string): RegExp {
     const body = seg.replace(/[.+^${}()|[\]\\*?]/g, (c) => (c === "*" ? "[^/]*" : c === "?" ? "[^/]" : `\\${c}`));
     src += sep + body;
   });
-  const re = new RegExp(`^${src}$`);
+  const re = new RegExp(`^${src}$`, "iu");
   compiled.set(glob, re);
   return re;
 }
