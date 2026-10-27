@@ -192,20 +192,7 @@ For one `--repo` it must print exactly two lines: the `mcp.tool-hashes` fail, it
 
 ## Kill switches
 
-These are spec §11.8's kill switches, fastest first.
-
-1. **Zero or revoke the provider keys.** Use the Anthropic Console workspaces, OpenRouter and OpenCode ([provider keys](provider-keys.md)). Calls fail at the provider, even from a running container.
-2. **Suspend the GitHub App installations:** GitHub, **Settings → Integrations → Applications → Configure → Suspend** ([GitHub Apps](github-apps.md)). Token minting fails (`hapi token mint` checks for a suspended installation), and existing tokens expire within an hour.
-3. **`mise run down`, as the host admin.** It re-execs as hapi and removes every container. As root, use `sudo -iu hapi docker compose -p hapi down`. That still works with a broken checkout, since down needs no file.
-4. **Firewall-drop the `hapi` user.** Under rootless Docker, the containers' traffic leaves the host from hapi's own network processes (slirp4netns or pasta), so an owner match catches all of it. **[verify in stage b]**
-
-   ```bash
-   sudo iptables  -I OUTPUT -m owner --uid-owner hapi -j REJECT
-   sudo ip6tables -I OUTPUT -m owner --uid-owner hapi -j REJECT
-   # undo: the same lines with -D instead of -I
-   ```
-
-   Under the dev bypass, the containers run on rootful Docker. Their traffic is forwarded, not sent by a user, so this switch doesn't apply; use 3.
+Spec §11.8's four kill switches, fastest first: disable or revoke the provider keys, suspend the GitHub App installations, stop the stack, and firewall-drop the `hapi` user. Each one's exact commands or UI path, what it stops and what it doesn't, how to confirm and undo it, and how fast it works, are in **[the kill-switch runbook](kill-switches.md)**. `mise run down` ([section 4](#4-mise-run-up-and-mise-run-down)) is switch 3; the runbook adds a fallback that needs no checkout or mise, and a hard stop of hapi's Docker.
 
 ## Pinned images
 
@@ -291,7 +278,7 @@ Spike T12 re-checks these settings under rootless Docker. If it relaxes one, it 
 
 ### Open items
 
-- **Not yet run on the real host:** host setup, rootless Docker, the subordinate ID range, lingering, kill switch 4, `up`'s re-exec through the host's real sudo, the whole stack under hapi, and the audit against it and the real GitHub repo. That is stage b, and spike T12 runs alongside it.
+- **Not yet run on the real host:** host setup, rootless Docker, the subordinate ID range, lingering, the kill switches' stage-b marks ([the runbook](kill-switches.md)), `up`'s re-exec through the host's real sudo, the whole stack under hapi, and the audit against it and the real GitHub repo. That is stage b, and spike T12 runs alongside it.
 
 ## What the tests prove
 
