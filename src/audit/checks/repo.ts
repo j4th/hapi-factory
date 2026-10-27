@@ -11,9 +11,11 @@
  * - `git ls-files -z -- ':(icase)private'` lists nothing. Any case, so a
  *   `Private/` that is private/ on a case-insensitive filesystem counts too; a
  *   nested repo added as a gitlink shows as `private` itself;
- * - `git check-ignore --no-index -v -- private/` names the root `.gitignore`.
- *   A local `.git/info/exclude` or a global excludes file isn't shared with a
- *   clone, so it doesn't count.
+ * - `git check-ignore --no-index -q -- private/` says it is ignored, and the
+ *   same with `-v` names the pattern that does it: a non-negated line of the
+ *   root `.gitignore`. A local `.git/info/exclude` or a global excludes file
+ *   isn't shared with a clone, so it doesn't count. The verdict comes from the
+ *   `-q` run, so a negated pattern `-v` might print can't read as "ignored".
  * git runs with GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE and GIT_COMMON_DIR
  * unset, so the caller's shell can't point it at another repo or index, and
  * with fsmonitor off. No checkout, or git failing, is a fail: the audit fails
@@ -57,14 +59,19 @@ export async function repoPrivateUntracked(run: AuditRun): Promise<CheckResult[]
     problems.push(`it tracks ${tracked.length} path${tracked.length === 1 ? "" : "s"} under private/ (${shown.join(", ")}${more}): \`git rm -r --cached private\` and commit, then make sure no pushed commit holds them`);
   }
 
-  const ignored = await git("check-ignore", "--no-index", "-v", "--", "private/");
-  if (ignored.code === 0) {
-    if (!ignored.stdout.startsWith(".gitignore:")) {
-      const source = ignored.stdout.split("\t")[0]!.replace(/:\d+:.*$/, "");
-      problems.push(`private/ is ignored only by ${JSON.stringify(source)}, which a clone doesn't get: add a \`private/\` line to the root .gitignore`);
+  const ignored = await git("check-ignore", "--no-index", "-q", "--", "private/");
+  if (ignored.code === 1) problems.push("its root .gitignore doesn't ignore private/: add a `private/` line");
+  else if (ignored.code !== 0) return failed("check-ignore -q", ignored);
+  else {
+    // Which pattern ignores it: "<source>:<line>:<pattern>\t<path>".
+    const why = await git("check-ignore", "--no-index", "-v", "--", "private/");
+    if (why.code !== 0) return failed("check-ignore -v", why);
+    const m = /^(.*?):(\d+):(.*)\t/.exec(why.stdout);
+    const [source, pattern] = m === null ? [why.stdout.trim(), ""] : [m[1]!, m[3]!];
+    if (source !== ".gitignore" || pattern.startsWith("!")) {
+      problems.push(`private/ is ignored by ${JSON.stringify(m === null ? source : `${source}:${m[2]}:${pattern}`)}, not a line of the root .gitignore (a clone doesn't get a local exclude): add a \`private/\` line to the root .gitignore`);
     }
-  } else if (ignored.code === 1) problems.push("its root .gitignore doesn't ignore private/: add a `private/` line");
-  else return failed("check-ignore", ignored);
+  }
 
   if (problems.length > 0) return [result(id, "fail", `${root}: ${problems.join("; ")}`)];
   return [result(id, "pass", `${root} tracks nothing under private/, and its root .gitignore ignores private/`)];

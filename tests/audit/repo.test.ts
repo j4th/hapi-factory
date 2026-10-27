@@ -24,7 +24,7 @@ describe("repo.private-untracked", () => {
     expect(r.detail).toContain("tracks nothing under private/");
     // git runs on the audit's root, with the variables that could point it elsewhere unset, and fsmonitor off.
     const gits = w.calls.filter((c) => c[0] === "env" && c.includes("git"));
-    expect(gits).toHaveLength(3);
+    expect(gits).toHaveLength(4);
     for (const c of gits) {
       for (const v of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"]) expect(c.join(" ")).toContain(`-u ${v}`);
       expect(c.slice(c.indexOf("git"), c.indexOf("git") + 5)).toEqual(["git", "-C", w.ctx.root, "-c", "core.fsmonitor=false"]);
@@ -54,7 +54,13 @@ describe("repo.private-untracked", () => {
   test("fails when only a local exclude file ignores private/, since a clone doesn't get it", async () => {
     const { r } = await check((w) => (w.git.ignoredBy = ".git/info/exclude:1:private/"));
     expect(r.status).toBe("fail");
-    expect(r.detail).toContain('private/ is ignored only by ".git/info/exclude"');
+    expect(r.detail).toContain('private/ is ignored by ".git/info/exclude:1:private/", not a line of the root .gitignore');
+  });
+
+  test("fails when the line -v names is a negated pattern", async () => {
+    const { r } = await check((w) => (w.git.ignoredBy = ".gitignore:2:!private/"));
+    expect(r.status).toBe("fail");
+    expect(r.detail).toContain('".gitignore:2:!private/"');
   });
 
   test("reports a tracked path and the missing ignore together", async () => {

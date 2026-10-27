@@ -415,7 +415,10 @@ function fakeGit(w: World, args: string[]): ExecResult {
   const sub = args[args.indexOf("core.fsmonitor=false") + 1];
   if (sub === "rev-parse") return ok(`${w.git.prefix}\n`);
   if (sub === "ls-files") return ok(w.git.tracked.map((f) => `${f}\0`).join(""));
-  if (sub === "check-ignore") return w.git.ignoredBy === undefined ? { code: 1, stdout: "", stderr: "" } : ok(`${w.git.ignoredBy}\tprivate/\n`);
+  if (sub === "check-ignore") {
+    if (w.git.ignoredBy === undefined) return { code: 1, stdout: "", stderr: "" };
+    return args.includes("-q") ? ok("") : ok(`${w.git.ignoredBy}\tprivate/\n`);
+  }
   return { code: 1, stdout: "", stderr: `unexpected git command: ${args.join(" ")}` };
 }
 
