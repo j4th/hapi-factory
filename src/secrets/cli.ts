@@ -13,12 +13,13 @@ import { dirname } from "node:path";
 import { loadPolicy } from "../policy/load";
 import { defaultRepoRoot, runtimeDir, secureDir } from "./files";
 import { initStore } from "./init";
-import { addMachine, drill, joinMachine, type LifecycleDeps, newRecovery, recipientReport, recover, revoke, toolsFor } from "./lifecycle";
+import { addMachine, drill, joinMachine, type LifecycleDeps, loadStore, newRecovery, recipientReport, recover, revoke, toolsFor } from "./lifecycle";
 import { loadManifest, MANIFEST_FILE, mcpSecretGaps, type McpSecretGap } from "./manifest";
 import { checkSecrets, configPath, describeSecretsConfig, entryLabel, loadSecretsConfig, resolveSecrets, SecretError, type SecretProvider, type SecretsConfig } from "./provider";
 import { type BwsRunner, bwsProvider } from "./providers/bws";
 import { envFileProvider } from "./providers/env-file";
 import { checkSopsKeys, sopsEditInvocation, sopsProvider } from "./providers/sops";
+import { withStoreLock } from "./store-files";
 
 /** Runs a command with stdio inherited (for `sops edit`); resolves to its exit code. */
 export type InteractiveRunner = (cmd: string, args: string[], o: { env: Record<string, string> }) => Promise<number>;
@@ -242,11 +243,16 @@ export async function secretsResolve(args: string[], deps: SecretsDeps = {}): Pr
 }
 
 /**
- * `hapi secrets edit [--config file]`: sops only. Checks the age key, then
- * runs `sops edit` on the configured file with stdio inherited. sops decrypts
- * into a temp file for the editor, so TMPDIR is `$XDG_RUNTIME_DIR/hapi` (the
- * user's tmpfs): the plaintext never lands on a disk. The editor gets the
- * caller's env minus every SOPS_* variable, plus SOPS_AGE_KEY_FILE,
+ * `hapi secrets edit [--config file]`: sops only. Under the store's lock
+ * (`withStoreLock`, as the lifecycle commands), it first runs the store
+ * checks every lifecycle command runs (`loadStore`: the file's shape, age
+ * recipients and nothing else, and the recipients file in step with it), so
+ * new values are never written into a store that a key outside the
+ * recipients file could open. Then it checks the age key, and runs `sops
+ * edit` on the configured file with stdio inherited. sops decrypts into a
+ * temp file for the editor, so TMPDIR is `$XDG_RUNTIME_DIR/hapi` (the user's
+ * tmpfs): the plaintext never lands on a disk. The editor gets the caller's
+ * env minus every SOPS_* variable, plus SOPS_AGE_KEY_FILE,
  * SOPS_DISABLE_VERSION_CHECK=1, GPG_AGENT_INFO= and the pinned age first on
  * PATH. sops's exit 200 (file unchanged) counts as success.
  */
@@ -259,12 +265,16 @@ export async function secretsEdit(args: string[], deps: SecretsDeps = {}): Promi
     throw new SecretError(`hapi secrets edit works with the sops provider only; ${cfg.path} selects ${cfg.provider}. Edit that store with its own tools (docs/secrets.md)`);
   }
   const tmp = runtimeDir(env);
-  await secureDir(tmp, dirname(tmp), deps.uid === undefined ? {} : { uid: deps.uid });
-  const { dir } = await toolsFor(deps);
-  const inv = sopsEditInvocation({ file: cfg.sops.file, ageKeyFile: cfg.sops.age_key_file, env, tmpDir: tmp, ageDir: dir });
-  await checkSopsKeys(cfg.sops.age_key_file, inv.env, { repoRoot: await (deps.repoRoot ?? defaultRepoRoot)(), ...(deps.uid === undefined ? {} : { uid: deps.uid }) });
-  const code = await (deps.interactive ?? runInteractive)("sops", inv.args, { env: inv.env });
-  if (code === 0 || code === 200) return 0;
-  console.error(`hapi secrets edit: sops exited with status ${code}; the file is unchanged unless sops said otherwise`);
-  return 1;
+  const file = cfg.sops.file;
+  return withStoreLock(file, "edit", async () => {
+    await loadStore(file);
+    await secureDir(tmp, dirname(tmp), deps.uid === undefined ? {} : { uid: deps.uid });
+    const { dir } = await toolsFor(deps);
+    const inv = sopsEditInvocation({ file, ageKeyFile: cfg.sops.age_key_file, env, tmpDir: tmp, ageDir: dir });
+    await checkSopsKeys(cfg.sops.age_key_file, inv.env, { repoRoot: await (deps.repoRoot ?? defaultRepoRoot)(), store: file, ...(deps.uid === undefined ? {} : { uid: deps.uid }) });
+    const code = await (deps.interactive ?? runInteractive)("sops", inv.args, { env: inv.env });
+    if (code === 0 || code === 200) return 0;
+    console.error(`hapi secrets edit: sops exited with status ${code}; the file is unchanged unless sops said otherwise`);
+    return 1;
+  });
 }

@@ -24,19 +24,25 @@
  * a failure leaves both as they were. Before any change, the store and its
  * recipients file must agree (`loadStore`).
  *
+ * Every command holds the store's lock (`withStoreLock`, ./store-files.ts)
+ * from before it reads the store until it is done, so two commands on one
+ * copy of the store can't interleave and lose an update. A command killed
+ * between the store's rename and the recipients file's rewrite leaves the
+ * two out of step and the lock behind: `check` reports the drift, and
+ * docs/secrets.md#an-interrupted-command says how to repair it.
+ *
  * sops is never given a wrapped identity: it would prompt through gpg-agent
  * or the terminal, and its gpg-agent client ignores GNUPGHOME. hapi unwraps
  * the recovery identity itself and hands it to the one sops child that needs
  * it as SOPS_AGE_KEY. Every sops child gets `GPG_AGENT_INFO=` (`sopsEnv`).
  */
 import { randomUUID } from "node:crypto";
-import { lstat, mkdtemp, readFile, rename, rm, rmdir } from "node:fs/promises";
+import { mkdtemp, readFile, rename, rm } from "node:fs/promises";
 import { hostname, userInfo } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { stringify } from "yaml";
 import { PolicyError } from "../policy/load";
-import { type CheckoutRoots, checkoutProblem, defaultRepoRoot, ensurePrivateDir, isWithin, realish, runtimeDir, secureDir, writeNewSecretFile, writeSecretFile } from "./files";
-import { configHome, configPath, defaultAgeKeyFile, type Env, expandPath, loadSecretsConfig, SecretError } from "./provider";
+import { type CheckoutRoots, checkoutProblem, defaultRepoRoot, runtimeDir, secureDir, writeNewSecretFile, writeSecretFile } from "./files";
+import { configPath, defaultAgeKeyFile, type Env, expandPath, loadSecretsConfig, SecretError } from "./provider";
 import {
   ageEnv,
   checkAgeKeyFile,
@@ -51,6 +57,7 @@ import {
   sopsFileProblem,
 } from "./providers/sops";
 import {
+  kindName,
   loadRecipients,
   machineName,
   RECIPIENT_NAME,
@@ -65,6 +72,7 @@ import {
   storeRecipients,
 } from "./recipients";
 import { attendedTerminal, generateWords, newIdentity, openTerminal, readRecoveryWords, showAndConfirmWords, type Tty, unwrapIdentity, wrapIdentity } from "./recovery";
+import { configText, exists, refuseCoinciding, refuseSharedDirs, withStoreLock, writeNewFiles } from "./store-files";
 
 /** What the lifecycle commands (and init) can be given instead of the real thing, for tests. */
 export interface LifecycleDeps {
@@ -124,89 +132,6 @@ export function checkName(name: string, flag = "--name", kind: "machine" | "reco
   if (kind === "machine" && name === "recovery") throw new SecretError(`${flag}: "recovery" is the recovery recipient's name; pick another for a machine`);
 }
 
-export async function exists(path: string): Promise<boolean> {
-  try {
-    await lstat(path);
-    return true;
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw e;
-  }
-}
-
-/** Throw if any two of `paths` (label -> path) are the same file, as given or through a symlink. */
-export async function refuseCoinciding(paths: [string, string][]): Promise<void> {
-  const real = await Promise.all(paths.map(async ([, p]) => [resolve(p), await realish(resolve(p))] as const));
-  for (let i = 0; i < paths.length; i++) {
-    for (let j = i + 1; j < paths.length; j++) {
-      if (real[i]![0] === real[j]![0] || real[i]![1] === real[j]![1]) {
-        throw new SecretError(`the ${paths[i]![0]} and the ${paths[j]![0]} are the same file (${real[i]![0]}): give each its own path`);
-      }
-    }
-  }
-}
-
-/** Refuse a new file directly in $HOME or the config home (or above): its directory would be made 0700. */
-export function refuseSharedDirs(paths: string[], env: Env): void {
-  const shared = [env.HOME, configHome(env)].filter((d): d is string => d !== undefined && d !== "").map((d) => resolve(d));
-  for (const path of paths) {
-    const dir = resolve(dirname(path));
-    if (shared.some((d) => isWithin(d, dir))) {
-      throw new Error(
-        `${path} would sit directly in ${dir}, which hapi would have to make 0700; put it in a directory of its own (the defaults are under ${join(configHome(env), "hapi")} and ${dirname(defaultAgeKeyFile(env))})`,
-      );
-    }
-  }
-}
-
-/** The local config text for a sops store and this machine's key. */
-export function configText(file: string, ageKey: string, by: string): string {
-  return (
-    `# hapi's local secrets config, written by \`hapi secrets ${by}\` (docs/secrets.md).\n` +
-    "# It picks the secret provider and binds it; it holds no secret.\n" +
-    stringify({ provider: "sops", sops: { file, age_key_file: ageKey } })
-  );
-}
-
-/**
- * New files, written as one step: each with `writeNewSecretFile` (0600, never
- * replacing anything) in a directory made or tightened to 0700. If one fails,
- * the ones already written, and the directories made for them, are removed,
- * and the error ends "; nothing was written".
- */
-export async function writeNewFiles(files: [string, string | Uint8Array][], o: { uid?: number } = {}): Promise<void> {
-  const written: string[] = [];
-  const made: [string, string][] = [];
-  try {
-    for (const [path, content] of files) {
-      const top = await ensurePrivateDir(dirname(path), o);
-      if (top !== undefined) made.push([dirname(path), top]);
-      try {
-        await writeNewSecretFile(path, content);
-      } catch (e) {
-        if ((e as NodeJS.ErrnoException).code === "EEXIST") throw new SecretError(`${path} already exists (it appeared after hapi checked), and hapi never replaces it`);
-        throw e;
-      }
-      written.push(path);
-    }
-  } catch (e) {
-    for (const path of written.reverse()) await rm(path, { force: true });
-    for (const [dir, top] of made.reverse()) {
-      // Each level hapi made, deepest first, while it is empty.
-      for (let d = resolve(dir); isWithin(d, resolve(top)); d = dirname(d)) {
-        try {
-          await rmdir(d);
-        } catch {
-          break;
-        }
-        if (d === resolve(top)) break;
-      }
-    }
-    if (e instanceof Error) e.message = `${e.message}; nothing was written`;
-    throw e;
-  }
-}
-
 /** This machine's age key: an existing file (checked), or a new identity in memory (`text`), to be written with `writeNewFiles`. */
 export interface MachineKey {
   path: string;
@@ -215,17 +140,18 @@ export interface MachineKey {
 }
 
 /**
- * This machine's age key at `path`. If the file exists it is reused, once it
- * passes `checkAgeKeyFile` and `age-keygen -y` gives one public key of the
- * store's kind (`mismatch` explains otherwise). If not, a new key is made in
- * memory (`age-keygen -pq`, or classic), never inside the checkout.
+ * This machine's age key at `path`, for the store `o.store`. If the file
+ * exists it is reused, once it passes `checkAgeKeyFile` and `age-keygen -y`
+ * gives one public key of the store's kind (`mismatch` explains otherwise).
+ * If not, a new key is made in memory (`age-keygen -pq`, or classic), never
+ * inside the checkout.
  */
 export async function machineKey(
   path: string,
   pq: boolean,
   tools: Tools,
   env: Env,
-  o: { repoRoot: CheckoutRoots; uid?: number; mismatch: (kind: string) => string },
+  o: { repoRoot: CheckoutRoots; uid?: number; store: string; mismatch: (kind: string) => string },
 ): Promise<MachineKey> {
   if (await exists(path)) {
     await checkAgeKeyFile(path, o);
@@ -237,7 +163,7 @@ export async function machineKey(
     }
     if (lines.length !== 1) throw new SecretError(`${path} holds ${lines.length} age keys; hapi expects one, this machine's, per key file`);
     const type = recipientType(lines[0]!);
-    if (type !== (pq ? "pq" : "classic")) throw new SecretError(o.mismatch(type === "pq" ? "post-quantum" : type === "classic" ? "classic (X25519)" : "not an X25519 or post-quantum age key"));
+    if (type !== (pq ? "pq" : "classic")) throw new SecretError(o.mismatch(type === undefined ? "not an X25519 or post-quantum age key" : kindName(type === "pq")));
     return { path, recipient: lines[0]! };
   }
   const where = await checkoutProblem(path, o.repoRoot);
@@ -255,7 +181,12 @@ export interface StoreState {
   recovery: string;
 }
 
-/** Read the store and its recipients file, and throw unless the store is encrypted and the two agree (no drift, no PQ/classic mix). */
+/**
+ * Read the store and its recipients file, and throw unless the store passes
+ * `sopsFileProblem` (encrypted, to age recipients and nothing else) and the
+ * two agree (no drift, no PQ/classic mix). Every lifecycle command, and
+ * `edit`, runs it before sops does.
+ */
 export async function loadStore(file: string): Promise<StoreState> {
   let text: string;
   try {
@@ -353,7 +284,6 @@ async function commit(state: StoreState, rotated: { tmp: string }, next: Recipie
 }
 
 const entry = (name: string, kind: RecipientEntry["kind"], recipient: string, deps: LifecycleDeps): RecipientEntry => ({ name, kind, recipient, added: today(deps) });
-const storeKind = (pq: boolean) => (pq ? "post-quantum" : "classic");
 const recipientCount = (n: number) => `${n} recipient${n === 1 ? "" : "s"}`;
 
 /** recovery.age's bytes, or a SecretError saying where it should be. */
@@ -393,30 +323,33 @@ export async function joinMachine(o: { store: string; config?: string | undefine
   if (await exists(config)) throw new SecretError(`${config} already exists, and hapi secrets join never overwrites anything: this machine is set up (run \`hapi secrets check\`)`);
   const name = o.name ?? defaultMachineName(deps);
   checkName(name);
-  const state = await loadStore(store);
-  const newKey = !(await exists(ageKey));
-  refuseSharedDirs(newKey ? [config, ageKey] : [config], env);
-  const tools = await toolsFor(deps);
-  const pq = state.recipients.pq;
-  const key = await machineKey(ageKey, pq, tools, env, {
-    repoRoot: await (deps.repoRoot ?? defaultRepoRoot)(),
-    ...uidOf(deps),
-    mismatch: (kind) => `the age key ${ageKey} is ${kind}, and this store is ${storeKind(pq)}: hapi won't mix them. Give --age-key a new path for a new ${storeKind(pq)} key (docs/secrets.md#post-quantum-by-default)`,
-  });
-  const listed = state.recipients.recipients.find((r) => r.recipient === key.recipient);
-  if (listed === undefined && state.recipients.recipients.some((r) => r.name === name)) throw new SecretError(`${name} is already a recipient of ${store}: pick another --name`);
-  await writeNewFiles([...(key.text === undefined ? [] : [[ageKey, key.text] as [string, string]]), [config, configText(store, ageKey, "join")]], uidOf(deps));
-  console.log(`${key.text === undefined ? "using" : "created"} the age key ${ageKey}`);
-  console.log(`wrote ${config} (provider: sops, store ${store})`);
-  if (listed !== undefined) {
-    console.log(`this key is already a recipient of the store, as ${listed.name}: nothing to add. Next: mise run secrets:check`);
+  return withStoreLock(store, "join", async () => {
+    const state = await loadStore(store);
+    const newKey = !(await exists(ageKey));
+    refuseSharedDirs(newKey ? [config, ageKey] : [config], env);
+    const tools = await toolsFor(deps);
+    const pq = state.recipients.pq;
+    const key = await machineKey(ageKey, pq, tools, env, {
+      repoRoot: await (deps.repoRoot ?? defaultRepoRoot)(),
+      ...uidOf(deps),
+      store,
+      mismatch: (kind) => `the age key ${ageKey} is ${kind}, and this store is ${kindName(pq)}: hapi won't mix them. Give --age-key a new path for a new ${kindName(pq)} key (docs/secrets.md#post-quantum-by-default)`,
+    });
+    const listed = state.recipients.recipients.find((r) => r.recipient === key.recipient);
+    if (listed === undefined && state.recipients.recipients.some((r) => r.name === name)) throw new SecretError(`${name} is already a recipient of ${store}: pick another --name`);
+    await writeNewFiles([...(key.text === undefined ? [] : [[ageKey, key.text] as [string, string]]), [config, configText(store, ageKey, "join")]], uidOf(deps));
+    console.log(`${key.text === undefined ? "using" : "created"} the age key ${ageKey}`);
+    console.log(`wrote ${config} (provider: sops, store ${store})`);
+    if (listed !== undefined) {
+      console.log(`this key is already a recipient of the store, as ${listed.name}: nothing to add. Next: mise run secrets:check`);
+      return 0;
+    }
+    console.log(`this machine's public key (${name}): ${key.recipient}`);
+    console.log("next, on a machine whose key already opens the store, run:");
+    console.log(`  mise run secrets:add-machine -- --name ${name} --recipient ${key.recipient}`);
+    console.log(`then bring the updated ${basename(store)} and ${basename(recipientsPath(store))} here (commit and pull private/, or copy both), and run mise run secrets:check`);
     return 0;
-  }
-  console.log(`this machine's public key (${name}): ${key.recipient}`);
-  console.log("next, on a machine whose key already opens the store, run:");
-  console.log(`  mise run secrets:add-machine -- --name ${name} --recipient ${key.recipient}`);
-  console.log(`then bring the updated ${basename(store)} and ${basename(recipientsPath(store))} here (commit and pull private/, or copy both), and run mise run secrets:check`);
-  return 0;
+  });
 }
 
 /** `hapi secrets add-machine --name <n> --recipient <age1...>`: add a machine's public key to the store, with a new data key. */
@@ -426,23 +359,25 @@ export async function addMachine(o: { config?: string | undefined; name: string;
   const type = recipientType(o.recipient);
   if (type === undefined) throw new SecretError("--recipient is not an age public key (age1pq1... or age1..., as `hapi secrets join` prints it)");
   const cfg = sopsConfigFor(o.config, deps, "add-machine");
-  const state = await loadStore(cfg.sops.file);
-  const pq = state.recipients.pq;
-  if (type !== (pq ? "pq" : "classic")) {
-    throw new SecretError(`--recipient is ${type === "pq" ? "post-quantum" : "classic (X25519)"}, and this store is ${storeKind(pq)}: hapi won't mix them (docs/secrets.md#post-quantum-by-default)`);
-  }
-  if (state.recipients.recipients.some((r) => r.name === o.name)) throw new SecretError(`${o.name} is already a recipient of ${state.file}: pick another --name`);
-  const same = state.recipients.recipients.find((r) => r.recipient === o.recipient);
-  if (same !== undefined) throw new SecretError(`that recipient is already in the store, as ${same.name}`);
-  const tools = await toolsFor(deps);
-  const key = cfg.sops.age_key_file;
-  await checkSopsKeys(key, sopsEnv(env, tools.dir, { file: key }), { repoRoot: await (deps.repoRoot ?? defaultRepoRoot)(), ...uidOf(deps) });
-  const rotated = await rotate(state, [{ add: o.recipient }], { file: key }, tools, env);
-  const next = { ...state.recipients, recipients: [...state.recipients.recipients, entry(o.name, "machine", o.recipient, deps)] };
-  await commit(state, rotated, next);
-  console.log(`added ${o.name} (${shortRecipient(o.recipient)}): ${state.file} has a new data key and is encrypted to ${recipientCount(next.recipients.length)}`);
-  console.log(`next: bring ${basename(state.file)} and ${basename(state.recipientsFile)} to ${o.name} (commit and push private/, then pull it there), and run mise run secrets:check on it`);
-  return 0;
+  return withStoreLock(cfg.sops.file, "add-machine", async () => {
+    const state = await loadStore(cfg.sops.file);
+    const pq = state.recipients.pq;
+    if (type !== (pq ? "pq" : "classic")) {
+      throw new SecretError(`--recipient is ${kindName(type === "pq")}, and this store is ${kindName(pq)}: hapi won't mix them (docs/secrets.md#post-quantum-by-default)`);
+    }
+    if (state.recipients.recipients.some((r) => r.name === o.name)) throw new SecretError(`${o.name} is already a recipient of ${state.file}: pick another --name`);
+    const same = state.recipients.recipients.find((r) => r.recipient === o.recipient);
+    if (same !== undefined) throw new SecretError(`that recipient is already in the store, as ${same.name}`);
+    const tools = await toolsFor(deps);
+    const key = cfg.sops.age_key_file;
+    await checkSopsKeys(key, sopsEnv(env, tools.dir, { file: key }), { repoRoot: await (deps.repoRoot ?? defaultRepoRoot)(), store: state.file, ...uidOf(deps) });
+    const rotated = await rotate(state, [{ add: o.recipient }], { file: key }, tools, env);
+    const next = { ...state.recipients, recipients: [...state.recipients.recipients, entry(o.name, "machine", o.recipient, deps)] };
+    await commit(state, rotated, next);
+    console.log(`added ${o.name} (${shortRecipient(o.recipient)}): ${state.file} has a new data key and is encrypted to ${recipientCount(next.recipients.length)}`);
+    console.log(`next: bring ${basename(state.file)} and ${basename(state.recipientsFile)} to ${o.name} (commit and push private/, then pull it there), and run mise run secrets:check on it`);
+    return 0;
+  });
 }
 
 /**
@@ -473,41 +408,44 @@ export async function recover(o: { store?: string | undefined; config?: string |
   await refuseCoinciding([["config", configFile], ["store", store], ["age key", ageKey], ["recovery.age", recoveryPath(store)], ["recipients file", recipientsPath(store)]]);
   const name = o.name ?? defaultMachineName(deps);
   checkName(name);
-  const state = await loadStore(store);
-  const rec = recoveryEntry(state);
-  const tty = terminalFor(deps);
-  if (tty === undefined) throw new SecretError("hapi secrets recover needs a terminal to read the recovery words");
-  const newKey = !(await exists(ageKey));
-  refuseSharedDirs([...(haveConfig ? [] : [configFile]), ...(newKey ? [ageKey] : [])], env);
-  const tools = await toolsFor(deps);
-  const repoRoot = await (deps.repoRoot ?? defaultRepoRoot)();
-  const pq = state.recipients.pq;
-  const key = await machineKey(ageKey, pq, tools, env, {
-    repoRoot,
-    ...uidOf(deps),
-    mismatch: (kind) => `the age key ${ageKey} is ${kind}, and this store is ${storeKind(pq)}: hapi won't mix them. Give --age-key a new path`,
+  return withStoreLock(store, "recover", async () => {
+    const state = await loadStore(store);
+    const rec = recoveryEntry(state);
+    const tty = terminalFor(deps);
+    if (tty === undefined) throw new SecretError("hapi secrets recover needs a terminal to read the recovery words");
+    const newKey = !(await exists(ageKey));
+    refuseSharedDirs([...(haveConfig ? [] : [configFile]), ...(newKey ? [ageKey] : [])], env);
+    const tools = await toolsFor(deps);
+    const repoRoot = await (deps.repoRoot ?? defaultRepoRoot)();
+    const pq = state.recipients.pq;
+    const key = await machineKey(ageKey, pq, tools, env, {
+      repoRoot,
+      ...uidOf(deps),
+      store,
+      mismatch: (kind) => `the age key ${ageKey} is ${kind}, and this store is ${kindName(pq)}: hapi won't mix them. Give --age-key a new path`,
+    });
+    const listed = state.recipients.recipients.find((r) => r.recipient === key.recipient);
+    if (listed !== undefined) throw new SecretError(`this machine's key (${ageKey}) already opens ${store}, as ${listed.name}: nothing to recover (run \`hapi secrets check\`)`);
+    if (state.recipients.recipients.some((r) => r.name === name)) {
+      throw new SecretError(`${name} is already a recipient of ${store} (is its key the lost one?): run recover with another --name, then \`hapi secrets revoke --name ${name}\``);
+    }
+    // 1. Join: this machine's key and config, before the words, so a retry reuses them.
+    await writeNewFiles(
+      [...(key.text === undefined ? [] : [[ageKey, key.text] as [string, string]]), ...(haveConfig ? [] : [[configFile, configText(store, ageKey, "recover")] as [string, string]])],
+      uidOf(deps),
+    );
+    // 2. The words, and the recovery identity, in memory.
+    const wrapped = await readRecovery(state);
+    const words = await readRecoveryWords(tty);
+    const identity = await unwrapIdentity(tools, ageEnv(env, tools.dir), wrapped, words, { file: state.recovery, recipient: rec.recipient });
+    // 3. Add this machine, with the recovery identity in that one sops child's env.
+    await checkSopsKeys(ageKey, sopsEnv(env, tools.dir, { file: ageKey }), { repoRoot, store, ...uidOf(deps) });
+    const rotated = await rotate(state, [{ add: key.recipient }], { identity }, tools, env);
+    await commit(state, rotated, { ...state.recipients, recipients: [...state.recipients.recipients, entry(name, "machine", key.recipient, deps)] });
+    console.log(`recovered: ${name} can open the store now, without the words (${state.file} has a new data key)`);
+    console.log("next: mise run secrets:check; then `mise run secrets:revoke -- --name <machine>` for any machine whose key is lost or may be compromised");
+    return 0;
   });
-  const listed = state.recipients.recipients.find((r) => r.recipient === key.recipient);
-  if (listed !== undefined) throw new SecretError(`this machine's key (${ageKey}) already opens ${store}, as ${listed.name}: nothing to recover (run \`hapi secrets check\`)`);
-  if (state.recipients.recipients.some((r) => r.name === name)) {
-    throw new SecretError(`${name} is already a recipient of ${store} (is its key the lost one?): run recover with another --name, then \`hapi secrets revoke --name ${name}\``);
-  }
-  // 1. Join: this machine's key and config, before the words, so a retry reuses them.
-  await writeNewFiles(
-    [...(key.text === undefined ? [] : [[ageKey, key.text] as [string, string]]), ...(haveConfig ? [] : [[configFile, configText(store, ageKey, "recover")] as [string, string]])],
-    uidOf(deps),
-  );
-  // 2. The words, and the recovery identity, in memory.
-  const wrapped = await readRecovery(state);
-  const words = await readRecoveryWords(tty);
-  const identity = await unwrapIdentity(tools, ageEnv(env, tools.dir), wrapped, words, { file: state.recovery, recipient: rec.recipient });
-  // 3. Add this machine, with the recovery identity in that one sops child's env.
-  await checkSopsKeys(ageKey, sopsEnv(env, tools.dir, { file: ageKey }), { repoRoot, ...uidOf(deps) });
-  const rotated = await rotate(state, [{ add: key.recipient }], { identity }, tools, env);
-  await commit(state, rotated, { ...state.recipients, recipients: [...state.recipients.recipients, entry(name, "machine", key.recipient, deps)] });
-  console.log(`recovered: ${name} can open the store now, without the words (${state.file} has a new data key)`);
-  console.log("next: mise run secrets:check; then `mise run secrets:revoke -- --name <machine>` for any machine whose key is lost or may be compromised");
-  return 0;
 }
 
 /**
@@ -521,29 +459,31 @@ export async function recover(o: { store?: string | undefined; config?: string |
 export async function drill(o: { config?: string | undefined }, deps: LifecycleDeps = {}): Promise<number> {
   const env = deps.env ?? process.env;
   const cfg = sopsConfigFor(o.config, deps, "drill");
-  const state = await loadStore(cfg.sops.file);
-  const rec = recoveryEntry(state);
-  const tty = terminalFor(deps);
-  if (tty === undefined) throw new SecretError("hapi secrets drill needs a terminal to read the recovery words");
-  const rt = runtimeDir(env);
-  await secureDir(rt, dirname(rt), uidOf(deps));
-  const tools = await toolsFor(deps);
-  const wrapped = await readRecovery(state);
-  const words = await readRecoveryWords(tty);
-  const identity = await unwrapIdentity(tools, ageEnv(env, tools.dir), wrapped, words, { file: state.recovery, recipient: rec.recipient });
-  const tmp = await mkdtemp(join(rt, "drill-"));
-  try {
-    const childEnv = { ...sopsEnv({ PATH: env.PATH, HOME: tmp }, tools.dir, { identity }), XDG_CONFIG_HOME: tmp };
-    const r = await tools.sops(["--config", "/dev/null", "decrypt", "--input-type", "yaml", "--output-type", "json", state.file], { env: childEnv });
-    if (r.code !== 0) {
-      const why = scrubToolError(r.stderr);
-      throw new SecretError(`the recovery key could not decrypt ${state.file} (exit ${r.code})${why ? `: ${why}` : ""}`);
+  return withStoreLock(cfg.sops.file, "drill", async () => {
+    const state = await loadStore(cfg.sops.file);
+    const rec = recoveryEntry(state);
+    const tty = terminalFor(deps);
+    if (tty === undefined) throw new SecretError("hapi secrets drill needs a terminal to read the recovery words");
+    const rt = runtimeDir(env);
+    await secureDir(rt, dirname(rt), uidOf(deps));
+    const tools = await toolsFor(deps);
+    const wrapped = await readRecovery(state);
+    const words = await readRecoveryWords(tty);
+    const identity = await unwrapIdentity(tools, ageEnv(env, tools.dir), wrapped, words, { file: state.recovery, recipient: rec.recipient });
+    const tmp = await mkdtemp(join(rt, "drill-"));
+    try {
+      const childEnv = { ...sopsEnv({ PATH: env.PATH, HOME: tmp }, tools.dir, { identity }), XDG_CONFIG_HOME: tmp };
+      const r = await tools.sops(["--config", "/dev/null", "decrypt", "--input-type", "yaml", "--output-type", "json", state.file], { env: childEnv });
+      if (r.code !== 0) {
+        const why = scrubToolError(r.stderr);
+        throw new SecretError(`the recovery key could not decrypt ${state.file} (exit ${r.code})${why ? `: ${why}` : ""}`);
+      }
+      console.log(`recovery works: ${decryptedMap(r.stdout, state.file).size} names readable`);
+    } finally {
+      await rm(tmp, { recursive: true, force: true });
     }
-    console.log(`recovery works: ${decryptedMap(r.stdout, state.file).size} names readable`);
-  } finally {
-    await rm(tmp, { recursive: true, force: true });
-  }
-  return 0;
+    return 0;
+  });
 }
 
 const COMPROMISED =
@@ -554,30 +494,32 @@ export async function revoke(o: { config?: string | undefined; name: string }, d
   const env = deps.env ?? process.env;
   checkName(o.name, "--name", "recovery");
   const cfg = sopsConfigFor(o.config, deps, "revoke");
-  const state = await loadStore(cfg.sops.file);
-  const all = state.recipients.recipients;
-  const target = all.find((r) => r.name === o.name);
-  if (target === undefined) throw new SecretError(`no recipient named ${o.name} in ${state.recipientsFile} (the names: ${all.map((r) => r.name).join(", ")})`);
-  if (all.filter((r) => r.kind === target.kind).length === 1) {
-    throw new SecretError(
-      target.kind === "machine"
-        ? `${o.name} is the last machine key: add another first (join, then add-machine), or no machine could open the store`
-        : `${o.name} is the only recovery recipient: use \`hapi secrets new-recovery\` to replace it`,
-    );
-  }
-  const tools = await toolsFor(deps);
-  const key = cfg.sops.age_key_file;
-  await checkSopsKeys(key, sopsEnv(env, tools.dir, { file: key }), { repoRoot: await (deps.repoRoot ?? defaultRepoRoot)(), ...uidOf(deps) });
-  const own = await tools.ageKeygen(["-y", key], { env: ageEnv(env, tools.dir) });
-  const rotated = await rotate(state, [{ rm: target.recipient }], { file: key }, tools, env);
-  const next = { ...state.recipients, recipients: all.filter((r) => r !== target) };
-  await commit(state, rotated, next);
-  console.log(`removed ${o.name} (${shortRecipient(target.recipient)}): ${state.file} has a new data key and is encrypted to ${recipientCount(next.recipients.length)}`);
-  if (own.code === 0 && own.stdout.split("\n").map((l) => l.trim()).includes(target.recipient)) {
-    console.log("that was this machine's own key: this machine can no longer open the store");
-  }
-  console.log(COMPROMISED);
-  return 0;
+  return withStoreLock(cfg.sops.file, "revoke", async () => {
+    const state = await loadStore(cfg.sops.file);
+    const all = state.recipients.recipients;
+    const target = all.find((r) => r.name === o.name);
+    if (target === undefined) throw new SecretError(`no recipient named ${o.name} in ${state.recipientsFile} (the names: ${all.map((r) => r.name).join(", ")})`);
+    if (all.filter((r) => r.kind === target.kind).length === 1) {
+      throw new SecretError(
+        target.kind === "machine"
+          ? `${o.name} is the last machine key: add another first (join, then add-machine), or no machine could open the store`
+          : `${o.name} is the only recovery recipient: use \`hapi secrets new-recovery\` to replace it`,
+      );
+    }
+    const tools = await toolsFor(deps);
+    const key = cfg.sops.age_key_file;
+    await checkSopsKeys(key, sopsEnv(env, tools.dir, { file: key }), { repoRoot: await (deps.repoRoot ?? defaultRepoRoot)(), store: state.file, ...uidOf(deps) });
+    const own = await tools.ageKeygen(["-y", key], { env: ageEnv(env, tools.dir) });
+    const rotated = await rotate(state, [{ rm: target.recipient }], { file: key }, tools, env);
+    const next = { ...state.recipients, recipients: all.filter((r) => r !== target) };
+    await commit(state, rotated, next);
+    console.log(`removed ${o.name} (${shortRecipient(target.recipient)}): ${state.file} has a new data key and is encrypted to ${recipientCount(next.recipients.length)}`);
+    if (own.code === 0 && own.stdout.split("\n").map((l) => l.trim()).includes(target.recipient)) {
+      console.log("that was this machine's own key: this machine can no longer open the store");
+    }
+    console.log(COMPROMISED);
+    return 0;
+  });
 }
 
 /**
@@ -591,30 +533,32 @@ export async function newRecovery(o: { config?: string | undefined; noConfirm: b
   const env = deps.env ?? process.env;
   const cfg = sopsConfigFor(o.config, deps, "new-recovery");
   if (o.noConfirm && (deps.attended ?? attendedTerminal())) throw new SecretError("--no-confirm is for tests and CI fixtures only, and a person is at this terminal: run it without, and confirm the words");
-  const state = await loadStore(cfg.sops.file);
-  const tty = terminalFor(deps);
-  if (tty === undefined && !o.noConfirm) throw new SecretError("hapi secrets new-recovery needs a terminal to show the new recovery words and check you kept them");
-  const tools = await toolsFor(deps);
-  const key = cfg.sops.age_key_file;
-  await checkSopsKeys(key, sopsEnv(env, tools.dir, { file: key }), { repoRoot: await (deps.repoRoot ?? defaultRepoRoot)(), ...uidOf(deps) });
-  const pq = state.recipients.pq;
-  const id = await newIdentity(tools.ageKeygen, ageEnv(env, tools.dir), pq);
-  const words = generateWords();
-  if (tty !== undefined) await showAndConfirmWords(words, tty, { confirm: !o.noConfirm });
-  else console.error("hapi secrets new-recovery: warning: no terminal, so the new recovery words were not shown: this store's recovery.age can't be opened");
-  const wrapped = await wrapIdentity(tools.age, ageEnv(env, tools.dir), id.text, words);
-  const old = state.recipients.recipients.filter((r) => r.kind === "recovery");
-  const rotated = await rotate(state, [{ add: id.recipient }, ...old.map((r) => ({ rm: r.recipient }))], { file: key }, tools, env);
-  const next = { ...state.recipients, recipients: [...state.recipients.recipients.filter((r) => r.kind !== "recovery"), entry("recovery", "recovery", id.recipient, deps)] };
-  await commit(state, rotated, next, wrapped);
-  console.log(`new recovery words are in place: ${state.recovery} and the recovery recipient are replaced, and ${state.file} has a new data key`);
-  if (old.length > 0) {
-    console.log(
-      "the old words no longer open this store, but old copies of the store and of recovery.age (in private/'s git history, say) still open with them: if the old words may be exposed, also reissue every credential in the store",
-    );
-  }
-  console.log("next: mise run secrets:drill, with the new words");
-  return 0;
+  return withStoreLock(cfg.sops.file, "new-recovery", async () => {
+    const state = await loadStore(cfg.sops.file);
+    const tty = terminalFor(deps);
+    if (tty === undefined && !o.noConfirm) throw new SecretError("hapi secrets new-recovery needs a terminal to show the new recovery words and check you kept them");
+    const tools = await toolsFor(deps);
+    const key = cfg.sops.age_key_file;
+    await checkSopsKeys(key, sopsEnv(env, tools.dir, { file: key }), { repoRoot: await (deps.repoRoot ?? defaultRepoRoot)(), store: state.file, ...uidOf(deps) });
+    const pq = state.recipients.pq;
+    const id = await newIdentity(tools.ageKeygen, ageEnv(env, tools.dir), pq);
+    const words = generateWords();
+    if (tty !== undefined) await showAndConfirmWords(words, tty, { confirm: !o.noConfirm });
+    else console.error("hapi secrets new-recovery: warning: no terminal, so the new recovery words were not shown: this store's recovery.age can't be opened");
+    const wrapped = await wrapIdentity(tools.age, ageEnv(env, tools.dir), id.text, words);
+    const old = state.recipients.recipients.filter((r) => r.kind === "recovery");
+    const rotated = await rotate(state, [{ add: id.recipient }, ...old.map((r) => ({ rm: r.recipient }))], { file: key }, tools, env);
+    const next = { ...state.recipients, recipients: [...state.recipients.recipients.filter((r) => r.kind !== "recovery"), entry("recovery", "recovery", id.recipient, deps)] };
+    await commit(state, rotated, next, wrapped);
+    console.log(`new recovery words are in place: ${state.recovery} and the recovery recipient are replaced, and ${state.file} has a new data key`);
+    if (old.length > 0) {
+      console.log(
+        "the old words no longer open this store, but old copies of the store and of recovery.age (in private/'s git history, say) still open with them: if the old words may be exposed, also reissue every credential in the store",
+      );
+    }
+    console.log("next: mise run secrets:drill, with the new words");
+    return 0;
+  });
 }
 
 /**
@@ -634,8 +578,7 @@ export async function recipientReport(file: string): Promise<{ lines: string[]; 
     }
     throw e;
   }
-  const kind = recipients.pq ? "post-quantum" : "classic";
-  out.lines = recipients.recipients.map((r) => `recipient ${r.kind.padEnd(8)} ${r.name} (${kind}, added ${r.added})`);
+  out.lines = recipients.recipients.map((r) => `recipient ${r.kind.padEnd(8)} ${r.name} (${kindName(recipients.pq)}, added ${r.added})`);
   out.errors = recipientProblems(recipients, storeRecipients(await readFile(file, "utf8")));
   if (!recipients.recipients.some((r) => r.kind === "recovery")) {
     out.warnings.push("the store has no recovery recipient: if every machine key is lost, so is the store. Run `mise run secrets:new-recovery` (docs/secrets.md#keys-and-recovery)");

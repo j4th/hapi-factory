@@ -30,26 +30,13 @@
 import { join } from "node:path";
 import { stringify } from "yaml";
 import { defaultRepoRoot } from "./files";
-import {
-  configText,
-  defaultMachineName,
-  exists,
-  machineKey,
-  checkName,
-  type LifecycleDeps,
-  refuseCoinciding,
-  refuseSharedDirs,
-  terminalFor,
-  today,
-  toolsFor,
-  uidOf,
-  writeNewFiles,
-} from "./lifecycle";
+import { checkName, defaultMachineName, type LifecycleDeps, machineKey, terminalFor, today, toolsFor, uidOf } from "./lifecycle";
 import { loadManifest, MANIFEST_FILE, manifestNames } from "./manifest";
 import { configHome, configPath, defaultAgeKeyFile, expandPath, SecretError } from "./provider";
 import { ageEnv, scrubToolError, sopsEnv, sopsFileProblem } from "./providers/sops";
-import { recipientsPath, recipientsText, recoveryPath, storeRecipients } from "./recipients";
+import { kindName, recipientsPath, recipientsText, recoveryPath, storeRecipients } from "./recipients";
 import { attendedTerminal, generateWords, newIdentity, showAndConfirmWords, wrapIdentity } from "./recovery";
+import { configText, exists, refuseCoinciding, refuseSharedDirs, writeNewFiles } from "./store-files";
 
 export interface InitOptions {
   config?: string | undefined;
@@ -89,13 +76,14 @@ export async function initStore(o: InitOptions, deps: LifecycleDeps = {}): Promi
     throw new SecretError("hapi secrets init needs a terminal to show the recovery words and check you kept them; run it in one (not in a pipe or CI)");
   }
   const pq = !o.classic;
-  const kind = pq ? "post-quantum" : "classic";
+  const kind = kindName(pq);
   const tools = await toolsFor(deps);
 
   // 1. This machine's key; 2. the recovery identity and its words. In memory, so far.
   const key = await machineKey(ageKey, pq, tools, env, {
     repoRoot: await (deps.repoRoot ?? defaultRepoRoot)(),
     ...uidOf(deps),
+    store: file,
     mismatch: (k) =>
       `the age key ${ageKey} is ${k}, and this store would be ${pq ? "post-quantum (the default)" : "classic (--classic)"}: hapi won't mix them. ` +
       `Give --age-key a new path for a new ${kind} key${pq ? ", or pass --classic for an all-classic store" : ""} (docs/secrets.md#post-quantum-by-default)`,

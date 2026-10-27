@@ -88,6 +88,9 @@ export function fakeRecipient(n: number, pq = true): string {
   return pq ? `age1pq1${s.padStart(1952, "q")}` : `age1${s.padStart(58, "q")}`;
 }
 
+/** An age key file's text with the shape age-keygen writes (comments, one identity line) and no real key behind it. */
+export const FAKE_KEY_FILE_TEXT = "# not a real age key (unit-test fixture)\nAGE-SECRET-KEY-PQ-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQFAKE\n";
+
 /** A machine recipient and a recovery recipient for the static fake store below. */
 export const FAKE_RECIPIENT = fakeRecipient(1);
 export const FAKE_RECOVERY_RECIPIENT = fakeRecipient(2);
@@ -127,7 +130,7 @@ export function sopsStore(dir: string, values: Record<string, string>) {
   writeFileSync(recovery, ENC_KEY, { mode: 0o600 });
   const ageKeyFile = join(dir, "age", "keys.txt");
   mkdirSync(join(dir, "age"), { mode: 0o700, recursive: true });
-  writeFileSync(ageKeyFile, "# not a real age key (unit-test fixture)\n", { mode: 0o600 });
+  writeFileSync(ageKeyFile, FAKE_KEY_FILE_TEXT, { mode: 0o600 });
   const calls: { args: string[]; env: Record<string, string>; stdin?: string }[] = [];
   const run: SopsRunner = async (args, o) => {
     calls.push({ args, env: o.env, ...(o.stdin === undefined ? {} : { stdin: String(o.stdin) }) });

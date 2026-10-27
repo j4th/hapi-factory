@@ -17,13 +17,16 @@
  * plugins from PATH).
  *
  * `fetch`:
- * 1. checks the age key file (`checkAgeKeyFile`), and sops's own default key
- *    file under the HOME it gets, if that exists too: sops 3.13 reads every
- *    key source it finds, not only SOPS_AGE_KEY_FILE (`checkSopsKeys`);
+ * 1. checks the age key file (`checkAgeKeyFile`: where it is, its mode, that
+ *    it isn't the store's recovery.age, and that it holds plain age identities
+ *    only), and sops's own default key file under the HOME it gets, if that
+ *    exists too: sops 3.13 reads every key source it finds, not only
+ *    SOPS_AGE_KEY_FILE (`checkSopsKeys`);
  * 2. parses the raw file and checks its shape before decrypting
- *    (`sopsFileProblem`): a sops block with an age recipient and no other
- *    kind of master key (one would open the store unseen by the recipients
- *    file), and every top-level value encrypted, so a value
+ *    (`sopsFileProblem`): a sops block with an age recipient and nothing else
+ *    but sops's bookkeeping (any other master key, or a field hapi doesn't
+ *    know, could open the store unseen by the recipients file), and every
+ *    top-level value encrypted, so a value
  *    `unencrypted_suffix` or `unencrypted_regex` left in plaintext is refused;
  * 3. runs `sops decrypt --output-type json <file>` through a `SopsRunner`,
  *    with the minimal env of `sopsEnv`. `--config /dev/null` keeps any
@@ -38,9 +41,10 @@ import { spawn } from "node:child_process";
 import { access, constants, lstat, readFile } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { parse } from "yaml";
-import { type CheckoutRoots, defaultRepoRoot, privateFileProblem } from "../files";
+import { type CheckoutRoots, defaultRepoRoot, privateFileProblem, realish } from "../files";
 import { shownName } from "../manifest";
 import { type Env, SecretError, type SecretProvider } from "../provider";
+import { recoveryPath } from "../recipients";
 
 /**
  * Runs a tool with these args and this whole env (nothing inherited). `stdin`
@@ -222,23 +226,37 @@ const AGE_RECIPIENT = /^age1[0-9a-z]+$/;
 const isRecord = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
 
 /**
- * The master-key lists sops 3.13's metadata can hold besides `age` (its
+ * The sops whose metadata fields hapi knows: the version mise.toml pins (a
+ * test keeps the two in step). A new sops may add a field, so bumping it
+ * means checking `OTHER_MASTER_KEYS` and `SOPS_BOOKKEEPING` against its
+ * metadata struct again.
+ */
+export const SOPS_METADATA_VERSION = "3.13.3";
+
+/**
+ * The master-key lists sops 3.13.3's metadata can hold besides `age` (its
  * `mapstructure` tags), each as a message names it. A key in any of them opens
  * the store as well as an age recipient does, and `sops rotate --add-age` /
  * `--rm-age` keep it, so hapi's store has none: its decryptors are its age
- * recipients, each named in the recipients file (../recipients.ts).
+ * recipients, each named in the recipients file (../recipients.ts). A Map, so
+ * a field named `constructor` or `__proto__` is just an unknown field.
  */
-const OTHER_MASTER_KEYS: Record<string, string> = {
-  pgp: "a PGP key",
-  kms: "an AWS KMS key",
-  gcp_kms: "a GCP KMS key",
-  azure_kv: "an Azure Key Vault key",
-  hc_vault: "a HashiCorp Vault transit key",
-  hckms: "a HuaweiCloud KMS key",
-  key_groups: "sops key groups",
-};
-/** The rest of sops 3.13's metadata: scalars that hold no key. */
-const SCALAR_METADATA = new Set([
+const OTHER_MASTER_KEYS = new Map<string, string>([
+  ["pgp", "a PGP key"],
+  ["kms", "an AWS KMS key"],
+  ["gcp_kms", "a GCP KMS key"],
+  ["azure_kv", "an Azure Key Vault key"],
+  ["hc_vault", "a HashiCorp Vault transit key"],
+  ["hckms", "a HuaweiCloud KMS key"],
+  ["key_groups", "sops key groups"],
+]);
+/**
+ * The rest of sops 3.13.3's metadata struct: its bookkeeping, scalars that
+ * hold no key (the last-modified time, the MAC, the version, the Shamir
+ * threshold and the encrypted/unencrypted suffix, regex and comment-regex
+ * settings).
+ */
+const SOPS_BOOKKEEPING = new Set([
   "lastmodified",
   "mac",
   "version",
@@ -252,20 +270,23 @@ const SCALAR_METADATA = new Set([
   "encrypted_comment_regex",
 ]);
 const isEmpty = (v: unknown) => v === null || v === undefined || v === "" || (Array.isArray(v) && v.length === 0) || (isRecord(v) && Object.keys(v).length === 0);
+/** A metadata field's name as a message shows it: `sops.<field>` if it is a plain identifier, else masked. */
+const shownField = (field: string) => (/^[a-z][a-z0-9_]{0,39}$/.test(field) ? `sops.${field}` : "name not shown");
 
 /**
- * The master keys in a sops block other than its age recipients, as a message
- * names them: every non-empty list `OTHER_MASTER_KEYS` names, and any other
- * non-empty list or mapping too (a newer sops's key type would be one), so
- * this fails closed. Never quotes a key's identifier.
+ * Everything in a sops block besides its age recipients and sops's
+ * bookkeeping, as a message names it: each non-empty list `OTHER_MASTER_KEYS`
+ * names, and every field sops 3.13.3 doesn't write, whatever its value (a
+ * newer sops's key type would be one), so this fails closed. Never quotes a
+ * key's identifier or a value.
  */
 function otherMasterKeys(meta: Record<string, unknown>): string[] {
   const found: string[] = [];
   for (const [field, value] of Object.entries(meta)) {
-    if (field === "age" || SCALAR_METADATA.has(field) || isEmpty(value)) continue;
-    const kind = OTHER_MASTER_KEYS[field];
-    if (kind !== undefined) found.push(`${kind} (sops.${field})`);
-    else if (typeof value === "object") found.push(`keys of a type hapi doesn't know (${/^[a-z][a-z0-9_]{0,39}$/.test(field) ? `sops.${field}` : "a sops metadata field, not shown"})`);
+    if (field === "age" || SOPS_BOOKKEEPING.has(field)) continue;
+    const kind = OTHER_MASTER_KEYS.get(field);
+    if (kind === undefined) found.push(`a field hapi doesn't know (${shownField(field)}: it may hold a key)`);
+    else if (!isEmpty(value)) found.push(`${kind} (sops.${field})`);
   }
   return found;
 }
@@ -273,9 +294,10 @@ function otherMasterKeys(meta: Record<string, unknown>): string[] {
 /**
  * Why the raw text of a sops file is not a usable encrypted store, or
  * undefined: it must be a YAML mapping with a `sops` block that lists at least
- * one age recipient and no other kind of master key (`otherMasterKeys`: a PGP,
- * cloud KMS or Vault key, or key groups, would open the store without being in
- * its recipients file), and every other top-level value must be a string sops
+ * one age recipient and nothing else but sops's bookkeeping (`otherMasterKeys`:
+ * a PGP, cloud KMS or Vault key, or key groups, would open the store without
+ * being in its recipients file, and so might a field hapi doesn't know), and
+ * every other top-level value must be a string sops
  * encrypted (`ENC[AES256_GCM,...`). The one exception is "": sops leaves an
  * empty string as it is (there is nothing to encrypt), and it holds nothing.
  * Never quotes the file.
@@ -298,7 +320,8 @@ export function sopsFileProblem(text: string): string | undefined {
   if (others.length > 0) {
     return (
       `has ${others.join(" and ")} in its sops metadata, besides its age recipients: hapi's store is encrypted to age recipients only, ` +
-      "each named in its recipients file, so any other key could open it unseen. Remove it with sops rotate -i (--rm-pgp, --rm-kms and so on) " +
+      `each named in its recipients file, so any other key could open it unseen (and hapi knows only the metadata fields of sops ${SOPS_METADATA_VERSION}, the pinned sops). ` +
+      "Remove it with sops rotate -i (--rm-pgp, --rm-kms and so on) " +
       "or restore the store from a commit without it; then, unless you added it yourself, reissue every credential in the store: whoever holds it may have read them " +
       "(docs/secrets.md#threat-notes)"
     );
@@ -315,22 +338,67 @@ export function sopsFileProblem(text: string): string | undefined {
   return undefined;
 }
 
-/** Throw a SecretError unless the age key file is ours, closed to group and other, and outside the checkout. */
-export async function checkAgeKeyFile(path: string, o: { repoRoot?: CheckoutRoots; uid?: number } = {}): Promise<void> {
-  const problem = await privateFileProblem(path, { repoRoot: o.repoRoot ?? (await defaultRepoRoot()), mode: "private", ...(o.uid === undefined ? {} : { uid: o.uid }) });
-  if (problem !== undefined) throw new SecretError(`age key file ${path} ${problem}`);
+/** An age identity line, as `age-keygen` writes one: X25519 (`AGE-SECRET-KEY-1...`) or post-quantum (`AGE-SECRET-KEY-PQ-1...`). */
+const AGE_IDENTITY = /^AGE-SECRET-KEY-(?:PQ-)?1[0-9A-Z]+$/;
+
+/**
+ * Why an age key file's text isn't a plain age identity file, or undefined:
+ * every line that isn't blank or a `#` comment must be an `AGE_IDENTITY`, and
+ * there must be at least one. A passphrase-wrapped identity (recovery.age, or
+ * any age-encrypted file) would make sops prompt through gpg-agent or the
+ * terminal; a plugin identity would run a plugin. Never quotes the file.
+ */
+export function ageKeyTextProblem(text: string): string | undefined {
+  const lines = text.split("\n").map((l) => l.trim());
+  const bad = lines.findIndex((l) => l !== "" && !l.startsWith("#") && !AGE_IDENTITY.test(l));
+  if (bad !== -1) {
+    return (
+      `is not a plain age identity file: line ${bad + 1} is not an AGE-SECRET-KEY-1... or AGE-SECRET-KEY-PQ-1... identity (not shown). ` +
+      "sops gets this file as it is, so it must hold unwrapped identities only, as age-keygen writes them: never recovery.age or another passphrase-protected or plugin key"
+    );
+  }
+  if (!lines.some((l) => AGE_IDENTITY.test(l))) return "holds no age identity (an AGE-SECRET-KEY-1... or AGE-SECRET-KEY-PQ-1... line), so it can't open anything";
+  return undefined;
 }
 
 /**
- * Check every age key file sops will read with `env`: `ageKeyFile` (it must
- * pass `checkAgeKeyFile`), and sops's own default,
+ * Throw a SecretError unless the age key file is ours, closed to group and
+ * other, outside the checkout, not the store's recovery.age (when `store` is
+ * given), and a plain age identity file (`ageKeyTextProblem`). So sops is
+ * never handed a wrapped identity.
+ */
+export async function checkAgeKeyFile(path: string, o: { repoRoot?: CheckoutRoots; uid?: number; store?: string } = {}): Promise<void> {
+  const problem = await privateFileProblem(path, { repoRoot: o.repoRoot ?? (await defaultRepoRoot()), mode: "private", ...(o.uid === undefined ? {} : { uid: o.uid }) });
+  if (problem !== undefined) throw new SecretError(`age key file ${path} ${problem}`);
+  if (o.store !== undefined) {
+    const rec = recoveryPath(o.store);
+    if (resolve(path) === resolve(rec) || (await realish(resolve(path))) === (await realish(resolve(rec)))) {
+      throw new SecretError(
+        `age key file ${path} is the store's recovery.age: that is the recovery key wrapped with the 10 words, never a machine key, and sops must never get it. Point sops.age_key_file in your secrets config at this machine's own key (docs/secrets.md#keys-and-recovery)`,
+      );
+    }
+  }
+  let text: string;
+  try {
+    text = await readFile(path, "utf8");
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    throw new SecretError(`age key file ${path} cannot be read${code ? ` (${code})` : ""}`);
+  }
+  const content = ageKeyTextProblem(text);
+  if (content !== undefined) throw new SecretError(`age key file ${path} ${content}`);
+}
+
+/**
+ * Check every age key file sops will read with `env` for `o.store`:
+ * `ageKeyFile` (it must pass `checkAgeKeyFile`), and sops's own default,
  * `${XDG_CONFIG_HOME:-$HOME/.config}/sops/age/keys.txt` as sops computes it
  * from `env`, if that is another file and exists. sops 3.13 loads identities
  * from every source it finds, so an unchecked default would be used too.
  * (It also tries ~/.ssh/id_ed25519 and id_rsa, but only for an SSH
  * recipient; hapi's store is encrypted to age recipients.)
  */
-export async function checkSopsKeys(ageKeyFile: string, env: Env, o: { repoRoot: CheckoutRoots; uid?: number }): Promise<void> {
+export async function checkSopsKeys(ageKeyFile: string, env: Env, o: { repoRoot: CheckoutRoots; uid?: number; store?: string }): Promise<void> {
   await checkAgeKeyFile(ageKeyFile, o);
   // As Go's os.UserConfigDir, which sops uses: $XDG_CONFIG_HOME if set (a relative one is an error, so no default), else $HOME/.config.
   const xdg = env.XDG_CONFIG_HOME;
@@ -389,7 +457,7 @@ export function sopsProvider(o: SopsOptions): SecretProvider {
     },
     async fetch(names) {
       const env = sopsEnv(o.env, await (o.ageDir ?? pinnedAgeDir)(), { file: o.ageKeyFile });
-      await checkSopsKeys(o.ageKeyFile, env, { repoRoot: await (o.repoRoot ?? defaultRepoRoot)(), ...(o.uid === undefined ? {} : { uid: o.uid }) });
+      await checkSopsKeys(o.ageKeyFile, env, { repoRoot: await (o.repoRoot ?? defaultRepoRoot)(), store: o.file, ...(o.uid === undefined ? {} : { uid: o.uid }) });
       await raw();
       const r = await run(["--config", "/dev/null", "decrypt", "--input-type", "yaml", "--output-type", "json", o.file], { env });
       if (r.code !== 0) {

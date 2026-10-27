@@ -26,7 +26,7 @@
 import { closeSync, openSync, writeSync } from "node:fs";
 import { SecretError } from "./provider";
 import { commandRunner, type SopsRunner, scrubToolError } from "./providers/sops";
-import { recipientType, shortRecipient } from "./recipients";
+import { kindName, recipientType, shortRecipient } from "./recipients";
 import { WORDLIST } from "./wordlist";
 
 /** How many words the passphrase has: 10 x 11 bits = 110 bits. */
@@ -206,8 +206,6 @@ export function identityLines(text: string): string[] {
     .map((l) => l.trim())
     .filter((l) => l.startsWith("AGE-SECRET-KEY-"));
 }
-
-const kindName = (pq: boolean) => (pq ? "post-quantum" : "classic (X25519)");
 
 /** The one recipient `age-keygen -y` gives for an identity's text on stdin, checked to be of the right kind. */
 async function recipientOf(keygen: SopsRunner, env: Record<string, string>, text: string | Uint8Array): Promise<string> {

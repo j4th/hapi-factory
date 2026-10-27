@@ -65,7 +65,10 @@ export function recipientType(r: string): "pq" | "classic" | undefined {
   return undefined;
 }
 
-const typeName = (pq: boolean) => (pq ? "post-quantum" : "classic (X25519)");
+/** A store's or a key's kind, as every message names it: "post-quantum" or "classic (X25519)". */
+export function kindName(pq: boolean): string {
+  return pq ? "post-quantum" : "classic (X25519)";
+}
 
 /** A public key short enough for a message (a post-quantum one is 1959 characters). */
 export function shortRecipient(r: string): string {
@@ -110,7 +113,7 @@ export function parseRecipients(text: string, path: string): RecipientsFile {
     keys.set(r.recipient, r.name);
     if (recipientType(r.recipient) !== (file.pq ? "pq" : "classic")) {
       throw new SecretError(
-        `${path}: pq: ${file.pq}, but ${r.name} is a ${typeName(!file.pq)} recipient: hapi refuses to mix post-quantum and classic recipients, ` +
+        `${path}: pq: ${file.pq}, but ${r.name} is a ${kindName(!file.pq)} recipient: hapi refuses to mix post-quantum and classic recipients, ` +
           "since sops would quietly drop the post-quantum protection (docs/secrets.md#post-quantum-by-default)",
       );
     }

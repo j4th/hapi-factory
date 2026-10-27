@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { SecretError } from "../../src/secrets/provider";
-import { AGE_MIN_VERSION, checkAgeKeyFile, resolveAgeDir, type SopsRunner, sopsFileProblem, sopsProvider } from "../../src/secrets/providers/sops";
-import { caught, cleanup, ENC, FAKE_AGE_DIR, FAKE_RECIPIENT, sopsFileText, sopsStore, tempDir } from "./helpers";
+import { AGE_MIN_VERSION, checkAgeKeyFile, resolveAgeDir, SOPS_METADATA_VERSION, type SopsRunner, sopsFileProblem, sopsProvider } from "../../src/secrets/providers/sops";
+import { caught, cleanup, ENC, FAKE_AGE_DIR, FAKE_KEY_FILE_TEXT, FAKE_RECIPIENT, sopsFileText, sopsStore, tempDir } from "./helpers";
 
 const FAKE = "sk-SECRET-123";
 
@@ -90,8 +90,8 @@ describe("the sops provider", () => {
       ["hc_vault", [{ vault_address: "https://vault.example.org:8200", engine_path: "transit", key_name: "fake", enc: ENC }], /a HashiCorp Vault transit key \(sops\.hc_vault\)/],
       ["hckms", [{ key_id: "region:fake", enc: ENC }], /a HuaweiCloud KMS key \(sops\.hckms\)/],
       ["key_groups", [{ age: [{ recipient: FAKE_RECIPIENT, enc: ENC }] }], /sops key groups \(sops\.key_groups\)/],
-      // A list sops 3.13 doesn't write is refused too: a newer sops's key type is a list like the rest.
-      ["future_kms", [{ id: "fake", enc: ENC }], /keys of a type hapi doesn't know \(sops\.future_kms\)/],
+      // A field sops 3.13.3 doesn't write is refused too: a newer sops's key type would be one.
+      ["future_kms", [{ id: "fake", enc: ENC }], /a field hapi doesn't know \(sops\.future_kms: it may hold a key\)/],
     ];
     const s = setup();
     for (const [field, value, why] of others) {
@@ -114,9 +114,58 @@ describe("the sops provider", () => {
       sopsFileProblem(sopsFileText({ "hapi-a": "enc" }, { lastmodified: "2026-10-26T12:00:00Z", mac: ENC, unencrypted_suffix: "_unencrypted", shamir_threshold: 1, mac_only_encrypted: false })),
     ).toBeUndefined();
     // A metadata field name that isn't a plain identifier isn't shown either.
-    expect(sopsFileProblem(sopsFileText({ "hapi-a": "enc" }, { [FAKE]: [{ x: 1 }] }))).toMatch(/keys of a type hapi doesn't know \(a sops metadata field, not shown\)/);
+    expect(sopsFileProblem(sopsFileText({ "hapi-a": "enc" }, { [FAKE]: [{ x: 1 }] }))).toMatch(/a field hapi doesn't know \(name not shown: it may hold a key\)/);
     expect(sopsFileProblem(sopsFileText({ "hapi-a": "enc" }, { [FAKE]: [{ x: 1 }] }))).not.toContain(FAKE);
     expect(s.store.calls).toEqual([]); // sops never ran
+  });
+
+  test("an unknown sops metadata field is refused whatever its value, and sops 3.13.3's bookkeeping passes", () => {
+    // The fields are those of sops 3.13.3's metadata struct; bumping sops in mise.toml means checking them again.
+    const pin = /^sops = "([0-9.]+)"/m.exec(readFileSync("mise.toml", "utf8"))![1];
+    expect(SOPS_METADATA_VERSION).toBe(pin!);
+    const store = (meta: Record<string, unknown>) => sopsFileText({ "hapi-a": "enc" }, meta);
+    for (const value of ["bar", "", 0, 1, false, true, null, [], {}, { nested: "x" }]) {
+      const problem = sopsFileProblem(store({ future_setting: value }));
+      expect([value, problem]).toEqual([value, expect.stringMatching(/^has a field hapi doesn't know \(sops\.future_setting: it may hold a key\) in its sops metadata, besides its age recipients: .*the metadata fields of sops 3\.13\.3, the pinned sops/)]);
+    }
+    // Its value is never shown, nor a name that isn't a plain identifier.
+    expect(sopsFileProblem(store({ future_setting: FAKE }))).not.toContain(FAKE);
+    expect(sopsFileProblem(store({ "Future-Setting": "x" }))).toMatch(/a field hapi doesn't know \(name not shown: it may hold a key\)/);
+    // A known key list and an unknown field are both named.
+    expect(sopsFileProblem(store({ pgp: [{ fp: "F" }], future_setting: 1 }))).toMatch(/^has a PGP key \(sops\.pgp\) and a field hapi doesn't know \(sops\.future_setting: it may hold a key\) in its sops metadata/);
+    // Every bookkeeping field sops 3.13.3 writes passes, as real sops output does.
+    const bookkeeping = {
+      lastmodified: "2026-10-26T12:00:00Z",
+      mac: ENC,
+      version: "3.13.3",
+      shamir_threshold: 1,
+      mac_only_encrypted: true,
+      unencrypted_suffix: "_unencrypted",
+      encrypted_suffix: "_encrypted",
+      unencrypted_regex: "^x$",
+      encrypted_regex: "^y$",
+      unencrypted_comment_regex: "^a",
+      encrypted_comment_regex: "^b",
+    };
+    expect(sopsFileProblem(store(bookkeeping))).toBeUndefined();
+  });
+
+  test("a metadata field named like an Object.prototype member is an unknown field, named sanely or masked", () => {
+    // YAML makes each of these an own key of the sops block; none is a known key list.
+    const base = sopsFileText({ "hapi-a": "enc" });
+    for (const [field, shown] of [
+      ["constructor", "sops.constructor"],
+      ["toString", "name not shown"],
+      ["__proto__", "name not shown"],
+      ["hasOwnProperty", "name not shown"],
+      ["valueOf", "name not shown"],
+    ] as const) {
+      const text = base.replace(/^sops:\n/m, `sops:\n  ${field}:\n    - fp: FAKEFINGERPRINT\n`);
+      expect(text).toContain(`  ${field}:`);
+      const problem = sopsFileProblem(text)!;
+      expect([field, problem.startsWith(`has a field hapi doesn't know (${shown}: it may hold a key) in its sops metadata`)]).toEqual([field, true]);
+      expect(problem).not.toMatch(/native code|function|\[object|FAKEFINGERPRINT/);
+    }
   });
 
   test("an empty value is allowed in the encrypted file: sops leaves \"\" as it is, and it holds nothing", () => {
@@ -194,12 +243,59 @@ describe("the age key file", () => {
     const s = setup();
     const implicit = join(s.env.HOME, ".config", "sops", "age", "keys.txt");
     mkdirSync(join(implicit, ".."), { recursive: true, mode: 0o700 });
-    writeFileSync(implicit, "# not a real age key\n", { mode: 0o644 });
+    writeFileSync(implicit, FAKE_KEY_FILE_TEXT, { mode: 0o644 });
     chmodSync(implicit, 0o644);
     await expect(s.provider.fetch(["hapi-a"])).rejects.toThrow(/age key file .*\.config\/sops\/age\/keys\.txt has group or other permission bits.*sops reads its default key file as well/);
     expect(s.store.calls).toEqual([]);
     chmodSync(implicit, 0o600);
     await expect(s.provider.fetch(["hapi-a"])).resolves.toBeDefined();
+  });
+
+  test("the age key file holds plain age identities only, and is never the store's recovery.age", async () => {
+    const s = setup();
+    const opts = { repoRoot: s.checkout, store: s.store.file };
+    const key = (text: string) => {
+      writeFileSync(s.store.ageKeyFile, text, { mode: 0o600 });
+      return checkAgeKeyFile(s.store.ageKeyFile, opts);
+    };
+    // As age-keygen writes it: comments and one identity, X25519 or post-quantum; several, blank lines and CRLF are fine too.
+    await expect(key(FAKE_KEY_FILE_TEXT)).resolves.toBeUndefined();
+    await expect(key("# created: 2026-10-26\r\n# public key: age1x\r\nAGE-SECRET-KEY-1QQQQFAKE\r\n\r\nAGE-SECRET-KEY-PQ-1QQQQFAKE\n")).resolves.toBeUndefined();
+    // A wrapped identity (recovery.age's armor, or age's binary format), a plugin identity, or anything else: refused, never quoted.
+    for (const [text, line] of [
+      ["-----BEGIN AGE ENCRYPTED FILE-----\nYWdlLWVuY3J5cHRpb24ub3JnL3Yx\n-----END AGE ENCRYPTED FILE-----\n", 1],
+      ["age-encryption.org/v1\n-> scrypt FAKESALT 18\nFAKEBODY\n", 1],
+      ["# a plugin key\nAGE-PLUGIN-YUBIKEY-1QQQQFAKE\n", 2],
+      [`# pasted\nAGE-SECRET-KEY-PQ-1QQQQFAKE\n${FAKE}\n`, 3],
+      ["age-secret-key-1qqqqfake\n", 1],
+    ] as const) {
+      const e = await caught(key(text));
+      expect(e).toBeInstanceOf(SecretError);
+      expect(e.message).toBe(
+        `age key file ${s.store.ageKeyFile} is not a plain age identity file: line ${line} is not an AGE-SECRET-KEY-1... or AGE-SECRET-KEY-PQ-1... identity (not shown). ` +
+          "sops gets this file as it is, so it must hold unwrapped identities only, as age-keygen writes them: never recovery.age or another passphrase-protected or plugin key",
+      );
+      expect(e.message).not.toMatch(/FAKESALT|FAKEBODY|YUBIKEY|QQQQFAKE|YWdl/);
+      expect(e.message).not.toContain(FAKE);
+    }
+    await expect(key("# only comments\n\n")).rejects.toThrow(/keys\.txt holds no age identity \(an AGE-SECRET-KEY-1\.\.\. or AGE-SECRET-KEY-PQ-1\.\.\. line\), so it can't open anything$/);
+    await expect(key("")).rejects.toThrow(/holds no age identity/);
+
+    // The store's recovery.age, as given or through a symlink, is refused by name before its text is read.
+    const recoveryMessage = /^age key file .* is the store's recovery\.age: that is the recovery key wrapped with the 10 words, never a machine key, and sops must never get it/;
+    await expect(checkAgeKeyFile(s.store.recovery, opts)).rejects.toThrow(recoveryMessage);
+    const alias = join(s.dir, "age", "alias.txt");
+    symlinkSync(s.store.recovery, alias);
+    await expect(checkAgeKeyFile(alias, opts)).rejects.toThrow(recoveryMessage);
+    // Without the store to compare with, its content still gives it away.
+    await expect(checkAgeKeyFile(s.store.recovery, { repoRoot: s.checkout })).rejects.toThrow(/is not a plain age identity file: line 1/);
+
+    // And the provider checks all of it before sops runs: a config whose age_key_file is recovery.age never reaches sops.
+    const wrong = sopsProvider({ file: s.store.file, ageKeyFile: s.store.recovery, run: s.store.run, env: s.env, repoRoot: async () => s.checkout, ageDir: async () => FAKE_AGE_DIR });
+    await expect(wrong.fetch(["hapi-a"])).rejects.toThrow(recoveryMessage);
+    writeFileSync(s.store.ageKeyFile, "-----BEGIN AGE ENCRYPTED FILE-----\nZmFrZQ==\n-----END AGE ENCRYPTED FILE-----\n", { mode: 0o600 });
+    await expect(s.provider.fetch(["hapi-a"])).rejects.toThrow(/is not a plain age identity file/);
+    expect(s.store.calls).toEqual([]);
   });
 
   test("the provider checks the age key before it decrypts", async () => {

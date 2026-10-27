@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { parse, stringify } from "yaml";
 import { secretsAddMachine, secretsCheck, secretsDrill, secretsEdit, secretsInit, secretsJoin, secretsNewRecovery, secretsRecover, secretsResolve, secretsRevoke } from "../../src/secrets/cli";
+import { loadStore } from "../../src/secrets/lifecycle";
 import { loadManifest, manifestNames } from "../../src/secrets/manifest";
 import { passphraseOf } from "../../src/secrets/recovery";
 import { shortRecipient } from "../../src/secrets/recipients";
@@ -101,6 +102,15 @@ async function fill(tools: Tools, store: string, values = fullStore()) {
 const idLine = (text: string) => text.split("\n").find((l) => l.startsWith("AGE-SECRET-KEY-"))!;
 const sopsCalls = (tools: Tools, cmd: string) => tools.calls.filter((c) => c.tool === "sops" && c.args[2] === cmd);
 const ROTATE = ["--config", "/dev/null", "rotate", "-i", "--input-type", "yaml", "--output-type", "yaml"];
+/** The words as they could leak: the passphrase age gets (joined by "-") and as typed (joined by spaces). Single words are ordinary English. */
+const phrases = (words: string[]) => [passphraseOf(words), words.join(" ")];
+/** Every file under `dir`, path -> bytes. */
+const snapshot = (dir: string) => tree(dir).map((f) => [f, readFileSync(join(dir, f), "utf8")]);
+/** An `edit` runner that records each run and changes nothing. */
+function editor() {
+  const runs: string[][] = [];
+  return { runs, interactive: async (_cmd: string, args: string[]) => (runs.push(args), 0) };
+}
 
 describe("hapi secrets join and add-machine", () => {
   test("join creates a key and config without touching the store, and prints the add-machine command", async () => {
@@ -237,7 +247,13 @@ describe("hapi secrets recover, drill and new-recovery", () => {
     expect(rotate.args.join(" ").includes(identity)).toBe(false);
     expect(allText(root).includes(identity)).toBe(false);
     expect([...out, ...err].join("\n").includes(identity)).toBe(false);
+    // The words reach age on fd 3 only: never a tool's argv or env, a file under any machine's HOME or private/, or output.
     expect(tools.calls[2]!.fd3).toBe(passphraseOf(words));
+    for (const phrase of phrases(words)) {
+      for (const x of tools.calls) expect(JSON.stringify([x.args, x.env]).includes(phrase)).toBe(false);
+      expect(allText(root).includes(phrase)).toBe(false);
+      expect([...out, ...err].join("\n").includes(phrase)).toBe(false);
+    }
 
     // Machine c is now a recipient, in the store and the recipients file, and has its config: it works without the words.
     expect(tools.readStore(c.store).listed).toContain(rC);
@@ -262,7 +278,7 @@ describe("hapi secrets recover, drill and new-recovery", () => {
 
   test("drill decrypts with an isolated HOME and only the recovery identity, and prints no value", async () => {
     const { out, err } = capture();
-    const { tools, a, words } = await initialised();
+    const { root, tools, a, words } = await initialised();
     await fill(tools, a.store);
     a.t.typed.push(words.join(" "));
     const before = tree(dirname(dirname(a.store)));
@@ -281,6 +297,15 @@ describe("hapi secrets recover, drill and new-recovery", () => {
     expect(readdirSync(join(a.xdg, "hapi"))).toEqual([]);
     expect(tree(dirname(dirname(a.store)))).toEqual(before);
     expect([...out, ...err].join("\n")).not.toContain("fake-hapi");
+    // The recovery identity is in the decrypt child's env as SOPS_AGE_KEY and nowhere else; the words reach age on fd 3 only.
+    for (const x of tools.calls.filter((c) => c !== decrypt)) expect(JSON.stringify([x.args, x.env]).includes(identity)).toBe(false);
+    expect(decrypt!.args.join(" ").includes(identity)).toBe(false);
+    expect(tools.calls.find((c) => c.tool === "age")!.fd3).toBe(passphraseOf(words));
+    for (const secret of [identity, ...phrases(words)]) {
+      expect(allText(root).includes(secret)).toBe(false);
+      expect([...out, ...err].join("\n").includes(secret)).toBe(false);
+    }
+    for (const phrase of phrases(words)) for (const x of tools.calls) expect(JSON.stringify([x.args, x.env]).includes(phrase)).toBe(false);
 
     // Wrong words fail, and still leave nothing behind.
     a.t.typed.push([...words].reverse().join(" "));
@@ -316,12 +341,46 @@ describe("hapi secrets recover, drill and new-recovery", () => {
     await expect(secretsDrill([], a.deps)).rejects.toThrow(/the words don't open/);
   });
 
-  test("a failed new-recovery restores recovery.age and leaves the store and recipients file as they were", async () => {
+  test("a new-recovery whose rotate fails leaves recovery.age, the store and the recipients file as they were", async () => {
     capture();
     const { a } = await initialised({ failRotate: true });
     const before = tree(dirname(a.store)).map((f) => [f, readFileSync(join(dirname(a.store), f), "utf8")]);
     await expect(secretsNewRecovery([], a.deps)).rejects.toThrow(/sops could not change the recipients/);
     expect(tree(dirname(a.store)).map((f) => [f, readFileSync(join(dirname(a.store), f), "utf8")])).toEqual(before);
+  });
+
+  test("a new-recovery that fails after recovery.age and the store are replaced puts both back byte for byte", async () => {
+    capture();
+    const { tools, a, words } = await initialised();
+    await fill(tools, a.store);
+    const dir = dirname(a.store);
+    const recipientsFile = join(dir, "secrets.recipients.yaml");
+    const bytes = () => ({ store: readFileSync(a.store), recovery: readFileSync(join(dir, "recovery.age")), recipients: readFileSync(recipientsFile) });
+    const before = bytes();
+    // Once sops has rotated the copy, the recipients file becomes a directory, so its rewrite, commit's last step, fails:
+    // by then the new recovery.age is written and the rotated store renamed over the old one.
+    a.deps.sops = async (args, o) => {
+      const r = await tools.sops(args, o);
+      if (args.includes("--rm-age")) {
+        rmSync(recipientsFile);
+        mkdirSync(recipientsFile);
+        writeFileSync(join(recipientsFile, "in-the-way"), "");
+      }
+      return r;
+    };
+    await expect(secretsNewRecovery([], a.deps)).rejects.toThrow(/secrets\.recipients\.yaml/);
+    expect(sopsCalls(tools, "rotate").length).toBe(2); // the add and the rm both ran: the failure came after them
+    // recovery.age and the store are as they were, byte for byte, and no temp file or lock is left.
+    expect(readFileSync(a.store).equals(before.store)).toBe(true);
+    expect(readFileSync(join(dir, "recovery.age")).equals(before.recovery)).toBe(true);
+    expect(tree(dir)).toEqual(["recovery.age", "secrets.enc.yaml", "secrets.recipients.yaml/in-the-way"]);
+    // With the recipients file back, the store and it agree, and the old words still open the store.
+    rmSync(recipientsFile, { recursive: true });
+    writeFileSync(recipientsFile, before.recipients);
+    await expect(loadStore(a.store)).resolves.toBeDefined();
+    a.deps.sops = tools.sops;
+    a.t.typed.push(words.join(" "));
+    expect(await secretsDrill([], a.deps)).toBe(0);
   });
 });
 
@@ -333,7 +392,6 @@ describe("a store with a master key that is not age", () => {
     return stringify(doc);
   };
   const REFUSED = /secrets\.enc\.yaml has a PGP key \(sops\.pgp\) in its sops metadata, besides its age recipients: hapi's store is encrypted to age recipients only/;
-  const snapshot = (dir: string) => tree(dir).map((f) => [f, readFileSync(join(dir, f), "utf8")]);
 
   test("check, resolve and every lifecycle command refuse a store also encrypted to a non-age key, before sops runs or anything is written", async () => {
     const { err } = capture();
@@ -345,6 +403,10 @@ describe("a store with a master key that is not age", () => {
 
     await expect(secretsCheck([], a.deps)).rejects.toThrow(REFUSED);
     await expect(secretsResolve([], a.deps)).rejects.toThrow(REFUSED);
+    // edit too: new values never go into a store a key outside the recipients file could open.
+    const ed = editor();
+    await expect(secretsEdit([], { ...a.deps, interactive: ed.interactive })).rejects.toThrow(REFUSED);
+    expect(ed.runs).toEqual([]);
     await expect(secretsAddMachine(["--name", "machine-b", "--recipient", fakeRecipient(999)], a.deps)).rejects.toThrow(REFUSED);
     await expect(secretsRevoke(["--name", "recovery"], a.deps)).rejects.toThrow(REFUSED);
     a.t.typed.push(words.join(" "));
@@ -378,6 +440,121 @@ describe("a store with a master key that is not age", () => {
       /^sops's result has a PGP key \(sops\.pgp\) in its sops metadata, besides its age recipients: .*; nothing was changed$/,
     );
     expect(snapshot(dirname(a.store))).toEqual(before);
+  });
+});
+
+describe("hapi secrets edit runs the store checks first", () => {
+  test("edit refuses recipient drift, a PQ/classic mix or a missing recipients file before sops runs", async () => {
+    capture();
+    const { tools, a } = await initialised();
+    const dir = dirname(a.store);
+    const recipientsFile = join(dir, "secrets.recipients.yaml");
+    const original = readFileSync(recipientsFile, "utf8");
+    const ed = editor();
+    const deps = { ...a.deps, interactive: ed.interactive };
+    expect(await secretsEdit([], deps)).toBe(0);
+    expect(ed.runs.length).toBe(1);
+    ed.runs.length = 0;
+
+    // Drift: a recipient the store has that the file doesn't list (planted with raw sops, say), or the other way round.
+    await fill(tools, a.store);
+    const planted = fakeRecipient(4242);
+    const doc = parse(readFileSync(a.store, "utf8")) as { sops: { age: { recipient: string; enc: string }[] } };
+    writeFileSync(a.store, stringify({ ...doc, sops: { ...doc.sops, age: [...doc.sops.age, { recipient: planted, enc: "x" }] } }));
+    await expect(secretsEdit([], deps)).rejects.toThrow(new RegExp(`secrets\\.enc\\.yaml and .*secrets\\.recipients\\.yaml disagree: the store is encrypted to ${shortRecipient(planted)}, which the recipients file doesn't list`));
+    // Back to the store's own two recipients, then a recipients file that lists one more.
+    const listed = (parse(original) as { recipients: { recipient: string }[] }).recipients.map((r) => r.recipient);
+    const r = await tools.sops(["--config", "/dev/null", "encrypt", "--age", listed.join(","), "--input-type", "yaml", "--output-type", "yaml", "--filename-override", a.store], { env: {}, stdin: stringify(fullStore()) });
+    writeFileSync(a.store, r.stdout);
+    writeFileSync(recipientsFile, `${original.trimEnd()}\n  - { name: gone, kind: machine, recipient: ${fakeRecipient(77)}, added: 2026-10-26 }\n`);
+    await expect(secretsEdit([], deps)).rejects.toThrow(/disagree: the recipients file lists gone \(.*\), but the store isn't encrypted to it/);
+    // A classic recipient in a post-quantum store, or no recipients file at all.
+    writeFileSync(recipientsFile, `${original.trimEnd()}\n  - { name: old-laptop, kind: machine, recipient: ${fakeRecipient(78, false)}, added: 2026-10-26 }\n`);
+    await expect(secretsEdit([], deps)).rejects.toThrow(/pq: true, but old-laptop is a classic \(X25519\) recipient: hapi refuses to mix/);
+    rmSync(recipientsFile);
+    await expect(secretsEdit([], deps)).rejects.toThrow(/no recipients file at .*secrets\.recipients\.yaml/);
+    expect(ed.runs).toEqual([]);
+    expect(existsSync(join(dir, ".secrets.enc.yaml.lock"))).toBe(false);
+  });
+
+  test("a config whose age_key_file is the store's recovery.age is refused before sops ever sees it", async () => {
+    capture();
+    const { tools, a } = await initialised();
+    await fill(tools, a.store);
+    // A second machine first, so revoking it gets as far as the key check.
+    expect(await secretsAddMachine(["--name", "machine-b", "--recipient", fakeRecipient(999)], a.deps)).toBe(0);
+    const recoveryAge = join(dirname(a.store), "recovery.age");
+    for (const keyFile of [recoveryAge, join(a.home, "alias-of-recovery.age")]) {
+      if (keyFile !== recoveryAge) symlinkSync(recoveryAge, keyFile);
+      writeFileSync(a.config, stringify({ provider: "sops", sops: { file: a.store, age_key_file: keyFile } }));
+      const before = snapshot(dirname(a.store));
+      tools.calls.length = 0;
+      const ed = editor();
+      const refused = /age key file .* is the store's recovery\.age: that is the recovery key wrapped with the 10 words, never a machine key, and sops must never get it/;
+      await expect(secretsCheck([], a.deps)).rejects.toThrow(refused);
+      await expect(secretsResolve([], a.deps)).rejects.toThrow(refused);
+      await expect(secretsEdit([], { ...a.deps, interactive: ed.interactive })).rejects.toThrow(refused);
+      await expect(secretsAddMachine(["--name", "machine-x", "--recipient", fakeRecipient(998)], a.deps)).rejects.toThrow(refused);
+      await expect(secretsRevoke(["--name", "machine-b"], a.deps)).rejects.toThrow(refused);
+      await expect(secretsNewRecovery([], a.deps)).rejects.toThrow(refused);
+      expect(tools.calls.filter((x) => x.tool === "sops")).toEqual([]);
+      expect(ed.runs).toEqual([]);
+      expect(snapshot(dirname(a.store))).toEqual(before);
+    }
+  });
+});
+
+describe("the store lock", () => {
+  test("every lifecycle command and edit refuse while the lock beside the store exists, naming it, and leave it and the store alone", async () => {
+    capture();
+    const { root, tools, a, words } = await initialised();
+    const b = machine(root, "machine-b", tools);
+    copyPrivate(a, b);
+    const c = machine(root, "machine-c", tools, [words.join(" ")]);
+    copyPrivate(a, c);
+    const lockOf = (m: { store: string }) => join(dirname(m.store), ".secrets.enc.yaml.lock");
+    for (const m of [a, b, c]) writeFileSync(lockOf(m), "hapi secrets add-machine, pid 1, started 2026-10-27T09:00:00Z\n", { mode: 0o600 });
+    const before = [a, b, c].map((m) => snapshot(dirname(m.store)));
+    tools.calls.length = 0;
+    const held = (m: { store: string }) =>
+      new RegExp(`^${lockOf(m).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} exists \\(made .*\\): another hapi secrets command is using .*secrets\\.enc\\.yaml, or one was interrupted and left it\\. If none is running, run \`hapi secrets check\`, repair the store and its recipients file if it reports drift \\(docs/secrets\\.md#an-interrupted-command\\), then remove .*\\.lock and run this again$`);
+    const ed = editor();
+    await expect(secretsAddMachine(["--name", "machine-b", "--recipient", fakeRecipient(999)], a.deps)).rejects.toThrow(held(a));
+    await expect(secretsRevoke(["--name", "recovery"], a.deps)).rejects.toThrow(held(a));
+    await expect(secretsNewRecovery([], a.deps)).rejects.toThrow(held(a));
+    a.t.typed.push(words.join(" "));
+    await expect(secretsDrill([], a.deps)).rejects.toThrow(held(a));
+    await expect(secretsEdit([], { ...a.deps, interactive: ed.interactive })).rejects.toThrow(held(a));
+    await expect(secretsJoin(["--store", b.store], b.deps)).rejects.toThrow(held(b));
+    await expect(secretsRecover(["--store", c.store], c.deps)).rejects.toThrow(held(c));
+    // Nothing ran, nothing changed, the lock hapi didn't make is still there, and the joining and recovering machines got no key or config.
+    expect(tools.calls).toEqual([]);
+    expect(ed.runs).toEqual([]);
+    expect([a, b, c].map((m) => snapshot(dirname(m.store)))).toEqual(before);
+    for (const m of [b, c]) expect([existsSync(m.key), existsSync(m.config)]).toEqual([false, false]);
+    // check and resolve only read: they don't take the lock.
+    expect(await secretsCheck([], { ...a.deps, tty: null })).toBe(1); // every value is still empty
+    // Once it is removed, the command runs, and leaves no lock behind.
+    rmSync(lockOf(a));
+    expect(await secretsAddMachine(["--name", "machine-b", "--recipient", fakeRecipient(999)], a.deps)).toBe(0);
+    expect(existsSync(lockOf(a))).toBe(false);
+  });
+
+  test("two recipient changes at once: one runs, the other is refused, and the store and recipients file agree", async () => {
+    capture();
+    const { a, file } = await initialised();
+    const results = await Promise.allSettled([
+      secretsAddMachine(["--name", "machine-b", "--recipient", fakeRecipient(901)], a.deps),
+      secretsAddMachine(["--name", "machine-c", "--recipient", fakeRecipient(902)], a.deps),
+    ]);
+    expect(results.map((r) => r.status).sort()).toEqual(["fulfilled", "rejected"]);
+    const refused = results.find((r) => r.status === "rejected") as PromiseRejectedResult;
+    expect((refused.reason as Error).message).toMatch(/\.secrets\.enc\.yaml\.lock exists .*another hapi secrets command is using/);
+    // No lost update: exactly one was added, in both files.
+    const state = await loadStore(a.store);
+    expect(state.recipients.recipients.length).toBe(3);
+    expect(file().recipients.map((r) => r.name).filter((n) => n !== "machine-a" && n !== "recovery").length).toBe(1);
+    expect(existsSync(join(dirname(a.store), ".secrets.enc.yaml.lock"))).toBe(false);
   });
 });
 

@@ -14,7 +14,8 @@
  *   file 0600), and a symlink swap (`rename` over `env`) makes it current. A
  *   reader sees the old set or the new one, never a mix, and the old
  *   generation is deleted, so a zone file the manifest dropped goes with it.
- *   Task 4-era zone files and generations a crash orphaned are removed too.
+ *   Task 4-era zone files, and generations a crash orphaned (once they are a
+ *   minute old), are removed too.
  * - `writeSecretFile`: one file, 0600, written to a temp file and renamed over
  *   the target (a minted token; a store, its recipients file or recovery.age
  *   when a recipient changes).
@@ -29,7 +30,8 @@
  * - `privateFileProblem`, `ensurePrivateDir` and `defaultRepoRoot`: a key or a
  *   plaintext store must be ours, closed to group and other, and outside the
  *   hapi-factory checkout, private/ included. The checkout is the worktree
- *   hapi runs from and the repo's main worktree (`repoRoots`).
+ *   hapi runs from and the repo's main worktree (`repoRoots`), as git says;
+ *   if git can't say, that is an error, never a guess.
  *
  * Every error names a key or a path, never a value. A bad XDG_RUNTIME_DIR is a
  * plain Error; the callers turn a `privateFileProblem` into a SecretError.
@@ -154,6 +156,14 @@ export async function writeNewSecretFile(path: string, content: string | Uint8Ar
 const GENERATION = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /**
+ * How old (by mtime) a generation the link doesn't point at must be before
+ * `writeSecretFiles` removes it: a younger one may be a concurrent resolve's,
+ * still being written, and removing it would leave that resolve's `env`
+ * dangling. One a crash left behind is removed by the next resolve after this.
+ */
+export const ORPHAN_AGE_MS = 60_000;
+
+/**
  * Write a whole set of files (`name -> content`) and make it current at `link`
  * in one step:
  * 1. write every file (0600) into a fresh `<link>.<random>/` (0700) beside `link`;
@@ -166,11 +176,16 @@ const GENERATION = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
  * symlink or absent: a real directory or file there is refused. Its directory
  * must exist (see `secureDir`). Resolves to the paths, `<link>/<name>`.
  *
- * After the swap it also removes, beside `link`: every generation directory
- * of ours that `link` doesn't point at (the old one, and any a crash
- * orphaned), and each `legacy` name that is a regular file (the zone files
- * Task 4 wrote directly in `$XDG_RUNTIME_DIR/hapi/`). It never touches a
- * symlink, or a directory or file of another name.
+ * After the swap it also removes, beside `link`:
+ * - the generation `link` pointed at before the swap;
+ * - every other generation directory of ours that `link` doesn't point at
+ *   and that is more than `ORPHAN_AGE_MS` old (one a crash orphaned). A
+ *   younger one may be a concurrent resolve's, still being written, so it is
+ *   left for a later run;
+ * - each `legacy` name that is a regular file (the zone files Task 4 wrote
+ *   directly in `$XDG_RUNTIME_DIR/hapi/`).
+ * An entry that vanishes meanwhile (a concurrent resolve removed it) is
+ * skipped. It never touches a symlink, or a directory or file of another name.
  */
 export async function writeSecretFiles(link: string, files: Record<string, string>, o: { legacy?: readonly string[] } = {}): Promise<string[]> {
   const base = dirname(link);
@@ -184,10 +199,12 @@ export async function writeSecretFiles(link: string, files: Record<string, strin
   const generation = `${linkName}.${randomUUID()}`;
   const genDir = join(base, generation);
   const tmpLink = join(base, `.${linkName}.${randomUUID()}.link`);
+  let previous: string | undefined;
   try {
     try {
       const st = await lstat(link);
       if (!st.isSymbolicLink()) throw new Error(`${link} is not hapi's symlink (a real ${st.isDirectory() ? "directory" : "file"}); move it away and run again`);
+      previous = await readlink(link);
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
     }
@@ -206,7 +223,16 @@ export async function writeSecretFiles(link: string, files: Record<string, strin
   const current = await readlink(link).catch(() => undefined);
   for (const entry of await readdir(base)) {
     if (entry === generation || entry === current || !entry.startsWith(`${linkName}.`) || !GENERATION.test(entry.slice(linkName.length + 1))) continue;
-    if ((await lstat(join(base, entry))).isDirectory()) await rm(join(base, entry), { recursive: true, force: true });
+    let st;
+    try {
+      st = await lstat(join(base, entry));
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") continue; // a concurrent resolve removed it
+      throw e;
+    }
+    if (!st.isDirectory()) continue;
+    if (entry !== previous && Date.now() - st.mtimeMs < ORPHAN_AGE_MS) continue; // maybe a concurrent resolve's, still being written
+    await rm(join(base, entry), { recursive: true, force: true });
   }
   for (const name of o.legacy ?? []) {
     const path = join(base, name);
@@ -284,16 +310,33 @@ export function parseEnvFile(text: string): Record<string, string> {
 /** The checkout a key may not sit in: one root, or several (a linked worktree and its main worktree). */
 export type CheckoutRoots = string | readonly string[];
 
-/** One line of git's output in `cwd`, or undefined if git fails. */
-async function gitLine(args: string[], cwd: string, env: Record<string, string>): Promise<string | undefined> {
+/**
+ * The absolute path git prints for `args` in `cwd`. Throws, naming the
+ * command, its exit code and the first line of git's stderr, if git can't
+ * run, fails, or prints anything but one absolute path.
+ */
+async function gitPath(args: string[], cwd: string, env: Record<string, string>): Promise<string> {
+  const what = `\`git ${args.join(" ")}\` in ${cwd}`;
+  const why =
+    "hapi needs it to find the hapi-factory checkout that age keys and plaintext must stay out of, and won't guess. " +
+    "For \"dubious ownership\", run hapi as the user that owns the checkout (git's safe.directory explains the check)";
+  let proc: Bun.Subprocess<"ignore", "pipe", "pipe">;
   try {
-    const proc = Bun.spawn(["git", ...args], { cwd, env, stdin: "ignore", stdout: "pipe", stderr: "ignore" });
-    const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
-    const line = out.trim();
-    return code === 0 && line !== "" ? line : undefined;
-  } catch {
-    return undefined;
+    proc = Bun.spawn(["git", ...args], { cwd, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    throw new Error(`cannot run ${what}${code ? ` (${code})` : ""}: is git installed? ${why}`);
   }
+  const [out, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+  const line = out.trim();
+  if (code === 0 && isAbsolute(line) && !line.includes("\n")) return line;
+  const first = err
+    .replace(/\x1b\[[0-9;]*[A-Za-z]/g, "")
+    .split("\n")
+    .map((l) => l.trim())
+    .find((l) => l !== "");
+  const said = first === undefined ? "" : `: ${first.length > 300 ? `${first.slice(0, 300)}...` : first}`;
+  throw new Error(`${what} ${code === 0 ? "printed no absolute path" : `failed (exit ${code})`}${said}. ${why}`);
 }
 
 /**
@@ -306,25 +349,27 @@ async function gitLine(args: string[], cwd: string, env: Record<string, string>)
  *    `.worktrees/`), the main worktree's private/ is still covered.
  * git runs with every GIT_* variable cleared, so a GIT_DIR or GIT_WORK_TREE in
  * the caller's shell can't point it at another repo. If git can't say (no git,
- * not a checkout), it is the directory two levels up from this module, which
- * holds src/ in a normal layout.
+ * not a checkout, "dubious ownership" when one user runs hapi from another's
+ * checkout), it throws, naming git's error: there is no fallback, because a
+ * guessed boundary could leave the main worktree's private/ outside it.
  */
 export async function repoRoots(o: { cwd?: string; env?: Record<string, string | undefined> } = {}): Promise<string[]> {
   const cwd = o.cwd ?? import.meta.dir;
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(o.env ?? process.env)) if (v !== undefined && !k.startsWith("GIT_")) env[k] = v;
-  const top = await gitLine(["rev-parse", "--show-toplevel"], cwd, env);
-  if (top === undefined || !isAbsolute(top)) return [resolve(import.meta.dir, "..", "..")];
-  const common = await gitLine(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd, env);
-  const main = common !== undefined && isAbsolute(common) ? dirname(common) : undefined;
-  return main === undefined || resolve(main) === resolve(top) ? [top] : [top, main];
+  const top = await gitPath(["rev-parse", "--show-toplevel"], cwd, env);
+  const main = dirname(await gitPath(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd, env));
+  return resolve(main) === resolve(top) ? [top] : [top, main];
 }
 
 let repoRootCache: Promise<string[]> | undefined;
 
-/** `repoRoots()` for this module's own checkout, worked out once per process. */
+/** `repoRoots()` for this module's own checkout, worked out once per process (a failure isn't kept: the next call tries again). */
 export function defaultRepoRoot(): Promise<string[]> {
   repoRootCache ??= repoRoots();
+  repoRootCache.catch(() => {
+    repoRootCache = undefined;
+  });
   return repoRootCache;
 }
 

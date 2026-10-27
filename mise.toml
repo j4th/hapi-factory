@@ -51,7 +51,7 @@ description = "Run the hapi CLI, e.g. `mise run hapi -- --help`"
 run = "bun run src/cli.ts"
 
 [tasks."secrets:init"]
-description = "Set up the default sops + age secrets store: an age key, an encrypted file of every name in stack/secrets.yaml (empty) and the config (never overwrites; e.g. `mise run secrets:init -- --file private/secrets.enc.yaml`)"
+description = "Set up the default sops + age secrets store: this machine's age key, a recovery key locked with 10 words (shown once, two typed back), an encrypted file of every name in stack/secrets.yaml (empty) for both keys, its recipients file, recovery.age and the config (never overwrites; e.g. `mise run secrets:init -- --file private/secrets.enc.yaml`)"
 run = "bun run src/cli.ts secrets init"
 
 [tasks."secrets:edit"]
@@ -59,7 +59,7 @@ description = "Edit your sops secrets store in $EDITOR (`sops edit`; the plainte
 run = "bun run src/cli.ts secrets edit"
 
 [tasks."secrets:check"]
-description = "List every secret in stack/secrets.yaml as found, missing or empty in your store, never a value; exits 1 unless all are found"
+description = "List every secret in stack/secrets.yaml as found, missing or empty in your store, never a value, and the store's recipients; exits 1 unless all are found, or on recipient drift, a post-quantum/classic mix or a non-age key; warns if there is no recovery key or recovery.age"
 run = "bun run src/cli.ts secrets check"
 
 [tasks."secrets:drill"]

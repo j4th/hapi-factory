@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import * as fsp from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { checkoutProblem, envFileText, isWithin, parseEnvFile, repoRoots, runtimeDir, secureDir, writeNewSecretFile, writeSecretFile, writeSecretFiles } from "../../src/secrets/files";
+import { checkoutProblem, envFileText, isWithin, ORPHAN_AGE_MS, parseEnvFile, repoRoots, runtimeDir, secureDir, writeNewSecretFile, writeSecretFile, writeSecretFiles } from "../../src/secrets/files";
 
 const FAKE = "fake-secret-value-7f3a";
 
@@ -151,6 +152,10 @@ describe("writeSecretFiles: the whole set at once", () => {
     expect(readdirSync(base)).toEqual(["env"]);
   });
 
+  /** Make `dir` look `ms` old, as a generation a crash left behind a while ago. */
+  const age = (dir: string, ms: number) => utimesSync(dir, new Date(Date.now() - ms), new Date(Date.now() - ms));
+  const generations = (base: string) => readdirSync(base).filter((n) => /^env\.[0-9a-f-]{36}$/.test(n)).sort();
+
   test("writeSecretFiles removes Task 4-era zone files and orphaned generations", async () => {
     const base = tempDir();
     const link = join(base, "env");
@@ -159,6 +164,7 @@ describe("writeSecretFiles: the whole set at once", () => {
     const orphan = join(base, "env.0b6c1c9e-5a8e-4a43-9d1e-2d6f8c2a1b3c");
     mkdirSync(orphan, { mode: 0o700 });
     writeFileSync(join(orphan, "hermes.env"), `A='${FAKE}'\n`);
+    age(orphan, ORPHAN_AGE_MS + 60_000);
     // Not ours: a directory that isn't a generation, a symlink with a zone file's name, and a file of another name.
     mkdirSync(join(base, "env.not-a-generation"));
     symlinkSync(join(base, "keep-target"), join(base, "slack.env"));
@@ -166,9 +172,73 @@ describe("writeSecretFiles: the whole set at once", () => {
     await writeSecretFiles(link, { "hermes.env": "A='new'\n" }, { legacy: ["hermes.env", "archon.env", "research.env", "host.env", "slack.env"] });
     expect(readdirSync(base).sort()).toEqual(["env", readlinkSync(link), "env.not-a-generation", "notes.txt", "slack.env"].sort());
     expect(readFileSync(join(link, "hermes.env"), "utf8")).toBe("A='new'\n");
-    // And it is idempotent: a second write leaves one generation.
+    // And it is idempotent: a second write leaves one generation (the one it replaced goes at once, however young).
     await writeSecretFiles(link, { "hermes.env": "A='newer'\n" }, { legacy: ["hermes.env"] });
-    expect(readdirSync(base).filter((n) => /^env\.[0-9a-f-]{36}$/.test(n)).length).toBe(1);
+    expect(generations(base)).toEqual([readlinkSync(link)]);
+  });
+
+  test("a generation the link doesn't point at is left alone until it is a minute old: a concurrent resolve may still be writing it", async () => {
+    expect(ORPHAN_AGE_MS).toBe(60_000);
+    const base = tempDir();
+    const link = join(base, "env");
+    await writeSecretFiles(link, { "hermes.env": "A='1'\n" });
+    const replaced = readlinkSync(link);
+    // Another resolve's generation, mid-write: not linked yet, and fresh.
+    const inFlight = join(base, "env.1a2b3c4d-0000-4000-8000-000000000001");
+    mkdirSync(inFlight, { mode: 0o700 });
+    writeFileSync(join(inFlight, "hermes.env"), "A='other'\n", { mode: 0o600 });
+    // One a crash left, 59 seconds ago: still possibly in flight, so kept too.
+    const recent = join(base, "env.1a2b3c4d-0000-4000-8000-000000000002");
+    mkdirSync(recent, { mode: 0o700 });
+    age(recent, ORPHAN_AGE_MS - 1000);
+    await writeSecretFiles(link, { "hermes.env": "A='2'\n" });
+    // The generation it replaced is gone at once; the young ones stay, intact.
+    expect(existsSync(join(base, replaced))).toBe(false);
+    expect(generations(base)).toEqual([readlinkSync(link), "env.1a2b3c4d-0000-4000-8000-000000000001", "env.1a2b3c4d-0000-4000-8000-000000000002"].sort());
+    expect(readFileSync(join(inFlight, "hermes.env"), "utf8")).toBe("A='other'\n");
+    // Once they are more than a minute old, the next write removes them.
+    age(inFlight, ORPHAN_AGE_MS + 1000);
+    age(recent, ORPHAN_AGE_MS + 1000);
+    await writeSecretFiles(link, { "hermes.env": "A='3'\n" });
+    expect(generations(base)).toEqual([readlinkSync(link)]);
+  });
+
+  test("concurrent writes never delete each other's generation: every one resolves, and env points at a whole set", async () => {
+    const base = tempDir();
+    const link = join(base, "env");
+    await writeSecretFiles(link, { "hermes.env": "A='0'\n", "host.env": "H='0'\n" });
+    const runs = Array.from({ length: 8 }, (_, i) => writeSecretFiles(link, { "hermes.env": `A='${i + 1}'\n`, "host.env": `H='${i + 1}'\n` }));
+    expect((await Promise.allSettled(runs)).map((r) => r.status)).toEqual(Array(8).fill("fulfilled"));
+    // Whichever swapped last, its set is whole: no dangling link, no mix.
+    const [a, h] = ["hermes.env", "host.env"].map((f) => readFileSync(join(link, f), "utf8"));
+    expect(a!.slice(3, -2)).toBe(h!.slice(3, -2));
+    expect(readdirSync(link).sort()).toEqual(["hermes.env", "host.env"]);
+  });
+
+  test("an entry that vanishes during the cleanup (a concurrent resolve removed it) doesn't fail a write that already swapped", async () => {
+    const base = tempDir();
+    const link = join(base, "env");
+    const orphan = join(base, "env.1a2b3c4d-0000-4000-8000-000000000003");
+    mkdirSync(orphan, { mode: 0o700 });
+    age(orphan, ORPHAN_AGE_MS + 60_000);
+    const realLstat = fsp.lstat;
+    let vanished = false;
+    // Between the cleanup's readdir and its lstat, another resolve removes the orphan.
+    const spy = spyOn(fsp, "lstat").mockImplementation((async (path: string, ...rest: unknown[]) => {
+      if (path === orphan) {
+        rmSync(orphan, { recursive: true, force: true });
+        vanished = true;
+      }
+      return (realLstat as (...a: unknown[]) => Promise<unknown>)(path, ...rest);
+    }) as typeof fsp.lstat);
+    try {
+      await writeSecretFiles(link, { "hermes.env": "A='1'\n" });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(vanished).toBe(true);
+    expect(readFileSync(join(link, "hermes.env"), "utf8")).toBe("A='1'\n");
+    expect(existsSync(orphan)).toBe(false);
   });
 
   test("an old target that isn't one of hapi's generation directories is never deleted", async () => {
@@ -277,5 +347,33 @@ describe("the checkout boundary", () => {
     // So private/ in the main worktree is inside the checkout, even when hapi runs from the linked one.
     expect(await checkoutProblem(join(main, "private", "keys.txt"), [wt, main])).toMatch(/inside the hapi-factory checkout/);
     expect(await checkoutProblem(join(dir, "elsewhere", "keys.txt"), [wt, main])).toBeUndefined();
+  });
+
+  test("repoRoots fails closed when git can't say: never a guessed boundary", async () => {
+    const dir = realpathSync(tempDir());
+    // Not a checkout at all.
+    const plain = join(dir, "plain");
+    mkdirSync(plain);
+    const env = { PATH: process.env.PATH, HOME: dir, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CEILING_DIRECTORIES: dir };
+    // (GIT_* is cleared for git, so the ceiling can't help it; /tmp is no checkout either way.)
+    await expect(repoRoots({ cwd: plain, env })).rejects.toThrow(/^`git rev-parse --show-toplevel` in .*plain failed \(exit 128\): fatal: not a git repository/);
+    // The hapi user running from another user's checkout: git refuses with "dubious ownership" (a fake git here, which says so).
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    const fakeGit = (script: string) => writeFileSync(join(bin, "git"), `#!/bin/sh\n${script}\n`, { mode: 0o755 });
+    fakeGit(`echo "fatal: detected dubious ownership in repository at '/srv/other-user/hapi-factory'" >&2\nexit 128`);
+    const e = await caught(repoRoots({ cwd: plain, env: { PATH: bin } }));
+    expect(e.message).toBe(
+      `\`git rev-parse --show-toplevel\` in ${plain} failed (exit 128): fatal: detected dubious ownership in repository at '/srv/other-user/hapi-factory'. ` +
+        "hapi needs it to find the hapi-factory checkout that age keys and plaintext must stay out of, and won't guess. " +
+        "For \"dubious ownership\", run hapi as the user that owns the checkout (git's safe.directory explains the check)",
+    );
+    // The worktree's top level, but not the main worktree (a broken linked worktree, say): still an error, not a one-root boundary.
+    fakeGit(`case "$*" in *show-toplevel*) echo /srv/checkout/.worktrees/task;; *) echo "fatal: not a git repository: /srv/checkout/.git/worktrees/task" >&2; exit 128;; esac`);
+    await expect(repoRoots({ cwd: plain, env: { PATH: bin } })).rejects.toThrow(/^`git rev-parse --path-format=absolute --git-common-dir` in .* failed \(exit 128\): fatal: not a git repository/);
+    // git printing something that isn't one absolute path, or no git at all.
+    fakeGit("echo relative/path");
+    await expect(repoRoots({ cwd: plain, env: { PATH: bin } })).rejects.toThrow(/--show-toplevel` in .* printed no absolute path\. hapi needs it/);
+    await expect(repoRoots({ cwd: plain, env: { PATH: join(dir, "no-bin") } })).rejects.toThrow(/^cannot run `git rev-parse --show-toplevel` in .*: is git installed\?/);
   });
 });
