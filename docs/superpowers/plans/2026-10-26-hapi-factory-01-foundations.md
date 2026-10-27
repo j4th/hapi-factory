@@ -907,7 +907,7 @@ test("audit passes a clean fixture", async () => { /* all pass/skip */ });
 
 ### Task 7b: Pre-publish cleanup (private split, sanitize, guardrails, history rewrite)
 
-The repo stays private until this task is done. Its requirements are this text plus the register's [§ Plan 01 Task 7b](handoffs.md#plan-01-task-7b-publishing) (H-054–H-060) and H-073. It runs after Task 7 and before the operator's publish steps (H-074–H-078). The secrets store, provider keys, Slack app and host setup don't wait on it. Stage b does: `mise run up` refuses an empty secret, the four `host` App values included, and those exist only once the GitHub Apps are made (H-077), which needs hapi-factory public with its rulesets. So stage b (H-080) runs after this task and the publish steps.
+The repo stays private until this task is done. Its requirements are this text plus the register's [§ Plan 01 Task 7b](handoffs.md#plan-01-task-7b-publishing) (H-054–H-060), H-073, and H-165 and H-169 (CodeRabbit's config and threat-model entry, which must land before the operator installs it, H-164). It runs after Task 7 and before the operator's publish steps (H-074–H-078). The secrets store, provider keys, Slack app and host setup don't wait on it. Stage b does: `mise run up` refuses an empty secret, the four `host` App values included, and those exist only once the GitHub Apps are made (H-077), which needs hapi-factory public with its rulesets. So stage b (H-080) runs after this task and the publish steps.
 
 **Operator gates.** The steps marked **[operator]** stop and wait for the operator:
 - edits to `mise.toml` and `.github/**` (protected paths, `interactive: ask`), so the diff goes to the operator to approve;
