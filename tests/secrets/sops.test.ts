@@ -135,7 +135,8 @@ describe("the age key file", () => {
     await expect(checkAgeKeyFile(join(s.dir, "absent.txt"), opts)).rejects.toThrow(/does not exist/);
 
     // Inside the checkout, private/ included: private/ is pushed beside the encrypted file.
-    for (const rel of ["keys.txt", join("private", "keys.txt"), join("private", "deep", "age.agekey")]) {
+    // A first segment that merely starts with ".." ("..private", "..agekey") is still inside.
+    for (const rel of ["keys.txt", join("private", "keys.txt"), join("private", "deep", "age.agekey"), join("..private", "keys.txt"), "..agekey", join("..keys", "age.txt")]) {
       const inside = join(s.checkout, rel);
       mkdirSync(join(inside, ".."), { recursive: true });
       writeFileSync(inside, "# not a real age key\n", { mode: 0o600 });

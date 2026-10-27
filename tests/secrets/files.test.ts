@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { envFileText, parseEnvFile, runtimeDir, secureDir, writeSecretFile, writeSecretFiles } from "../../src/secrets/files";
+import { checkoutProblem, envFileText, isWithin, parseEnvFile, runtimeDir, secureDir, writeSecretFile, writeSecretFiles } from "../../src/secrets/files";
 
 const FAKE = "fake-secret-value-7f3a";
 
@@ -182,5 +182,29 @@ describe("runtimeDir", () => {
     expect(() => runtimeDir({})).toThrow(/XDG_RUNTIME_DIR is not set/);
     expect(() => runtimeDir({ XDG_RUNTIME_DIR: "" })).toThrow(/XDG_RUNTIME_DIR is not set/);
     expect(() => runtimeDir({ XDG_RUNTIME_DIR: "run/user/1000" })).toThrow(/XDG_RUNTIME_DIR must be an absolute path/);
+  });
+});
+
+describe("isWithin and checkoutProblem: the inside-the-checkout boundary", () => {
+  test("a first segment that merely starts with \"..\" is inside; only \"..\" itself or \"../\" leaves", () => {
+    const repo = "/srv/example-owner/hapi-factory";
+    for (const p of [repo, `${repo}/keys.txt`, `${repo}/private/keys.txt`, `${repo}/..private/keys.txt`, `${repo}/..agekey`, `${repo}/..plain/secrets.env`, `${repo}/...`]) {
+      expect([p, isWithin(p, repo)]).toEqual([p, true]);
+    }
+    for (const p of ["/srv/example-owner", "/srv/example-owner/hapi-factory-other/keys.txt", "/srv/example-owner/..hapi-factory/keys.txt", "/elsewhere/keys.txt", "/"]) {
+      expect([p, isWithin(p, repo)]).toEqual([p, false]);
+    }
+  });
+
+  test("checkoutProblem refuses \"..x\" names under the checkout, existing or not, and accepts a sibling", async () => {
+    const repo = tempDir();
+    mkdirSync(join(repo, "..keys"));
+    writeFileSync(join(repo, "..keys", "age.txt"), "# not a real age key\n", { mode: 0o600 });
+    for (const rel of [join("..keys", "age.txt"), join("..private", "keys.txt"), "..agekey", join("..plain", "secrets.env")]) {
+      expect(await checkoutProblem(join(repo, rel), repo)).toMatch(/inside the hapi-factory checkout/);
+    }
+    const outside = tempDir();
+    expect(await checkoutProblem(join(outside, "..agekey"), repo)).toBeUndefined();
+    expect(await checkoutProblem(`${repo}-sibling/keys.txt`, repo)).toBeUndefined();
   });
 });

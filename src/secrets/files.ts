@@ -30,7 +30,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, open, readlink, realpath, rename, rm, stat, symlink } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 /** An env var name, as hapi writes one. */
 export const ENV_NAME = /^[A-Z_][A-Z0-9_]*$/;
@@ -58,10 +58,14 @@ export function runtimeDir(env: Record<string, string | undefined>): string {
   return join(xdg, "hapi");
 }
 
-/** Whether `path` is `dir` or under it (both absolute and normalized). */
+/**
+ * Whether `path` is `dir` or under it (both absolute and normalized). Only a
+ * relative path of `..` or one starting `../` leaves `dir`: a first segment
+ * that merely starts with two dots (`..private`, `..agekey`) is still inside.
+ */
 export function isWithin(path: string, dir: string): boolean {
   const rel = relative(dir, path);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
 /**

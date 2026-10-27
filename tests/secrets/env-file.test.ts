@@ -33,7 +33,8 @@ describe("the env-file provider", () => {
       /owned by uid \d+, not you/,
     );
     // Inside the checkout, private/ included: plaintext there could be committed, or pushed to the private remote.
-    for (const rel of ["secrets.env", join("private", "secrets.env")]) {
+    // A first segment that merely starts with ".." ("..plain", "..secrets.env") is still inside.
+    for (const rel of ["secrets.env", join("private", "secrets.env"), join("..plain", "secrets.env"), "..secrets.env"]) {
       const inside = join(s.checkout, rel);
       mkdirSync(join(inside, ".."), { recursive: true });
       writeFileSync(inside, "HAPI_A='x'\n", { mode: 0o600 });
