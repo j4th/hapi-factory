@@ -2,7 +2,7 @@
 
 hapi-factory is a public, best-practices reference stack for an end-to-end agentic software factory. **HAPi** stands for **H**ermes + **A**rchon + **Pi**: Hermes is the coordinator you talk to, Archon is the run engine and Pi is the worker. The stack puts existing tools together into one working system. It also covers the steps most factories skip: discovery research, architecture, threat modeling and breaking work into tasks. Security is designed in from the start: one policy compiled into every tool's config, rootless containers behind default-deny egress, secrets from a vault, short-lived GitHub App tokens, and an audit that catches drift. Read the design in [docs/superpowers/specs/2026-10-26-hapi-factory-design.md](docs/superpowers/specs/2026-10-26-hapi-factory-design.md). It is the binding reference for everything here.
 
-> **Status: Plan 01 (Phase 0 foundations) is in progress.** Today the repo has the pinned toolchain, the `hapi` CLI skeleton, CI, `policy/` with its JSON Schemas, loader, tighten-only repo overlay and work-order validator, the generators that compile policy into Hermes, Archon, Pi and egress-proxy configs (`mise run policy:build`), and the pinned per-zone MCP catalog with its tool-description lock. Anything marked *arrives in Plan 01 Task N* is not built yet. The plan is [docs/superpowers/plans/2026-10-26-hapi-factory-01-foundations.md](docs/superpowers/plans/2026-10-26-hapi-factory-01-foundations.md).
+> **Status: Plan 01 (Phase 0 foundations) is in progress.** Today the repo has the pinned toolchain, the `hapi` CLI skeleton, CI, `policy/` with its JSON Schemas, loader, tighten-only repo overlay and work-order validator, the generators that compile policy into Hermes, Archon, Pi and egress-proxy configs (`mise run policy:build`), the pinned per-zone MCP catalog with its tool-description lock, fail-closed secrets from Bitwarden (`hapi secrets resolve`), scoped GitHub App token minting (`hapi token mint`), and the setup runbooks. Anything marked *arrives in Plan 01 Task N* is not built yet. The plan is [docs/superpowers/plans/2026-10-26-hapi-factory-01-foundations.md](docs/superpowers/plans/2026-10-26-hapi-factory-01-foundations.md).
 
 ## Contents
 
@@ -51,10 +51,13 @@ What exists now:
 | `src/cli.ts` | The `hapi` CLI: the entry point, the command registry and `main(argv)`. |
 | `src/version.ts` | `HAPI_VERSION`. It must match `version` in `package.json`, and a test checks that it does. |
 | `policy/` | The single source of truth: protected paths, commands, trusted sources, budgets, approvals, roles, flags, the model rosters (`policy/rosters/`), and the MCP catalog (`mcp.yaml`) with its tool-description lock (`mcp.lock.json`). See [docs/policy.md](docs/policy.md) and [docs/mcp.md](docs/mcp.md). |
-| `policy/schemas/` | JSON Schemas (draft 2020-12) for every policy file, the MCP lock, the repo overlay (`.factory/config.yaml`) and the work order (`order.yaml`) |
+| `policy/schemas/` | JSON Schemas (draft 2020-12) for every policy file, the MCP lock, the repo overlay (`.factory/config.yaml`), the work order (`order.yaml`) and the secrets map (`stack/secrets.map.yaml`) |
 | `src/policy/` | `loadPolicy` (load and validate `policy/`), `loadOverlay` and `applyOverlay` (the repo overlay, which may only tighten policy), `effectiveModes` (a file's protected-path modes: the strictest across every matching glob), `matchCommand` (whether Hermes's argv-exact command rules allow a command), `forgeDomain` (forge hosts, which the archon zone may never reach), `isHostname` (a plain domain name, as the schema defines it), `zoneHosts` (an egress zone's allowlist), `serversForZone` (a zone's MCP servers, with the catalog's floor, blocklist and tool checks in `mcp.ts`), the policy types and the shared schema checker |
 | `src/mcp/` | The MCP tool-description lock (`lock.ts`): `hashToolSurface`, `verifyLock`, and the `hapi mcp verify` and `hapi mcp pin` commands |
 | `src/workorder/` | `validateWorkOrder` and the `hapi workorder validate` command |
+| `stack/secrets.map.yaml` | The secrets map: which Bitwarden secret fills which env var, per zone (`hermes`, `archon`, `research`, `host`). It holds bws secret ids, never values; the committed ids are placeholders until the operator fills them in. See [docs/secrets.md](docs/secrets.md). |
+| `src/secrets/` | `bws.ts`: `resolveSecrets` (fail-closed: every key into memory, then the env files), `checkSecrets` (the dry run), `mcpSecretGaps` (the map covers the MCP catalog's bws references), `loadSecretMap` and `hapi secrets resolve`. `files.ts`: secrets on disk: `runtimeDir` (`$XDG_RUNTIME_DIR/hapi`, no fallback), `secureDir` (0700), `writeSecretFiles` (0600, atomic) and the env-file format. |
+| `src/forge/` | Every forge call goes through here (spec §16). `github/app-token.ts`: `appJwt`, `findInstallationId`, `mintInstallationToken` (one repo, checked scope, a broader token revoked) and `hapi token mint` |
 | `src/generate/` | The config generators and `hapi policy build`: one pure emitter per tool (`hermes.ts`, `archon.ts`, `pi.ts`, `egress.ts`, and `mcp.ts` for the MCP servers) and `buildAll` (`index.ts`). See [docs/generated-configs.md](docs/generated-configs.md). |
 | `build/` | Generated by `mise run policy:build`, and gitignored: `hermes/config.yaml`, `archon/config.yaml` and `archon.env`, `pi/models.json` and `hapi-guard.json`, `egress/{hermes,archon,research}.squid.conf`, `mcp/{hermes,research}.mcp.json`. Never edit it by hand. |
 | `tests/` | Unit tests for `bun test`. `tests/fixtures/` holds example work orders, overlays, a broken policy directory, and `command-vectors.json`, the command-allowlist cases that Plan 04's Python hook must also pass. |
@@ -62,6 +65,8 @@ What exists now:
 | `docs/policy.md` | The policy files (the MCP catalog and its lock included), the command-allowlist semantics, the overlay rule, the work-order format and the `hapi mcp` commands |
 | `docs/generated-configs.md` | Every file under `build/`: what it is, which policy files feed it, what each hardening setting does and why, and how to regenerate it |
 | `docs/mcp.md` | The MCP layer: which zone gets which server, how to add or upgrade one, the release cooldown, advisory floors, the tool-description lock and the CI scanners |
+| `docs/secrets.md` | Secrets: the zones and their keys, the secrets map, setting up Bitwarden, `hapi secrets resolve`, the env files, `hapi token mint`, rotation |
+| `docs/runbooks/` | Manual setup runbooks: [GitHub Apps and rulesets](docs/runbooks/github-apps.md), [provider keys and spend caps](docs/runbooks/provider-keys.md), [Slack](docs/runbooks/slack.md) |
 | `docs/superpowers/specs/` | The design spec. It is the binding authority. |
 | `docs/superpowers/plans/` | Implementation plans. Plan 01 is the current one. |
 | `reports/`, `research_notes/` | The evidence the design rests on: the recon report and the research notes. |
@@ -70,9 +75,8 @@ Still to come in Plan 01:
 
 | Path | What it will be | Arrives in |
 |---|---|---|
-| `src/secrets/`, `src/forge/`, `stack/secrets.map.yaml` | Secrets resolved from Bitwarden (`bws`), and GitHub App installation-token minting | Task 4 |
-| `docs/runbooks/` | Runbooks for GitHub App setup, provider keys and kill switches | Tasks 4, 7 |
-| `scripts/host-setup.sh`, `stack/`, `src/stack/` | The one-time host setup (the `hapi` user and rootless Docker), the Compose stack and Squid egress | Task 5 |
+| `docs/runbooks/` | The kill-switch runbook | Task 7 |
+| `scripts/host-setup.sh`, `stack/compose.yaml` and the Dockerfiles, `src/stack/` | The one-time host setup (the `hapi` user and rootless Docker), the Compose stack and Squid egress | Task 5 |
 | `tests/stack/` | Integration tests (`*.int.test.ts`), run by `mise run test:int` | Task 5 |
 | `src/audit/` | `hapi audit`, the drift and settings checks | Task 6 |
 | `docs/security/threat-model.md` | Threat model v0 | Task 7 |
@@ -125,8 +129,8 @@ You can run it two ways:
 | `policy build [--policy dir] [--out dir] [--roster name]` | Loads and checks `--policy` (default `policy`), writes the generated configs under `--out` (default `build`) and prints each path. `--roster` (`budget`, `anthropic` or `portable`; default `anthropic`) picks Archon's tiers and Pi's models; Hermes always uses `anthropic`. A usage error exits 2; a bad policy file exits 1 and names the file. See [docs/generated-configs.md](docs/generated-configs.md). | Works |
 | `mcp verify [--policy dir] [--lock file]` | Checks every MCP server's live tool surface against `policy/mcp.lock.json`. Prints `ok`, `changed` or `unpinned` per server, and `orphaned` for a lock entry whose server left the catalog, and exits 1 unless all are `ok`. Until the live fetch is wired it exits 1. See [docs/policy.md](docs/policy.md#hapi-mcp-verify-and-hapi-mcp-pin). | The command works now; the live fetch arrives in Plan 01 Task 5 |
 | `mcp pin --server name [--policy dir] [--lock file]` | Records one MCP server's live tool surface and its hash in `policy/mcp.lock.json`. A re-pin is a reviewed change ([docs/mcp.md](docs/mcp.md#adding-or-upgrading-a-server)). | The command works now; the live fetch arrives in Plan 01 Task 5 |
-| `secrets resolve [--dry-run]` | Resolves the stack's secrets from Bitwarden into `0600` files under `$XDG_RUNTIME_DIR/hapi/` | Plan 01 Task 4 |
-| `token mint --app planner\|factory --repo owner/name` | Mints a 1-hour GitHub App installation token | Plan 01 Task 4 |
+| `secrets resolve [--dry-run] [--map file] [--policy dir]` | Resolves `stack/secrets.map.yaml` (or `--map`) from Bitwarden, all into memory first, then writes `$XDG_RUNTIME_DIR/hapi/<zone>.env` (mode `0600`, directory `0700`, atomically) and prints each path. Any missing or empty secret fails, naming the key, and nothing is written. It fails if `XDG_RUNTIME_DIR` is unset (no `/tmp` fallback), or if the map misses a bws reference of the MCP catalog in `--policy` (default `policy`). `--dry-run` prints `found`, `missing` or `placeholder` per key, never a value, writes nothing, and exits 1 unless every key is found. See [docs/secrets.md](docs/secrets.md#hapi-secrets-resolve). | Works |
+| `token mint --app planner\|factory --repo owner/name` | Mints a 1-hour GitHub App installation token for that one repo, with the App's fixed permissions. It reads the App's id and key from `$XDG_RUNTIME_DIR/hapi/host.env`, rejects (and revokes) a token broader than requested, and writes the token to `$XDG_RUNTIME_DIR/hapi/tokens/<app>.<owner>.<repo>.token` (mode `0600`). It prints the path and expiry, never the token. See [docs/secrets.md](docs/secrets.md#hapi-token-mint). | Works |
 | `audit [--repo owner/name ...]` | Runs the audit checks, and exits 1 if any check fails | Plan 01 Task 6 |
 
 **Adding a command (for contributors).** Write the handler in its own module, as `policyBuild` is in `src/generate/index.ts`. Then register it in the *Commands* section at the bottom of `src/cli.ts`:
@@ -142,6 +146,7 @@ Here is how commands work:
 - Registering the same name twice throws.
 - A handler gets the args after its name, as `(args: string[]) => number | Promise<number>`, and returns the exit code.
 - Print results to stdout and diagnostics to stderr.
+- **Error messages name keys, never values.** Name the zone, key, file, line or JSON Pointer; never print a secret or token, and never pass through text that might hold one (a tool's stdout, `JSON.parse`'s own message). See [docs/secrets.md](docs/secrets.md#error-messages-name-keys-never-values).
 
 ## Toolchain and pinning
 
@@ -161,7 +166,7 @@ Here is how commands work:
 - **A committed lockfile.** `bun.lock` is in git, and `mise run setup` installs with `--frozen-lockfile`.
 - **A release-age cooldown.** `bunfig.toml` sets `minimumReleaseAge` to 3 days, so Bun won't resolve a package version published less than 3 days ago.
 - **Pinned actions.** CI actions are pinned to full commit SHAs, CI runs with a read-only token, and checkout doesn't persist credentials.
-- **No secrets on disk.** `.env*` files are gitignored, and the design never writes secrets to `.env` files.
+- **No secrets on disk.** `.env*` files are gitignored. Secrets are written only to `0600` files on the user's tmpfs (`$XDG_RUNTIME_DIR/hapi/`), never to the repo or a `.env` file on disk.
 
 **To upgrade a tool:**
 1. Find the version with `mise ls-remote <tool>` or `mise latest <tool>`.
@@ -194,7 +199,7 @@ Plan 05 builds the template and `mise run new-repo`. This section will become th
 
 ## Manual setup steps (the operator)
 
-These steps are outward-facing or privileged, so agents never do them; the operator does them by hand. Later tasks add their own steps here (GitHub Apps and Bitwarden secrets in Task 4, `sudo scripts/host-setup.sh` in Task 5).
+These steps are outward-facing or privileged, so agents never do them; the operator does them by hand. Later tasks add their own steps here (`sudo scripts/host-setup.sh` in Task 5).
 
 ### Plan 01 Task 1: the GitHub remote and the `main` rulesets
 
@@ -267,16 +272,27 @@ These steps are outward-facing or privileged, so agents never do them; the opera
 
 4. **Task 5 needs this remote.** Task 5's `scripts/host-setup.sh` clones hapi-factory from `github.com/j4th/hapi-factory` into `/home/hapi/hapi-factory`.
 
-### Plan 01 Task 3b: MCP server keys (not needed yet)
+### Plan 01 Task 3b: MCP server keys
 
-`policy/mcp.yaml` names each MCP server's secret by its Bitwarden (`bws`) key. Nothing runs these servers yet, so there is nothing to do now. When a server first runs, store its key in Bitwarden Secrets Manager under exactly this name:
+`policy/mcp.yaml` names each MCP server's secret by its Bitwarden (`bws`) key. Store each in Bitwarden Secrets Manager under exactly this name, and put its id in `stack/secrets.map.yaml` under the env var shown:
 
-| bws key | What it is | Needed when |
-|---|---|---|
-| `hapi-mcp-context7-api-key` | A Context7 API key, on a spend-capped, search-only account (spec §10.1) | The hapi-research container runs Context7 (Plan 04) |
-| `hapi-mcp-phoenix-viewer-key` | A Phoenix API key minted by a **VIEWER**-role user, never an admin or member | The observability profile runs (`flags.otel.enabled: true`) |
+| bws key | Map entry | What it is | Needed when |
+|---|---|---|---|
+| `hapi-mcp-context7-api-key` | `research` / `HAPI_MCP_CONTEXT7_API_KEY` (already in the map, as a placeholder) | A Context7 API key, on a spend-capped, search-only account (spec §10.1). Task 4's [provider-keys runbook](docs/runbooks/provider-keys.md#search-keys-brave-exa-context7) covers it. | Now: `hapi secrets resolve` needs every key in the map |
+| `hapi-mcp-phoenix-viewer-key` | `hermes` / `HAPI_MCP_PHOENIX_VIEWER_KEY` (add it then) | A Phoenix API key minted by a **VIEWER**-role user, never an admin or member | Before you turn on the observability profile (`flags.otel.enabled: true`); until it's in the map, `hapi secrets resolve` fails |
 
-Each key belongs to one server only. The generated configs reference it as `${HAPI_MCP_<NAME>}` (for example `${HAPI_MCP_CONTEXT7_API_KEY}`), never by value. See [docs/mcp.md](docs/mcp.md).
+Each key belongs to one server only. The generated configs reference it as `${HAPI_MCP_<NAME>}` (for example `${HAPI_MCP_CONTEXT7_API_KEY}`), never by value. See [docs/mcp.md](docs/mcp.md) and [docs/secrets.md](docs/secrets.md#the-secrets-map-stacksecretsmapyaml).
+
+### Plan 01 Task 4: Bitwarden, provider keys, Slack and the GitHub Apps
+
+Do these in order. Each runbook says which bws key each secret goes under.
+
+1. **Bitwarden Secrets Manager:** a `hapi` project, a read-only machine account and its access token, kept only in your shell's environment as `BWS_ACCESS_TOKEN` ([docs/secrets.md](docs/secrets.md#setting-up-bitwarden-secrets-manager-the operator)).
+2. **Provider keys:** the Anthropic Console workspaces `hapi-hermes` ($60), `hapi-factory` ($100) and `hapi-evals` ($40), OpenCode Go, the OpenRouter key `hapi-jev` ($2/month), and the Brave, Exa and Context7 search keys ([provider keys](docs/runbooks/provider-keys.md)).
+3. **Slack:** a dedicated workspace, `#hapi-intake` and `#hapi-alerts`, and the app's tokens ([Slack](docs/runbooks/slack.md)). The app is created from the hapi Hermes container's manifest, so this step waits for Plan 01 Task 13; until then its three keys stay placeholders.
+4. **GitHub Apps and rulesets:** `hapi-planner` and `hapi-factory` with exactly their permissions, their keys in Bitwarden, and the rulesets, including closing the App-approval gap ([GitHub Apps](docs/runbooks/github-apps.md)). The rulesets need the repo to be public.
+5. **Fill in the map:** replace each placeholder in `stack/secrets.map.yaml` with the secret's id from the Bitwarden web app ([docs/secrets.md](docs/secrets.md#filling-in-the-map-the operator)).
+6. **Check:** `mise run hapi -- secrets resolve --dry-run`. Expected: every key `found`, no value printed, exit 0.
 
 ## Documentation map
 
@@ -285,8 +301,12 @@ Each key belongs to one server only. The generated configs reference it as `${HA
 | [Design spec](docs/superpowers/specs/2026-10-26-hapi-factory-design.md) | Intent, architecture, policy, security, phases. It is the binding authority. |
 | [Policy](docs/policy.md) | Each policy file and its schema (the MCP catalog `mcp.yaml` and its lockfile included), how Hermes's command rules match (and what the Plan 04 hook must do first), the tighten-only overlay rule with examples, the work-order format, `hapi workorder validate`, and `hapi mcp verify` and `hapi mcp pin` |
 | [Generated configs](docs/generated-configs.md) | Each file `hapi policy build` writes under `build/`, its policy sources, every hardening setting and why, how protected paths stay strictest-wins, and how to regenerate |
+| [Secrets](docs/secrets.md) | The zones and their keys, the secrets map and its placeholders, setting up Bitwarden, `hapi secrets resolve` and its env files, `hapi token mint`, the "keys, never values" rule, rotation |
+| [Runbook: GitHub Apps](docs/runbooks/github-apps.md) | Creating `hapi-planner` and `hapi-factory` with exact permissions, the rulesets (both on `main`, the App-approval gap, branch and tag scope), checks, suspending an installation, rotating a key |
+| [Runbook: provider keys](docs/runbooks/provider-keys.md) | The Console workspaces and their limits, OpenCode Go settings, the OpenRouter keys, the Brave, Exa and Context7 search keys, and where each goes |
+| [Runbook: Slack](docs/runbooks/slack.md) | The workspace and channels, creating the app from Hermes's manifest, the three Slack secrets, Hermes's Slack settings |
 | [MCP servers](docs/mcp.md) | Which zone gets which MCP server and why, how to add or upgrade one (a planning PR plus a re-pin), the release cooldown and its security-fix exception, advisory floors, the tool-description lock and the CI scanners |
 | [Plan 01: Foundations](docs/superpowers/plans/2026-10-26-hapi-factory-01-foundations.md) | Tasks 1–14: toolchain, policy, generators, secrets, stack, audit, threat model, spikes |
 | [Recon report](reports/Agentic%20software%20factory%20recon.md) | The evidence the design rests on, with sources and versions |
 | [`research_notes/`](research_notes/) | Detailed research notes behind the report |
-| `docs/runbooks/`, `docs/security/`, `docs/spikes/` | Runbooks, the threat model and spike results, which arrive in Plan 01 Tasks 4–14 |
+| `docs/security/`, `docs/spikes/`, the kill-switch runbook | The threat model, spike results and the kill-switch runbook, which arrive in Plan 01 Tasks 7–14 |

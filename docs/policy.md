@@ -209,7 +209,7 @@ All amounts are in USD.
 | `run_usd` | 3.00 | Target spend per factory run |
 | `hermes_max_turns` | 60 | Hermes `agent.max_turns` |
 
-The monthly caps are enforced at the provider. the operator sets them on the Console workspaces and OpenRouter keys; the Task 4 runbook covers it. The workspaces add up to the $200/month credit, and the default workspace is unused.
+The monthly caps are enforced at the provider. the operator sets them on the Console workspaces and OpenRouter keys; the [provider-keys runbook](runbooks/provider-keys.md) covers it. The workspaces add up to the $200/month credit, and the default workspace is unused.
 
 ### `approvals.yaml`
 
@@ -349,7 +349,7 @@ These are the real messages:
 | `HTTPS_PROXY: http://...` in `env` | `policy/mcp.yaml: /servers/context7/env/HTTPS_PROXY: a server may not set HTTPS_PROXY: the zone's proxy settings come from the stack, never from a server entry (spec §10.1)` |
 | `PHOENIX_API_KEY: bws:hapi-mcp-context7-api-key` | `policy/mcp.yaml: /servers/phoenix/env/PHOENIX_API_KEY: bws key "hapi-mcp-context7-api-key" is already context7's; each server gets only its own key (spec §10.1)` |
 
-**Secrets by name.** A `bws:hapi-mcp-<slug>` value never reaches a generated file. The generators write `${HAPI_MCP_<SLUG>}` instead (`secretEnvName`: upper-case, `-` as `_`), so `bws:hapi-mcp-context7-api-key` becomes `${HAPI_MCP_CONTEXT7_API_KEY}`. Hermes resolves that from its env, which the stack fills from Bitwarden. The `hapi-mcp-` prefix keeps these names apart from every variable Hermes itself reads.
+**Secrets by name.** A `bws:hapi-mcp-<slug>` value never reaches a generated file. The generators write `${HAPI_MCP_<SLUG>}` instead (`secretEnvName`: upper-case, `-` as `_`), so `bws:hapi-mcp-context7-api-key` becomes `${HAPI_MCP_CONTEXT7_API_KEY}`. Hermes resolves that from its env, which `hapi secrets resolve` fills from Bitwarden: the zone's entry `HAPI_MCP_<SLUG>` in `stack/secrets.map.yaml` gives the secret's id, and `mcpSecretGaps` fails if a server's reference has no entry ([docs/secrets.md](secrets.md#the-secrets-map-stacksecretsmapyaml)). The `hapi-mcp-` prefix keeps these names apart from every variable Hermes itself reads.
 
 #### The env allowlist
 
