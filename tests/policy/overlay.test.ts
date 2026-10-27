@@ -210,7 +210,7 @@ describe("applyOverlay", () => {
 describe("loadOverlay", () => {
   test("hapi-factory's own overlay protects policy/** and stack/** like AGENTS.md", () => {
     const r = applyOverlay(p, loadOverlay(".factory/config.yaml"));
-    const ask = { interactive: "ask", unattended: "deny", workers: "deny" };
+    const ask = { interactive: "ask", unattended: "deny", workers: "deny" } as const;
     for (const file of ["policy/protected_paths.yaml", "policy/rosters/budget.yaml", "stack/compose.yaml", "stack/secrets.yaml"]) {
       expect(effectiveModes(r, file)).toEqual(ask);
       expect(effectiveModes(p, file)).toEqual({ interactive: "allow", unattended: "allow", workers: "allow" }); // central policy: every repo
