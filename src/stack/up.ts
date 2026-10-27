@@ -21,8 +21,10 @@
  * 4. `docker compose up --no-start --build`: build the images, create the
  *    networks and containers, start nothing.
  * 5. Check the zone networks Docker made (`networkProblems`): internal, and
- *    inside the proxies' zone_clients ranges. Otherwise remove what step 4
- *    made, and stop.
+ *    inside the proxies' zone_clients ranges. If any check fails, or can't
+ *    be made (`docker network inspect` fails, prints something that isn't
+ *    JSON, or a subnet doesn't parse), remove what step 4 made
+ *    (`compose down`), and stop.
  * 6. `docker compose up -d --wait`: start, and wait until every service is
  *    healthy.
  * Nothing starts unless steps 1-5 pass.
@@ -109,6 +111,27 @@ export function networkProblems(networks: unknown[], project: string): string[] 
   return problems;
 }
 
+/**
+ * The zone networks of the project as `docker network inspect` prints them.
+ * Throws, with inspect's exit code and stderr, when it fails (a daemon error,
+ * or a network Compose didn't make), and when its output isn't a JSON array.
+ */
+async function zoneNetworks(run: Runner, env: Record<string, string>): Promise<unknown[]> {
+  const names = ZONE_NETWORKS.map((n) => `${PROJECT}_${n}`);
+  const r = await run(["docker", "network", "inspect", ...names], { env, inherit: false });
+  if (r.code !== 0) {
+    throw new Error(`docker network inspect ${names.join(" ")} exited ${r.code}: ${r.stderr?.trim() || "(no error output)"}`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(r.stdout);
+  } catch {
+    parsed = undefined;
+  }
+  if (!Array.isArray(parsed)) throw new Error(`docker network inspect ${names.join(" ")} printed something that is not a JSON array of networks`);
+  return parsed;
+}
+
 /** A SHA-256 over the generated files, each path and its contents, in path order. */
 export function buildDigest(paths: string[]): string {
   const h = createHash("sha256");
@@ -116,8 +139,8 @@ export function buildDigest(paths: string[]): string {
   return h.digest("hex");
 }
 
-/** Runs a command: with `inherit`, its output goes to the terminal; otherwise stdout is captured. */
-export type Runner = (cmd: string[], o: { env: Record<string, string>; inherit: boolean }) => Promise<{ code: number; stdout: string }>;
+/** Runs a command: with `inherit`, its output goes to the terminal; otherwise stdout and stderr are captured. */
+export type Runner = (cmd: string[], o: { env: Record<string, string>; inherit: boolean }) => Promise<{ code: number; stdout: string; stderr?: string }>;
 
 /** What `stackUp` and `stackDown` can be given instead of the real thing, for tests. */
 export interface StackDeps {
@@ -131,14 +154,16 @@ export interface StackDeps {
 }
 
 const runCommand: Runner = async (cmd, o) => {
-  let proc: Bun.Subprocess<"ignore", "pipe" | "inherit", "inherit">;
+  let proc: Bun.Subprocess<"ignore", "pipe" | "inherit", "pipe" | "inherit">;
+  const out = o.inherit ? "inherit" : "pipe";
   try {
-    proc = Bun.spawn(cmd, { env: o.env, stdin: "ignore", stdout: o.inherit ? "inherit" : "pipe", stderr: "inherit" });
+    proc = Bun.spawn(cmd, { env: o.env, stdin: "ignore", stdout: out, stderr: out });
   } catch {
     throw new Error(`cannot run ${cmd[0]}: is it installed and on PATH?`);
   }
-  const stdout = o.inherit ? "" : await new Response(proc.stdout as ReadableStream).text();
-  return { code: await proc.exited, stdout };
+  if (o.inherit) return { code: await proc.exited, stdout: "" };
+  const [stdout, stderr] = await Promise.all([new Response(proc.stdout as ReadableStream).text(), new Response(proc.stderr as ReadableStream).text()]);
+  return { code: await proc.exited, stdout, stderr };
 };
 
 const definedEnv = (env: Env): Record<string, string> => Object.fromEntries(Object.entries(env).filter((e): e is [string, string] => e[1] !== undefined));
@@ -206,17 +231,18 @@ export async function stackUp(args: string[], deps: StackDeps = {}): Promise<num
   const created = await compose(["up", "--no-start", "--build"]);
   if (created.code !== 0) throw new Error(`docker compose up --no-start failed (exit ${created.code}); nothing was started`);
 
-  const inspect = await run(["docker", "network", "inspect", ...ZONE_NETWORKS.map((n) => `${PROJECT}_${n}`)], { env: composeEnv, inherit: false });
-  let networks: unknown[] = [];
+  // Step 5. Anything that goes wrong here, a check that fails or one that can't be made, removes what step 4
+  // created, so nothing is left started or created.
   try {
-    networks = JSON.parse(inspect.stdout || "[]") as unknown[];
-  } catch {
-    networks = [];
-  }
-  const problems = networkProblems(networks, PROJECT);
-  if (problems.length > 0) {
-    await run(["docker", "compose", "-p", PROJECT, "down"], { env: composeEnv, inherit: true });
-    throw new Error(`${problems.join("; ")}. Nothing was started (docs/runbooks/stack.md#troubleshooting)`);
+    const problems = networkProblems(await zoneNetworks(run, composeEnv), PROJECT);
+    if (problems.length > 0) throw new Error(problems.join("; "));
+  } catch (e) {
+    const down = await run(["docker", "compose", "-p", PROJECT, "down"], { env: composeEnv, inherit: true });
+    const cleanup =
+      down.code === 0
+        ? "and what `compose up --no-start` created was removed"
+        : `but removing what \`compose up --no-start\` created failed (docker compose -p ${PROJECT} down exited ${down.code}): run \`mise run down\``;
+    throw new Error(`${(e as Error).message}. Nothing was started, ${cleanup} (docs/runbooks/stack.md#troubleshooting)`);
   }
 
   const up = await compose(["up", "-d", "--wait", "--wait-timeout", "300"]);

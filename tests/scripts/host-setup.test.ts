@@ -45,9 +45,9 @@ test("strict mode, and it refuses to run without root before it changes anything
 test("idempotent: each step checks before it acts", () => {
   expect(text).toContain(`id -u "$HAPI_USER" >/dev/null 2>&1`);
   expect(text).toContain("systemctl --user is-active --quiet docker");
-  expect(text).toContain(`[[ -d "$dest/.git" ]]`);
-  expect(text).toMatch(/grep -q "\^\$MISE_VERSION "/);
-  expect(text).toMatch(/grep -qxF "\$line" "\$profile"/);
+  expect(text).toContain(`as_hapi_sh '[ -d "$1/.git" ]' "$HAPI_CHECKOUT"`);
+  expect(text).toMatch(/hapi_mise_version \| grep -q "\^\$MISE_VERSION "/);
+  expect(text).toContain(`as_hapi_sh 'grep -qxF "$1" .bashrc 2>/dev/null || printf "%s\\n" "$1" >>.bashrc'`);
 });
 
 test("creates the hapi user with subordinate IDs wide enough for the Squid rock's uid 584792", () => {
@@ -75,12 +75,27 @@ test("mise is the version mise.toml requires, downloaded over HTTPS and checked 
   expect(text).not.toMatch(/\|\s*(ba)?sh\b/);
 });
 
-test("clones into ~hapi/hapi-factory (where up re-execs), from a URL or a local path, owned by hapi", () => {
-  expect(text).toContain(`dest="/home/$HAPI_USER/${HAPI_CHECKOUT}"`);
-  expect(text).toContain(`git -c safe.directory='*' clone --no-local "$src" "$dest"`);
-  expect(text).toContain(`chown -R "$HAPI_USER:$HAPI_USER" "$dest"`);
+test("hapi's checkout is ~/hapi-factory (where up re-execs), made by hapi: a URL cloned as hapi, a local path cloned by root into its own temp dir and unpacked by hapi", () => {
+  expect(text).toContain(`readonly HAPI_CHECKOUT=${HAPI_CHECKOUT}`);
+  // A local path: root clones it --no-local into a mktemp -d, and streams it to hapi's tar.
+  expect(text).toContain(`checkout_tmp="$(mktemp -d)"`);
+  expect(text).toContain(`git -c safe.directory='*' clone --no-local -- "$src" "$checkout_tmp/repo"`);
+  expect(text).toContain(`tar -C "$checkout_tmp/repo" -cf - . | as_hapi_sh 'umask 022\nmkdir -- "$1" || exit 1\nif tar -C "$1" --no-same-owner -xf -; then exit 0; fi`);
+  // A URL: hapi clones it, into a directory it has just made.
+  expect(text).toContain(`mkdir -- "$1" || exit 1\nif git clone -- "$2" "$1"; then exit 0; fi`);
+  // The temp dir goes however the script ends.
+  expect(text).toContain(`[[ -z "$checkout_tmp" ]] || rm -rf -- "$checkout_tmp"`);
+  expect(text).toContain("trap cleanup EXIT");
   // The default source is this checkout's origin remote: no account name in the script.
   expect(text).toContain("remote get-url origin");
+});
+
+test("mise reaches hapi on stdin: root verifies its own download, hapi writes a temp name, chmods it and renames it into place", () => {
+  expect(text).toContain(`mise_tmp="$(mktemp)"`);
+  expect(text).toContain(`tmp="$(mktemp .local/bin/.mise.XXXXXX)" || exit 1\nif cat >"$tmp" && chmod 0755 "$tmp" && mv -fT "$tmp" .local/bin/mise; then exit 0; fi`);
+  expect(text).toContain(`exit 1' <"$mise_tmp"`);
+  // Checked again, as hapi, after the install.
+  expect(text.match(/hapi_mise_version \| grep -q "\^\$MISE_VERSION "/g)?.length).toBe(2);
 });
 
 test("prints the next steps: the rootless check, mise trust and install as hapi with its XDG_RUNTIME_DIR, the secrets join and add-machine, then up", () => {
@@ -89,7 +104,7 @@ test("prints the next steps: the rootless check, mise trust and install as hapi 
     "sudo -iu $HAPI_USER docker info --format '{{.SecurityOptions}}'",
     "export XDG_RUNTIME_DIR=/run/user/$uid",
     "mise trust && mise install && mise run setup",
-    "sudo install -o $HAPI_USER -g $HAPI_USER -m 0600 private/secrets.enc.yaml private/secrets.recipients.yaml private/recovery.age",
+    "scripts/copy-secrets-to-hapi.sh",
     "mise run secrets:join -- --store ~/.config/hapi/secrets.enc.yaml --name $HAPI_USER",
     "mise run secrets:add-machine -- --name $HAPI_USER --recipient <age1...>",
     "mise run secrets:check",

@@ -168,6 +168,11 @@ export class Project {
     return name;
   }
 
+  /** Run `cmd` in the curl client on `net` (busybox's nslookup and nc are there too); never throws. */
+  async inClient(net: string, cmd: string[]): Promise<Result> {
+    return run(["docker", "exec", await this.client(net), ...cmd], { timeoutMs: 60_000 });
+  }
+
   /** curl `url` from a client on `net`, through `proxy` (host:port), or directly when `proxy` is undefined. */
   async curl(net: string, url: string, proxy: string | undefined, extra: string[] = []): Promise<CurlResult> {
     const client = await this.client(net);

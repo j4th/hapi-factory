@@ -19,11 +19,23 @@
 #      /run/user/<uid> (XDG_RUNTIME_DIR) and its Docker survive logout and reboot;
 #   4. sets up rootless Docker for hapi (dockerd-rootless-setuptool.sh install);
 #   5. installs mise for hapi, the pinned release, checked against its SHA-256;
-#   6. clones hapi-factory into ~hapi/hapi-factory, owned by hapi;
+#   6. has hapi clone hapi-factory into ~hapi/hapi-factory (a URL), or unpack a
+#      copy root made (a local path);
 #   7. prints the next steps, which run as hapi and as the operator.
+#
+# Root never acts on a path inside hapi's home: it never writes, creates, chowns
+# or chmods anything there, and never tests or follows a path there. hapi runs the
+# agent stack, so it is less trusted than root, and it may have planted a symlink
+# anywhere in its home (~/.bashrc -> /etc/sudoers, ~/.local/bin -> /usr/local/bin),
+# and this script is meant to be run again. Every step that changes hapi's home
+# hands bytes to a process running as hapi (`as_hapi_sh`, reading stdin), so the
+# kernel checks hapi's own permissions, and a planted symlink reaches only what
+# hapi could already write. docs/runbooks/stack.md#hardening says the same.
 set -euo pipefail
 
 readonly HAPI_USER=hapi
+# hapi's checkout, relative to its home (HAPI_CHECKOUT in src/stack/up.ts: where up re-execs).
+readonly HAPI_CHECKOUT=hapi-factory
 # Canonical's rock images (ubuntu/squid, the egress proxies) own files with uid
 # 584792, beyond the 65,536 subordinate IDs useradd gives by default, and rootless
 # Docker can't unpack an image with an ID it can't map. 2^20 covers it.
@@ -126,6 +138,8 @@ ensure_linger() {
 }
 
 # Run a command as hapi, in its user session (systemctl --user and its runtime dir).
+# sudo -i hands the words to hapi's login shell with every `$` unescaped, so none
+# of the arguments given here may hold one.
 as_hapi() {
   local uid
   uid="$(id -u "$HAPI_USER")"
@@ -148,10 +162,31 @@ ensure_rootless_docker() {
   log "$HAPI_USER's docker is rootless"
 }
 
-# 5. mise, the pinned release, verified before it is installed.
+# Run a shell script as hapi, in hapi's home, with hapi's HOME (-H), the rest of
+# the arguments as its $1, $2, ... and this script's stdin as its stdin. sudo -u
+# runs sh directly (no login shell re-reads the words), so the script and its
+# arguments arrive exactly as written. The only way this script changes anything
+# under hapi's home: paths in the script are relative to it, and hapi's process
+# makes each change with hapi's own permissions.
+as_hapi_sh() {
+  local script="$1"
+  shift
+  sudo -u "$HAPI_USER" -H -- sh -c "cd ~ || exit 1
+$script" host-setup "$@"
+}
+
+# The version line of hapi's own ~/.local/bin/mise, or nothing; checked by hapi.
+hapi_mise_version() {
+  as_hapi_sh '[ -x .local/bin/mise ] && exec .local/bin/mise --version' 2>/dev/null || true
+}
+
+# 5. mise, the pinned release, verified before hapi installs it. Root downloads and
+# checks it in its own temp file; hapi copies it from stdin into its own
+# ~/.local/bin (a temp name, then a rename: mv -T, so never into a directory that
+# stands where the binary goes) and adds the activate line to its own ~/.bashrc.
 ensure_mise() {
-  local bin="/home/$HAPI_USER/.local/bin/mise" arch sum
-  if [[ -x "$bin" ]] && sudo -iu "$HAPI_USER" -- "$bin" --version 2>/dev/null | grep -q "^$MISE_VERSION "; then
+  local arch sum
+  if hapi_mise_version | grep -q "^$MISE_VERSION "; then
     log "mise $MISE_VERSION is installed for $HAPI_USER"
     return
   fi
@@ -163,32 +198,61 @@ ensure_mise() {
   mise_tmp="$(mktemp)"
   curl -fsSL --proto '=https' -o "$mise_tmp" "https://github.com/jdx/mise/releases/download/v$MISE_VERSION/mise-v$MISE_VERSION-linux-$arch"
   printf '%s  %s\n' "$sum" "$mise_tmp" | sha256sum -c --quiet - || die "the mise download does not match its pinned SHA-256"
-  install -d -o "$HAPI_USER" -g "$HAPI_USER" -m 0755 "/home/$HAPI_USER/.local" "/home/$HAPI_USER/.local/bin"
-  install -o "$HAPI_USER" -g "$HAPI_USER" -m 0755 "$mise_tmp" "$bin"
-  # The line is written literally: it is expanded in hapi's own shells.
+  # The single quotes are deliberate: hapi's sh expands these, not this script.
   # shellcheck disable=SC2016
-  local profile="/home/$HAPI_USER/.bashrc" line='eval "$(~/.local/bin/mise activate bash)"'
-  grep -qxF "$line" "$profile" 2>/dev/null || printf '%s\n' "$line" >>"$profile"
-  chown "$HAPI_USER:$HAPI_USER" "$profile"
+  as_hapi_sh 'umask 022
+mkdir -p .local/bin
+tmp="$(mktemp .local/bin/.mise.XXXXXX)" || exit 1
+if cat >"$tmp" && chmod 0755 "$tmp" && mv -fT "$tmp" .local/bin/mise; then exit 0; fi
+rm -f "$tmp"
+exit 1' <"$mise_tmp" || die "$HAPI_USER could not install mise into its ~/.local/bin"
+  hapi_mise_version | grep -q "^$MISE_VERSION " || die "$HAPI_USER's ~/.local/bin/mise does not report $MISE_VERSION after the install"
+  # The activate line is appended by hapi, to its own ~/.bashrc, written literally:
+  # hapi's shells expand it.
+  # shellcheck disable=SC2016
+  as_hapi_sh 'grep -qxF "$1" .bashrc 2>/dev/null || printf "%s\n" "$1" >>.bashrc' 'eval "$(~/.local/bin/mise activate bash)"' ||
+    die "$HAPI_USER could not add mise's activate line to its ~/.bashrc"
   log "installed mise $MISE_VERSION for $HAPI_USER"
 }
 
-# 6. hapi's own checkout. A local path is copied (--no-local), never hardlinked to
-# another user's files; root clones it, since hapi may not be able to read it.
+# 6. hapi's own checkout, made by hapi in a directory it creates itself: `mkdir`
+# fails on any path that exists, a dangling symlink included, so nothing hapi
+# planted is followed. A URL is cloned by hapi (so with hapi's own credentials: an
+# SSH URL needs hapi's own key, so pass the HTTPS one). A local path, which hapi
+# may not be able to read, is cloned by root into its own temp dir (--no-local:
+# copied, never hardlinked to another user's files), then streamed to hapi, whose
+# tar unpacks it as hapi.
 ensure_checkout() {
-  local src="$1" dest="/home/$HAPI_USER/hapi-factory"
-  if [[ -d "$dest/.git" ]]; then
-    log "$dest exists; to update it, as $HAPI_USER: git -C ~/hapi-factory pull"
+  local src="$1"
+  # shellcheck disable=SC2016
+  if as_hapi_sh '[ -d "$1/.git" ]' "$HAPI_CHECKOUT"; then
+    log "$HAPI_USER's checkout exists; to update it, as $HAPI_USER: git -C ~/$HAPI_CHECKOUT pull"
     return
   fi
-  [[ ! -e "$dest" ]] || die "$dest exists but is not a git checkout: move it away and run this again"
-  if [[ -d "$src" ]]; then
-    git -c safe.directory='*' clone --no-local "$src" "$dest"
-  else
-    git clone "$src" "$dest"
+  # shellcheck disable=SC2016
+  if as_hapi_sh '[ -e "$1" ] || [ -L "$1" ]' "$HAPI_CHECKOUT"; then
+    die "$HAPI_USER's ~/$HAPI_CHECKOUT exists but is not a git checkout: as $HAPI_USER, move it away, then run this again"
   fi
-  chown -R "$HAPI_USER:$HAPI_USER" "$dest"
-  log "cloned $src into $dest"
+  if [[ -d "$src" ]]; then
+    checkout_tmp="$(mktemp -d)"
+    git -c safe.directory='*' clone --no-local -- "$src" "$checkout_tmp/repo"
+    # shellcheck disable=SC2016
+    tar -C "$checkout_tmp/repo" -cf - . | as_hapi_sh 'umask 022
+mkdir -- "$1" || exit 1
+if tar -C "$1" --no-same-owner -xf -; then exit 0; fi
+rm -rf -- "$1"
+exit 1' "$HAPI_CHECKOUT" || die "$HAPI_USER could not unpack the checkout into ~/$HAPI_CHECKOUT"
+    rm -rf -- "$checkout_tmp"
+    checkout_tmp=""
+  else
+    # shellcheck disable=SC2016
+    as_hapi_sh 'umask 022
+mkdir -- "$1" || exit 1
+if git clone -- "$2" "$1"; then exit 0; fi
+rm -rf -- "$1"
+exit 1' "$HAPI_CHECKOUT" "$src" || die "$HAPI_USER could not clone $src (an SSH URL needs $HAPI_USER's own key: pass the HTTPS URL)"
+  fi
+  log "cloned $src into $HAPI_USER's ~/$HAPI_CHECKOUT, as $HAPI_USER"
 }
 
 next_steps() {
@@ -208,14 +272,13 @@ host-setup: done. Next steps (docs/runbooks/stack.md):
        cd ~/hapi-factory && mise trust && mise install && mise run setup
 
   3. Give $HAPI_USER its copy of the secrets store, then its own key. As the
-     operator, from your checkout:
-       sudo install -d -o $HAPI_USER -g $HAPI_USER -m 0700 /home/$HAPI_USER/.config /home/$HAPI_USER/.config/hapi
-       sudo install -o $HAPI_USER -g $HAPI_USER -m 0600 private/secrets.enc.yaml private/secrets.recipients.yaml private/recovery.age /home/$HAPI_USER/.config/hapi/
+     operator (not root), from your checkout:
+       scripts/copy-secrets-to-hapi.sh
      As $HAPI_USER (XDG_RUNTIME_DIR exported as in step 2):
        mise run secrets:join -- --store ~/.config/hapi/secrets.enc.yaml --name $HAPI_USER
      As the operator, with the command join printed, then copy the store again:
        mise run secrets:add-machine -- --name $HAPI_USER --recipient <age1...>
-       sudo install -o $HAPI_USER -g $HAPI_USER -m 0600 private/secrets.enc.yaml private/secrets.recipients.yaml private/recovery.age /home/$HAPI_USER/.config/hapi/
+       scripts/copy-secrets-to-hapi.sh
      As $HAPI_USER: mise run secrets:check
 
   4. Start the stack (from any account; it runs as $HAPI_USER):
@@ -223,9 +286,15 @@ host-setup: done. Next steps (docs/runbooks/stack.md):
 EOF
 }
 
-# The download ensure_mise makes, removed however the script ends.
+# Root's own temp files (ensure_mise's download, ensure_checkout's clone), removed
+# however the script ends.
 mise_tmp=""
-trap 'rm -f "$mise_tmp"' EXIT
+checkout_tmp=""
+cleanup() {
+  [[ -z "$mise_tmp" ]] || rm -f -- "$mise_tmp"
+  [[ -z "$checkout_tmp" ]] || rm -rf -- "$checkout_tmp"
+}
+trap cleanup EXIT
 
 if [[ $# -eq 1 ]]; then
   source_arg="$1"

@@ -8,15 +8,19 @@
  * - serves only clients on the private container networks;
  * - refuses private, loopback, link-local and other special addresses, checked
  *   on what a name resolves to, so a public name pointing inside is refused too;
+ * - refuses a destination written as an IP address, in any form (`ip_literal`):
+ *   a host is reached by name only, so the address checks above always apply
+ *   to what a name resolves to;
  * - tunnels (CONNECT) only to port 443;
  * - caches nothing and logs to stdout;
  * - ends with `http_access deny all`.
  *
  * An allowlisted zone (hermes, archon) allows only HTTPS tunnels to its
  * allowlist (`zoneHosts`, src/policy/zones.ts): each domain and its subdomains,
- * as a Squid dstdomain with a leading dot, matched by name only. An IP-address
- * destination is refused. The research zone (`openWeb`) allows any public host:
- * HTTPS tunnels to 443 and http:// requests to 80.
+ * as a Squid dstdomain with a leading dot, matched by name only. The research
+ * zone (`openWeb`) allows any public host by name: HTTPS tunnels to 443 and
+ * http:// requests to 80. Its IP-literal refusal was added in Plan 01 Task 5's
+ * security fix pass (ruling R1).
  *
  * Hosts and tier names are pasted into squid.conf, so the emitter checks every
  * one first (`checkedHosts`): it is the last gate before the network boundary.
@@ -143,10 +147,11 @@ function squidConf(p: Policy, zone: ZoneName): string {
     ...wrap(`Zone ${zone} (tiers ${z.tiers.join(", ")}): ${ABOUT[zone]}.`),
     ...wrap(
       open
-        ? "Open web: any public host, as HTTPS tunnels to port 443 or http:// requests to port 80."
+        ? "Open web: any public host, by name, as HTTPS tunnels to port 443 or http:// requests to port 80."
         : "Default-deny: only HTTPS tunnels (CONNECT to port 443) to the domains below and their subdomains.",
     ),
-    "Private, loopback and link-local addresses are refused whatever a name resolves to.",
+    "Private, loopback and link-local addresses are refused whatever a name resolves to,",
+    "and a destination written as an IP address is refused outright.",
   ]);
 
   const lines = [
@@ -181,6 +186,11 @@ function squidConf(p: Policy, zone: ZoneName): string {
     "# Refusing the NAT64 prefixes also refuses the addresses DNS64 synthesises for",
     "# IPv4-only sites, so on an IPv6-only host behind DNS64 those sites are unreachable.",
     `acl to_localnet dst ${PRIVATE_RANGES.map(([r]) => r).join(" ")}`,
+    "# A destination written as an IP address, in any form. IPv4 is all digits and dots",
+    "# (Squid rewrites 0x7f.1, 2130706433 and 127.1 as 127.0.0.1, and ::ffff:1.2.3.4 as",
+    "# 1.2.3.4), and IPv6 always holds a colon. A host name has no colon, and its last label",
+    "# is never all digits. -n: no DNS lookups.",
+    "acl ip_literal dstdom_regex -n ^[0-9.]+$ :",
   ];
   if (open) {
     lines.push(
@@ -188,6 +198,7 @@ function squidConf(p: Policy, zone: ZoneName): string {
       "http_access deny !zone_clients",
       "http_access deny to_localnet",
       "http_access deny CONNECT !https_port",
+      "http_access deny ip_literal",
       "http_access allow CONNECT",
       "# Plain HTTP is http:// on port 80 only: ftp://host:80/ and other schemes are refused.",
       "http_access allow http_proto port_80",
@@ -196,11 +207,6 @@ function squidConf(p: Policy, zone: ZoneName): string {
   } else {
     const domains = dstdomains(hosts);
     lines.push(
-      "# A destination written as an IP address, in any form. IPv4 is all digits and dots",
-      "# (Squid rewrites 0x7f.1, 2130706433 and 127.1 as 127.0.0.1, and ::ffff:1.2.3.4 as",
-      "# 1.2.3.4), and IPv6 always holds a colon. A host name has no colon, and its last label",
-      "# is never all digits. -n: no DNS lookups.",
-      "acl ip_literal dstdom_regex -n ^[0-9.]+$ :",
       ...(domains.length > 0
         ? [
             "# The allowlist: the zone's hosts plus its tiers' hosts (zoneHosts in src/policy/zones.ts).",

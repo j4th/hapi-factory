@@ -159,10 +159,25 @@ describe("every zone", () => {
   }
 });
 
-describe("allowlisted zones never let an IP-literal destination through", () => {
+describe("no zone lets an IP-literal destination through, the research zone included (ruling R1)", () => {
   // Each address as a client writes it, and as Squid 7.6 rewrites it for its ACLs:
   // [::ffff:1.2.3.4] becomes 1.2.3.4, and 0x7f.1, 2130706433 and 127.1 become 127.0.0.1.
-  const LITERALS = ["1.2.3.4", "[2001:db8::1]", "2001:db8::1", "[::ffff:1.2.3.4]", "::ffff:1.2.3.4", "[64:ff9b::102:304]", "[::]", "0.0.0.0", "127.0.0.1"];
+  const LITERALS = ["1.2.3.4", "[2001:db8::1]", "2001:db8::1", "[::ffff:1.2.3.4]", "::ffff:1.2.3.4", "[64:ff9b::102:304]", "[::]", "0.0.0.0", "127.0.0.1", "[2606:4700::1111]"];
+  test("research: ip_literal refuses every literal form before either allow, public addresses included", () => {
+    const c = conf("research");
+    const lines = directives(c).filter((l) => l.startsWith("http_access "));
+    const firstAllow = lines.findIndex((l) => l.startsWith("http_access allow"));
+    expect(lines.indexOf("http_access deny ip_literal")).toBeGreaterThan(-1);
+    expect(lines.indexOf("http_access deny ip_literal")).toBeLessThan(firstAllow);
+    const patterns = ipLiteral(c);
+    for (const host of LITERALS) expect({ host, refused: patterns.some((r) => r.test(host)) }).toEqual({ host, refused: true });
+    for (const host of ["example.com", "cafe.de", "bad.cafe", "1password.com", "123.example.org"]) {
+      expect({ host, refused: patterns.some((r) => r.test(host)) }).toEqual({ host, refused: false });
+    }
+    // The same ACL, word for word, as the allowlisted zones'.
+    expect(directives(c).find((l) => l.startsWith("acl ip_literal "))).toBe(directives(conf("archon")).find((l) => l.startsWith("acl ip_literal ")));
+  });
+
   for (const zone of ["hermes", "archon"] as const) {
     test(`${zone}: the allowlist matches by name only, and ip_literal refuses 1.2.3.4, [2001:db8::1] and ::ffff:1.2.3.4 before it`, () => {
       const c = conf(zone);

@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadPolicy, PolicyError } from "../../src/policy/load";
-import { LOGICAL_NAME, loadManifest, MANIFEST_FILE, manifestNames, mcpSecretGaps, SECRET_ZONES } from "../../src/secrets/manifest";
+import { LOGICAL_NAME, loadManifest, MANIFEST_FILE, manifestEntries, manifestNames, mcpSecretGaps, SECRET_ZONES } from "../../src/secrets/manifest";
+import { resolveSecrets, type SecretProvider } from "../../src/secrets/provider";
+import { RESERVED_ENV_NAMES, serviceEnvironment, ZONE_SERVICES } from "../../src/stack/env";
 
 // Obviously fake: not, and not like, a real credential.
 const FAKE = "fake-secret-value-7f3a";
@@ -131,6 +133,59 @@ describe("loadManifest", () => {
 
   test("a missing zone is refused", () => {
     expect(() => loadManifest(manifestFile("hermes:\n  A: hapi-a\n"))).toThrow(/\/archon: missing required key/);
+  });
+
+  test("an env name hapi sets in the containers itself is refused, in any zone, naming each one (R4)", () => {
+    // HOST would rebind Archon off loopback, HTTPS_PROXY route around the proxy, PI_OFFLINE let Pi fetch packages.
+    const e = policyError(() =>
+      loadManifest(manifestFile(full().replace("  A: hapi-a", "  A: hapi-a\n  HTTPS_PROXY: hapi-a").replace("  B: hapi-b", "  HOST: hapi-b\n  PI_OFFLINE: hapi-b").replace("  D: hapi-a", "  ALL_PROXY: hapi-a"))),
+    );
+    expect(e.issues.map((i) => i.path)).toEqual(["/hermes/HTTPS_PROXY", "/archon/HOST", "/archon/PI_OFFLINE", "/host/ALL_PROXY"]);
+    expect(e.message).toContain("/archon/HOST: HOST is reserved: hapi sets it in the containers itself (src/stack/env.ts, stack/compose.yaml's environment:)");
+  });
+
+  test("every reserved name is refused, and the committed manifest uses none", () => {
+    for (const name of RESERVED_ENV_NAMES) {
+      const e = policyError(() => loadManifest(manifestFile(full(`  ${name}: hapi-x\n`))));
+      // The lower-case proxy names never get that far: an env name is upper case (the schema's pattern).
+      expect([name, e.issues.map((i) => i.path)]).toEqual([name, [name === name.toUpperCase() ? `/host/${name}` : "/host/<ENV>"]]);
+    }
+    const committed = loadManifest(MANIFEST_FILE);
+    for (const zone of SECRET_ZONES) expect(Object.keys(committed[zone]!).filter((k) => RESERVED_ENV_NAMES.includes(k))).toEqual([]);
+  });
+
+  test("a manifest built in code with a reserved name is refused too, before resolve fetches or writes anything", async () => {
+    const m = { archon: { ANTHROPIC_API_KEY: "hapi-a", HOST: "hapi-b" } };
+    expect(() => manifestEntries(m)).toThrow("archon/HOST: HOST is reserved");
+    let fetched = false;
+    const provider: SecretProvider = { name: "sops", downgrade: false, list: async () => [], fetch: async () => ((fetched = true), new Map()) };
+    const dir = mkdtempSync(join(tmpdir(), "hapi-manifest-"));
+    temps.push(dir);
+    await expect(resolveSecrets(m, provider, { outDir: join(dir, "hapi") })).rejects.toThrow("archon/HOST: HOST is reserved");
+    expect(fetched).toBe(false);
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  test("the reserved set: every name the zone services' environment: sets, the research proxy's, and ALL_PROXY", () => {
+    for (const s of ZONE_SERVICES) for (const name of Object.keys(serviceEnvironment(s))) expect(RESERVED_ENV_NAMES).toContain(name);
+    expect(RESERVED_ENV_NAMES).toEqual([
+      "ALL_PROXY",
+      "ARCHON_DOCKER",
+      "ARCHON_TELEMETRY_DISABLED",
+      "DO_NOT_TRACK",
+      "HERMES_HOME",
+      "HOST",
+      "HTTPS_PROXY",
+      "HTTP_PROXY",
+      "NO_PROXY",
+      "PI_CODING_AGENT_DIR",
+      "PI_OFFLINE",
+      "PI_TELEMETRY",
+      "all_proxy",
+      "http_proxy",
+      "https_proxy",
+      "no_proxy",
+    ]);
   });
 
   test("the logical-name pattern", () => {

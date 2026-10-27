@@ -15,6 +15,12 @@
  * manifest maps that env var to that name in the server's zone, so the two
  * never drift.
  *
+ * No env name may be one hapi sets in the containers itself
+ * (`RESERVED_ENV_NAMES`, src/stack/env.ts: the proxy variables, HOST, PI_OFFLINE,
+ * the telemetry switches and the rest), in any zone: such a secret is refused
+ * when the manifest loads, by `loadManifest` and by `manifestEntries` for a
+ * manifest built in code, before resolve writes anything.
+ *
  * Errors never echo what might be a pasted secret: a JSON Pointer shows a zone
  * only if it is one of `SECRET_ZONES` (else `<zone>`), and an env name only if
  * it is one (else `<ENV>`).
@@ -22,6 +28,7 @@
 import { loadChecked, PolicyError } from "../policy/load";
 import { MCP_ZONES, type McpOptions, type McpZone, secretEnvName, secretKey, serversForZone } from "../policy/mcp";
 import type { Policy } from "../policy/types";
+import { RESERVED_ENV_NAMES } from "../stack/env";
 import { ENV_NAME } from "./files";
 
 /** The env files hapi writes, one per zone. `host` is for host tools only, never a container. */
@@ -51,6 +58,10 @@ export function shownName(name: string): string {
 
 const isZone = (z: string): z is SecretZone => (SECRET_ZONES as readonly string[]).includes(z);
 
+/** Why a reserved env name is refused (`RESERVED_ENV_NAMES`). The name itself is a known one, so it may be shown. */
+const reservedMessage = (key: string) =>
+  `${key} is reserved: hapi sets it in the containers itself (src/stack/env.ts, stack/compose.yaml's environment:), and a secret must never override it. Give the secret another env name`;
+
 /**
  * The manifest's entries, zones in `SECRET_ZONES` order and env vars in file
  * order. Throws for a zone, env name or logical name a manifest built in code
@@ -64,6 +75,7 @@ export function manifestEntries(m: Manifest): ManifestEntry[] {
   for (const zone of SECRET_ZONES) {
     for (const [key, name] of Object.entries(m[zone] ?? {})) {
       if (!ENV_NAME.test(key)) throw new Error(`${zone}/<ENV>: an env name is not of the form ${ENV_NAME.source} (not shown, in case it is a value)`);
+      if (RESERVED_ENV_NAMES.includes(key)) throw new Error(`${zone}/${key}: ${reservedMessage(key)}`);
       if (typeof name !== "string" || !LOGICAL_NAME.test(name)) {
         throw new Error(`${zone}/${key}: not a logical name of the form ${LOGICAL_NAME.source} (not shown, in case it is a value)`);
       }
@@ -119,12 +131,14 @@ function scrubPointer(path: string): string {
 
 /**
  * Load and check a manifest file (`secrets-manifest.schema.json`; default the
- * committed stack/secrets.yaml). Throws a PolicyError naming the file and the
- * JSON Pointer of each problem, scrubbed as above.
+ * committed stack/secrets.yaml), then refuse any reserved env name
+ * (`RESERVED_ENV_NAMES`). Throws a PolicyError naming the file and the JSON
+ * Pointer of each problem, scrubbed as above.
  */
 export function loadManifest(file: string = MANIFEST_FILE): Manifest {
+  let m: Manifest;
   try {
-    return loadChecked(file, "secrets-manifest") as Manifest;
+    m = loadChecked(file, "secrets-manifest") as Manifest;
   } catch (e) {
     if (!(e instanceof PolicyError)) throw e;
     throw new PolicyError(
@@ -132,4 +146,11 @@ export function loadManifest(file: string = MANIFEST_FILE): Manifest {
       e.issues.map((i) => ({ ...i, path: scrubPointer(i.path) })),
     );
   }
+  const reserved = SECRET_ZONES.flatMap((zone) =>
+    Object.keys(m[zone] ?? {})
+      .filter((key) => RESERVED_ENV_NAMES.includes(key))
+      .map((key) => ({ path: `/${zone}/${key}`, message: reservedMessage(key) })),
+  );
+  if (reserved.length > 0) throw new PolicyError(file, reserved);
+  return m;
 }

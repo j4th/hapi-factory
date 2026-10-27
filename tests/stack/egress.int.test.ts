@@ -6,11 +6,13 @@
  *
  * No real secret is used. The zone env files are written by hapi's own
  * resolver (`resolveSecrets`) from a fake provider into a temp
- * XDG_RUNTIME_DIR, and the test's override (a second compose file) adds only
- * `extra_hosts` on the proxies, which plant names that resolve to private,
- * NAT64 and other special addresses, so the DNS-rebinding checks need no DNS
- * server, blanks Hermes's Slack tokens so the gateway calls nobody, and gives
- * the built images project-named tags.
+ * XDG_RUNTIME_DIR; then the test appends lines to them that try to override
+ * hapi's own settings (HOST, PI_OFFLINE, HTTPS_PROXY, ...), which compose's
+ * `environment:` must win against. The test's override (a second compose
+ * file) adds only `extra_hosts` on the proxies, which plant names that resolve
+ * to private, NAT64, public and other addresses, so the DNS-rebinding checks
+ * need no DNS server, blanks Hermes's Slack tokens so the gateway calls nobody,
+ * and gives the built images project-named tags.
  *
  * Nothing a running stack uses is touched, so this may run beside `mise run
  * up`'s `hapi` project: the configs are generated into the project's own
@@ -27,7 +29,7 @@
  * What each test proves is in docs/runbooks/stack.md#what-the-tests-prove.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { buildAll } from "../../src/generate/index";
 import { loadPolicy } from "../../src/policy/load";
@@ -35,6 +37,7 @@ import { loadManifest, type Manifest } from "../../src/secrets/manifest";
 import { resolveSecrets, type SecretProvider } from "../../src/secrets/provider";
 import { cidrContains } from "../../src/stack/cidr";
 import { CLIENT_RANGES } from "../../src/generate/egress";
+import { serviceEnvironment } from "../../src/stack/env";
 import { composeFile, must, online, Project, REPO, treeSnapshot } from "./helpers";
 
 const INT = Boolean(process.env.HAPI_INT);
@@ -63,7 +66,24 @@ const PLANTED = {
     "sixtofour.hapi.test=2002:a09:909::1",
     "teredo.hapi.test=2001::a09:909",
     "compat.hapi.test=::10.9.9.9",
+    "metadata.hapi.test=169.254.169.254",
+    "loopback.hapi.test=127.0.0.1",
+    "discard.hapi.test=100::1",
+    "sitelocal.hapi.test=fec0::1",
+    // The controls: public addresses no range covers.
+    "public4.hapi.test=1.1.1.1",
+    "public6.hapi.test=2606:4700::1111",
   ],
+};
+
+/**
+ * Lines appended to each zone's env file after resolve wrote it: values that would undo the hardening if an
+ * env file could override compose's `environment:` (the manifest loader refuses these names, so only a hand
+ * edit of the file could put them there).
+ */
+const OVERRIDES: Record<"hermes" | "archon", Record<string, string>> = {
+  hermes: { HERMES_HOME: "/tmp/elsewhere", HTTPS_PROXY: "http://203.0.113.9:3128", NO_PROXY: "*" },
+  archon: { HOST: "0.0.0.0", PI_OFFLINE: "0", ARCHON_TELEMETRY_DISABLED: "0", PI_CODING_AGENT_DIR: "/tmp/elsewhere", HTTPS_PROXY: "http://203.0.113.9:3128", no_proxy: "*" },
 };
 
 describe.skipIf(!INT)("the stack's egress boundary (throwaway compose project)", () => {
@@ -88,6 +108,9 @@ describe.skipIf(!INT)("the stack's egress boundary (throwaway compose project)",
     const manifest: Manifest = loadManifest(join(REPO, "stack", "secrets.yaml"));
     manifest.archon = { ...manifest.archon, HAPI_INT_PROBE: "hapi-int-probe" };
     await resolveSecrets(manifest, fakeProvider, { outDir: join(p.xdg, "hapi") });
+    for (const [zone, lines] of Object.entries(OVERRIDES)) {
+      appendFileSync(join(p.xdg, "hapi", "env", `${zone}.env`), Object.entries(lines).map(([k, v]) => `${k}='${v}'\n`).join(""));
+    }
     await p.mustCompose(["up", "-d", "--wait", "--wait-timeout", "120", "egress-hermes", "egress-archon", "egress-research"]);
   }, 600_000);
 
@@ -104,6 +127,24 @@ describe.skipIf(!INT)("the stack's egress boundary (throwaway compose project)",
     for (const point of want.rw) expect([service, point, flag(point)]).toEqual([service, point, "rw"]);
     const w = await p.exec(service, ["sh", "-c", 'echo x > "$1"', "sh", probe]);
     expect([service, probe, w.code === 0, /Read-only file system/.test(w.stderr)]).toEqual([service, probe, false, true]);
+  };
+
+  /**
+   * Who is on each network, by service name (`<project>-<service>-1` without the project and index), leaving
+   * out the containers the test itself started (the curl clients, the PTR test's proxies).
+   */
+  const members = async (): Promise<Record<string, string[]>> => {
+    const testMade = new Set((await must(["docker", "ps", "-a", "--filter", `label=org.hapi.int=${p.name}`, "--format", "{{.Names}}"])).split("\n").filter(Boolean));
+    const out: Record<string, string[]> = {};
+    for (const net of ["hermes-net", "archon-net", "research-net", "outbound"]) {
+      const [info] = JSON.parse(await must(["docker", "network", "inspect", p.network(net)]));
+      out[net] = Object.values((info.Containers ?? {}) as Record<string, { Name: string }>)
+        .map((c) => c.Name)
+        .filter((n) => !testMade.has(n))
+        .map((n) => n.replace(`${p.name}-`, "").replace(/-\d+$/, ""))
+        .sort();
+    }
+    return out;
   };
 
   afterAll(async () => {
@@ -126,10 +167,13 @@ describe.skipIf(!INT)("the stack's egress boundary (throwaway compose project)",
       }
       const [outbound] = JSON.parse(await must(["docker", "network", "inspect", p.network("outbound")]));
       expect(outbound.Internal).toBe(false);
-      const names = Object.values(outbound.Containers as Record<string, { Name: string }>)
-        .map((c) => c.Name.replace(`${p.name}-`, "").replace(/-\d+$/, ""))
-        .filter((n) => !n.startsWith("client-"));
-      expect(names.sort()).toEqual(["egress-archon", "egress-hermes", "egress-research"]);
+      // Only the proxies so far; the same check runs again once hermes and archon are up (the zone services, below).
+      expect(await members()).toEqual({
+        "hermes-net": ["egress-hermes"],
+        "archon-net": ["egress-archon"],
+        "research-net": ["egress-research"],
+        outbound: ["egress-archon", "egress-hermes", "egress-research"],
+      });
     });
 
     test("each proxy runs non-root, with no capabilities and a read-only root filesystem and config", async () => {
@@ -225,24 +269,34 @@ describe.skipIf(!INT)("the stack's egress boundary (throwaway compose project)",
       expect(r.status).toBeLessThan(400);
     });
 
-    test("cloud metadata and other private literals are refused", async () => {
+    test("every IP-literal destination is refused here too, public or private: v4, v6, bracketed, mapped, NAT64, numeric (ruling R1)", async () => {
       expect((await p.via("research", "http://169.254.169.254/latest/meta-data/")).status).toBe(403);
-      for (const host of ["10.0.0.1", "127.0.0.1", "[::]", "[::1]", "[::ffff:10.0.0.1]", "[64:ff9b::a00:1]", "[::10.9.9.9]", "[2002:a09:909::1]", "[2001::a09:909]", "[100::1]", "[fec0::1]"]) {
+      expect((await p.via("research", "http://1.1.1.1/")).status).toBe(403);
+      for (const host of [
+        // Public: refused by ip_literal alone, since no range covers them.
+        "1.1.1.1", "203.0.113.7", "2130706433", "[2606:4700::1111]", "[::ffff:1.1.1.1]",
+        // Private and the other special ranges.
+        "10.0.0.1", "127.0.0.1", "[::]", "[::1]", "[::ffff:10.0.0.1]", "[64:ff9b::a00:1]", "[::10.9.9.9]", "[2002:a09:909::1]", "[2001::a09:909]", "[100::1]", "[fec0::1]",
+      ]) {
         expect([host, await p.raw("research-net", proxy, `CONNECT ${host}:443`)]).toEqual([host, 403]);
       }
+      for (const host of ["1.1.1.1", "[2606:4700::1111]"]) expect([host, await p.raw("research-net", proxy, `GET http://${host}/`)]).toEqual([host, 403]);
     });
 
-    test("DNS rebinding (static): a name that resolves to a private, unspecified, mapped, NAT64, 6to4, Teredo or IPv4-compatible address is refused", async () => {
-      for (const name of ["rebind", "zero", "mapped", "nat64", "sixtofour", "teredo", "compat"]) {
+    test("DNS rebinding (static): a name that resolves to a private, unspecified, mapped, NAT64, 6to4, Teredo, IPv4-compatible, metadata, loopback, discard-only or site-local address is refused by to_localnet", async () => {
+      for (const name of ["rebind", "zero", "mapped", "nat64", "sixtofour", "teredo", "compat", "metadata", "loopback", "discard", "sitelocal"]) {
         const host = `${name}.hapi.test`;
         expect([host, await p.raw("research-net", proxy, `CONNECT ${host}:443`)]).toEqual([host, 403]);
         expect([host, await p.raw("research-net", proxy, `GET http://${host}/`)]).toEqual([host, 403]);
       }
     });
 
-    test("a public address the ranges don't cover is not refused (the control: it is the ranges that refuse)", async () => {
-      // 2606:4700::1111 is public; the proxy tries it (503 with no IPv6 route, or 200 with one), never 403.
-      expect(await p.raw("research-net", proxy, "CONNECT [2606:4700::1111]:443")).not.toBe(403);
+    test("a public name that resolves to an address no range covers is not refused (the control: the ranges and ip_literal refuse, nothing else)", async () => {
+      // 1.1.1.1 and 2606:4700::1111 are public. The proxy tries each (200 with a route, 503 without one), never 403.
+      for (const host of ["public4.hapi.test", "public6.hapi.test"]) {
+        const status = await p.raw("research-net", proxy, `CONNECT ${host}:443`);
+        expect([host, status, status === 403]).toEqual([host, status, false]);
+      }
     });
 
     test("only http:// on port 80: ftp://host:80/, https://host:80/ as a GET, and port 8080 are refused", async () => {
@@ -253,12 +307,34 @@ describe.skipIf(!INT)("the stack's egress boundary (throwaway compose project)",
   });
 
   describe("no way around the proxy", () => {
-    test("a direct connection from a zone network fails, by name and by address, with the proxy up", async () => {
+    test("a direct connection from a zone network fails, by name (no DNS: curl exit 6) and by address (no route: exit 7), with the proxy up", async () => {
+      // --max-time 15: the curl image's resolver (musl) retries a SERVFAIL for 5 s before curl reports exit 6, so a
+      // 5 s limit would end in exit 28 (timed out), which proves nothing about DNS.
       for (const zone of ["archon", "hermes", "research"]) {
-        for (const url of ["https://api.anthropic.com/", "http://1.1.1.1/"]) {
-          const r = await p.curl(`${zone}-net`, url, undefined, ["--max-time", "5"]);
-          expect([zone, url, r.exit === 0, r.status]).toEqual([zone, url, false, 0]);
+        for (const [url, exit] of [["https://api.anthropic.com/", 6], ["http://1.1.1.1/", 7]] as const) {
+          const r = await p.curl(`${zone}-net`, url, undefined, ["--max-time", "15"]);
+          expect([zone, url, r.exit, r.status]).toEqual([zone, url, exit, 0]);
         }
+      }
+    }, 120_000);
+
+    test("no DNS out: a zone network's resolver answers the stack's own names, and no name outside it", async () => {
+      for (const zone of ["archon", "hermes", "research"] as const) {
+        // The control: Docker's embedded resolver works on this network, for the zone's own proxy...
+        const own = await p.inClient(`${zone}-net`, ["nslookup", `egress-${zone}`]);
+        expect([zone, own.code, /Address: \d+\.\d+\.\d+\.\d+/.test(own.stdout)]).toEqual([zone, 0, true]);
+        // ...and refuses every outside name (SERVFAIL), so DNS is no channel out of an internal network.
+        for (const name of ["example.com", "api.anthropic.com"]) {
+          const r = await p.inClient(`${zone}-net`, ["nslookup", "-type=a", name]);
+          expect([zone, name, r.code === 0, /SERVFAIL|NXDOMAIN|REFUSED/.test(r.stdout + r.stderr)]).toEqual([zone, name, false, true]);
+        }
+      }
+    }, 120_000);
+
+    test.skipIf(!ONLINE)("(internet) the DNS control: the same outside names resolve from a non-internal network", async () => {
+      for (const name of ["example.com", "api.anthropic.com"]) {
+        const r = await p.inClient("outbound", ["nslookup", "-type=a", name]);
+        expect([name, r.code]).toEqual([name, 0]);
       }
     });
 
@@ -271,9 +347,9 @@ describe.skipIf(!INT)("the stack's egress boundary (throwaway compose project)",
       await p.mustCompose(["stop", "egress-archon"]);
       try {
         expect((await p.via("archon", "https://api.anthropic.com/", ["--max-time", "5"])).status).toBe(0);
-        for (const url of ["https://api.anthropic.com/", "http://1.1.1.1/", "http://[2606:4700:4700::1111]/"]) {
-          const r = await p.curl("archon-net", url, undefined, ["--max-time", "5"]);
-          expect([url, r.exit === 0, r.status]).toEqual([url, false, 0]);
+        for (const [url, exit] of [["https://api.anthropic.com/", 6], ["http://1.1.1.1/", 7], ["http://[2606:4700:4700::1111]/", 7]] as const) {
+          const r = await p.curl("archon-net", url, undefined, ["--max-time", "15"]);
+          expect([url, r.exit, r.status]).toEqual([url, exit, 0]);
         }
       } finally {
         await p.mustCompose(["up", "-d", "--wait", "--wait-timeout", "60", "egress-archon"]);
@@ -287,6 +363,35 @@ describe.skipIf(!INT)("the stack's egress boundary (throwaway compose project)",
       await p.mustCompose(["build", "archon", "hermes"], 900_000);
       await p.mustCompose(["up", "-d", "--wait", "--wait-timeout", "240", "archon", "hermes"], 600_000);
     }, 1_200_000);
+
+    test("with the zone services up, only the proxies join outbound, and each zone service is on its own zone network only", async () => {
+      expect(await members()).toEqual({
+        "hermes-net": ["egress-hermes", "hermes"],
+        "archon-net": ["archon", "egress-archon"],
+        "research-net": ["egress-research"],
+        outbound: ["egress-archon", "egress-hermes", "egress-research"],
+      });
+      for (const service of ["hermes", "archon"] as const) {
+        const id = (await p.mustCompose(["ps", "-q", service])).trim();
+        const nets = Object.keys(JSON.parse(await must(["docker", "inspect", "--format", "{{json .NetworkSettings.Networks}}", id])));
+        expect([service, nets]).toEqual([service, [p.network(`${service}-net`)]]);
+      }
+    });
+
+    test("a zone's env file can't override hapi's own settings: compose's environment: wins, though the file says otherwise", async () => {
+      for (const service of ["hermes", "archon"] as const) {
+        // The control: the env file the container read does hold the overriding lines.
+        const file = readFileSync(join(p.xdg, "hapi", "env", `${service}.env`), "utf8");
+        for (const [k, v] of Object.entries(OVERRIDES[service])) expect(file).toContain(`${k}='${v}'\n`);
+        const env = new Map(
+          (await p.exec(service, ["env"])).stdout
+            .split("\n")
+            .filter((l) => l.includes("="))
+            .map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)] as const),
+        );
+        for (const [k, v] of Object.entries(serviceEnvironment(service))) expect([service, k, env.get(k)]).toEqual([service, k, v]);
+      }
+    });
 
     test("archon listens on loopback only: 127.0.0.1:3090 answers inside; archon:3090 (and :3000) is refused from archon-net", async () => {
       const inside = await p.exec("archon", ["curl", "-fsS", "--max-time", "5", "http://127.0.0.1:3090/api/health"]);

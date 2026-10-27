@@ -2,6 +2,8 @@
 
 Hermes talks to you through Slack, in Socket Mode, so there is no inbound endpoint (spec §9.1). This runbook sets up the workspace, the app and its three secrets. You do it by hand. The gateway itself is tried out in Plan 01 Task 13 (the Socket Mode spike) and built in Plan 04.
 
+**Do this before stage b of the stack** ([docs/runbooks/stack.md](stack.md)). `mise run up` refuses to start with an empty secret, the three Slack values included, so they must be in your store first. Nothing here needs the stack: the app's manifest comes from a one-off container of the pinned Hermes image, with no network, no gateway and no secrets.
+
 ## The workspace
 
 - **Use a dedicated Slack workspace for hapi**, not a personal or work one. **Slack's free plan is fine.**
@@ -13,15 +15,20 @@ Hermes talks to you through Slack, in Socket Mode, so there is no inbound endpoi
 
 ## The app
 
-1. **Generate the manifest from the hapi Hermes container.** Inside the container (Plan 01 Task 13, once Task 5's stack runs), run:
+1. **Generate the manifest from the pinned Hermes image**, on any machine with Docker, outside your checkout (the file holds no secret):
 
    ```bash
-   hermes slack manifest --agent-view --write
+   docker run --rm --init --network none --user 10000:10000 --read-only --cap-drop ALL \
+     --security-opt no-new-privileges:true --tmpfs /tmp --entrypoint hermes \
+     nousresearch/hermes-agent:v0.22.5@sha256:9c5561579f3ffdf333401797094ac3a743738d6c25d40f4331c7bf77b694238d \
+     slack manifest --agent-view > slack-manifest.json
    ```
 
-   It writes `slack-manifest.json` in that Hermes's home directory. **Never generate it from your personal Hermes** (`~/.hermes`). The manifest lists the commands of the Hermes that made it, and your personal Hermes is never pointed at hapi (spec §9.1, Coexistence).
+   - The image is the stack's own: the `FROM` line of `stack/hermes/Dockerfile`, tag and digest (a test keeps the two equal). The container is hardened like the stack's `hermes` service, has no network at all, and runs no gateway; `hermes slack manifest` without `--write` prints the manifest to stdout. Checked on 2026-10-27 with that digest: it exits 0, prints the manifest (Socket Mode on, 50 slash commands), and needs nothing else.
+   - **Never generate it from your personal Hermes** (`~/.hermes`). The manifest lists the commands of the Hermes that made it, and your personal Hermes is never pointed at hapi (spec §9.1, Coexistence).
+   - It lists the commands built into Hermes v0.22.5. When Plan 04 adds hapi's own commands, regenerate it from the running stack (`docker compose -p hapi exec hermes hermes slack manifest --agent-view`, as hapi) and update the app's manifest (**Features → App Manifest**).
 2. **Create the app from it:** at api.slack.com/apps, choose **Create New App → From a manifest**, pick the hapi workspace, and paste the manifest.
-3. **Scopes:** first try without any `files:*` scope. Hermes posts links and summaries, not files. Add a `files:*` scope only if a feature turns out to need it.
+3. **Scopes:** first try without any `files:*` scope. Hermes posts links and summaries, not files. The manifest asks for `files:read` and `files:write` under `oauth_config.scopes.bot`: delete both before you paste it. Add a `files:*` scope only if a feature turns out to need it.
 4. **App Home → Show Tabs:** turn on the **Messages Tab**, and allow users to send messages from it. Without that, you can't DM the bot.
 5. **Socket Mode** is on in the manifest. Under **Basic Information → App-Level Tokens**, create a token with the `connections:write` scope. That is `SLACK_APP_TOKEN` (`xapp-...`).
 6. **Install the app to the workspace.** The **Bot User OAuth Token** on the OAuth page is `SLACK_BOT_TOKEN` (`xoxb-...`).
@@ -30,7 +37,7 @@ Hermes talks to you through Slack, in Socket Mode, so there is no inbound endpoi
 
 ## The secrets
 
-Add all three to your secrets store (`mise run secrets:edit`) under these logical names ([docs/secrets.md](../secrets.md#adding-a-secret)). `stack/secrets.yaml` already puts them in the `hermes` zone:
+Add all three to your secrets store (`mise run secrets:edit`), before stage b, under these logical names ([docs/secrets.md](../secrets.md#adding-a-secret)). `stack/secrets.yaml` already puts them in the `hermes` zone:
 
 | Env var | Logical name | Value |
 |---|---|---|

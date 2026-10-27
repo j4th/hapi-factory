@@ -12,10 +12,14 @@
 #   archon    archon-net    egress-archon     archon  (the run engine; Pi runs inside it)
 #   research  research-net  egress-research   none yet: the hapi-research container is Plan 04's
 #
-# Secrets. Each zone service reads only its own zone's env file,
+# Secrets. Each zone service's one env_file is its own zone's secrets,
 # $XDG_RUNTIME_DIR/hapi/env/<zone>.env, which `hapi secrets resolve` writes on the
 # user's tmpfs (docs/secrets.md#the-env-files). The host zone's file holds the
-# GitHub App keys and is never given to a container.
+# GitHub App keys and is never given to a container. Everything else a zone
+# service is given, the proxy variables and the generated hardening settings, is
+# in its `environment:`, which Compose puts above env_file, so no secret can
+# override it; src/stack/env.ts is the list, tests/stack/compose.test.ts checks
+# this file against it, and the manifest may not name any of it (docs/secrets.md).
 #
 # Hardening, on every service: no capabilities, no new privileges, a non-root user,
 # pid and memory limits, a read-only root filesystem (writable paths are tmpfs or a
@@ -41,8 +45,9 @@ x-hardening: &hardening
     org.hapi.stack: hapi-factory
     # Who started the stack, and whether HAPI_ALLOW_CURRENT_USER bypassed the hapi
     # user (a dev-only downgrade); set by `hapi stack up`, read by Task 6's audit.
-    org.hapi.started-by: ${HAPI_STARTED_BY:-}
-    org.hapi.dev-override: ${HAPI_DEV_OVERRIDE:-0}
+    # A stack started any other way (a raw `docker compose up`) says `unknown`.
+    org.hapi.started-by: ${HAPI_STARTED_BY:-unknown}
+    org.hapi.dev-override: ${HAPI_DEV_OVERRIDE:-unknown}
     # A digest of build/, set by `hapi stack up`. Compose recreates a container when its
     # config changes, but not when only a bind-mounted file does; this label is how a
     # policy change reaches a running proxy, Hermes and Archon.
@@ -108,6 +113,8 @@ services:
     <<: *hardening
     build: { context: ./hermes }
     image: hapi-factory/hermes:v0.22.5
+    # A local build, never a registry pull of hapi-factory/*, whatever command starts it.
+    pull_policy: build
     command: ["gateway", "run"]
     # The image's hermes user. Its s6-overlay init accepts that UID (any other is
     # refused) and then skips its root-only bootstrap (UID remap, volume chown), so
@@ -119,9 +126,13 @@ services:
       # Exception: exec, because s6-overlay's init runs its programs from /run.
       - /run:exec,size=64m,uid=10000,gid=10000,mode=0755
       - /tmp:size=512m,uid=10000,gid=10000,mode=1777
+    # The hermes zone's secrets only.
     env_file:
       - ${XDG_RUNTIME_DIR:?set XDG_RUNTIME_DIR to your own runtime dir, e.g. /run/user/<uid> (docs/runbooks/stack.md)}/hapi/env/hermes.env
+    # Above env_file: serviceEnvironment("hermes") in src/stack/env.ts.
     environment:
+      # Where Hermes reads its read-only generated config; the image sets it too.
+      HERMES_HOME: /opt/data
       HTTP_PROXY: http://egress-hermes:3128
       HTTPS_PROXY: http://egress-hermes:3128
       http_proxy: http://egress-hermes:3128
@@ -147,25 +158,34 @@ services:
 
   # Archon, the run engine (spec §9.2), with Pi in-process (§9.3): the pinned
   # official image plus baked toolchains (stack/archon/Dockerfile), so runs need no
-  # GitHub egress. Its server listens on 127.0.0.1:3090 only (HOST in archon.env)
+  # GitHub egress. Its server listens on 127.0.0.1:3090 only (HOST below)
   # and has no auth in SQLite mode, so nothing outside this container reaches it.
   archon:
     <<: *hardening
     build: { context: ./archon }
     image: hapi-factory/archon:0.12.1
+    pull_policy: build
     # The image's appuser. Its entrypoint skips the root-only chown and gosu then.
     user: "1001:1001"
     pids_limit: 2048
     mem_limit: 4g
     tmpfs:
       - /tmp:size=1g,uid=1001,gid=1001,mode=1777
-    # The generated, non-secret settings first, then the archon zone's secrets.
+    # The archon zone's secrets only.
     env_file:
-      - ../build/archon/archon.env
       - ${XDG_RUNTIME_DIR:?set XDG_RUNTIME_DIR to your own runtime dir, e.g. /run/user/<uid> (docs/runbooks/stack.md)}/hapi/env/archon.env
+    # Above env_file: serviceEnvironment("archon") in src/stack/env.ts. The six from HOST
+    # to PI_CODING_AGENT_DIR are build/archon/archon.env's settings (ARCHON_ENV in
+    # src/generate/archon.ts), set here so that no secret can override them.
     environment:
       # Archon's home is /.archon (the run DB, workspaces, worktrees), as in its own compose file.
       ARCHON_DOCKER: "true"
+      HOST: 127.0.0.1
+      ARCHON_TELEMETRY_DISABLED: "1"
+      DO_NOT_TRACK: "1"
+      PI_OFFLINE: "1"
+      PI_TELEMETRY: "0"
+      PI_CODING_AGENT_DIR: /opt/hapi/pi-agent
       HTTP_PROXY: http://egress-archon:3128
       HTTPS_PROXY: http://egress-archon:3128
       http_proxy: http://egress-archon:3128
@@ -177,7 +197,7 @@ services:
       # $HOME: Claude Code and Pi session state, ~/.gitconfig.
       - archon-home:/home/appuser
       - ../build/archon/config.yaml:/.archon/config.yaml:ro
-      # PI_CODING_AGENT_DIR (archon.env): Pi's models.json and hapi-guard.json, read-only.
+      # PI_CODING_AGENT_DIR (above): Pi's models.json and hapi-guard.json, read-only.
       # The path is PI_AGENT_DIR in src/generate/archon.ts; tests/stack/compose.test.ts keeps them equal.
       - ../build/pi:/opt/hapi/pi-agent:ro
     networks:

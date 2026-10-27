@@ -15,7 +15,7 @@ This runbook covers running the hapi-factory stack (spec §4.3, §9, §10, §11.
 It runs in two stages:
 
 - **Stage a (done in Plan 01 Task 5):** the files below were written, and the integration tests ran on the build host's rootful Docker as an ordinary user. That run covered the egress proxies and networks, plus Hermes and Archon started with fake secrets. No real secret was used, and `scripts/host-setup.sh` was not run.
-- **Stage b (the operator, later):** sections 1–4 on the real host, as the `hapi` user on rootless Docker, then `mise run test:int` there. It may run while the stack is up, because it never touches the running stack or the checkout's `build/` ([what the tests prove](#what-the-tests-prove)).
+- **Stage b (the operator, later):** first the Slack app ([docs/runbooks/slack.md](slack.md)), with its three values in your store: `mise run up` refuses an empty secret, and the app's manifest needs no stack (a one-off `docker run` of the pinned Hermes image with no network). Then sections 1–4 on the real host, as the `hapi` user on rootless Docker, then `mise run test:int` there. It may run while the stack is up, because it never touches the running stack or the checkout's `build/` ([what the tests prove](#what-the-tests-prove)).
 
 Every command marked *as hapi* runs in a shell of the `hapi` user (`sudo -iu hapi`). The other commands run as the operator, from the operator's own checkout.
 
@@ -33,13 +33,14 @@ Every command marked *as hapi* runs in a shell of the `hapi` user (`sudo -iu hap
 
 The research zone's own container, hapi-research, arrives in Plan 04. Task 5 ships its network, its proxy and its tests.
 
-- **The zone networks are `internal`.** A container on one has no route out and no external DNS. Its only way out is its zone's proxy, through `HTTP_PROXY` and `HTTPS_PROXY` (in both cases) set to `http://egress-<zone>:3128`. Loopback goes direct (`NO_PROXY=localhost,127.0.0.1,::1`).
+- **The zone networks are `internal`.** A container on one has no route out and no external DNS: Docker's embedded resolver answers the stack's own names there, and `SERVFAIL` for every other, even one the host's own resolver answers locally (checked on Docker 29.9.2; the integration test checks it each run). Its only way out is its zone's proxy, through `HTTP_PROXY` and `HTTPS_PROXY` (in both cases) set to `http://egress-<zone>:3128`. Loopback goes direct (`NO_PROXY=localhost,127.0.0.1,::1`).
 - **Only the proxies join `outbound`**, and they can't reach each other on it (`enable_icc=false`).
 - **No service publishes a port.**
-  - Archon's server listens on `127.0.0.1:3090` inside its container (`HOST` in `archon.env`). It has no auth in SQLite mode.
+  - Archon's server listens on `127.0.0.1:3090` inside its container (`HOST`, in its `environment:`). It has no auth in SQLite mode.
   - The Hermes gateway uses Slack Socket Mode, so it has no inbound endpoint. Its API listens on `127.0.0.1:8642` inside its container.
   - To reach either one, `docker compose -p hapi exec` into the container.
-- **Secrets.** Each zone service reads only its own zone's env file, `$XDG_RUNTIME_DIR/hapi/env/<zone>.env` ([docs/secrets.md](../secrets.md#the-env-files)). `host.env` holds the GitHub App keys and goes to no container.
+- **Secrets.** Each zone service's only `env_file` is its own zone's, `$XDG_RUNTIME_DIR/hapi/env/<zone>.env` ([docs/secrets.md](../secrets.md#the-env-files)). `host.env` holds the GitHub App keys and goes to no container.
+- **hapi's own settings are in `environment:`**, which Compose puts above `env_file`: the proxy variables, Hermes's `HERMES_HOME`, and for Archon `ARCHON_DOCKER` plus the six settings of `build/archon/archon.env` (`HOST`, `ARCHON_TELEMETRY_DISABLED`, `DO_NOT_TRACK`, `PI_OFFLINE`, `PI_TELEMETRY`, `PI_CODING_AGENT_DIR`). So no secret can override one, and the secrets manifest may not name one at all ([docs/secrets.md](../secrets.md#the-manifest-stacksecretsyaml)). `src/stack/env.ts` is the list; a unit test checks `stack/compose.yaml` against it.
 - **State** lives in three named volumes:
   - `hermes-data`: Hermes's home (sessions, memories, skills);
   - `archon-data`: `/.archon` (the run DB, workspaces, worktrees);
@@ -55,7 +56,7 @@ The host admin does this once, with `sudo`. No agent ever runs it.
 sudo scripts/host-setup.sh [source]
 ```
 
-`source` is where the `hapi` user's checkout is cloned from. It defaults to your checkout's `origin` remote. Until hapi-factory is pushed (Plan 01 Task 7b), there is no remote, so pass your checkout's path: `sudo scripts/host-setup.sh "$PWD"`. A local path is copied, never hardlinked. Once the GitHub remote exists, point hapi's checkout at it, as hapi: `git -C ~/hapi-factory remote set-url origin <url>`.
+`source` is where the `hapi` user's checkout is cloned from. It defaults to your checkout's `origin` remote. Until hapi-factory is pushed (Plan 01 Task 7b), there is no remote, so pass your checkout's path: `sudo scripts/host-setup.sh "$PWD"`. A local path is copied, never hardlinked. Once the GitHub remote exists, point hapi's checkout at it, as hapi: `git -C ~/hapi-factory remote set-url origin <url>`. A URL is cloned by hapi itself, so with hapi's credentials, not yours or root's: if your `origin` is an SSH URL, pass the HTTPS one (`sudo scripts/host-setup.sh https://github.com/<owner>/hapi-factory.git`).
 
 The script runs with `set -euo pipefail` and refuses to run without root. Each step is skipped when it is already done, so a second run changes nothing. The steps:
 
@@ -63,8 +64,8 @@ The script runs with `set -euo pipefail` and refuses to run without root. Each s
 2. **Installs the rootless Docker prerequisites** if they are missing, with apt: `uidmap`, `docker-ce-rootless-extras` and `dbus-user-session`.
 3. **Turns on lingering** (`loginctl enable-linger hapi`). hapi's systemd user manager, its `/run/user/<uid>` (its `XDG_RUNTIME_DIR`) and its Docker then keep running without a login, and across reboots.
 4. **Sets up rootless Docker for hapi** (`dockerd-rootless-setuptool.sh install`) as a user service, and checks that `docker info` says `rootless`.
-5. **Installs mise for hapi.** It downloads the release that `mise.toml`'s `min_version` names and checks it against a SHA-256 pinned in the script. Nothing is piped to a shell.
-6. **Clones hapi-factory** into `/home/hapi/hapi-factory`, owned by hapi.
+5. **Installs mise for hapi.** It downloads the release that `mise.toml`'s `min_version` names into root's own temp file and checks it against a SHA-256 pinned in the script. Nothing is piped to a shell. Then hapi installs it: a process running as hapi reads it on stdin into `~/.local/bin` under a temp name, makes it executable, renames it into place, checks its version, and adds mise's activate line to its own `~/.bashrc`.
+6. **Makes hapi's checkout,** `~hapi/hapi-factory`, in a directory hapi creates itself, so a path that already exists (a dangling symlink included) stops the script. A URL is cloned by hapi. A local path is cloned by root, `--no-local`, into root's own temp dir, then streamed to a `tar` running as hapi, which unpacks it; the temp dir is removed however the script ends.
 7. **Prints the next steps**, which are sections 2 and 3 below.
 
 **Check it.** The output must contain `rootless`:
@@ -89,12 +90,13 @@ cd ~/hapi-factory && mise trust && mise install && mise run setup
 
 The `hapi` user is another user, so it gets its **own** age key to the store, never a copy of yours ([docs/secrets.md](../secrets.md#keys-and-recovery)).
 
-1. **Give hapi a copy of the store**, as the operator, from your checkout. The store, its recipients file and `recovery.age` live in your `private/`:
+1. **Give hapi a copy of the store**, as yourself (not root), from your checkout. The store, its recipients file and `recovery.age` live in your `private/`:
 
    ```bash
-   sudo install -d -o hapi -g hapi -m 0700 /home/hapi/.config /home/hapi/.config/hapi
-   sudo install -o hapi -g hapi -m 0600 private/secrets.enc.yaml private/secrets.recipients.yaml private/recovery.age /home/hapi/.config/hapi/
+   scripts/copy-secrets-to-hapi.sh
    ```
+
+   It packs the three files with `tar` and pipes them to a `tar` running as hapi (`sudo -u hapi -H`, the one thing it asks sudo for), which makes `~/.config/hapi` (mode `0700`) and writes them there (mode `0600`). Root never writes into hapi's home ([why](#hardening)), so there is no `sudo install` step.
 
 2. **Make hapi's key**, as hapi (with `XDG_RUNTIME_DIR` exported):
 
@@ -107,7 +109,7 @@ The `hapi` user is another user, so it gets its **own** age key to the store, ne
 
 3. **Add hapi's key to the store**, as the operator: run the printed command (`mise run secrets:add-machine -- --name hapi --recipient age1pq1...`). It re-keys the store and updates its recipients file, so commit and push `private/` as usual.
 
-4. **Copy the updated store to hapi again** (the same `install` line as step 1). Then, as hapi:
+4. **Copy the updated store to hapi again** (`scripts/copy-secrets-to-hapi.sh`, as in step 1). Then, as hapi:
 
    ```bash
    mise run secrets:check     # every secret found, hapi among the recipients
@@ -118,11 +120,11 @@ The `hapi` user is another user, so it gets its **own** age key to the store, ne
 You keep editing your own copy (`mise run secrets:edit` in `private/`). hapi's copy doesn't change on its own. After each edit, rotation or recipient change, copy all three files again, then restart the stack so it resolves the new values:
 
 ```bash
-sudo install -o hapi -g hapi -m 0600 private/secrets.enc.yaml private/secrets.recipients.yaml private/recovery.age /home/hapi/.config/hapi/
+scripts/copy-secrets-to-hapi.sh
 mise run up        # re-resolves, and recreates any container whose env file changed
 ```
 
-Copy the three files together. `secrets:check` refuses a recipients file that disagrees with the store, or a `recovery.age` other than the one it records.
+The helper always copies the three files together. `secrets:check` refuses a recipients file that disagrees with the store, or a `recovery.age` other than the one it records.
 
 ## 4. mise run up and mise run down
 
@@ -145,7 +147,7 @@ mise run down
 2. **Policy build:** `buildAll` writes `build/` ([docs/generated-configs.md](../generated-configs.md)). A digest of `build/` becomes a label on every container (`org.hapi.build-sha256`). Compose recreates a container whose config changed, but not one whose bind-mounted file changed. With the label, a policy change still reaches the running proxies, Hermes and Archon.
 3. **Secrets:** exactly `hapi secrets resolve`. It loads the local config, builds its provider, resolves every name into memory, then writes the zone env files as one set ([docs/secrets.md](../secrets.md#hapi-secrets-resolve)). A missing or empty secret, a provider failure or a missing pinned age stops it here, naming the secret or the fix.
 4. **`docker compose up --no-start --build`:** builds the two images, and creates the networks and containers without starting any.
-5. **The network check:** each zone network must be internal, with every subnet inside the proxies' `zone_clients` ranges (10/8, 172.16/12, 192.168/16, fc00::/7, fe80::/10). Otherwise it removes what step 4 made and stops.
+5. **The network check:** each zone network must be internal, with every subnet inside the proxies' `zone_clients` ranges (10/8, 172.16/12, 192.168/16, fc00::/7, fe80::/10). If a check fails, or can't be made (`docker network inspect` exits non-zero, which the error reports with its exit code and stderr, or prints something unreadable), it removes what step 4 made (`docker compose -p hapi down`) and stops. Nothing is left started or created.
 6. **`docker compose up -d --wait`:** starts the stack, and waits up to 5 minutes for every health check to pass. If one fails, `up` fails and says where to look; the containers are left for you to inspect.
 
 **`mise run down`** is `hapi stack down`, which runs `docker compose -p hapi down`. It goes by project name, so it needs no compose file, `build/` or `XDG_RUNTIME_DIR`, and it works whatever state the checkout is in. It keeps the volumes. As any other user, it re-execs as hapi, as `up` does.
@@ -161,7 +163,7 @@ HAPI_ALLOW_CURRENT_USER=1 mise run up
 With this set, `up` and `down` skip the re-exec and run the stack as **you**, on your own Docker. This is a **dev-only downgrade**: there is no dedicated user, and on a rootful host there is no rootless Docker. It exists for development and for the stage-a tests.
 
 - `up` prints a warning.
-- Every container is labelled `org.hapi.dev-override=1` and `org.hapi.started-by=<you>`.
+- Every container is labelled `org.hapi.dev-override=1` and `org.hapi.started-by=<you>`. (`up` as hapi sets `0` and `hapi`; a stack started some other way, such as a raw `docker compose up`, says `unknown` for both.)
 - `hapi audit` (Plan 01 Task 6) reports it, through `currentUserOverride(env)` in `src/stack/up.ts`.
 - Only exactly `1` turns it on. It means nothing for the hapi user itself.
 
@@ -227,6 +229,12 @@ Every service has these settings (`x-hardening` in `stack/compose.yaml`):
 
 Writable paths are size-capped tmpfs or named volumes.
 
+Three more rules hold for the whole stack:
+
+- **Root never acts on a path inside hapi's home.** hapi runs the agent stack, so it is less trusted than root, and it may have planted a symlink anywhere in its home (`~/.bashrc` pointing at `/etc/sudoers`, `~/.local/bin` at `/usr/local/bin`). Root writing, creating, chowning or chmodding a path there would follow it, and `scripts/host-setup.sh` is meant to be run again. So root never does: it hands bytes to a process running as hapi (`sudo -u hapi -H -- sh -c ...` reading stdin, or `tar ... | sudo -u hapi -H -- tar -x`), the kernel checks hapi's own permissions, and a planted symlink reaches only what hapi could already write. `scripts/host-setup.sh` installs mise and makes the checkout that way, and `scripts/copy-secrets-to-hapi.sh` hands over the secrets store; no doc tells you to `sudo install` or `chown` anything there. `tests/scripts/hapi-home.test.ts` checks the scripts and the docs for it.
+- **A secret can't change a hardening setting.** Each zone service's settings are in its `environment:`, above its only `env_file` (the zone's secrets), and the manifest may not use their names ([what runs](#what-runs)).
+- **Hermes and Archon are only ever built, never pulled** (`pull_policy: build`), so even a raw `docker compose up` or `pull` never asks a registry for an image named `hapi-factory/*`.
+
 | Service | User | Writable | Limits | Health check |
 |---|---|---|---|---|
 | `egress-*` | `584792` (the rock's `_daemon_`) | tmpfs `/var/spool/squid`, `/var/log/squid`, `/tmp` (16 MB each; Squid writes nothing to them: no cache dir, logs on stdout, no pid file) | 64 pids, 256 MB | Port 3128 accepts a connection (perl; the rock has no curl or bash) |
@@ -248,7 +256,11 @@ Spike T12 re-checks these settings under rootless Docker. If it relaxes one, it 
 | `required variable XDG_RUNTIME_DIR is missing a value` | You ran `docker compose` (not `mise run up`) in a shell without `XDG_RUNTIME_DIR`. Run `export XDG_RUNTIME_DIR=/run/user/$(id -u)`. |
 | `XDG_RUNTIME_DIR is not set` or `... does not exist` from `secrets:*` or `up` | The same, or lingering is off: run `loginctl show-user hapi -p Linger` (should say `yes`), then re-run `scripts/host-setup.sh`. |
 | `` `mise where age` failed ... run `mise install` in the hapi-factory checkout `` | hapi's checkout isn't trusted or installed. As hapi: `cd ~/hapi-factory && mise trust && mise install`. |
-| `hermes/SLACK_BOT_TOKEN (...) is empty` | Every secret in `stack/secrets.yaml` must have a value before anything starts, the three Slack values included. They come from the Slack app, which Plan 01 Task 13 creates. Until then the stack can't start (see [the open item](#open-items)). |
+| `hermes/SLACK_BOT_TOKEN (...) is empty` | Every secret in `stack/secrets.yaml` must have a value before anything starts, the three Slack values included. Make the Slack app first ([docs/runbooks/slack.md](slack.md): its manifest comes from a one-off `docker run` of the pinned Hermes image), add its three values to your store, run `scripts/copy-secrets-to-hapi.sh`, then `mise run up`. |
+| `docker network inspect hapi_hermes-net ... exited 1: ...` | `up` couldn't read the zone networks, so it removed what it had created. The rest of the message is Docker's own error: a daemon that isn't running (as hapi: `systemctl --user status docker`), or a network Compose didn't make. |
+| `stack/secrets.yaml: /<zone>/<NAME>: <NAME> is reserved` | The manifest names an env var hapi sets in the containers itself (`HOST`, `HTTPS_PROXY`, `PI_OFFLINE`, ...). Give the secret another env name ([docs/secrets.md](../secrets.md#the-manifest-stacksecretsyaml)). |
+| `host-setup: error: hapi could not clone <url>` | hapi clones a URL source with its own credentials. Pass the HTTPS URL, not an SSH one. |
+| `host-setup: error: hapi's ~/hapi-factory exists but is not a git checkout` | Something is at that path already (a file, a directory, or a symlink, even a dangling one). As hapi, move it away, then run the script again. |
 | `zone network hapi_<zone>-net has subnet ..., outside the proxies' zone_clients ranges` | This host's Docker `default-address-pools` hands out non-private ranges. Set the pools to private ranges (hapi's `~/.config/docker/daemon.json` under rootless Docker), restart its Docker, then run `mise run up`. |
 | `zone network ... is not internal` | Someone edited `stack/compose.yaml`. Restore `internal: true`; `tests/stack/compose.test.ts` fails on this too. |
 | Pulling `ubuntu/squid` fails with `lchown ...: invalid argument` (rootless) | hapi's subordinate ID range is narrower than uid 584792. Check `grep hapi /etc/subuid /etc/subgid` (each should be 1048576 wide), re-run `scripts/host-setup.sh`, then restart hapi's Docker. |
@@ -258,7 +270,7 @@ Spike T12 re-checks these settings under rootless Docker. If it relaxes one, it 
 
 ### Open items
 
-- **The Slack values before Task 13.** `resolve` refuses an empty secret, and the Slack app (its tokens) is made in spike T13 from the running Hermes container. So stage b needs the order settled first: make the Slack app before stage b (its manifest from a one-off `docker run` of the pinned Hermes image), or another ruling.
+- **A `$` in an argument to the re-exec (H-148).** `sudo -i` escapes every character of the command for hapi's login shell except letters, digits, `_`, `-` and `$` (sudo(8)), so that shell expands a `$` in an argument you pass to `mise run up --` (a `--config` path, say), as hapi, before `up` sees it; the single quotes `up` adds don't protect it. Until it is fixed, pass no argument holding a `$` to `up` from another account, or run `mise run up` in a shell of hapi's own.
 - **Not yet run on the real host:** host setup, rootless Docker, the subordinate ID range, lingering, kill switch 4 and the whole stack under hapi. That is stage b, and spike T12 runs alongside it.
 
 ## What the tests prove
@@ -267,13 +279,16 @@ Spike T12 re-checks these settings under rootless Docker. If it relaxes one, it 
 
 | Test | What it proves |
 |---|---|
-| `tests/stack/compose.test.ts` | It reads `stack/compose.yaml` and the Dockerfiles. There are exactly five services. The zone networks are internal, and only the proxies join `outbound`. No ports are published. Every service has the full hardening set (no capabilities, no new privileges, non-root, limits, read-only, health checks, the labels). Every image, `FROM` and `COPY --from` is pinned by tag and digest, at Hermes v0.22.5 and Archon 0.12.1. Each zone service gets only its own zone's env file, never `host.env`. Each gets proxy variables for its own proxy, and starts after that proxy is healthy. Archon mounts `build/pi` read-only at exactly `PI_AGENT_DIR`. |
-| `tests/stack/up.test.ts` | The order of `up`: build, secrets, create, the network check, start. A failed secret, policy build or pinned-age lookup starts nothing (the last through the real `resolve` path). A non-internal or non-private zone network removes what was created. The re-exec as hapi uses exact quoting and passes on the exit code. The dev bypass warns and labels. `currentUserOverride` turns on only with exactly `1`. The build digest covers each generated file. `down` works by project name. Usage errors exit 2. |
+| `tests/stack/compose.test.ts` | It reads `stack/compose.yaml` and the Dockerfiles. There are exactly five services. The zone networks are internal, and only the proxies join `outbound`. No ports are published. Every service has the full hardening set (no capabilities, no new privileges, non-root, limits, read-only, health checks, the labels, which default to `unknown`). Every image, `FROM` and `COPY --from` is pinned by tag and digest, at Hermes v0.22.5 and Archon 0.12.1, and the two built images have `pull_policy: build`. Each zone service's only env file is its own zone's, never `host.env`. Its `environment:` is exactly `serviceEnvironment` (`src/stack/env.ts`), every name in it reserved, archon's holding every setting of the generated `archon.env`. Each gets proxy variables for its own proxy, and starts after that proxy is healthy. Archon mounts `build/pi` read-only at exactly `PI_AGENT_DIR`. |
+| `tests/stack/up.test.ts` | The order of `up`: build, secrets, create, the network check, start. A failed secret, policy build or pinned-age lookup starts nothing (the last through the real `resolve` path). A non-internal or non-private zone network removes what was created, and so does a check that can't be made: a failed `docker network inspect` (its exit code and stderr in the error, never "does not exist"), output that isn't a JSON array, or a subnet the CIDR parser rejects. When that removal fails too, the error says so. The re-exec as hapi uses exact quoting and passes on the exit code. The dev bypass warns and labels. `currentUserOverride` turns on only with exactly `1`. The build digest covers each generated file. `down` works by project name. Usage errors exit 2. |
 | `tests/stack/cidr.test.ts` | The CIDR maths behind the network check and the `to_localnet` overlap check. |
-| `tests/scripts/host-setup.test.ts` | It never runs the script. `bash -n` parses it, and shellcheck lints it when on PATH. It is in strict mode, and every step runs after the root check. Each step checks before it acts. The subordinate ID range covers uid 584792. Docker is rootless and lingering is on. mise is pinned to `min_version`, checked by SHA-256, and never piped to a shell. The checkout goes where `up` re-execs. The next steps are printed. |
-| `tests/generate/egress.test.ts` | The proxies' new `to_localnet` ranges (`::/96`, `2002::/16`, `2001::/32`, `100::/64`, `fec0::/10`). No range covers another, so `squid -k parse` stays clean. `pinger_enable off` is set, and the NAT64 trade-off is noted. |
+| `tests/scripts/host-setup.test.ts` | It never runs the script. `bash -n` parses it, and shellcheck lints it when on PATH. It is in strict mode, and every step runs after the root check. Each step checks before it acts. The subordinate ID range covers uid 584792. Docker is rootless and lingering is on. mise is pinned to `min_version`, checked by SHA-256, never piped to a shell, and reaches hapi on stdin. The checkout goes where `up` re-execs, made by hapi. The next steps are printed, with the secrets helper. |
+| `tests/scripts/hapi-home.test.ts` | [Root never acts on hapi's home](#hardening). The root-side code of `host-setup.sh` and `copy-secrets-to-hapi.sh` (everything but the snippets they hand to hapi's `sh`) names no path in hapi's home and runs no `install`, `chown`, `chmod`, `mkdir`, `>>` or the like; every sudo runs as hapi; nothing given to `sudo -i` holds a `$`. No doc (README, `docs/secrets.md`, the runbooks) has a root `sudo` on a hapi-home path, or an `install` or `chown` that hands a file to hapi. The controls: the old lines are caught. Then the snippets hapi runs are run as this user in a temp `HOME`: the checkout refuses a dangling symlink and follows nothing; a failed clone leaves nothing; mise is renamed into place at `0755`; the activate line is added once; the helper, with `sudo` and `id` stood in, writes the three files at `0600` in a `0700` dir. |
+| `tests/docs/slack-manifest.test.ts` | The Slack runbook's manifest command runs exactly `stack/hermes/Dockerfile`'s pinned image, with `--network none`, as its user, read-only, and prints to stdout. |
+| `tests/secrets/manifest.test.ts` (the reserved names) | A manifest env name hapi sets itself (`HOST`, `HTTPS_PROXY`, `PI_OFFLINE`, `ALL_PROXY`, ...) is refused in any zone, naming each, by `loadManifest` and for a manifest built in code, before resolve fetches anything. The set is pinned, and the committed manifest uses none. |
+| `tests/generate/egress.test.ts` | The proxies' new `to_localnet` ranges (`::/96`, `2002::/16`, `2001::/32`, `100::/64`, `fec0::/10`). No range covers another, so `squid -k parse` stays clean. `pinger_enable off` is set, and the NAT64 trade-off is noted. Every zone, the research zone included, refuses IP literals (`ip_literal`) before any allow. |
 
-`mise run test:int` (`HAPI_INT=1`) runs every `*.int.test.ts`. It needs Docker, and the internet for the tests marked so; offline, those are skipped with a warning. Each run builds its own Compose project, `hapi-int-<random>`, from a byte-for-byte copy of `stack/` in a temp dir. It uses fake secrets written by hapi's own resolver, plus a test override that only plants `/etc/hosts` names on the proxies, blanks Hermes's Slack tokens and gives the images it builds project-named tags. Afterwards it removes every container, network, volume and image it made, and checks that none is left.
+`mise run test:int` (`HAPI_INT=1`) runs every `*.int.test.ts`. It needs Docker, and the internet for the tests marked so; offline, those are skipped with a warning. Each run builds its own Compose project, `hapi-int-<random>`, from a byte-for-byte copy of `stack/` in a temp dir. It uses fake secrets written by hapi's own resolver, then appends lines to those env files that try to override hapi's own settings, plus a test override that only plants `/etc/hosts` names on the proxies, blanks Hermes's Slack tokens and gives the images it builds project-named tags. Afterwards it removes every container, network, volume and image it made, and checks that none is left.
 
 It never touches a running stack, so you can run it while the `hapi` project is up:
 
@@ -285,7 +300,7 @@ It does start a second Hermes and Archon, with fake keys, so allow for their mem
 
 | Test (`tests/stack/egress.int.test.ts`) | What it proves |
 |---|---|
-| the networks | The zone networks Docker makes are internal and inside `zone_clients`, and only the three proxies are on `outbound`. Each proxy runs non-root, with no capabilities. Its root and its config are read-only, and so are its mounts; see [how the read-only checks work](#how-the-read-only-checks-work). |
+| the networks | The zone networks Docker makes are internal and inside `zone_clients`, and only the three proxies are on `outbound` (checked again once Hermes and Archon are up, below). Each proxy runs non-root, with no capabilities. Its root filesystem and its config bind mount are read-only; its tmpfs mounts (`/tmp`, `/var/spool/squid`, `/var/log/squid`) are read-write, the control. See [how the read-only checks work](#how-the-read-only-checks-work). |
 | `egress: allowed host via proxy succeeds` (archon and hermes; internet) | `api.anthropic.com` tunnels through its zone's proxy, `API.Anthropic.COM` too. |
 | `egress: disallowed host via proxy is denied` | A host off the allowlist gets `403`: `github.com` for archon, `example.com` for hermes. |
 | every IP-literal destination is refused | `203.0.113.7`, `1.2.3.4`, `[2001:db8::1]`, `[::ffff:1.2.3.4]`, `[::ffff:203.0.113.7]`, `[::]`, `[::1]`, `[64:ff9b::1.2.3.4]` and `2130706433` all get `403` in both allowlisted zones. They are sent raw, so curl normalises nothing. |
@@ -294,12 +309,15 @@ It does start a second Hermes and Archon, with fake keys, so allow for their mem
 | the forge (internet) | hermes reaches `github.com`; archon gets `403` for `github.com` and `api.github.com`. |
 | PTR bypass | Two throwaway proxies on archon-net, each with `203.0.113.7` → `api.anthropic.com` planted (which Squid also uses for reverse lookups). The control proxy, without `-n` and `ip_literal`, tunnels `CONNECT 203.0.113.7:443`. The real config refuses it with `403` before any connection. |
 | research: public hosts (internet) | HTTPS and `GET http://example.com/` work. |
-| research: private literals | `169.254.169.254`, `10.0.0.1`, `127.0.0.1`, `[::]`, `[::1]`, `[::ffff:10.0.0.1]`, `[64:ff9b::a00:1]` and the new ranges' `[::10.9.9.9]`, `[2002:a09:909::1]`, `[2001::a09:909]`, `[100::1]`, `[fec0::1]` are all refused. |
-| DNS rebinding (static) | Names planted on the research proxy that resolve to `10.9.9.9`, `::`, `::ffff:10.9.9.9`, NAT64, 6to4, Teredo and IPv4-compatible addresses are refused by `to_localnet`, for both CONNECT and GET. A rebinding test with a live 0-TTL resolver is the next level, in the threat model (H-045). |
-| research: the control | A public IPv6 address the ranges don't cover is not refused, so it is the ranges that refuse. |
+| research: IP literals | Every IP-literal destination is refused here too, as in the allowlisted zones: public ones (`1.1.1.1`, `203.0.113.7`, `2130706433`, `[2606:4700::1111]`, `[::ffff:1.1.1.1]`) and private ones (`169.254.169.254`, `10.0.0.1`, `127.0.0.1`, `[::]`, `[::1]`, `[::ffff:10.0.0.1]`, `[64:ff9b::a00:1]`, `[::10.9.9.9]`, `[2002:a09:909::1]`, `[2001::a09:909]`, `[100::1]`, `[fec0::1]`), for CONNECT and GET. |
+| DNS rebinding (static) | Names planted on the research proxy that resolve to `10.9.9.9`, `::`, `::ffff:10.9.9.9`, NAT64, 6to4, Teredo, IPv4-compatible, `169.254.169.254`, `127.0.0.1`, `100::1` and `fec0::1` are refused by `to_localnet`, for both CONNECT and GET: each range in a real Squid, by name. A rebinding test with a live 0-TTL resolver is the next level, in the threat model (H-045). |
+| research: the control | Names planted to resolve to public addresses no range covers (`1.1.1.1`, `2606:4700::1111`) are not refused, so it is the ranges and `ip_literal` that refuse, nothing else. |
 | research: schemes and ports | `GET ftp://example.com:80/`, `GET https://example.com:80/`, port 8080 and `CONNECT :8443` are refused. |
-| no way around the proxy | From every zone network, a direct connection fails, by name (no DNS) and by address (no route). The control (internet) is that the same address answers from `outbound`. |
-| `egress: direct connection is blocked even when proxy is stopped` | With `egress-archon` stopped, the proxy route fails, and so do direct connections over IPv4 and IPv6. They fail closed, never bypass. |
+| no way around the proxy | From every zone network, a direct connection fails, by name with curl's exit 6 (could not resolve: no DNS) and by address with exit 7 (no route). The control (internet) is that the same address answers from `outbound`. |
+| no DNS out | On every zone network, Docker's resolver answers the zone's proxy name and refuses every outside name (`SERVFAIL`), so DNS is no channel out. The control (internet): the same names resolve from `outbound`. |
+| `egress: direct connection is blocked even when proxy is stopped` | With `egress-archon` stopped, the proxy route fails, and so do direct connections: by name (exit 6), over IPv4 and over IPv6 (exit 7). They fail closed, never bypass. |
+| the networks, with the zone services up | Still only the three proxies on `outbound`; `hermes` only on `hermes-net` and `archon` only on `archon-net`, each beside its proxy, by the networks' member lists and by each container's own network settings. |
+| hapi's settings beat the env file | The zone env files hold lines that try to override hapi's own settings (`HOST='0.0.0.0'`, `PI_OFFLINE='0'`, `HTTPS_PROXY=...`, `NO_PROXY='*'`, `HERMES_HOME=...`), and each container still has exactly `serviceEnvironment`'s values. |
 | `archon listens on loopback only` (internet: the image build) | `127.0.0.1:3090/api/health` answers inside the container. From archon-net, `archon:3090` and `:3000` refuse the connection. |
 | hermes listens on loopback only | Every listening socket in the Hermes container is on a loopback address. |
 | the zone services' hardening | Archon runs as 1001 and Hermes as 10000, with no capabilities and `NoNewPrivs`. The root and the config files (`/.archon/config.yaml`, `/opt/data/config.yaml`) are mounted read-only, and a write to `/` fails with `Read-only file system`. The controls: the tmpfs and volume paths are mounted read-write. |

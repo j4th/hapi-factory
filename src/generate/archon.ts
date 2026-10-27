@@ -9,7 +9,9 @@
  *   with "@". A pi-provider model is a Pi ref `<vendor>/<id>`; a claude one is
  *   an Anthropic model id. Both pass through unchanged.
  * - `archon.env`: the Archon container's environment: loopback bind, telemetry
- *   off, and the Pi worker settings (spec §9.2, §9.3).
+ *   off, and the Pi worker settings (spec §9.2, §9.3). The record of what
+ *   stack/compose.yaml's archon `environment:` sets (`ARCHON_ENV`), and what
+ *   Task 6's audit compares the running container with.
  */
 import YAML from "yaml";
 import { type ModelSpec, type Policy, ROLES, type RosterName, type Tier } from "../policy/types";
@@ -59,8 +61,13 @@ function configYaml(p: Policy, roster: RosterName): string {
   return doc.toString({ lineWidth: 0 });
 }
 
-/** The container environment, in this order. Values never need quoting. */
-const ENV: [string, string, string][] = [
+/**
+ * The container environment, in this order: name, value, why. Values never
+ * need quoting. stack/compose.yaml sets every one in the archon service's
+ * `environment:` (src/stack/env.ts), which beats any env_file, so no secret
+ * can override them; tests/stack/compose.test.ts keeps the two equal.
+ */
+export const ARCHON_ENV: readonly (readonly [name: string, value: string, why: string])[] = [
   ["HOST", "127.0.0.1", "Archon's server listens on loopback only; it has no auth in SQLite mode (spec §9.2)"],
   ["ARCHON_TELEMETRY_DISABLED", "1", "no Archon telemetry"],
   ["DO_NOT_TRACK", "1", "the cross-tool telemetry opt-out, which Archon also honours"],
@@ -73,7 +80,7 @@ function archonEnv(): string {
   const head = hashComment([
     ...notice("Archon container environment", ["the hardening settings of spec §9.2 and §9.3 (no policy file)"]),
   ]);
-  const body = ENV.map(([key, value, why]) => `${hashComment(wrap(why))}\n${key}=${value}`).join("\n");
+  const body = ARCHON_ENV.map(([key, value, why]) => `${hashComment(wrap(why))}\n${key}=${value}`).join("\n");
   return `${head}\n\n${body}\n`;
 }
 

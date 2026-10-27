@@ -7,10 +7,12 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { PI_AGENT_DIR } from "../../src/generate/archon";
+import { emitArchon, PI_AGENT_DIR } from "../../src/generate/archon";
 import { PROXY_PORT } from "../../src/generate/egress";
+import { loadPolicy } from "../../src/policy/load";
 import { ENV_DIR } from "../../src/secrets/files";
 import { SECRET_ZONES } from "../../src/secrets/manifest";
+import { RESERVED_ENV_NAMES, serviceEnvironment, ZONE_SERVICES } from "../../src/stack/env";
 import { composeFile, REPO } from "./helpers";
 
 const c = composeFile();
@@ -76,9 +78,10 @@ describe("hardening, on every service", () => {
       expect(s.read_only).toBe(true);
       expect(s.healthcheck?.test).toBeDefined();
       expect(s.restart).toBe("unless-stopped");
-      // The labels Task 6's audit reads: who started the stack, and whether the dev bypass was on.
-      expect(s.labels["org.hapi.started-by"]).toBe("${HAPI_STARTED_BY:-}");
-      expect(s.labels["org.hapi.dev-override"]).toBe("${HAPI_DEV_OVERRIDE:-0}");
+      // The labels Task 6's audit reads: who started the stack, and whether the dev bypass was on. A stack
+      // started without `hapi stack up` (a raw `docker compose up`) says `unknown`, never "not dev-override".
+      expect(s.labels["org.hapi.started-by"]).toBe("${HAPI_STARTED_BY:-unknown}");
+      expect(s.labels["org.hapi.dev-override"]).toBe("${HAPI_DEV_OVERRIDE:-unknown}");
       // The digest of build/: a policy change recreates the containers that mount its files.
       expect(s.labels["org.hapi.build-sha256"]).toBe("${HAPI_BUILD_SHA256:-}");
     });
@@ -121,6 +124,12 @@ describe("pins", () => {
     expect(svc("hermes").image).toBe("hapi-factory/hermes:v0.22.5");
     expect(svc("archon").image).toBe("hapi-factory/archon:0.12.1");
   });
+
+  test("a built image is only ever built, never pulled: a raw `docker compose up` or `pull` never asks a registry for hapi-factory/*", () => {
+    for (const [name, s] of Object.entries(c.services)) {
+      expect([name, s.pull_policy]).toEqual([name, s.build === undefined ? undefined : "build"]);
+    }
+  });
 });
 
 describe("the egress proxies", () => {
@@ -137,21 +146,36 @@ describe("the egress proxies", () => {
 });
 
 describe("the zone services", () => {
-  test("each reads only its own zone's env file, at $XDG_RUNTIME_DIR/hapi/env/<zone>.env, and never host.env", () => {
+  test("each one's only env_file is its own zone's secrets, at $XDG_RUNTIME_DIR/hapi/env/<zone>.env, and never host.env", () => {
     expect(svc("hermes").env_file).toEqual([envFile("hermes")]);
-    expect(svc("archon").env_file).toEqual(["../build/archon/archon.env", envFile("archon")]);
+    expect(svc("archon").env_file).toEqual([envFile("archon")]);
     expect(SECRET_ZONES).toContain("host");
     expect(text).not.toContain("host.env");
   });
 
-  for (const z of ["hermes", "archon"] as const) {
+  for (const z of ZONE_SERVICES) {
     test(`${z}: HTTP(S)_PROXY points at egress-${z}, loopback goes direct, and it starts once its proxy is healthy`, () => {
       const env = svc(z).environment as Record<string, string>;
       for (const v of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]) expect([v, env[v]]).toEqual([v, `http://egress-${z}:${PROXY_PORT}`]);
       for (const v of ["NO_PROXY", "no_proxy"]) expect([v, env[v]]).toEqual([v, "localhost,127.0.0.1,::1"]);
       expect(svc(z).depends_on).toEqual({ [`egress-${z}`]: { condition: "service_healthy" } });
     });
+
+    test(`${z}: its environment: is exactly serviceEnvironment("${z}"), every name reserved, so no secret can override it`, () => {
+      // Compose puts environment: above env_file, and the manifest loader refuses these names (tests/secrets/manifest.test.ts).
+      expect(svc(z).environment).toEqual(serviceEnvironment(z));
+      for (const name of Object.keys(svc(z).environment)) expect([name, RESERVED_ENV_NAMES.includes(name)]).toEqual([name, true]);
+    });
   }
+
+  test("archon: every setting of the generated build/archon/archon.env is in its environment:, with the same value", () => {
+    const generated = emitArchon(loadPolicy(join(REPO, "policy")))["archon.env"]!
+      .split("\n")
+      .filter((l) => l !== "" && !l.startsWith("#"))
+      .map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)]);
+    expect(generated.length).toBe(6);
+    for (const [name, value] of generated) expect([name, svc("archon").environment[name!]]).toEqual([name, value]);
+  });
 
   test("archon: build/pi read-only at exactly PI_CODING_AGENT_DIR (PI_AGENT_DIR), its generated config read-only, state in volumes", () => {
     const s = svc("archon");

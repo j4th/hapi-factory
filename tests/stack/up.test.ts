@@ -22,7 +22,19 @@ const net = (name: string, subnet = "172.20.0.0/16", internal = true) => ({ Name
 const GOOD = [net("hapi_hermes-net"), net("hapi_archon-net", "172.21.0.0/16"), net("hapi_research-net", "192.168.16.0/20"), net("hapi_outbound", "172.23.0.0/16", false)];
 
 /** Fakes for every step; `steps` records the order. */
-function fakes(o: { user?: string; env?: Record<string, string>; networks?: unknown[]; upCode?: number; resolve?: StackDeps["resolve"]; build?: StackDeps["build"] } = {}) {
+function fakes(
+  o: {
+    user?: string;
+    env?: Record<string, string>;
+    networks?: unknown[];
+    /** What `docker network inspect` returns instead of `networks` as JSON. */
+    inspect?: { code: number; stdout: string; stderr?: string };
+    downCode?: number;
+    upCode?: number;
+    resolve?: StackDeps["resolve"];
+    build?: StackDeps["build"];
+  } = {},
+) {
   const steps: string[] = [];
   const calls: Call[] = [];
   const built = join(tempDir("hapi-stack-up-"), "config.yaml");
@@ -35,8 +47,9 @@ function fakes(o: { user?: string; env?: Record<string, string>; networks?: unkn
     run: async (cmd, opts) => {
       calls.push({ cmd, env: opts.env, inherit: opts.inherit });
       steps.push(cmd.slice(0, 2).join(" ") === "docker network" ? "docker network inspect" : cmd.join(" "));
-      if (cmd[1] === "network") return { code: 0, stdout: JSON.stringify(o.networks ?? GOOD) };
+      if (cmd[1] === "network") return o.inspect ?? { code: 0, stdout: JSON.stringify(o.networks ?? GOOD), stderr: "" };
       if (cmd.includes("--wait")) return { code: o.upCode ?? 0, stdout: "" };
+      if (cmd.at(-1) === "down") return { code: o.downCode ?? 0, stdout: "" };
       return { code: 0, stdout: "" };
     },
   };
@@ -203,6 +216,43 @@ describe("hapi stack up", () => {
       expect(f.steps.at(-1)).toBe("docker compose -p hapi down");
       expect(f.steps.some((s) => s.includes("--wait"))).toBe(false);
     }
+  });
+
+  test("a failed `docker network inspect` names its exit code and stderr, and removes what was created", async () => {
+    capture();
+    const f = fakes({ inspect: { code: 1, stdout: "[]", stderr: "Error response from daemon: Cannot connect to the Docker daemon at unix:///run/user/1001/docker.sock\n" } });
+    const e = await caught(stackUp([], f.deps));
+    expect(e.message).toMatch(/^docker network inspect hapi_hermes-net hapi_archon-net hapi_research-net exited 1: Error response from daemon: Cannot connect to the Docker daemon/);
+    // Not mistaken for a missing network.
+    expect(e.message).not.toContain("does not exist");
+    expect(e.message).toContain("Nothing was started, and what `compose up --no-start` created was removed");
+    expect(f.steps.at(-1)).toBe("docker compose -p hapi down");
+    expect(f.steps.some((s) => s.includes("--wait"))).toBe(false);
+  });
+
+  test("inspect output that isn't a JSON array of networks stops the stack too, and removes what was created", async () => {
+    capture();
+    for (const stdout of ["", "not json", "{}"]) {
+      const f = fakes({ inspect: { code: 0, stdout, stderr: "" } });
+      await expect(stackUp([], f.deps)).rejects.toThrow(/printed something that is not a JSON array of networks\. Nothing was started/);
+      expect(f.steps.at(-1)).toBe("docker compose -p hapi down");
+      expect(f.steps.some((s) => s.includes("--wait"))).toBe(false);
+    }
+  });
+
+  test("a subnet the CIDR parser rejects throws inside the check, and still removes what was created", async () => {
+    capture();
+    const f = fakes({ networks: [net("hapi_hermes-net", "not-a-subnet"), ...GOOD.slice(1)] });
+    const e = await caught(stackUp([], f.deps));
+    expect(e.message).toContain('"not-a-subnet" is not an IP address or network');
+    expect(f.steps.at(-1)).toBe("docker compose -p hapi down");
+    expect(f.steps.some((s) => s.includes("--wait"))).toBe(false);
+  });
+
+  test("when removing what was created fails too, the error says so and how to finish", async () => {
+    capture();
+    const f = fakes({ networks: [net("hapi_hermes-net", "172.20.0.0/16", false), ...GOOD.slice(1)], downCode: 3 });
+    await expect(stackUp([], f.deps)).rejects.toThrow(/not internal.*Nothing was started, but removing what `compose up --no-start` created failed \(docker compose -p hapi down exited 3\): run `mise run down`/);
   });
 
   test("a stack that doesn't come up healthy fails, and says where to look", async () => {
