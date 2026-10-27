@@ -25,6 +25,7 @@ import {
   secretsResolve,
   secretsRevoke,
 } from "./secrets/cli";
+import { CancelledError } from "./secrets/recovery";
 import { HAPI_VERSION } from "./version";
 import { workorderValidate } from "./workorder/validate";
 
@@ -112,7 +113,8 @@ export async function main(argv: string[]): Promise<number> {
     return await found.command.handler(found.rest);
   } catch (e) {
     console.error(`hapi ${found.name}: ${e instanceof Error ? e.message : String(e)}`);
-    return 1;
+    // A cancelled prompt exits 130, as a shell gives Ctrl-C.
+    return e instanceof CancelledError ? e.exitCode : 1;
   }
 }
 

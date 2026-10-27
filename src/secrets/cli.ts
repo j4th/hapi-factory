@@ -13,6 +13,7 @@ import { dirname } from "node:path";
 import { loadPolicy } from "../policy/load";
 import { defaultRepoRoot, runtimeDir, secureDir } from "./files";
 import { initStore } from "./init";
+import { shielded } from "./interrupt";
 import { addMachine, drill, joinMachine, type LifecycleDeps, loadStore, newRecovery, recipientReport, recover, revoke, toolsFor } from "./lifecycle";
 import { loadManifest, MANIFEST_FILE, mcpSecretGaps, type McpSecretGap } from "./manifest";
 import { checkSecrets, configPath, describeSecretsConfig, entryLabel, loadSecretsConfig, resolveSecrets, SecretError, type SecretProvider, type SecretsConfig } from "./provider";
@@ -244,7 +245,8 @@ export async function secretsResolve(args: string[], deps: SecretsDeps = {}): Pr
 
 /**
  * `hapi secrets edit [--config file]`: sops only. Under the store's lock
- * (`withStoreLock`, as the lifecycle commands), it first runs the store
+ * (`withStoreLock`, as the lifecycle commands; Ctrl-C while sops runs is the
+ * editor's, so hapi ignores it until sops ends), it first runs the store
  * checks every lifecycle command runs (`loadStore`: the file's shape, age
  * recipients and nothing else, and the recipients file in step with it), so
  * new values are never written into a store that a key outside the
@@ -266,15 +268,23 @@ export async function secretsEdit(args: string[], deps: SecretsDeps = {}): Promi
   }
   const tmp = runtimeDir(env);
   const file = cfg.sops.file;
-  return withStoreLock(file, "edit", async () => {
-    await loadStore(file);
-    await secureDir(tmp, dirname(tmp), deps.uid === undefined ? {} : { uid: deps.uid });
-    const { dir } = await toolsFor(deps);
-    const inv = sopsEditInvocation({ file, ageKeyFile: cfg.sops.age_key_file, env, tmpDir: tmp, ageDir: dir });
-    await checkSopsKeys(cfg.sops.age_key_file, inv.env, { repoRoot: await (deps.repoRoot ?? defaultRepoRoot)(), store: file, ...(deps.uid === undefined ? {} : { uid: deps.uid }) });
-    const code = await (deps.interactive ?? runInteractive)("sops", inv.args, { env: inv.env });
-    if (code === 0 || code === 200) return 0;
-    console.error(`hapi secrets edit: sops exited with status ${code}; the file is unchanged unless sops said otherwise`);
-    return 1;
-  });
+  const uid = deps.uid === undefined ? {} : { uid: deps.uid };
+  return withStoreLock(
+    file,
+    "edit",
+    async () => {
+      await loadStore(file);
+      await secureDir(tmp, dirname(tmp), uid);
+      const { dir } = await toolsFor(deps);
+      const inv = sopsEditInvocation({ file, ageKeyFile: cfg.sops.age_key_file, env, tmpDir: tmp, ageDir: dir });
+      await checkSopsKeys(cfg.sops.age_key_file, inv.env, { repoRoot: await (deps.repoRoot ?? defaultRepoRoot)(), store: file, ...uid });
+      // Ctrl-C in the editor is the editor's (it reaches hapi too, in the same foreground group), so hapi ignores it
+      // until sops ends, as system(3) does; a SIGTERM or SIGHUP waits until then, so the lock outlives no edit.
+      const code = await shielded(() => (deps.interactive ?? runInteractive)("sops", inv.args, { env: inv.env }), { ignoreInterrupt: true, done: "stopped after sops edit ended" });
+      if (code === 0 || code === 200) return 0;
+      console.error(`hapi secrets edit: sops exited with status ${code}; the file is unchanged unless sops said otherwise`);
+      return 1;
+    },
+    { env, ...uid },
+  );
 }

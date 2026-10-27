@@ -19,11 +19,12 @@
  * recovery identity is in a sops child's env only as SOPS_AGE_KEY).
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, cpSync, lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { parse, stringify } from "yaml";
 import { secretsAddMachine, secretsCheck, secretsDrill, secretsInit, secretsJoin, secretsNewRecovery, secretsRecover, secretsResolve, secretsRevoke } from "../../src/secrets/cli";
 import { parseEnvFile } from "../../src/secrets/files";
+import { recoveryDigest } from "../../src/secrets/recipients";
 import { passphraseOf, unwrapIdentity } from "../../src/secrets/recovery";
 import { ageEnv, commandRunner, pinnedAgeDir, runSops, type SopsRunner } from "../../src/secrets/providers/sops";
 import { capture, cleanup, fakeTty, fullStore, tempDir, tree } from "./helpers";
@@ -78,7 +79,11 @@ describe.skipIf(!process.env.HAPI_INT)("sops + age key lifecycle (real binaries,
         rmSync(dirname(to.store), { recursive: true, force: true });
         cpSync(dirname(from.store), dirname(to.store), { recursive: true });
       };
-      const recipients = (h: { store: string }) => parse(readFileSync(join(dirname(h.store), "secrets.recipients.yaml"), "utf8")).recipients as { name: string; kind: string; recipient: string }[];
+      const recipients = (h: { store: string }) =>
+        parse(readFileSync(join(dirname(h.store), "secrets.recipients.yaml"), "utf8")).recipients as { name: string; kind: string; recipient: string; recovery_age_sha256?: string }[];
+      /** The recovery entry records the SHA-256 of the real recovery.age beside it. */
+      const recordsRecoveryAge = (h: { store: string }) =>
+        expect(recipients(h).find((r) => r.kind === "recovery")!.recovery_age_sha256).toBe(recoveryDigest(readFileSync(join(dirname(h.store), "recovery.age"))));
 
       // Machine a: init, with the words confirmed on the (fake) terminal. Every recipient is post-quantum.
       const a = host("machine-a");
@@ -88,6 +93,7 @@ describe.skipIf(!process.env.HAPI_INT)("sops + age key lifecycle (real binaries,
         ["machine-a", "machine", "age1pq1", 1959],
         ["recovery", "recovery", "age1pq1", 1959],
       ]);
+      recordsRecoveryAge(a);
 
       // Fill in the values, as `secrets:edit` would: re-encrypted to the same two recipients, from stdin.
       const values = { ...fullStore(), "hapi-host-planner-app-private-key": "-----BEGIN FAKE-----\nnot a key\n-----END FAKE-----\n" };
@@ -138,11 +144,18 @@ describe.skipIf(!process.env.HAPI_INT)("sops + age key lifecycle (real binaries,
 
       // New words: the old ones stop opening this store.
       expect(await secretsNewRecovery([], c.deps)).toBe(0);
+      recordsRecoveryAge(c);
       const newWords = c.t.shown.at(-1)!;
       c.t.typed.push(newWords.join(" "));
       expect(await secretsDrill([], c.deps)).toBe(0);
       c.t.typed.push(words.join(" "));
       await expect(secretsDrill([], c.deps)).rejects.toThrow(/the words don't open .*recovery\.age/);
+
+      // Every command released its lock, which lived on each machine's tmpfs, never beside a store.
+      for (const h of [a, b, c]) {
+        expect(readdirSync(join(h.xdg, "hapi", "locks"))).toEqual([]);
+        expect(readdirSync(dirname(h.store)).filter((f) => f.includes("lock") || f.endsWith(".tmp"))).toEqual([]);
+      }
 
       // Nothing printed a value, a word or a key.
       const printed = [...out, ...err].join("\n");

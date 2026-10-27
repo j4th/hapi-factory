@@ -107,6 +107,8 @@ function toIssue(e: ErrorObject): Issue | undefined {
       return { path: e.instancePath, message: `must be one of: ${(p.allowedValues as unknown[]).join(", ")}` };
     case "uniqueItems":
       return { path: at(Number(p.i)), message: `duplicate of item ${String(p.j)}` };
+    case "false schema": // a key a `properties: {key: false}` forbids where it is
+      return { path: e.instancePath, message: "not allowed here" };
     case "not": {
       if (e.propertyName !== undefined) return undefined; // about a key, reported as "invalid key"
       // The schemas' only `not` is nonForgeHost's `not: {$ref: forgeHost}`; say which forge.

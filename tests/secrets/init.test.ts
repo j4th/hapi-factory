@@ -5,7 +5,7 @@ import { parse } from "yaml";
 import { secretsInit } from "../../src/secrets/cli";
 import { loadManifest, manifestNames } from "../../src/secrets/manifest";
 import { passphraseOf } from "../../src/secrets/recovery";
-import { recipientType } from "../../src/secrets/recipients";
+import { recipientType, recoveryDigest } from "../../src/secrets/recipients";
 import type { SopsRunner } from "../../src/secrets/providers/sops";
 import { allText, capture, caught, cleanup, FAKE_AGE_DIR, fakeTools, fakeTty, mode, tempDir, tree } from "./helpers";
 
@@ -80,7 +80,7 @@ describe("hapi secrets init", () => {
       pq: true,
       recipients: [
         { name: "test-box-user", kind: "machine", recipient: expect.any(String), added: "2026-10-26" },
-        { name: "recovery", kind: "recovery", recipient: expect.any(String), added: "2026-10-26" },
+        { name: "recovery", kind: "recovery", recipient: expect.any(String), added: "2026-10-26", recovery_age_sha256: recoveryDigest(readFileSync(p.recovery)) },
       ],
     });
     const [machine, recovery] = recipients.recipients.map((r: { recipient: string }) => r.recipient);

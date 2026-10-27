@@ -177,10 +177,11 @@ What sits where:
 | File | Where | What it is |
 |---|---|---|
 | The store, `secrets.enc.yaml` | anywhere (`private/` is fine) | the values, encrypted to every recipient |
-| The recipients file, `secrets.recipients.yaml` | beside the store | each recipient's name, kind and public key: no secret |
+| The recipients file, `secrets.recipients.yaml` | beside the store | each recipient's name, kind and public key, and `recovery.age`'s SHA-256: no secret |
 | `recovery.age` | beside the store | the recovery key, wrapped with the 10 words (age's scrypt passphrase format, mode `0600`) |
 | This machine's key, `keys.txt` | `~/.config/sops/age/` by default, **never** in a checkout | this machine's age identity, mode `0600` |
 | The config, `secrets.yaml` | `~/.config/hapi/` by default | which store and which key this machine uses |
+| The store's lock | `$XDG_RUNTIME_DIR/hapi/locks/`, never beside the store | while a command runs: which command holds the store, and its pid ([one command at a time](#the-commands)) |
 
 ### The recipients file
 
@@ -196,11 +197,13 @@ recipients:
     kind: recovery
     recipient: age1pq1...
     added: 2026-10-26
+    recovery_age_sha256: 9f86d081...   # recovery.age's SHA-256, 64 hex characters
 ```
 
 - It sits beside the store, at the same basename stem: `private/secrets.enc.yaml` → `private/secrets.recipients.yaml`. The schema is [`policy/schemas/secrets-recipients.schema.json`](../policy/schemas/secrets-recipients.schema.json).
 - A `name` matches `^[a-z0-9][a-z0-9-]{0,62}$`; `recovery` is the recovery recipient's. The default machine name is `<hostname>-<user>`, normalised to that pattern.
 - **It must agree with the store.** `check` and every command below compare it with the recipients in the store's own sops metadata (read without decrypting). Drift either way is an error that names the recipient: `the store is encrypted to age1pq1qxyz…, which the recipients file doesn't list`, or `the recipients file lists vm-hapi (age1pq1…), but the store isn't encrypted to it`. Public keys aren't secret. It means one of the two files was changed outside hapi, or the two come from different commits: restore both from the same commit.
+- **It records `recovery.age`'s SHA-256** in the recovery entry (`recovery_age_sha256`, required there and nowhere else). `recovery.age` is wrapped with the words, and its age header (an `scrypt` stanza: a salt and a work factor) names no recipient, so this is how `check` ties it to the recovery recipient without the words. A `recovery.age` from another commit or another store is an error for `check`, and `drill` and `recover` stop on it before asking for the words: `<dir>/recovery.age is not the recovery.age the recipients file records for recovery (age1pq1…): its SHA-256 differs, …`. `init` and `new-recovery` write it.
 - **Age recipients only.** A store that is also encrypted to any other kind of sops master key (PGP, AWS, GCP or HuaweiCloud KMS, Azure Key Vault, Vault transit, or key groups) is refused by `check`, `resolve`, `edit` and every command below, naming the key type: `has a PGP key (sops.pgp) in its sops metadata, besides its age recipients`. So is any metadata field that sops 3.13.3, the pinned sops, doesn't write, whatever its value (`has a field hapi doesn't know (sops.<field>: it may hold a key)`): a newer sops's key type would be one. Such a key opens the store without being in the recipients file, and `sops rotate --rm-age` keeps it, so revoking a party who planted one (with raw `sops rotate -i --add-pgp`, say) would leave them able to read the reissued credentials. Remove it (`sops rotate -i --rm-pgp`, `--rm-kms` and so on) or restore the store from a commit without it, and unless you added it yourself, reissue every credential in the store.
 - Change it only through the commands below. Each one writes the store and the recipients file in step.
 
@@ -226,15 +229,20 @@ Each is also a mise task: `mise run secrets:<command> -- <flags>`. `--config` pi
 | [`revoke --name <n>`](#hapi-secrets-revoke) | a machine whose key opens the store | removes a recipient |
 | [`new-recovery`](#hapi-secrets-new-recovery) | a machine whose key opens the store | new recovery key and words, for lost or exposed ones |
 
-**Every recipient change makes a new data key.** It runs `sops --config /dev/null rotate -i --add-age … / --rm-age …` (never `updatekeys`, which keeps the old data key, so a removed key holder with an old copy could still read secrets added later). sops works on a temp copy beside the store; hapi checks the copy is encrypted to exactly the recipients asked for, renames it over the store in one step, and only then rewrites the recipients file. If anything fails, both stay as they were.
+**Every recipient change makes a new data key.** It runs `sops --config /dev/null rotate -i --add-age … / --rm-age …` (never `updatekeys`, which keeps the old data key, so a removed key holder with an old copy could still read secrets added later). sops works on a temp copy beside the store; hapi checks the copy is encrypted to exactly the recipients asked for, renames it over the store in one step, then (for `new-recovery`) renames the new `recovery.age`, written beside it beforehand, into place, and only then rewrites the recipients file. If anything fails, all three stay as they were. The order is chosen so that a command killed between two of those steps always leaves a state `check` reports ([an interrupted command](#an-interrupted-command)).
 
-**One command at a time.** Each of these commands, and [`edit`](#hapi-secrets-edit), holds a lock beside the store, `.secrets.enc.yaml.lock` for `secrets.enc.yaml`, from before it reads the store until it is done. hapi makes it with `O_EXCL`, so only one command can, and removes it when the command ends, however it ends. So two commands can't interleave and lose an update. A second command stops, naming the lock:
+**One command at a time.** Each of these commands, and [`edit`](#hapi-secrets-edit), holds the store's lock from before it reads the store until it is done, so two commands can't interleave and lose an update.
+- **Where:** `$XDG_RUNTIME_DIR/hapi/locks/<SHA-256 of the store's real path>.lock` (the file `0600`, the directory `0700`), on your tmpfs. Never beside the store: `private/` is a git repo, and a lock committed there would stop every other machine. So these commands need `XDG_RUNTIME_DIR`, as `resolve` does ([below](#hapi-secrets-resolve)).
+- **What:** one line, made whole and at once (a temp file hard-linked into place, which fails if a lock exists): `hapi secrets add-machine, pid 4242 (start 98765), started 2026-10-27T09:00:00.000Z, id 1a2b3c4d, store <checkout>/private/secrets.enc.yaml`. The start is the process's start time, so a pid reused by a later process isn't taken for the holder.
+- **Released** when the command ends, however it ends, and on Ctrl-C, `SIGTERM` or `SIGHUP` too: hapi handles those signals itself while it holds the lock, removes the lock, prints `hapi secrets <command>: cancelled (SIGINT); released the lock on <store>` and exits 128 + the signal's number (130 for Ctrl-C). While the store, `recovery.age` and the recipients file are being renamed into place, a signal waits until they are, so Ctrl-C never leaves them half done.
+- **A second command** while the first runs stops, naming it, and never takes a lock whose process still runs:
 
-```text
-hapi secrets add-machine: <checkout>/private/.secrets.enc.yaml.lock exists (made 2026-10-27T09:00:00.000Z): another hapi secrets command is using <checkout>/private/secrets.enc.yaml, or one was interrupted and left it. If none is running, run `hapi secrets check`, ...
-```
+  ```text
+  hapi secrets add-machine: another command, hapi secrets drill (pid 4242, started 2026-10-27T09:00:00.000Z), is using <checkout>/private/secrets.enc.yaml: wait for it to end, or stop it, and run this again. hapi never takes the lock (...) while its process runs
+  ```
+- **A stale lock**, whose process is gone (killed with `SIGKILL`, a crash), is removed by the next command, which says so in one line and goes on: `hapi secrets add-machine: removed a stale lock on <store>: hapi secrets drill (pid 4242, started …) is no longer running`. Then run `mise run secrets:check`: a command killed outright may have left the store and its recipients file out of step ([an interrupted command](#an-interrupted-command)). A reboot clears the tmpfs, and every lock with it.
 
-The lock guards one copy of the store on one machine. Other machines' copies meet through git, and `check` reports a copy whose store and recipients file disagree. `check` and `resolve` only read, so they don't take the lock.
+The lock guards one copy of the store on one machine, for one user. Other machines' copies meet through git, and `check` reports a copy whose store and recipients file disagree. `check` and `resolve` only read, so they don't take the lock.
 
 #### `hapi secrets join`
 
@@ -268,7 +276,7 @@ hapi secrets recover [--store file] [--name name] [--config file] [--age-key fil
 
 For a box that has the store, `recovery.age` and the recipients file, but no key that opens them: a new laptop after the old one died, say. Give `--store` if the box has no config yet.
 1. It joins: this machine's key and config, as `join` would.
-2. It reads the 10 words on the terminal (spaces, hyphens and case don't matter; a word not in the list is named by its position: `word 4 is not in the list`), and unwraps the recovery key **in memory**.
+2. It checks `recovery.age` is the one the recipients file records, then reads the 10 words on the terminal (spaces, hyphens and case don't matter; a word not in the list is named by its position: `word 4 is not in the list`; Ctrl-C cancels, with echo back on), and unwraps the recovery key **in memory**.
 3. It adds this machine's key with `rotate -i --add-age`, handing the recovery key to that one sops child as `SOPS_AGE_KEY`.
 4. It updates the recipients file.
 
@@ -280,7 +288,7 @@ After that the machine works without the words. Then revoke the machine whose ke
 hapi secrets drill [--config file]
 ```
 
-It proves your backup works, without changing anything. It reads the words, unwraps the recovery key, and decrypts the store in a sops child whose `HOME` and `XDG_CONFIG_HOME` are a fresh temp directory under `$XDG_RUNTIME_DIR/hapi/`, so no machine key can be loaded, and whose only key is the recovery one. It prints `recovery works: N names readable`, never a value, and deletes the temp directory. Beside the store it writes only [the lock](#the-commands), which it removes when it ends. Run it after `init`, after `new-recovery`, and now and then.
+It proves your backup works, without changing anything. It reads the words, unwraps the recovery key, and decrypts the store in a sops child whose `HOME` and `XDG_CONFIG_HOME` are a fresh temp directory under `$XDG_RUNTIME_DIR/hapi/`, so no machine key can be loaded, and whose only key is the recovery one. It prints `recovery works: N names readable`, never a value, and deletes the temp directory. Besides that, it writes only [the lock](#the-commands), on your tmpfs, which it removes when it ends. Run it after `init`, after `new-recovery`, and now and then.
 
 #### `hapi secrets revoke`
 
@@ -296,23 +304,26 @@ It removes a recipient with `rotate -i --rm-age` and updates the recipients file
 hapi secrets new-recovery [--config file] [--no-confirm]
 ```
 
-For words that are lost or exposed. It needs a working machine key. It makes a new recovery key and 10 new words, with the same show-and-confirm as `init`; adds the new recipient (`rotate -i --add-age`), then removes the old one (`--rm-age`); and replaces `recovery.age` and the recipients file. That replace is the one deliberate one: the old `recovery.age` is kept in memory and put back if any step fails. Then run `mise run secrets:drill` with the new words.
+For words that are lost or exposed, or a `recovery.age` that no longer matches the recipients file. It needs a working machine key. It makes a new recovery key and 10 new words, with the same show-and-confirm as `init`; adds the new recipient (`rotate -i --add-age`), then removes the old one (`--rm-age`); and replaces `recovery.age` and the recipients file (with the new `recovery.age`'s SHA-256). That replace is the one deliberate one: the old `recovery.age` is kept in memory and put back if any step fails. Then run `mise run secrets:drill` with the new words.
 
 `--no-confirm` skips the word check, as for `init`. It exists only for tests and non-interactive CI fixtures, and is refused when a person is at the terminal (stdin is a terminal, or `/dev/tty` opens). Without a terminal the new words are not shown at all, so that store's `recovery.age` can't be opened.
 
 #### An interrupted command
 
-A command stopped at the wrong moment (Ctrl-C, a crash, a power cut) can leave two things behind.
+**Ctrl-C, `SIGTERM` or `SIGHUP`** leave nothing to repair: the command releases [the lock](#the-commands), turns the terminal's echo back on if it was reading the words, and exits 130 (or 143, 129). A signal that arrives while the store, `recovery.age` and the recipients file are being renamed into place waits until they are.
 
-**The lock.** Every lifecycle command and `edit` then refuses, naming it. The lock's one line says which command made it, its pid and when (`cat private/.secrets.enc.yaml.lock`). If that process is gone, check the store first (below), then remove the lock and run the command again.
+**A command killed outright** (`SIGKILL`, a crash, a power cut) can leave two things behind.
 
-**A store and recipients file out of step.** Each command renames the new store into place and then rewrites the recipients file. Stopped between the two, the store is encrypted to the new recipients while the file still lists the old ones. `mise run secrets:check` reports it as [drift](#the-recipients-file), naming the recipient, and every command refuses the store until it is fixed. Either:
-- **restore both from the same commit**, the state before the command: `git -C private checkout HEAD -- secrets.enc.yaml secrets.recipients.yaml recovery.age` (for a store in `private/`, committed before the command), then run the command again; or
-- **make the recipients file match the store.** The recipients in the store's own `sops.age[].recipient` metadata are what can open it, so they are the truth. Add the entry `check` says is missing (its `name`, `kind`, `recipient` and `added`), or delete the one it says the store isn't encrypted to, until `check` passes.
+**The lock.** The next command finds its process gone, removes it, and says so (`removed a stale lock on …`). After that message, run `mise run secrets:check` before anything else.
 
-Also delete any `.secrets.enc.yaml.*.tmp` or `.secrets.recipients.yaml.*.tmp` file left beside the store: a half-done copy (encrypted, never plaintext).
+**A store, recovery.age and recipients file out of step.** A recipient change renames the new store into place, then (for `new-recovery`) the new `recovery.age`, then rewrites the recipients file. Killed between two of those, the store is encrypted to the new recipients while the recipients file still lists the old ones, and for `new-recovery`, `recovery.age` may be the new one while the recipients file records the old one's SHA-256. `mise run secrets:check` reports each: [drift](#the-recipients-file), naming the recipient, and `recovery.age is not the recovery.age the recipients file records`. Every command refuses the store until it is fixed.
 
-An interrupted `new-recovery` can also have replaced `recovery.age` before the store took the new recovery recipient. `check` can't see that, so after one, run `mise run secrets:drill` with the new words. If it fails, restore all three files from git as above (the old words open them again), and run `new-recovery` again.
+Drift is also how a recipient planted with raw sops shows up (someone with write access to the store, adding their own key). So don't make the recipients file match the store by copying in whatever the store lists:
+- **A recipient the recipients file is missing:** add its entry back only if its whole public key, in the store's `sops.age[].recipient`, is exactly the one the interrupted command was adding: the `--recipient` you gave `add-machine`, or for `recover`, this machine's own (`mise exec -- age-keygen -y <its key file>`). Give it the `name` you used, `kind: machine` and today's date as `added`.
+- **An entry the store lacks:** delete it only if it is the recipient the interrupted `revoke` was removing.
+- **Anything else, or any doubt** (and always after an interrupted `new-recovery`, whose new recovery key you never saw): **restore the store, its recipients file and `recovery.age` from the same commit**, the state before the command: `git -C private checkout HEAD -- secrets.enc.yaml secrets.recipients.yaml recovery.age` (for a store in `private/`, committed before the command), then run the command again (`new-recovery` makes new words again; forget the ones it showed). Use a commit `check` passes on. And **treat a recipient you didn't add as a possible compromise**: restore a commit without it (or, if it is listed in the recipients file there too, revoke it), and reissue every credential in the store, since its holder could read every copy made while it was there ([a compromised key](#a-lost-key-a-compromised-key-lost-or-exposed-words)).
+
+`check` passes once they agree. Also delete any `.secrets.enc.yaml.*.tmp`, `.recovery.age.*.tmp` or `.secrets.recipients.yaml.*.tmp` file left beside the store: a half-done copy (encrypted, never plaintext; a `.recovery.age.*.tmp` is a new recovery key wrapped with the words `new-recovery` showed, so it holds nothing the restored store needs).
 
 ### Worked example: a laptop, a VM and the `hapi` user
 
@@ -343,7 +354,7 @@ Not built; each would be one more recipient. The last two are sops master keys o
 ### Threat notes: keys and recovery
 
 - **The words plus `recovery.age` are a master key.** Either alone is nothing: the words are 10 words from age's 2048-word list (about 110 bits, drawn by hapi with `crypto.getRandomValues`), behind age's scrypt. Keep them apart.
-- **The words and the recovery key live only in memory.** The words are shown on, and read from, your terminal (`/dev/tty`, echo off), never stdout or stderr. hapi hands the passphrase to age on file descriptor 3 (`AGE_PASSPHRASE_FD`, through the bundled `age-plugin-batchpass`), never on a command line, in an environment variable or in a file. The unwrapped recovery key goes to age-keygen and age on stdin; it is never on a command line or in a file, and in an environment variable only for the one sops child that needs it, as `SOPS_AGE_KEY`, in `recover` and `drill`. (`new-recovery` rotates with this machine's key, so its sops child never gets the recovery key.) Tests check every tool call, file and message for them, the integration test with the real binaries included.
+- **The words and the recovery key live only in memory.** The words are shown on, and read from, your terminal (`/dev/tty`, echo off), never stdout or stderr. Ctrl-C at the prompt kills the shell reading the line (left behind, it would swallow the next line you type at your prompt) and turns echo back on. hapi hands the passphrase to age on file descriptor 3 (`AGE_PASSPHRASE_FD`, through the bundled `age-plugin-batchpass`), never on a command line, in an environment variable or in a file. The unwrapped recovery key goes to age-keygen and age on stdin; it is never on a command line or in a file, and in an environment variable only for the one sops child that needs it, as `SOPS_AGE_KEY`, in `recover` and `drill`. (`new-recovery` rotates with this machine's key, so its sops child never gets the recovery key.) Tests check every tool call, file and message for them, the integration test with the real binaries included.
 - **sops never gets a wrapped key.** A passphrase-wrapped key in sops's key sources would make sops prompt through gpg-agent or the terminal, on every decrypt, on every machine. hapi unwraps `recovery.age` itself and hands the plain key to the one sops child that needs it (in `recover` and `drill`), as `SOPS_AGE_KEY`.
 - **No gpg-agent.** sops's gpg-agent client ignores `GNUPGHOME` and `$HOME`, so a sandboxed `HOME` still reaches your real agent. Every sops child hapi runs gets `GPG_AGENT_INFO=` (empty), which keeps sops off any agent.
 - **The pinned age, always.** hapi finds it with `mise where age` and checks `age --version` is at least the pin (1.3.2); its directory leads the `PATH` of every age and sops child (sops runs age plugins from `PATH`).
@@ -386,6 +397,7 @@ For the sops provider only. Holding the store's [lock](#the-commands), it first 
 - **The temp file is on your tmpfs.** hapi sets `TMPDIR` to `$XDG_RUNTIME_DIR/hapi`, so it needs `XDG_RUNTIME_DIR` ([below](#hapi-secrets-resolve)). Make sure your editor doesn't copy the buffer anywhere else: Neovim, for one, keeps swap files under `~/.local/state/nvim/` by default (run it with `-n` for no swap file).
 - **Your shell's `SOPS_*` variables are dropped**, so they can't add a recipient or a key; hapi sets `SOPS_AGE_KEY_FILE`, `SOPS_DISABLE_VERSION_CHECK=1` and `GPG_AGENT_INFO=`, and puts the pinned age first on `PATH`. sops runs with `--config /dev/null`.
 - If you quit without a change, sops exits 200, which hapi treats as success.
+- **Ctrl-C in the editor is the editor's.** It reaches hapi too (they share the terminal), so while `sops edit` runs, hapi ignores it, as `system(3)` does; a `SIGTERM` or `SIGHUP` waits until sops ends, then hapi releases the lock and exits.
 
 ## `hapi secrets check`
 
@@ -411,6 +423,7 @@ recipient recovery recovery (post-quantum, added 2026-10-26)
 - `unknown`: a name in the store (for bws, in `bws.ids`) that the manifest doesn't list. It doesn't fail the check. A name that isn't a logical name is shown as `(a name that is not a logical name, not shown)`, in case a value was pasted as a key.
 - `recipient` (sops only): each of the store's recipients, with its kind and whether the store is post-quantum ([keys and recovery](#keys-and-recovery)).
 - **It exits 1 if anything is missing, empty or invalid**, and says so on stderr. A provider failure (sops can't decrypt, say) is an error, exit 1. For sops, so is a missing or invalid recipients file, [drift](#the-recipients-file) between it and the store, a post-quantum/classic mix, or a master key in the store that [isn't an age recipient](#the-recipients-file), or a metadata field hapi doesn't know.
+- For sops it is also an error when `recovery.age` isn't the one the recipients file [records](#the-recipients-file) (its SHA-256 differs). After drift it ends with what to do: add a missing recipient back only if it is exactly the key an interrupted command was adding, otherwise restore all three files from one commit and treat the recipient as a compromise ([an interrupted command](#an-interrupted-command)).
 - **It warns, and still exits 0,** when the store has no recovery recipient (`if every machine key is lost, so is the store`) or `recovery.age` is missing beside it.
 
 ## `hapi secrets resolve`
@@ -570,5 +583,5 @@ The error kinds: a `PolicyError` when the manifest or the config doesn't match i
 - **The research container's model key.** `hapi-research` (Plan 04) runs Hermes, so it needs a model key as well as its search keys. Plan 04 decides which capped key it gets, and adds it to the `research` zone of the manifest.
 - **One store reads every zone.** A key, or a bws machine account, per zone would limit what one leaked key exposes. The resolver uses one store today.
 - **`describeSecretsConfig` lists the config, the store and the age key**, not yet the recipients file and `recovery.age` beside the store. Plan 01 Task 6's audit should check those too.
-- **A store made before recovery keys** (by an earlier `hapi secrets init`) has no recipients file, so `check` and the lifecycle commands refuse it. There is no migration command: make a new store with `mise run secrets:init` at another path and copy the values across with `secrets:edit`.
+- **A store made before recovery keys** (by an earlier `hapi secrets init`) has no recipients file, so `check`, `edit` and the lifecycle commands refuse it. There is no migration command: make a new store with `mise run secrets:init` at another path, read the old values with raw sops and the old age key, in your terminal, `GPG_AGENT_INFO= SOPS_AGE_KEY_FILE=<the old age key> mise exec -- sops --config /dev/null decrypt <the old store>` (it prints every value: never redirect it to a file), and type or paste each into the new store with `mise run secrets:edit`. Then delete the old store, and its key once nothing else uses it.
 - **bws ids aren't cross-checked against secret names.** `bws secret get` returns the secret's name. Checking it against the logical name would catch an id bound to the wrong name.

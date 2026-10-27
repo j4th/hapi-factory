@@ -21,11 +21,14 @@
  *   on stdin. Neither it nor the words ever reach argv, env or a file.
  * - **The terminal** (`openTerminal`): the words are shown on /dev/tty, never
  *   stdout or stderr (which a log or pipe could keep), and read back from it
- *   with echo off where the terminal allows.
+ *   with echo off where the terminal allows. Ctrl-C at a prompt turns echo
+ *   back on and cancels the command (exit 130).
  */
+import { spawn, spawnSync } from "node:child_process";
 import { closeSync, openSync, writeSync } from "node:fs";
+import { onInterrupt } from "./interrupt";
 import { SecretError } from "./provider";
-import { commandRunner, type SopsRunner, scrubToolError } from "./providers/sops";
+import { type SopsRunner, scrubToolError } from "./providers/sops";
 import { kindName, recipientType, shortRecipient } from "./recipients";
 import { WORDLIST } from "./wordlist";
 
@@ -72,23 +75,43 @@ export interface Tty {
   read(prompt: string): Promise<string>;
 }
 
+/** The words weren't read: the user cancelled (Ctrl-C at the prompt). hapi exits 130 for it, as a shell does. */
+export class CancelledError extends SecretError {
+  readonly exitCode = 130;
+  constructor() {
+    super("cancelled");
+  }
+}
+
 /**
- * Read one line from /dev/tty with echo off, in a shell that restores echo
- * however it ends (Ctrl-C included), and print the line on stdout: a pipe to
- * hapi, never a file.
+ * Read one line from the terminal (`$1`) with echo off, in a shell that
+ * restores echo however it ends (Ctrl-C included), and print the line on
+ * stdout: a pipe to hapi, never a file.
  */
 const READ_LINE = [
-  "exec 0</dev/tty || exit 3",
+  'exec 0<"$1" || exit 3',
   "trap 'stty echo 2>/dev/null; exit 130' INT TERM HUP",
   "stty -echo 2>/dev/null",
   "IFS= read -r line; s=$?",
   "stty echo 2>/dev/null",
-  "printf '\\n' >/dev/tty",
+  "printf '\\n' >\"$1\"",
   "printf '%s' \"$line\"",
   "exit $s",
 ].join("\n");
 
-/** The user's terminal, /dev/tty, or undefined if there is none (no controlling terminal: CI, a service). */
+const SHELL_ENV = { PATH: "/usr/bin:/bin" };
+
+/**
+ * The user's terminal, `path` (/dev/tty), or undefined if there is none (no
+ * controlling terminal: CI, a service).
+ *
+ * A Ctrl-C at a prompt signals hapi as well as the shell reading the line,
+ * and a SIGTERM or SIGHUP may reach hapi alone. So while a line is read,
+ * hapi handles those signals itself (./interrupt.ts): it kills the reading
+ * shell (an orphaned one would swallow the next line typed at your prompt),
+ * turns echo back on, ends the prompt's line, and the command then releases
+ * its lock, prints "cancelled" and exits 130.
+ */
 export function openTerminal(path = "/dev/tty"): Tty | undefined {
   let fd: number;
   try {
@@ -101,15 +124,36 @@ export function openTerminal(path = "/dev/tty"): Tty | undefined {
       closeSync(fd);
     } catch {}
   });
-  const sh = commandRunner("/bin/sh");
+  const restore = () => {
+    spawnSync("/bin/sh", ["-c", 'stty echo <"$1" 2>/dev/null', "sh", path], { env: SHELL_ENV, stdio: "ignore" });
+    try {
+      writeSync(fd, "\n");
+    } catch {}
+  };
   return {
     write: (text) => void writeSync(fd, text),
     async read(prompt) {
       writeSync(fd, prompt);
-      const r = await sh(["-c", READ_LINE], { env: { PATH: "/usr/bin:/bin" } });
-      if (r.code === 130) throw new SecretError("cancelled");
-      if (r.code !== 0) throw new SecretError(`could not read from the terminal (exit ${r.code})`);
-      return r.stdout;
+      const child = spawn("/bin/sh", ["-c", READ_LINE, "sh", path], { env: SHELL_ENV, stdio: ["ignore", "pipe", "ignore"] });
+      const release = onInterrupt(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {}
+        restore();
+      }, "hapi secrets");
+      try {
+        const r = await new Promise<{ code: number; stdout: string }>((done, fail) => {
+          const out: Buffer[] = [];
+          child.stdout!.on("data", (d: Buffer) => out.push(d));
+          child.on("error", () => fail(new SecretError("could not read from the terminal (cannot run /bin/sh)")));
+          child.on("close", (code) => done({ code: code ?? 130, stdout: Buffer.concat(out).toString("utf8") }));
+        });
+        if (r.code === 130) throw new CancelledError();
+        if (r.code !== 0) throw new SecretError(`could not read from the terminal (exit ${r.code})`);
+        return r.stdout;
+      } finally {
+        release();
+      }
     },
   };
 }
@@ -191,7 +235,7 @@ export async function readRecoveryWords(tty: Tty): Promise<string[]> {
     try {
       return parseWords(await tty.read("Type your 10 recovery words: "));
     } catch (e) {
-      if (!(e instanceof SecretError) || e.message === "cancelled") throw e;
+      if (!(e instanceof SecretError) || e instanceof CancelledError) throw e;
       last = e;
       tty.write(`${e.message}\n`);
     }

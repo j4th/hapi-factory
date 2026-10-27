@@ -6,17 +6,20 @@
  *   file is made;
  * - `configText`: the local config for a store and this machine's key;
  * - `writeNewFiles`: several new files as one step, each no-replace;
- * - `withStoreLock`: the lock beside the store, held by every lifecycle
- *   command and by `edit` while they read and change the store and its
- *   recipients file, so two of them can't interleave and lose an update.
+ * - `withStoreLock`: the store's lock, on the user's tmpfs, held by every
+ *   lifecycle command and by `edit` while they read and change the store and
+ *   its recipients file, so two of them can't interleave and lose an update.
  *
- * It imports ./files and ./provider only, so init, lifecycle and cli can all
- * import it without a cycle.
+ * It imports ./files, ./interrupt and ./provider only, so init, lifecycle and
+ * cli can all import it without a cycle.
  */
-import { lstat, open, rm, rmdir } from "node:fs/promises";
-import { basename, dirname, join, resolve } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { readFileSync, unlinkSync } from "node:fs";
+import { lstat, readFile, rm, rmdir } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import { stringify } from "yaml";
-import { ensurePrivateDir, isWithin, realish, writeNewSecretFile } from "./files";
+import { ensurePrivateDir, isWithin, realish, runtimeDir, secureDir, writeNewSecretFile } from "./files";
+import { onInterrupt } from "./interrupt";
 import { configHome, defaultAgeKeyFile, type Env, SecretError } from "./provider";
 
 /** Whether anything (a file, a directory, a dangling symlink) is at `path`. */
@@ -103,51 +106,176 @@ export async function writeNewFiles(files: [string, string | Uint8Array][], o: {
   }
 }
 
-/** The lock file beside `store`: `.<basename>.lock` (`private/.secrets.enc.yaml.lock`). */
-export function lockPath(store: string): string {
-  return join(dirname(store), `.${basename(store)}.lock`);
+/**
+ * The lock on `store`: `$XDG_RUNTIME_DIR/hapi/locks/<sha256 of the store's
+ * real path>.lock`. It lives on the user's tmpfs, never beside the store: a
+ * file in private/ (a git repo) could be committed, and a committed lock
+ * would stop every other machine. A reboot clears it.
+ */
+export async function lockPath(store: string, env: Env): Promise<string> {
+  const real = await realish(resolve(store));
+  return join(runtimeDir(env), "locks", `${createHash("sha256").update(real).digest("hex")}.lock`);
+}
+
+/** Who holds a lock, as its one line records it. */
+interface Holder {
+  what: string;
+  pid: number;
+  /** The process's start time (`/proc/<pid>/stat`, clock ticks since boot), so a reused pid isn't taken for the holder. */
+  start?: string;
+  started: string;
+}
+
+/** Linux's largest pid (`/proc/sys/kernel/pid_max` can't exceed it). */
+const PID_MAX = 4_194_304;
+
+const HOLDER = /^hapi secrets ([a-z][a-z-]{0,30}), pid (\d{1,7})(?: \(start (\d{1,20})\))?, started (\d{4}-\d\d-\d\dT[0-9:.]+Z), id [0-9a-f]{8}, store /;
+
+/** A process's start time in clock ticks since boot (field 22 of `/proc/<pid>/stat`), or undefined if it can't be read. */
+function processStart(pid: number): string | undefined {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    // The fields after the command name, which is in parentheses and may hold spaces: field 3 (state) is first.
+    return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
+  } catch {
+    return undefined;
+  }
+}
+
+/** The lock's one line: the command, this process (pid and start time), when, a random id (so each holder's line is its own) and the store. */
+function holderLine(what: string, store: string): string {
+  const start = processStart(process.pid);
+  return `hapi secrets ${what}, pid ${process.pid}${start === undefined ? "" : ` (start ${start})`}, started ${new Date().toISOString()}, id ${randomUUID().slice(0, 8)}, store ${store}\n`;
+}
+
+function parseHolder(text: string): Holder | undefined {
+  const m = HOLDER.exec(text);
+  if (m === null) return undefined;
+  const pid = Number(m[2]);
+  if (pid < 2 || pid > PID_MAX) return undefined;
+  return { what: m[1]!, pid, ...(m[3] === undefined ? {} : { start: m[3] }), started: m[4]! };
+}
+
+const describeHolder = (h: Holder) => `hapi secrets ${h.what} (pid ${h.pid}, started ${h.started})`;
+
+/** Whether the lock's process still runs: its pid exists, and (when both are known) started when the lock says. */
+function running(h: Holder): boolean {
+  try {
+    process.kill(h.pid, 0);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ESRCH") return false;
+    // EPERM: the pid exists (another user's process).
+  }
+  if (h.start !== undefined) {
+    const now = processStart(h.pid);
+    if (now !== undefined && now !== h.start) return false;
+  }
+  return true;
+}
+
+async function readText(path: string): Promise<string | undefined> {
+  try {
+    return await readFile(path, "utf8");
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw e;
+  }
+}
+
+/** Remove `path` if it still holds exactly `text` (so only the lock this command made). Synchronous, for a signal handler. */
+function removeIfOursSync(path: string, text: string): boolean {
+  try {
+    if (readFileSync(path, "utf8") !== text) return false;
+    unlinkSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function removeIfOurs(path: string, text: string): Promise<void> {
+  if ((await readText(path)) === text) await rm(path, { force: true });
 }
 
 /**
- * Run `fn` holding the lock on `store`: a file beside it, made with
- * O_CREAT|O_EXCL (`open(..., "wx")`), so only one `hapi secrets` command at a
- * time reads and changes a store and its recipients file. `what` names the
- * command in the lock's text. The lock is removed when `fn` settles, however
- * it ends. It guards this copy of the store on this machine; other machines
- * have their own copies, and `check` reports copies that disagree.
- *
- * If the lock already exists, another command holds it, or one was
- * interrupted (killed, a crash, a power cut) and left it: the SecretError
- * names the file, says how to tell, and never removes a lock hapi didn't make.
+ * Clear a lock whose process is gone, under a second lock (`<lock>.clearing`)
+ * so two commands that find the same stale lock can't both clear it and then
+ * both take a new one: only the command holding `.clearing` removes a lock it
+ * didn't make, and only if the lock still holds the stale line it read.
  */
-export async function withStoreLock<T>(store: string, what: string, fn: () => Promise<T>): Promise<T> {
-  const lock = lockPath(store);
-  let fh: Awaited<ReturnType<typeof open>>;
+async function clearStale(lock: string, seen: string, holder: Holder, o: { store: string; what: string }): Promise<void> {
+  const guard = `${lock}.clearing`;
+  const mine = holderLine(o.what, o.store);
   try {
-    fh = await open(lock, "wx", 0o600);
+    await writeNewSecretFile(guard, mine);
   } catch (e) {
-    const code = (e as NodeJS.ErrnoException).code;
-    if (code === "EEXIST") {
-      const made = await lstat(lock).then(
-        (s) => ` (made ${s.mtime.toISOString()})`,
-        () => "",
-      );
-      throw new SecretError(
-        `${lock} exists${made}: another hapi secrets command is using ${store}, or one was interrupted and left it. ` +
-          `If none is running, run \`hapi secrets check\`, repair the store and its recipients file if it reports drift (docs/secrets.md#an-interrupted-command), then remove ${lock} and run this again`,
-      );
-    }
-    if (code === "ENOENT") throw new SecretError(`no sops file at ${store}: ${dirname(store)} does not exist. Run \`mise run secrets:init\`, or give the path of your copy of the store`);
-    throw new SecretError(`cannot make the lock file ${lock} beside the store${code ? ` (${code})` : ""}: hapi secrets ${what} needs to write in ${dirname(store)}`);
+    if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+    const other = parseHolder((await readText(guard)) ?? "");
+    if (other !== undefined && running(other)) throw new SecretError(`another hapi secrets command, ${describeHolder(other)}, is clearing a stale lock on ${o.store}: run this again in a moment`);
+    throw new SecretError(`${guard} was left by an interrupted hapi secrets command while it cleared a stale lock on ${o.store}: if none is running, remove ${guard} and run this again`);
   }
+  const release = onInterrupt(() => void removeIfOursSync(guard, mine));
   try {
-    try {
-      await fh.writeFile(`hapi secrets ${what}, pid ${process.pid}, started ${new Date().toISOString()}\n`);
-    } finally {
-      await fh.close();
+    if ((await readText(lock)) === seen) {
+      await rm(lock, { force: true });
+      console.error(`hapi secrets ${o.what}: removed a stale lock on ${o.store}: ${describeHolder(holder)} is no longer running`);
+    }
+  } finally {
+    await removeIfOurs(guard, mine);
+    release();
+  }
+}
+
+/**
+ * Run `fn` holding the lock on `store` (`lockPath`), so only one `hapi
+ * secrets` command at a time reads and changes a store and its recipients
+ * file. `what` names the command in the lock's line. The lock is made whole
+ * and at once (a temp file hard-linked into place, which fails if the lock
+ * exists), and holds this process's pid. It guards this copy of the store on
+ * this machine, for this user; other machines have their own copies, and
+ * `check` reports copies that disagree.
+ *
+ * The lock is removed when `fn` settles, however it ends, and also on SIGINT,
+ * SIGTERM or SIGHUP (./interrupt.ts): Ctrl-C at the word prompt leaves no
+ * lock. If a lock exists:
+ * - its process still runs: a SecretError names it; hapi never takes a live
+ *   lock;
+ * - its process is gone (killed with SIGKILL, a crash): the lock is stale, so
+ *   hapi removes it, says so in one line, and takes the lock;
+ * - it names no process: a SecretError says to remove it by hand.
+ */
+export async function withStoreLock<T>(store: string, what: string, fn: () => Promise<T>, o: { env: Env; uid?: number }): Promise<T> {
+  const rt = runtimeDir(o.env);
+  const uid = o.uid === undefined ? {} : { uid: o.uid };
+  await secureDir(rt, dirname(rt), uid);
+  await secureDir(join(rt, "locks"), dirname(rt), uid);
+  const lock = await lockPath(store, o.env);
+  const mine = holderLine(what, resolve(store));
+  // Registered first, so a signal from here on never leaves this command's lock behind.
+  const release = onInterrupt(() => (removeIfOursSync(lock, mine) ? `released the lock on ${store}` : undefined), `hapi secrets ${what}`);
+  try {
+    for (let attempt = 1; ; attempt++) {
+      if (attempt > 4) throw new SecretError(`the lock on ${store} (${lock}) keeps changing hands: run this again`);
+      try {
+        await writeNewSecretFile(lock, mine);
+        break;
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw new SecretError(`cannot make the lock on ${store} (${lock})${(e as NodeJS.ErrnoException).code ? ` (${(e as NodeJS.ErrnoException).code})` : ""}`);
+      }
+      const seen = await readText(lock);
+      if (seen === undefined) continue; // released meanwhile
+      const holder = parseHolder(seen);
+      if (holder === undefined) {
+        throw new SecretError(`${lock}, the lock on ${store}, is not one hapi wrote (it names no process): if no hapi secrets command is running, remove it and run this again`);
+      }
+      if (running(holder)) {
+        throw new SecretError(`another command, ${describeHolder(holder)}, is using ${store}: wait for it to end, or stop it, and run this again. hapi never takes the lock (${lock}) while its process runs`);
+      }
+      await clearStale(lock, seen, holder, { store, what });
     }
     return await fn();
   } finally {
-    await rm(lock, { force: true });
+    await removeIfOurs(lock, mine);
+    release();
   }
 }

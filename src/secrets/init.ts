@@ -23,8 +23,9 @@
  *    disk.
  * 5. **The writes**, each no-replace (`writeNewFiles`: a file that appears
  *    after the checks is never replaced), 0600 in a 0700 directory: this
- *    machine's key (if new), the store, recovery.age, the recipients file and
- *    the config. If one fails, the others are removed again.
+ *    machine's key (if new), the store, recovery.age, the recipients file
+ *    (which records recovery.age's SHA-256) and the config. If one fails, the
+ *    others are removed again.
  * An abort at any step writes nothing.
  */
 import { join } from "node:path";
@@ -34,7 +35,7 @@ import { checkName, defaultMachineName, type LifecycleDeps, machineKey, terminal
 import { loadManifest, MANIFEST_FILE, manifestNames } from "./manifest";
 import { configHome, configPath, defaultAgeKeyFile, expandPath, SecretError } from "./provider";
 import { ageEnv, scrubToolError, sopsEnv, sopsFileProblem } from "./providers/sops";
-import { kindName, recipientsPath, recipientsText, recoveryPath, storeRecipients } from "./recipients";
+import { kindName, recipientsPath, recipientsText, recoveryDigest, recoveryPath, storeRecipients } from "./recipients";
 import { attendedTerminal, generateWords, newIdentity, showAndConfirmWords, wrapIdentity } from "./recovery";
 import { configText, exists, refuseCoinciding, refuseSharedDirs, writeNewFiles } from "./store-files";
 
@@ -117,7 +118,7 @@ export async function initStore(o: InitOptions, deps: LifecycleDeps = {}): Promi
     pq,
     recipients: [
       { name, kind: "machine" as const, recipient: key.recipient, added },
-      { name: "recovery", kind: "recovery" as const, recipient: rec.recipient, added },
+      { name: "recovery", kind: "recovery" as const, recipient: rec.recipient, added, recovery_age_sha256: recoveryDigest(wrapped) },
     ],
   };
   await writeNewFiles(

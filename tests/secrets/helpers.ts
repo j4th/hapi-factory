@@ -10,6 +10,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { parse, stringify } from "yaml";
+import { recoveryDigest } from "../../src/secrets/recipients";
 import type { Tty } from "../../src/secrets/recovery";
 import type { SopsRunner } from "../../src/secrets/providers/sops";
 
@@ -105,9 +106,15 @@ export function sopsFileText(names: Record<string, "" | "enc">, metadata: Record
   return stringify(doc);
 }
 
-/** The text of a recipients file. */
-export function recipientsFileText(recipients: { name: string; kind: "machine" | "recovery"; recipient: string }[], pq = true): string {
-  return stringify({ pq, recipients: recipients.map((r) => ({ ...r, added: "2026-10-26" })) });
+/** The fake recovery.age `sopsStore` writes (an armored token, no real key behind it). */
+export const FAKE_RECOVERY_AGE = ENC_KEY;
+
+/** The text of a recipients file. A recovery entry records `recoveryAge`'s SHA-256 (default: FAKE_RECOVERY_AGE's), as hapi writes it. */
+export function recipientsFileText(recipients: { name: string; kind: "machine" | "recovery"; recipient: string }[], pq = true, recoveryAge: string | Uint8Array = FAKE_RECOVERY_AGE): string {
+  return stringify({
+    pq,
+    recipients: recipients.map((r) => ({ ...r, added: "2026-10-26", ...(r.kind === "recovery" ? { recovery_age_sha256: recoveryDigest(recoveryAge) } : {}) })),
+  });
 }
 
 /**
@@ -185,11 +192,12 @@ const identityLines = (text: string) => text.split(/\s+/).filter((l) => l.starts
  *   identity whose recipient the file lists, as with real sops.
  * Every call is recorded in `calls`.
  */
-export function fakeTools(o: { failRotate?: boolean } = {}) {
+export function fakeTools(o: { failRotate?: boolean; firstKey?: number } = {}) {
   const calls: ToolCall[] = [];
   const recipients = new Map<string, string>(); // identity -> recipient
   const wrapped = new Map<string, { identity: string; passphrase: string }>();
-  let n = 100;
+  // Another process's fake tools (tests/secrets/fixtures/) start elsewhere, so their keys don't collide with the test's.
+  let n = o.firstKey ?? 100;
   const record = (tool: ToolCall["tool"], args: string[], opts: { env: Record<string, string>; stdin?: string | Uint8Array; fd3?: string }) => {
     const stdin = opts.stdin === undefined ? undefined : typeof opts.stdin === "string" ? opts.stdin : new TextDecoder().decode(opts.stdin);
     calls.push({ tool, args, env: opts.env, ...(stdin === undefined ? {} : { stdin }), ...(opts.fd3 === undefined ? {} : { fd3: opts.fd3 }) });

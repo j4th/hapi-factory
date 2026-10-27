@@ -1,15 +1,20 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { spawn, spawnSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import * as fs from "node:fs";
+import * as fsp from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import { parse, stringify } from "yaml";
 import { secretsAddMachine, secretsCheck, secretsDrill, secretsEdit, secretsInit, secretsJoin, secretsNewRecovery, secretsRecover, secretsResolve, secretsRevoke } from "../../src/secrets/cli";
-import { loadStore } from "../../src/secrets/lifecycle";
+import { DRIFT_FIX, loadStore, recipientReport } from "../../src/secrets/lifecycle";
+import { lockPath } from "../../src/secrets/store-files";
 import { loadManifest, manifestNames } from "../../src/secrets/manifest";
 import { passphraseOf } from "../../src/secrets/recovery";
 import { shortRecipient } from "../../src/secrets/recipients";
 import {
   allText,
   capture,
+  caught,
   cleanup,
   FAKE_AGE_DIR,
   FAKE_RECIPIENT,
@@ -70,7 +75,7 @@ function machine(root: string, name: string, tools: Tools, typed: string[] = [])
 }
 
 /** Machine `a` runs init with its store in its private/; returns the words and the recipients. */
-async function initialised(o: { failRotate?: boolean } = {}) {
+async function initialised(o: { failRotate?: boolean; firstKey?: number } = {}) {
   const root = tempDir();
   mkdirSync(join(root, "checkout"));
   const tools = fakeTools(o);
@@ -294,7 +299,8 @@ describe("hapi secrets recover, drill and new-recovery", () => {
     expect(decrypt!.args).toEqual(["--config", "/dev/null", "decrypt", "--input-type", "yaml", "--output-type", "json", a.store]);
     // The temp dir is gone, nothing else was written, and no value was printed.
     expect(existsSync(tmp)).toBe(false);
-    expect(readdirSync(join(a.xdg, "hapi"))).toEqual([]);
+    expect(readdirSync(join(a.xdg, "hapi"))).toEqual(["locks"]); // and the lock is released
+    expect(readdirSync(join(a.xdg, "hapi", "locks"))).toEqual([]);
     expect(tree(dirname(dirname(a.store)))).toEqual(before);
     expect([...out, ...err].join("\n")).not.toContain("fake-hapi");
     // The recovery identity is in the decrypt child's env as SOPS_AGE_KEY and nowhere else; the words reach age on fd 3 only.
@@ -310,7 +316,8 @@ describe("hapi secrets recover, drill and new-recovery", () => {
     // Wrong words fail, and still leave nothing behind.
     a.t.typed.push([...words].reverse().join(" "));
     await expect(secretsDrill([], a.deps)).rejects.toThrow(/the words don't open/);
-    expect(readdirSync(join(a.xdg, "hapi"))).toEqual([]);
+    expect(readdirSync(join(a.xdg, "hapi"))).toEqual(["locks"]); // and the lock is released
+    expect(readdirSync(join(a.xdg, "hapi", "locks"))).toEqual([]);
   });
 
   test("new-recovery adds a new recovery recipient, then removes the old, and replaces recovery.age; old words stop working", async () => {
@@ -381,6 +388,98 @@ describe("hapi secrets recover, drill and new-recovery", () => {
     a.deps.sops = tools.sops;
     a.t.typed.push(words.join(" "));
     expect(await secretsDrill([], a.deps)).toBe(0);
+  });
+});
+
+describe("an interrupted command leaves a state check reports", () => {
+  const FILES = ["secrets.enc.yaml", "recovery.age", "secrets.recipients.yaml"];
+
+  test("new-recovery renames the store, then recovery.age, then the recipients file: killed after any of them, check reports it", async () => {
+    capture();
+    const { tools, a, words } = await initialised();
+    await fill(tools, a.store);
+    const dir = dirname(a.store);
+    const state = () => Object.fromEntries(FILES.map((f) => [f, readFileSync(join(dir, f))]));
+    // What a kill (SIGKILL, a power cut) right after each rename in the store's directory would leave on disk.
+    const states = [state()];
+    const order: string[] = [];
+    const realRename = fsp.rename;
+    const spy = spyOn(fsp, "rename").mockImplementation((async (from: string, to: string) => {
+      await realRename(from, to);
+      if (dirname(to) === dir) {
+        order.push(basename(to));
+        states.push(state());
+      }
+    }) as typeof fsp.rename);
+    try {
+      expect(await secretsNewRecovery([], a.deps)).toBe(0);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(order).toEqual(FILES);
+    // Each state, alone in a directory, as `check` sees it: the old state and the new are whole; the two between are reported.
+    const reports = [];
+    for (const st of states) {
+      const d = tempDir();
+      for (const f of FILES) writeFileSync(join(d, f), st[f]!);
+      reports.push(await recipientReport(join(d, "secrets.enc.yaml")));
+    }
+    expect(reports.map((r) => r.errors.length > 0)).toEqual([false, true, true, false]);
+    // Killed after the store's rename: drift, both ways (the new recovery recipient isn't listed, the old one isn't in the store).
+    expect(reports[1]!.errors.join("\n")).toMatch(/the store is encrypted to age1pq1.*, which the recipients file doesn't list/);
+    expect(reports[1]!.errors.join("\n")).toMatch(/the recipients file lists recovery \(age1pq1.*\), but the store isn't encrypted to it/);
+    // Killed after recovery.age's rename: drift, and recovery.age isn't the one the recipients file records.
+    expect(reports[2]!.errors.join("\n")).toMatch(/recovery\.age is not the recovery\.age the recipients file records for recovery \(age1pq1.*\): its SHA-256 differs/);
+    // Every drift report ends with what to do, and how to tell an interrupted command from a planted recipient.
+    for (const r of [reports[1]!, reports[2]!]) expect(r.errors.at(-1)).toBe(DRIFT_FIX);
+    expect(reports[2]!.errors.slice(0, -1).at(-1)).toMatch(/recovery\.age is not the recovery\.age/);
+    // The finished state is whole: the new words open it.
+    a.t.typed.push(a.t.shown.at(-1)!.join(" "));
+    expect(await secretsDrill([], a.deps)).toBe(0);
+    expect(words).not.toEqual(a.t.shown.at(-1));
+  });
+
+  test("a recovery.age that isn't the one the recipients file records is an error for check, and drill and recover stop before the words", async () => {
+    const { err } = capture();
+    const { root, tools, a, words } = await initialised();
+    await fill(tools, a.store);
+    const dir = dirname(a.store);
+    // Another store's recovery.age (or this one's from another commit): it opens with other words, to another recipient.
+    const other = await initialised({ firstKey: 7000 });
+    const recoveryAge = join(dir, "recovery.age");
+    writeFileSync(recoveryAge, readFileSync(join(dirname(other.a.store), "recovery.age")));
+    const problem = new RegExp(
+      `^${recoveryAge.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} is not the recovery\\.age the recipients file records for recovery \\(age1pq1.*\\): its SHA-256 differs, so it comes from another commit or another store, or a command was interrupted\\. Restore recovery\\.age, the store and its recipients file from the same commit \\(docs/secrets\\.md#an-interrupted-command\\), or run \`mise run secrets:new-recovery\` for new words$`,
+    );
+    err.length = 0;
+    expect(await secretsCheck([], { ...a.deps, tty: null })).toBe(1);
+    expect(err.filter((l) => problem.test(l.replace(/^hapi secrets check: /, ""))).length).toBe(1);
+    // drill and recover refuse before asking for the words, and recover writes no key or config.
+    const prompts = a.t.prompts.length;
+    a.t.typed.push(words.join(" "));
+    await expect(secretsDrill([], a.deps)).rejects.toThrow(problem);
+    expect(a.t.prompts.length).toBe(prompts);
+    const c = machine(root, "machine-c", tools, [words.join(" ")]);
+    copyPrivate(a, c);
+    await expect(secretsRecover(["--store", c.store], c.deps)).rejects.toThrow(/recovery\.age is not the recovery\.age the recipients file records/);
+    expect([c.t.prompts, existsSync(c.key), existsSync(c.config)]).toEqual([[], false, false]);
+    // new-recovery is the way out for lost words, so it still runs, and makes recovery.age whole again.
+    expect(await secretsNewRecovery([], a.deps)).toBe(0);
+    err.length = 0;
+    expect(await secretsCheck([], { ...a.deps, tty: null })).toBe(0);
+    expect(err).toEqual([]);
+  });
+
+  test("a drift error says to add a missing recipient back only if it is exactly the key being added, and otherwise to restore and treat it as a compromise", async () => {
+    capture();
+    const { tools, a } = await initialised();
+    await fill(tools, a.store);
+    const doc = parse(readFileSync(a.store, "utf8")) as { sops: { age: { recipient: string; enc: string }[] } };
+    writeFileSync(a.store, stringify({ ...doc, sops: { ...doc.sops, age: [...doc.sops.age, { recipient: fakeRecipient(4243), enc: "x" }] } }));
+    const e = await caught(secretsRevoke(["--name", "recovery"], a.deps));
+    expect(e.message).toEndWith(`. ${DRIFT_FIX}`);
+    expect(DRIFT_FIX).toContain("add a recipient the file is missing only if its whole public key is exactly the one that command was adding");
+    expect(DRIFT_FIX).toContain("treat it as a possible compromise, since drift is also how a planted recipient shows up: revoke any recipient you didn't add, and reissue every credential in the store (docs/secrets.md#an-interrupted-command)");
   });
 });
 
@@ -505,39 +604,115 @@ describe("hapi secrets edit runs the store checks first", () => {
 });
 
 describe("the store lock", () => {
-  test("every lifecycle command and edit refuse while the lock beside the store exists, naming it, and leave it and the store alone", async () => {
+  /** The lock's path for machine `m`'s store, on its tmpfs. */
+  const lockOf = (m: { store: string; env: Record<string, string> }) => lockPath(m.store, m.env);
+  /** A lock line, as hapi writes it, for process `pid`. */
+  const lockLine = (store: string, pid: number, extra = "") => `hapi secrets drill, pid ${pid}${extra}, started 2026-10-27T09:00:00.000Z, id 0123abcd, store ${store}\n`;
+  /** Plant a lock for `m`'s store, as another hapi process would leave it: in a 0700 locks dir, the file 0600. */
+  async function plant(m: { store: string; env: Record<string, string> }, text: string) {
+    const lock = await lockOf(m);
+    mkdirSync(dirname(lock), { recursive: true, mode: 0o700 });
+    writeFileSync(lock, text, { mode: 0o600 });
+    return lock;
+  }
+  /** A pid that no process has: a child's, after it has exited. */
+  const deadPid = () => {
+    const pid = spawnSync("true").pid!;
+    expect(() => process.kill(pid, 0)).toThrow();
+    return pid;
+  };
+  const re = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+  test("the lock is on the tmpfs, never in the store's directory: one 0600 file in a 0700 dir, named by the store's real path, holding the pid", async () => {
+    capture();
+    const { tools, a } = await initialised();
+    const lock = await lockOf(a);
+    expect(lock).toMatch(new RegExp(`^${re(join(a.xdg, "hapi", "locks"))}/[0-9a-f]{64}\\.lock$`));
+    // The same store through a symlinked directory is the same lock.
+    symlinkSync(dirname(a.store), join(a.home, "private-link"));
+    expect(await lockPath(join(a.home, "private-link", "secrets.enc.yaml"), a.env)).toBe(lock);
+    // While add-machine runs (seen from inside its sops call): the lock is held, by this process, and nothing is beside the store.
+    const seen: { inStoreDir: string[]; lock: string; modes: number[] }[] = [];
+    a.deps.sops = async (args, o) => {
+      seen.push({ inStoreDir: readdirSync(dirname(a.store)).filter((f) => /lock/.test(f)), lock: readFileSync(lock, "utf8"), modes: [mode(lock), mode(dirname(lock))] });
+      return tools.sops(args, o);
+    };
+    expect(await secretsAddMachine(["--name", "machine-b", "--recipient", fakeRecipient(999)], a.deps)).toBe(0);
+    expect(seen.length).toBe(1);
+    expect(seen[0]!.inStoreDir).toEqual([]);
+    expect(seen[0]!.lock).toMatch(new RegExp(`^hapi secrets add-machine, pid ${process.pid}( \\(start \\d+\\))?, started \\S+Z, id [0-9a-f]{8}, store ${re(a.store)}\\n$`));
+    expect(seen[0]!.modes).toEqual([0o600, 0o700]);
+    // Released when it ends; the store's directory never had one.
+    expect(readdirSync(dirname(lock))).toEqual([]);
+    expect(readdirSync(dirname(a.store)).filter((f) => /lock/.test(f))).toEqual([]);
+  });
+
+  test("a live lock refuses every lifecycle command and edit, naming its holder, and is left alone", async () => {
     capture();
     const { root, tools, a, words } = await initialised();
     const b = machine(root, "machine-b", tools);
     copyPrivate(a, b);
     const c = machine(root, "machine-c", tools, [words.join(" ")]);
     copyPrivate(a, c);
-    const lockOf = (m: { store: string }) => join(dirname(m.store), ".secrets.enc.yaml.lock");
-    for (const m of [a, b, c]) writeFileSync(lockOf(m), "hapi secrets add-machine, pid 1, started 2026-10-27T09:00:00Z\n", { mode: 0o600 });
+    // A lock held by a running process (this one, the test runner).
+    const live = (m: { store: string }) => lockLine(m.store, process.pid);
+    const locks = [await plant(a, live(a)), await plant(b, live(b)), await plant(c, live(c))];
     const before = [a, b, c].map((m) => snapshot(dirname(m.store)));
     tools.calls.length = 0;
-    const held = (m: { store: string }) =>
-      new RegExp(`^${lockOf(m).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} exists \\(made .*\\): another hapi secrets command is using .*secrets\\.enc\\.yaml, or one was interrupted and left it\\. If none is running, run \`hapi secrets check\`, repair the store and its recipients file if it reports drift \\(docs/secrets\\.md#an-interrupted-command\\), then remove .*\\.lock and run this again$`);
+    const held = (m: { store: string }, lock: string) =>
+      new RegExp(
+        `^another command, hapi secrets drill \\(pid ${process.pid}, started 2026-10-27T09:00:00\\.000Z\\), is using ${re(m.store)}: wait for it to end, or stop it, and run this again\\. hapi never takes the lock \\(${re(lock)}\\) while its process runs$`,
+      );
     const ed = editor();
-    await expect(secretsAddMachine(["--name", "machine-b", "--recipient", fakeRecipient(999)], a.deps)).rejects.toThrow(held(a));
-    await expect(secretsRevoke(["--name", "recovery"], a.deps)).rejects.toThrow(held(a));
-    await expect(secretsNewRecovery([], a.deps)).rejects.toThrow(held(a));
+    await expect(secretsAddMachine(["--name", "machine-b", "--recipient", fakeRecipient(999)], a.deps)).rejects.toThrow(held(a, locks[0]!));
+    await expect(secretsRevoke(["--name", "recovery"], a.deps)).rejects.toThrow(held(a, locks[0]!));
+    await expect(secretsNewRecovery([], a.deps)).rejects.toThrow(held(a, locks[0]!));
     a.t.typed.push(words.join(" "));
-    await expect(secretsDrill([], a.deps)).rejects.toThrow(held(a));
-    await expect(secretsEdit([], { ...a.deps, interactive: ed.interactive })).rejects.toThrow(held(a));
-    await expect(secretsJoin(["--store", b.store], b.deps)).rejects.toThrow(held(b));
-    await expect(secretsRecover(["--store", c.store], c.deps)).rejects.toThrow(held(c));
-    // Nothing ran, nothing changed, the lock hapi didn't make is still there, and the joining and recovering machines got no key or config.
+    await expect(secretsDrill([], a.deps)).rejects.toThrow(held(a, locks[0]!));
+    await expect(secretsEdit([], { ...a.deps, interactive: ed.interactive })).rejects.toThrow(held(a, locks[0]!));
+    await expect(secretsJoin(["--store", b.store], b.deps)).rejects.toThrow(held(b, locks[1]!));
+    await expect(secretsRecover(["--store", c.store], c.deps)).rejects.toThrow(held(c, locks[2]!));
+    // Nothing ran, nothing changed, each lock is as it was, and the joining and recovering machines got no key or config.
     expect(tools.calls).toEqual([]);
     expect(ed.runs).toEqual([]);
     expect([a, b, c].map((m) => snapshot(dirname(m.store)))).toEqual(before);
+    expect([a, b, c].map((m, i) => readFileSync(locks[i]!, "utf8") === live(m))).toEqual([true, true, true]);
     for (const m of [b, c]) expect([existsSync(m.key), existsSync(m.config)]).toEqual([false, false]);
     // check and resolve only read: they don't take the lock.
     expect(await secretsCheck([], { ...a.deps, tty: null })).toBe(1); // every value is still empty
-    // Once it is removed, the command runs, and leaves no lock behind.
-    rmSync(lockOf(a));
-    expect(await secretsAddMachine(["--name", "machine-b", "--recipient", fakeRecipient(999)], a.deps)).toBe(0);
-    expect(existsSync(lockOf(a))).toBe(false);
+    // A lock that names no process isn't hapi's: refused, and left for the user to remove.
+    writeFileSync(locks[0]!, "not a lock\n");
+    await expect(secretsAddMachine(["--name", "machine-b", "--recipient", fakeRecipient(999)], a.deps)).rejects.toThrow(
+      new RegExp(`^${re(locks[0]!)}, the lock on ${re(a.store)}, is not one hapi wrote \\(it names no process\\): if no hapi secrets command is running, remove it and run this again$`),
+    );
+    expect(readFileSync(locks[0]!, "utf8")).toBe("not a lock\n");
+  });
+
+  test("a stale lock (its process is gone, or its pid now belongs to a later process) is removed with a one-line message, and the command runs", async () => {
+    const { err } = capture();
+    const { a } = await initialised();
+    const dead = deadPid();
+    const lock = await plant(a, lockLine(a.store, dead));
+    expect(await secretsAddMachine(["--name", "machine-b", "--recipient", fakeRecipient(901)], a.deps)).toBe(0);
+    expect(err).toEqual([`hapi secrets add-machine: removed a stale lock on ${a.store}: hapi secrets drill (pid ${dead}, started 2026-10-27T09:00:00.000Z) is no longer running`]);
+    expect(readdirSync(dirname(lock))).toEqual([]); // the new lock is released too, and the .clearing guard is gone
+    // A live pid whose process started at another time than the lock records: the pid was reused, so the lock is stale too.
+    err.length = 0;
+    await plant(a, lockLine(a.store, process.pid, " (start 1)"));
+    expect(await secretsAddMachine(["--name", "machine-c", "--recipient", fakeRecipient(902)], a.deps)).toBe(0);
+    expect(err).toEqual([`hapi secrets add-machine: removed a stale lock on ${a.store}: hapi secrets drill (pid ${process.pid}, started 2026-10-27T09:00:00.000Z) is no longer running`]);
+    expect((await loadStore(a.store)).recipients.recipients.map((r) => r.name)).toEqual(["machine-a", "recovery", "machine-b", "machine-c"]);
+    // Another command clearing a stale lock at the same moment (its .clearing guard, live): refused, nothing removed.
+    await plant(a, lockLine(a.store, dead));
+    writeFileSync(`${lock}.clearing`, lockLine(a.store, process.pid), { mode: 0o600 });
+    await expect(secretsRevoke(["--name", "machine-c"], a.deps)).rejects.toThrow(/^another hapi secrets command, hapi secrets drill \(pid \d+, started .*\), is clearing a stale lock on .*: run this again in a moment$/);
+    expect(existsSync(lock)).toBe(true);
+    // A guard whose process is gone was left by an interrupted command: the user removes it.
+    writeFileSync(`${lock}.clearing`, lockLine(a.store, dead), { mode: 0o600 });
+    await expect(secretsRevoke(["--name", "machine-c"], a.deps)).rejects.toThrow(new RegExp(`^${re(lock)}\\.clearing was left by an interrupted hapi secrets command while it cleared a stale lock on .*: if none is running, remove ${re(lock)}\\.clearing and run this again$`));
+    rmSync(`${lock}.clearing`);
+    expect(await secretsRevoke(["--name", "machine-c"], a.deps)).toBe(0);
+    expect(readdirSync(dirname(lock))).toEqual([]);
   });
 
   test("two recipient changes at once: one runs, the other is refused, and the store and recipients file agree", async () => {
@@ -549,13 +724,203 @@ describe("the store lock", () => {
     ]);
     expect(results.map((r) => r.status).sort()).toEqual(["fulfilled", "rejected"]);
     const refused = results.find((r) => r.status === "rejected") as PromiseRejectedResult;
-    expect((refused.reason as Error).message).toMatch(/\.secrets\.enc\.yaml\.lock exists .*another hapi secrets command is using/);
+    expect((refused.reason as Error).message).toMatch(new RegExp(`^another command, hapi secrets add-machine \\(pid ${process.pid}, started .*\\), is using ${re(a.store)}: wait for it to end`));
     // No lost update: exactly one was added, in both files.
     const state = await loadStore(a.store);
     expect(state.recipients.recipients.length).toBe(3);
     expect(file().recipients.map((r) => r.name).filter((n) => n !== "machine-a" && n !== "recovery").length).toBe(1);
-    expect(existsSync(join(dirname(a.store), ".secrets.enc.yaml.lock"))).toBe(false);
+    expect(readdirSync(dirname(await lockOf(a)))).toEqual([]);
   });
+
+  /**
+   * Signals delivered in-process (`process.emit`), with process.exit and the
+   * message's writeSync recorded instead of run, so the test runner survives
+   * a wrong answer.
+   */
+  function trapExit() {
+    const exits: number[] = [];
+    const lines: string[] = [];
+    const exit = spyOn(process, "exit").mockImplementation(((code?: number) => {
+      exits.push(code ?? 0);
+      throw new Error(`process.exit(${code})`);
+    }) as typeof process.exit);
+    const realWrite = fs.writeSync;
+    const write = spyOn(fs, "writeSync").mockImplementation(((fd: number, text: string, ...rest: unknown[]) =>
+      fd === 2 ? (lines.push(String(text)), String(text).length) : (realWrite as (...a: unknown[]) => number)(fd, text, ...rest)) as typeof fs.writeSync);
+    return { exits, lines, restore: () => (exit.mockRestore(), write.mockRestore()) };
+  }
+
+  test("a Ctrl-C while sops edit runs is the editor's: hapi ignores it; a SIGTERM waits for sops to end, then releases the lock and exits 143", async () => {
+    capture();
+    const { a } = await initialised();
+    const lock = await lockOf(a);
+    const t = trapExit();
+    try {
+      // Ctrl-C reaches the editor and hapi alike (one foreground group): the edit goes on and ends normally.
+      let held = "";
+      expect(await secretsEdit([], { ...a.deps, interactive: async () => (process.emit("SIGINT"), await Bun.sleep(20), (held = readFileSync(lock, "utf8")), 0) })).toBe(0);
+      expect(held).toContain("hapi secrets edit, pid");
+      expect([t.exits, t.lines]).toEqual([[], []]);
+      expect(readdirSync(dirname(lock))).toEqual([]);
+      // SIGTERM: held back until sops ends, then the lock goes and hapi exits 128+15.
+      let ran = false;
+      await expect(secretsEdit([], { ...a.deps, interactive: async () => (process.emit("SIGTERM"), await Bun.sleep(20), (ran = existsSync(lock)), 0) })).rejects.toThrow("process.exit(143)");
+      expect(ran).toBe(true);
+      expect(t.exits).toEqual([143]);
+      expect(t.lines).toEqual([`hapi secrets edit: stopped after sops edit ended (SIGTERM); released the lock on ${a.store}\n`]);
+      expect(readdirSync(dirname(lock))).toEqual([]);
+    } finally {
+      t.restore();
+    }
+    // Afterwards hapi no longer handles the signals: nothing is left listening.
+    expect(process.listenerCount("SIGINT") + process.listenerCount("SIGTERM") + process.listenerCount("SIGHUP")).toBe(0);
+  });
+
+  test("a Ctrl-C during the renames waits for them: new-recovery finishes its change, then releases the lock and exits 130", async () => {
+    capture();
+    const { tools, a } = await initialised();
+    await fill(tools, a.store);
+    const lock = await lockOf(a);
+    const realRename = fsp.rename;
+    let signalled = false;
+    const rename = spyOn(fsp, "rename").mockImplementation((async (from: string, to: string) => {
+      await realRename(from, to);
+      // Ctrl-C right after the store's rename, before recovery.age and the recipients file are in place.
+      if (to === a.store && !signalled) {
+        signalled = true;
+        process.emit("SIGINT");
+      }
+    }) as typeof fsp.rename);
+    const t = trapExit();
+    try {
+      await expect(secretsNewRecovery([], a.deps)).rejects.toThrow("process.exit(130)");
+    } finally {
+      t.restore();
+      rename.mockRestore();
+    }
+    expect(signalled).toBe(true);
+    expect(t.lines).toEqual([`hapi secrets new-recovery: stopped after the change was written (SIGINT); released the lock on ${a.store}\n`]);
+    // The change is whole (no drift, recovery.age the recorded one), and the lock is gone.
+    const report = await recipientReport(a.store);
+    expect(report.errors).toEqual([]);
+    expect(readdirSync(dirname(lock))).toEqual([]);
+    a.t.typed.push(a.t.shown.at(-1)!.join(" "));
+    expect(await secretsDrill([], a.deps)).toBe(0);
+  });
+
+  /** Run the fixture (tests/secrets/fixtures/at-the-prompt.ts) as `hapi secrets <command>` for machine `m`, up to its first prompt. */
+  async function atThePrompt(m: ReturnType<typeof machine>, root: string, command: "drill" | "recover" | "new-recovery", args: string[] = []) {
+    const fixture = { command, args, env: m.env, cwd: m.deps.cwd, checkout: join(root, "checkout"), machineName: m.name, tty: "fake" };
+    const child = spawn(process.execPath, [join(import.meta.dir, "fixtures", "at-the-prompt.ts")], { env: { ...m.env, HAPI_FIXTURE: JSON.stringify(fixture) }, stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    let err = "";
+    child.stdout.on("data", (d: Buffer) => (out += d));
+    child.stderr.on("data", (d: Buffer) => (err += d));
+    const exited = new Promise<{ code: number | null; signal: string | null }>((done) => child.on("close", (code, signal) => done({ code, signal })));
+    for (let i = 0; i < 400 && !out.includes("PROMPT ") && child.exitCode === null; i++) await Bun.sleep(25);
+    if (!out.includes("PROMPT ")) throw new Error(`the fixture never reached a prompt: ${out} ${err}`);
+    return { child, exited, out: () => out, err: () => err };
+  }
+
+  test("a signal releases the lock: SIGINT, SIGTERM or SIGHUP at the word prompt of drill, recover or new-recovery prints cancelled and exits 128+n", async () => {
+    capture();
+    const { root, tools, a, words } = await initialised();
+    await fill(tools, a.store);
+    const lock = await lockOf(a);
+    const before = snapshot(dirname(a.store));
+    const cases: ["drill" | "recover" | "new-recovery", NodeJS.Signals, number][] = [
+      ["drill", "SIGINT", 130],
+      ["drill", "SIGTERM", 143],
+      ["drill", "SIGHUP", 129],
+      ["new-recovery", "SIGINT", 130],
+    ];
+    for (const [command, signal, code] of cases) {
+      const run = await atThePrompt(a, root, command);
+      // At the prompt: the lock is held by the child.
+      expect(readFileSync(lock, "utf8")).toContain(`hapi secrets ${command}, pid ${run.child.pid}`);
+      run.child.kill(signal);
+      expect(await run.exited).toEqual({ code, signal: null });
+      expect(run.err()).toBe(`hapi secrets ${command}: cancelled (${signal}); released the lock on ${a.store}\n`);
+      expect(readdirSync(dirname(lock))).toEqual([]);
+      expect(snapshot(dirname(a.store))).toEqual(before);
+    }
+    // recover on a new box: Ctrl-C at the word prompt leaves its key and config (a retry reuses them) but no lock, and the store as it was.
+    const c = machine(root, "machine-c", tools);
+    copyPrivate(a, c);
+    const run = await atThePrompt(c, root, "recover", ["--store", c.store]);
+    expect(run.out()).toContain("PROMPT Type your 10 recovery words: ");
+    run.child.kill("SIGINT");
+    expect(await run.exited).toEqual({ code: 130, signal: null });
+    expect(run.err()).toBe(`hapi secrets recover: cancelled (SIGINT); released the lock on ${c.store}\n`);
+    expect(readdirSync(dirname(await lockOf(c)))).toEqual([]);
+    expect(snapshot(dirname(c.store))).toEqual(before);
+    expect([existsSync(c.key), existsSync(c.config)]).toEqual([true, true]);
+    // And the next command runs: no stale lock to clear.
+    a.t.typed.push(words.join(" "));
+    const { err } = capture();
+    expect(await secretsDrill([], a.deps)).toBe(0);
+    expect(err).toEqual([]);
+  }, 30_000);
+
+  test.skipIf(!existsSync("/usr/bin/script") || !existsSync("/bin/bash"))("on a real terminal (script(1)), Ctrl-C at the word prompt turns echo back on, leaves no reader behind, releases the lock and exits 130", async () => {
+    capture();
+    const { root, tools, a } = await initialised();
+    await fill(tools, a.store);
+    const lock = await lockOf(a);
+    /** The pids whose parent is `pid` (from /proc/<n>/stat: the fields after the command's closing parenthesis are state, then ppid). */
+    const childrenOf = (pid: number) =>
+      readdirSync("/proc")
+        .filter((n) => /^\d+$/.test(n))
+        .filter((n) => {
+          try {
+            const stat = readFileSync(`/proc/${n}/stat`, "utf8");
+            return Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]) === pid;
+          } catch {
+            return false;
+          }
+        })
+        .map(Number);
+    for (const how of ["ctrl-c", "sigint-to-hapi-only", "sigint-to-the-reader-only"] as const) {
+      const fixture = { command: "drill", args: [], env: a.env, cwd: a.deps.cwd, checkout: join(root, "checkout"), machineName: a.name, tty: "real" };
+      const shell = [
+        `${JSON.stringify(process.execPath)} ${JSON.stringify(join(import.meta.dir, "fixtures", "at-the-prompt.ts"))}`,
+        'echo "rc=$?"',
+        "stty -a | tr ' ;' '\\n\\n' | grep -x -- '-\\?echo'",
+        'IFS= read -r x; echo "next=$x"',
+      ].join("; ");
+      // script(1) runs `$SHELL -c`. bash, after a Ctrl-C, goes on once its child exits normally (dash would stop too).
+      const env = { ...a.env, HAPI_FIXTURE: JSON.stringify(fixture), TERM: "dumb", SHELL: "/bin/bash" };
+      const child = spawn("/usr/bin/script", ["-qfec", shell, "/dev/null"], { env, stdio: ["pipe", "pipe", "pipe"] });
+      let out = "";
+      child.stdout.on("data", (d: Buffer) => (out += d.toString().replaceAll("\r", "")));
+      const exited = new Promise<number | null>((done) => child.on("close", (code) => done(code)));
+      const until = async (s: string) => {
+        for (let i = 0; i < 400 && !out.includes(s); i++) await Bun.sleep(25);
+        expect([s, out.includes(s)]).toEqual([s, true]);
+      };
+      await until("Type your 10 recovery words: ");
+      await Bun.sleep(300); // the reading shell has turned echo off by now
+      const pid = Number(/PID (\d+)/.exec(out)![1]);
+      expect(readFileSync(lock, "utf8")).toContain(`hapi secrets drill, pid ${pid}`);
+      if (how === "ctrl-c") child.stdin.write("\x03");
+      else if (how === "sigint-to-hapi-only") process.kill(pid, "SIGINT");
+      else {
+        // Only the shell reading the line: its trap turns echo on and exits 130, and hapi cancels from that.
+        const readers = childrenOf(pid);
+        expect(readers.length).toBe(1);
+        process.kill(readers[0]!, "SIGINT");
+      }
+      await until("rc=");
+      child.stdin.write("typed after\n");
+      await until("next=");
+      child.stdin.end();
+      expect(await exited).toBe(0);
+      const cancelled = how === "sigint-to-the-reader-only" ? /hapi secrets drill: cancelled\n/ : /hapi secrets drill: cancelled \(SIGINT\); released the lock on .*secrets\.enc\.yaml\n/;
+      expect([how, cancelled.test(out)]).toEqual([how, true]);
+      expect([how, /rc=(\d+)/.exec(out)?.[1], /^-?echo$/m.exec(out)?.[0], /next=(.*)/.exec(out)?.[1]]).toEqual([how, "130", "echo", "typed after"]);
+      expect(readdirSync(dirname(lock))).toEqual([]);
+    }
+  }, 30_000);
 });
 
 describe("hapi secrets check: the recipients", () => {

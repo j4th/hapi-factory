@@ -19,17 +19,23 @@
  * Every recipient change is `sops --config /dev/null rotate -i --add-age /
  * --rm-age`, which makes a new data key (`updatekeys` doesn't), on a temp copy
  * beside the store. The copy is checked (encrypted, and to exactly the
- * recipients asked for), renamed over the store in one step, and only then is
- * the recipients file rewritten; if that fails, the old store is put back. So
- * a failure leaves both as they were. Before any change, the store and its
- * recipients file must agree (`loadStore`).
+ * recipients asked for), renamed over the store in one step, then (for
+ * new-recovery) the new recovery.age, staged beside it beforehand, is renamed
+ * into place, and only then is the recipients file rewritten; if a step
+ * fails, the earlier ones are undone. So a failure leaves all three as they
+ * were. Before any change, the store and its recipients file must agree
+ * (`loadStore`).
  *
  * Every command holds the store's lock (`withStoreLock`, ./store-files.ts)
  * from before it reads the store until it is done, so two commands on one
- * copy of the store can't interleave and lose an update. A command killed
- * between the store's rename and the recipients file's rewrite leaves the
- * two out of step and the lock behind: `check` reports the drift, and
- * docs/secrets.md#an-interrupted-command says how to repair it.
+ * copy of the store can't interleave and lose an update. Ctrl-C, SIGTERM or
+ * SIGHUP releases the lock (./interrupt.ts); during the renames it waits for
+ * them to finish. A command killed outright (SIGKILL, a crash, a power cut)
+ * between the store's rename and the recipients file's rewrite leaves them
+ * out of step, which `check` reports as drift (a recovery.age out of step
+ * too: the recipients file records its SHA-256), and leaves a lock the next
+ * command finds stale and removes. docs/secrets.md#an-interrupted-command
+ * says how to repair the drift.
  *
  * sops is never given a wrapped identity: it would prompt through gpg-agent
  * or the terminal, and its gpg-agent client ignores GNUPGHOME. hapi unwraps
@@ -37,11 +43,13 @@
  * it as SOPS_AGE_KEY. Every sops child gets `GPG_AGENT_INFO=` (`sopsEnv`).
  */
 import { randomUUID } from "node:crypto";
+import { rmSync } from "node:fs";
 import { mkdtemp, readFile, rename, rm } from "node:fs/promises";
 import { hostname, userInfo } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { PolicyError } from "../policy/load";
 import { type CheckoutRoots, checkoutProblem, defaultRepoRoot, runtimeDir, secureDir, writeNewSecretFile, writeSecretFile } from "./files";
+import { onInterrupt, shielded } from "./interrupt";
 import { configPath, defaultAgeKeyFile, type Env, expandPath, loadSecretsConfig, SecretError } from "./provider";
 import {
   ageEnv,
@@ -67,6 +75,7 @@ import {
   recipientsPath,
   recipientsText,
   recipientType,
+  recoveryDigest,
   recoveryPath,
   shortRecipient,
   storeRecipients,
@@ -172,6 +181,17 @@ export async function machineKey(
   return { path, recipient: id.recipient, text: id.text };
 }
 
+/**
+ * What to do about drift (docs/secrets.md#an-interrupted-command). Drift is
+ * also how a recipient planted with raw sops shows up, so a missing entry is
+ * added back only if it is exactly the key the interrupted command was
+ * adding; anything else is restored from git and treated as a compromise.
+ */
+export const DRIFT_FIX =
+  "If a hapi secrets command was interrupted, add a recipient the file is missing only if its whole public key is exactly the one that command was adding " +
+  "(and delete an entry the store lacks only if it is the one being revoked). Otherwise restore the store, its recipients file and recovery.age from one commit that check passes on (private/'s history, say), " +
+  "and treat it as a possible compromise, since drift is also how a planted recipient shows up: revoke any recipient you didn't add, and reissue every credential in the store (docs/secrets.md#an-interrupted-command)";
+
 /** A store and its recipients file, read and checked to agree. */
 export interface StoreState {
   file: string;
@@ -201,9 +221,7 @@ export async function loadStore(file: string): Promise<StoreState> {
   const recipientsFile = recipientsPath(file);
   const recipients = await loadRecipients(recipientsFile);
   const problems = recipientProblems(recipients, storeRecipients(text));
-  if (problems.length > 0) {
-    throw new SecretError(`${file} and ${recipientsFile} disagree: ${problems.join("; ")}. Restore both from the same commit (private/'s history, say) and run it again (docs/secrets.md#keys-and-recovery)`);
-  }
+  if (problems.length > 0) throw new SecretError(`${file} and ${recipientsFile} disagree: ${problems.join("; ")}. ${DRIFT_FIX}`);
   return { file, text, recipientsFile, recipients, recovery: recoveryPath(file) };
 }
 
@@ -226,8 +244,10 @@ const ROTATE = ["--config", "/dev/null", "rotate", "-i", "--input-type", "yaml",
  */
 async function rotate(state: StoreState, steps: ({ add: string } | { rm: string })[], key: { file: string } | { identity: string }, tools: Tools, env: Env) {
   const tmp = join(dirname(state.file), `.${basename(state.file)}.${randomUUID()}.tmp`);
-  await writeNewSecretFile(tmp, state.text);
+  // Interrupted, the half-done copy goes (it is encrypted, but it is clutter beside the store).
+  const release = onInterrupt(() => rmSync(tmp, { force: true }));
   try {
+    await writeNewSecretFile(tmp, state.text);
     const childEnv = sopsEnv(env, tools.dir, key);
     let expected = storeRecipients(state.text);
     for (const step of steps) {
@@ -250,52 +270,103 @@ async function rotate(state: StoreState, steps: ({ add: string } | { rm: string 
   } catch (e) {
     await rm(tmp, { force: true });
     throw e;
+  } finally {
+    release();
   }
 }
 
 /**
- * Put a rotated store in place and the recipients file in step with it: the
- * new recovery.age first, if there is one (backing up the old in memory), then
- * the store (one rename), then the recipients file. If a step fails, the
- * earlier ones are undone.
+ * Put a rotated store in place and the recipients file in step with it. The
+ * order is chosen so that a command killed at any point leaves a state
+ * `check` reports, or a whole one:
+ * 1. stage the new recovery.age, if there is one, as a temp file beside it
+ *    (killed here: the old state, plus a temp file);
+ * 2. rename the rotated store over the store (killed here: the store has
+ *    the new recipients and the recipients file the old: drift);
+ * 3. rename the staged recovery.age into place (killed here: drift, and
+ *    recovery.age's SHA-256 isn't the one the recipients file records);
+ * 4. rewrite the recipients file (done).
+ * Steps 2 to 4 run `shielded`: a Ctrl-C waits for them. If a step fails, the
+ * earlier ones are undone (the old recovery.age and store were kept in
+ * memory).
  */
 async function commit(state: StoreState, rotated: { tmp: string }, next: RecipientsFile, recovery?: string): Promise<void> {
+  let staged: string | undefined;
   let oldRecovery: Buffer | undefined;
-  let recoveryWritten = false;
-  let storeReplaced = false;
+  // Interrupted before the renames, the rotated copy and the staged recovery.age go.
+  const release = onInterrupt(() => {
+    rmSync(rotated.tmp, { force: true });
+    if (staged !== undefined) rmSync(staged, { force: true });
+  });
   try {
     if (recovery !== undefined) {
       oldRecovery = (await exists(state.recovery)) ? await readFile(state.recovery) : undefined;
-      await writeSecretFile(state.recovery, recovery);
-      recoveryWritten = true;
+      staged = join(dirname(state.recovery), `.${basename(state.recovery)}.${randomUUID()}.tmp`);
+      await writeNewSecretFile(staged, recovery);
     }
-    await rename(rotated.tmp, state.file);
-    storeReplaced = true;
-    await writeSecretFile(state.recipientsFile, recipientsText(next, state.file));
   } catch (e) {
-    if (storeReplaced) await writeSecretFile(state.file, state.text);
-    else await rm(rotated.tmp, { force: true });
-    if (recoveryWritten) {
-      if (oldRecovery === undefined) await rm(state.recovery, { force: true });
-      else await writeSecretFile(state.recovery, oldRecovery);
-    }
+    if (staged !== undefined) await rm(staged, { force: true });
+    await rm(rotated.tmp, { force: true });
     throw e;
+  } finally {
+    // In the same tick as `shielded` below takes over, so no signal falls between the two.
+    release();
   }
+  await shielded(
+    async () => {
+      let storeReplaced = false;
+      let recoveryReplaced = false;
+      try {
+        await rename(rotated.tmp, state.file);
+        storeReplaced = true;
+        if (staged !== undefined) {
+          await rename(staged, state.recovery);
+          recoveryReplaced = true;
+        }
+        await writeSecretFile(state.recipientsFile, recipientsText(next, state.file));
+      } catch (e) {
+        if (recoveryReplaced) {
+          if (oldRecovery === undefined) await rm(state.recovery, { force: true });
+          else await writeSecretFile(state.recovery, oldRecovery);
+        } else if (staged !== undefined) await rm(staged, { force: true });
+        if (storeReplaced) await writeSecretFile(state.file, state.text);
+        else await rm(rotated.tmp, { force: true });
+        throw e;
+      }
+    },
+    { done: "stopped after the change was written" },
+  );
 }
 
-const entry = (name: string, kind: RecipientEntry["kind"], recipient: string, deps: LifecycleDeps): RecipientEntry => ({ name, kind, recipient, added: today(deps) });
+const entry = (name: string, recipient: string, deps: LifecycleDeps): RecipientEntry => ({ name, kind: "machine", recipient, added: today(deps) });
 const recipientCount = (n: number) => `${n} recipient${n === 1 ? "" : "s"}`;
 
-/** recovery.age's bytes, or a SecretError saying where it should be. */
-async function readRecovery(state: StoreState): Promise<Buffer> {
+/**
+ * Why `bytes` (recovery.age) isn't the file the recovery entry records, or
+ * undefined: its SHA-256 isn't the entry's `recovery_age_sha256`.
+ */
+export function recoveryAgeProblem(path: string, bytes: Uint8Array, rec: RecipientEntry): string | undefined {
+  if (recoveryDigest(bytes) === rec.recovery_age_sha256) return undefined;
+  return (
+    `${path} is not the recovery.age the recipients file records for ${rec.name} (${shortRecipient(rec.recipient)}): its SHA-256 differs, so it comes from another commit or another store, or a command was interrupted. ` +
+    "Restore recovery.age, the store and its recipients file from the same commit (docs/secrets.md#an-interrupted-command), or run `mise run secrets:new-recovery` for new words"
+  );
+}
+
+/** recovery.age's bytes, checked to be the file the recovery entry `rec` records; or a SecretError saying where it should be. */
+async function readRecovery(state: StoreState, rec: RecipientEntry): Promise<Buffer> {
+  let bytes: Buffer;
   try {
-    return await readFile(state.recovery);
+    bytes = await readFile(state.recovery);
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === "ENOENT") {
       throw new SecretError(`there is no recovery.age at ${state.recovery}: the words can't open the store without it. Restore it from a backup of ${dirname(state.recovery)} (private/'s history, say)`);
     }
     throw e;
   }
+  const problem = recoveryAgeProblem(state.recovery, bytes, rec);
+  if (problem !== undefined) throw new SecretError(problem);
+  return bytes;
 }
 
 /** The store's one recovery recipient. */
@@ -349,7 +420,7 @@ export async function joinMachine(o: { store: string; config?: string | undefine
     console.log(`  mise run secrets:add-machine -- --name ${name} --recipient ${key.recipient}`);
     console.log(`then bring the updated ${basename(store)} and ${basename(recipientsPath(store))} here (commit and pull private/, or copy both), and run mise run secrets:check`);
     return 0;
-  });
+  }, { env, ...uidOf(deps) });
 }
 
 /** `hapi secrets add-machine --name <n> --recipient <age1...>`: add a machine's public key to the store, with a new data key. */
@@ -372,12 +443,12 @@ export async function addMachine(o: { config?: string | undefined; name: string;
     const key = cfg.sops.age_key_file;
     await checkSopsKeys(key, sopsEnv(env, tools.dir, { file: key }), { repoRoot: await (deps.repoRoot ?? defaultRepoRoot)(), store: state.file, ...uidOf(deps) });
     const rotated = await rotate(state, [{ add: o.recipient }], { file: key }, tools, env);
-    const next = { ...state.recipients, recipients: [...state.recipients.recipients, entry(o.name, "machine", o.recipient, deps)] };
+    const next = { ...state.recipients, recipients: [...state.recipients.recipients, entry(o.name, o.recipient, deps)] };
     await commit(state, rotated, next);
     console.log(`added ${o.name} (${shortRecipient(o.recipient)}): ${state.file} has a new data key and is encrypted to ${recipientCount(next.recipients.length)}`);
     console.log(`next: bring ${basename(state.file)} and ${basename(state.recipientsFile)} to ${o.name} (commit and push private/, then pull it there), and run mise run secrets:check on it`);
     return 0;
-  });
+  }, { env, ...uidOf(deps) });
 }
 
 /**
@@ -429,23 +500,24 @@ export async function recover(o: { store?: string | undefined; config?: string |
     if (state.recipients.recipients.some((r) => r.name === name)) {
       throw new SecretError(`${name} is already a recipient of ${store} (is its key the lost one?): run recover with another --name, then \`hapi secrets revoke --name ${name}\``);
     }
+    // recovery.age, checked against the recipients file before anything is written.
+    const wrapped = await readRecovery(state, rec);
     // 1. Join: this machine's key and config, before the words, so a retry reuses them.
     await writeNewFiles(
       [...(key.text === undefined ? [] : [[ageKey, key.text] as [string, string]]), ...(haveConfig ? [] : [[configFile, configText(store, ageKey, "recover")] as [string, string]])],
       uidOf(deps),
     );
     // 2. The words, and the recovery identity, in memory.
-    const wrapped = await readRecovery(state);
     const words = await readRecoveryWords(tty);
     const identity = await unwrapIdentity(tools, ageEnv(env, tools.dir), wrapped, words, { file: state.recovery, recipient: rec.recipient });
     // 3. Add this machine, with the recovery identity in that one sops child's env.
     await checkSopsKeys(ageKey, sopsEnv(env, tools.dir, { file: ageKey }), { repoRoot, store, ...uidOf(deps) });
     const rotated = await rotate(state, [{ add: key.recipient }], { identity }, tools, env);
-    await commit(state, rotated, { ...state.recipients, recipients: [...state.recipients.recipients, entry(name, "machine", key.recipient, deps)] });
+    await commit(state, rotated, { ...state.recipients, recipients: [...state.recipients.recipients, entry(name, key.recipient, deps)] });
     console.log(`recovered: ${name} can open the store now, without the words (${state.file} has a new data key)`);
     console.log("next: mise run secrets:check; then `mise run secrets:revoke -- --name <machine>` for any machine whose key is lost or may be compromised");
     return 0;
-  });
+  }, { env, ...uidOf(deps) });
 }
 
 /**
@@ -467,10 +539,11 @@ export async function drill(o: { config?: string | undefined }, deps: LifecycleD
     const rt = runtimeDir(env);
     await secureDir(rt, dirname(rt), uidOf(deps));
     const tools = await toolsFor(deps);
-    const wrapped = await readRecovery(state);
+    const wrapped = await readRecovery(state, rec);
     const words = await readRecoveryWords(tty);
     const identity = await unwrapIdentity(tools, ageEnv(env, tools.dir), wrapped, words, { file: state.recovery, recipient: rec.recipient });
     const tmp = await mkdtemp(join(rt, "drill-"));
+    const release = onInterrupt(() => rmSync(tmp, { recursive: true, force: true }));
     try {
       const childEnv = { ...sopsEnv({ PATH: env.PATH, HOME: tmp }, tools.dir, { identity }), XDG_CONFIG_HOME: tmp };
       const r = await tools.sops(["--config", "/dev/null", "decrypt", "--input-type", "yaml", "--output-type", "json", state.file], { env: childEnv });
@@ -481,9 +554,10 @@ export async function drill(o: { config?: string | undefined }, deps: LifecycleD
       console.log(`recovery works: ${decryptedMap(r.stdout, state.file).size} names readable`);
     } finally {
       await rm(tmp, { recursive: true, force: true });
+      release();
     }
     return 0;
-  });
+  }, { env, ...uidOf(deps) });
 }
 
 const COMPROMISED =
@@ -519,7 +593,7 @@ export async function revoke(o: { config?: string | undefined; name: string }, d
     }
     console.log(COMPROMISED);
     return 0;
-  });
+  }, { env, ...uidOf(deps) });
 }
 
 /**
@@ -548,7 +622,8 @@ export async function newRecovery(o: { config?: string | undefined; noConfirm: b
     const wrapped = await wrapIdentity(tools.age, ageEnv(env, tools.dir), id.text, words);
     const old = state.recipients.recipients.filter((r) => r.kind === "recovery");
     const rotated = await rotate(state, [{ add: id.recipient }, ...old.map((r) => ({ rm: r.recipient }))], { file: key }, tools, env);
-    const next = { ...state.recipients, recipients: [...state.recipients.recipients.filter((r) => r.kind !== "recovery"), entry("recovery", "recovery", id.recipient, deps)] };
+    const recoveryEntry: RecipientEntry = { name: "recovery", kind: "recovery", recipient: id.recipient, added: today(deps), recovery_age_sha256: recoveryDigest(wrapped) };
+    const next = { ...state.recipients, recipients: [...state.recipients.recipients.filter((r) => r.kind !== "recovery"), recoveryEntry] };
     await commit(state, rotated, next, wrapped);
     console.log(`new recovery words are in place: ${state.recovery} and the recovery recipient are replaced, and ${state.file} has a new data key`);
     if (old.length > 0) {
@@ -558,12 +633,13 @@ export async function newRecovery(o: { config?: string | undefined; noConfirm: b
     }
     console.log("next: mise run secrets:drill, with the new words");
     return 0;
-  });
+  }, { env, ...uidOf(deps) });
 }
 
 /**
  * For `hapi secrets check`: the recipients (names, kinds, PQ) as lines, the
- * errors (no or a bad recipients file, drift, a PQ/classic mix) and the
+ * errors (no or a bad recipients file, drift, a PQ/classic mix, a
+ * recovery.age that isn't the one the recovery entry records) and the
  * warnings (no recovery recipient, no recovery.age).
  */
 export async function recipientReport(file: string): Promise<{ lines: string[]; errors: string[]; warnings: string[] }> {
@@ -579,13 +655,22 @@ export async function recipientReport(file: string): Promise<{ lines: string[]; 
     throw e;
   }
   out.lines = recipients.recipients.map((r) => `recipient ${r.kind.padEnd(8)} ${r.name} (${kindName(recipients.pq)}, added ${r.added})`);
-  out.errors = recipientProblems(recipients, storeRecipients(await readFile(file, "utf8")));
-  if (!recipients.recipients.some((r) => r.kind === "recovery")) {
+  const drift = recipientProblems(recipients, storeRecipients(await readFile(file, "utf8")));
+  out.errors.push(...drift);
+  const recs = recipients.recipients.filter((r) => r.kind === "recovery");
+  const rec = recoveryPath(file);
+  if (recs.length === 0) {
     out.warnings.push("the store has no recovery recipient: if every machine key is lost, so is the store. Run `mise run secrets:new-recovery` (docs/secrets.md#keys-and-recovery)");
-  } else if (!(await exists(recoveryPath(file)))) {
+  } else if (!(await exists(rec))) {
     out.warnings.push(
-      `there is no recovery.age at ${recoveryPath(file)}: the 10 words can't open the store without it. Restore it from a backup of ${dirname(file)} (private/'s history, say), or run \`mise run secrets:new-recovery\` for new words`,
+      `there is no recovery.age at ${rec}: the 10 words can't open the store without it. Restore it from a backup of ${dirname(file)} (private/'s history, say), or run \`mise run secrets:new-recovery\` for new words`,
     );
+  } else {
+    // recovery.age is wrapped with the words (age's scrypt stanza names no recipient), so its SHA-256, which the
+    // recovery entry records, is what ties it to the recovery recipient without them.
+    const bytes = await readFile(rec);
+    if (!recs.some((r) => recoveryAgeProblem(rec, bytes, r) === undefined)) out.errors.push(recoveryAgeProblem(rec, bytes, recs[0]!)!);
   }
+  if (drift.length > 0) out.errors.push(DRIFT_FIX);
   return out;
 }

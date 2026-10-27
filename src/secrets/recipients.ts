@@ -9,13 +9,15 @@
  *   pq: true
  *   recipients:
  *     - { name: laptop-user, kind: machine, recipient: age1pq1..., added: 2026-10-26 }
- *     - { name: recovery, kind: recovery, recipient: age1pq1..., added: 2026-10-26 }
+ *     - { name: recovery, kind: recovery, recipient: age1pq1..., added: 2026-10-26, recovery_age_sha256: 9f86... }
  *
  * It holds public keys only (schema: secrets-recipients.schema.json), so it
  * may sit in private/ with the store. hapi compares it with the store's own
  * `sops.age[].recipient` metadata, read without decrypting
  * (`recipientProblems`): drift in either direction is an error naming the
- * recipient. Any other kind of master key in the store (PGP, a cloud KMS,
+ * recipient. The recovery entry also records recovery.age's SHA-256, so a
+ * recovery.age that isn't the recovery recipient's (one from another commit,
+ * say) is found without the words. Any other kind of master key in the store (PGP, a cloud KMS,
  * Vault, key groups) is refused before that, by `sopsFileProblem`
  * (./providers/sops.ts), so the age recipients are all the store's
  * decryptors.
@@ -26,6 +28,7 @@
  * `pq: true` every recipient is `age1pq1...`, with `pq: false` (the trade-off
  * for P-256 hardware plugins later) every one is classic X25519.
  */
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { parse, stringify } from "yaml";
@@ -42,6 +45,13 @@ export interface RecipientEntry {
   recipient: string;
   /** YYYY-MM-DD (UTC). */
   added: string;
+  /**
+   * A recovery recipient only (and required for one): the SHA-256 of the
+   * recovery.age that holds its identity (`recoveryDigest`). recovery.age is
+   * wrapped with the words (an age `scrypt` stanza, which names no
+   * recipient), so this is how `check` ties it to the recipient without them.
+   */
+  recovery_age_sha256?: string;
 }
 
 export interface RecipientsFile {
@@ -87,6 +97,11 @@ export function recoveryPath(store: string): string {
   return join(dirname(store), "recovery.age");
 }
 
+/** recovery.age's SHA-256, as the recovery entry's `recovery_age_sha256` records it: lower-case hex. */
+export function recoveryDigest(bytes: string | Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
 /**
  * Parse and check a recipients file's text: the schema, then unique names and
  * recipients, then every recipient of the file's kind (`pq`). Throws a
@@ -130,7 +145,7 @@ export async function loadRecipients(path: string): Promise<RecipientsFile> {
     const code = (e as NodeJS.ErrnoException).code;
     if (code === "ENOENT") {
       throw new SecretError(
-        `no recipients file at ${path}: it sits beside the store and names every key the store is encrypted to. Restore it with the store from the same commit; a store made before hapi had recovery keys has none, so make a new one with \`mise run secrets:init\` and copy the values across (docs/secrets.md#keys-and-recovery)`,
+        `no recipients file at ${path}: it sits beside the store and names every key the store is encrypted to. Restore it with the store from the same commit; a store made before hapi had recovery keys has none, so make a new one with \`mise run secrets:init\` and copy the values across: read them with raw \`sops decrypt\` and the old age key, and put them in with \`mise run secrets:edit\` (docs/secrets.md#open-items)`,
       );
     }
     throw new SecretError(`cannot read ${path}${code ? ` (${code})` : ""}`);

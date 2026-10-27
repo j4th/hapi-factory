@@ -11,11 +11,12 @@ import {
   recipientsPath,
   recipientsText,
   recipientType,
+  recoveryDigest,
   recoveryPath,
   shortRecipient,
   storeRecipients,
 } from "../../src/secrets/recipients";
-import { caught, cleanup, fakeRecipient, recipientsFileText, sopsFileText, tempDir } from "./helpers";
+import { caught, cleanup, FAKE_RECOVERY_AGE, fakeRecipient, recipientsFileText, sopsFileText, tempDir } from "./helpers";
 
 afterEach(cleanup);
 
@@ -52,7 +53,7 @@ describe("the recipients file", () => {
       pq: true,
       recipients: [
         { name: "laptop-user", kind: "machine", recipient: A, added: "2026-10-26" },
-        { name: "recovery", kind: "recovery", recipient: R, added: "2026-10-26" },
+        { name: "recovery", kind: "recovery", recipient: R, added: "2026-10-26", recovery_age_sha256: recoveryDigest(FAKE_RECOVERY_AGE) },
       ],
     });
     const problem = (text: string) => {
@@ -71,6 +72,13 @@ describe("the recipients file", () => {
     expect(problem("pq: true\nrecipients: []\n")).toBeInstanceOf(PolicyError);
     expect(problem(`pq: true\nextra: 1\nrecipients:\n  - { name: x, kind: machine, recipient: ${A}, added: 2026-10-26 }\n`)).toBeInstanceOf(PolicyError);
     expect(problem(`pq: true\nrecipients:\n  - { name: x, kind: machine, recipient: ${A}, added: yesterday }\n`)).toBeInstanceOf(PolicyError);
+    // recovery.age's SHA-256: required on the recovery entry, lower-case hex, and on no machine entry.
+    const digest = recoveryDigest(FAKE_RECOVERY_AGE);
+    expect(digest).toMatch(/^[0-9a-f]{64}$/);
+    const issues = (text: string) => (problem(text) as PolicyError).message;
+    expect(issues(`pq: true\nrecipients:\n  - { name: recovery, kind: recovery, recipient: ${R}, added: 2026-10-26 }\n`)).toMatch(/\/recipients\/0\/recovery_age_sha256: missing required key/);
+    expect(issues(`pq: true\nrecipients:\n  - { name: recovery, kind: recovery, recipient: ${R}, added: 2026-10-26, recovery_age_sha256: ${digest.toUpperCase()} }\n`)).toMatch(/\/recipients\/0\/recovery_age_sha256: must match pattern/);
+    expect(issues(`pq: true\nrecipients:\n  - { name: x, kind: machine, recipient: ${A}, added: 2026-10-26, recovery_age_sha256: ${digest} }\n`)).toMatch(/\/recipients\/0\/recovery_age_sha256: not allowed here/);
     // Duplicates, by name or by recipient.
     expect(problem(recipientsFileText([{ name: "x", kind: "machine", recipient: A }, { name: "x", kind: "machine", recipient: B }])).message).toMatch(/name x appears twice/);
     expect(problem(recipientsFileText([{ name: "x", kind: "machine", recipient: A }, { name: "y", kind: "machine", recipient: A }])).message).toMatch(/y has the same recipient as x/);
