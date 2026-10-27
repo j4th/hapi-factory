@@ -325,6 +325,62 @@ describe("hapi secrets recover, drill and new-recovery", () => {
   });
 });
 
+describe("a store with a master key that is not age", () => {
+  /** The store's text with a PGP master key added, as `sops rotate -i --add-pgp` by someone holding a key would leave it. */
+  const planted = (text: string) => {
+    const doc = parse(text) as { sops: Record<string, unknown> };
+    doc.sops.pgp = [{ created_at: "2026-10-27T09:00:00Z", enc: "-----BEGIN PGP MESSAGE-----\nfake\n-----END PGP MESSAGE-----\n", fp: "FAKEFINGERPRINT" }];
+    return stringify(doc);
+  };
+  const REFUSED = /secrets\.enc\.yaml has a PGP key \(sops\.pgp\) in its sops metadata, besides its age recipients: hapi's store is encrypted to age recipients only/;
+  const snapshot = (dir: string) => tree(dir).map((f) => [f, readFileSync(join(dir, f), "utf8")]);
+
+  test("check, resolve and every lifecycle command refuse a store also encrypted to a non-age key, before sops runs or anything is written", async () => {
+    const { err } = capture();
+    const { root, tools, a, words } = await initialised();
+    await fill(tools, a.store);
+    writeFileSync(a.store, planted(readFileSync(a.store, "utf8")));
+    const before = snapshot(dirname(a.store));
+    tools.calls.length = 0;
+
+    await expect(secretsCheck([], a.deps)).rejects.toThrow(REFUSED);
+    await expect(secretsResolve([], a.deps)).rejects.toThrow(REFUSED);
+    await expect(secretsAddMachine(["--name", "machine-b", "--recipient", fakeRecipient(999)], a.deps)).rejects.toThrow(REFUSED);
+    await expect(secretsRevoke(["--name", "recovery"], a.deps)).rejects.toThrow(REFUSED);
+    a.t.typed.push(words.join(" "));
+    await expect(secretsDrill([], a.deps)).rejects.toThrow(REFUSED);
+    await expect(secretsNewRecovery([], a.deps)).rejects.toThrow(REFUSED);
+    // A new machine joining, or recovering with the words, is refused too, and gets no key or config.
+    const b = machine(root, "machine-b", tools);
+    copyPrivate(a, b);
+    await expect(secretsJoin(["--store", b.store], b.deps)).rejects.toThrow(REFUSED);
+    const c = machine(root, "machine-c", tools, [words.join(" ")]);
+    copyPrivate(a, c);
+    await expect(secretsRecover(["--store", c.store], c.deps)).rejects.toThrow(REFUSED);
+    for (const m of [b, c]) expect([existsSync(m.key), existsSync(m.config)]).toEqual([false, false]);
+
+    expect(tools.calls.filter((x) => x.tool === "sops")).toEqual([]);
+    expect(snapshot(dirname(a.store))).toEqual(before);
+    expect([...err].join("\n")).not.toContain("FAKEFINGERPRINT");
+  });
+
+  test("a rotate whose result carries a non-age key is not put in place", async () => {
+    capture();
+    const { tools, a } = await initialised();
+    const before = snapshot(dirname(a.store));
+    // A sops that adds a key of its own while rotating (say, from a .sops.yaml, were --config /dev/null ever lost).
+    a.deps.sops = async (args, o) => {
+      const r = await tools.sops(args, o);
+      if (args[2] === "rotate") writeFileSync(args.at(-1)!, planted(readFileSync(args.at(-1)!, "utf8")));
+      return r;
+    };
+    await expect(secretsAddMachine(["--name", "machine-b", "--recipient", fakeRecipient(999)], a.deps)).rejects.toThrow(
+      /^sops's result has a PGP key \(sops\.pgp\) in its sops metadata, besides its age recipients: .*; nothing was changed$/,
+    );
+    expect(snapshot(dirname(a.store))).toEqual(before);
+  });
+});
+
 describe("hapi secrets check: the recipients", () => {
   /** A full static store (every name found), its recipients file and config, with the age dir injected. */
   function setup(values = fullStore()) {

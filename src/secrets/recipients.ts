@@ -15,7 +15,10 @@
  * may sit in private/ with the store. hapi compares it with the store's own
  * `sops.age[].recipient` metadata, read without decrypting
  * (`recipientProblems`): drift in either direction is an error naming the
- * recipient.
+ * recipient. Any other kind of master key in the store (PGP, a cloud KMS,
+ * Vault, key groups) is refused before that, by `sopsFileProblem`
+ * (./providers/sops.ts), so the age recipients are all the store's
+ * decryptors.
  *
  * Post-quantum by default. sops accepts a mix of post-quantum and classic
  * recipients without a word, and the file is then only as strong as its

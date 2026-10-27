@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { SecretError } from "../../src/secrets/provider";
 import { AGE_MIN_VERSION, checkAgeKeyFile, resolveAgeDir, type SopsRunner, sopsFileProblem, sopsProvider } from "../../src/secrets/providers/sops";
-import { caught, cleanup, ENC, FAKE_AGE_DIR, sopsFileText, sopsStore, tempDir } from "./helpers";
+import { caught, cleanup, ENC, FAKE_AGE_DIR, FAKE_RECIPIENT, sopsFileText, sopsStore, tempDir } from "./helpers";
 
 const FAKE = "sk-SECRET-123";
 
@@ -77,6 +77,45 @@ describe("the sops provider", () => {
     await refuse(sopsFileText({ "hapi-a": "enc" }, {}, ["not-a-recipient"]), /no age recipient/);
     await refuse(`- ${FAKE}\n`, /not a sops-encrypted YAML mapping/);
     await refuse(`hapi-a: [${FAKE}\n`, /not valid YAML \(not shown\)/);
+    expect(s.store.calls).toEqual([]); // sops never ran
+  });
+
+  test("sops provider refuses a store also encrypted to a master key that is not age, naming its type, before sops runs", async () => {
+    // sops 3.13.3's master-key lists besides age (its metadata's mapstructure tags), each with its type as named.
+    const others: [string, unknown, RegExp][] = [
+      ["pgp", [{ fp: "FAKEFINGERPRINT", enc: ENC }], /a PGP key \(sops\.pgp\)/],
+      ["kms", [{ arn: "arn:aws:kms:us-east-1:000000000000:key/fake", enc: ENC }], /an AWS KMS key \(sops\.kms\)/],
+      ["gcp_kms", [{ resource_id: "projects/fake/keyRings/fake/cryptoKeys/fake", enc: ENC }], /a GCP KMS key \(sops\.gcp_kms\)/],
+      ["azure_kv", [{ vault_url: "https://fake.vault.azure.net", name: "fake", enc: ENC }], /an Azure Key Vault key \(sops\.azure_kv\)/],
+      ["hc_vault", [{ vault_address: "https://vault.example.org:8200", engine_path: "transit", key_name: "fake", enc: ENC }], /a HashiCorp Vault transit key \(sops\.hc_vault\)/],
+      ["hckms", [{ key_id: "region:fake", enc: ENC }], /a HuaweiCloud KMS key \(sops\.hckms\)/],
+      ["key_groups", [{ age: [{ recipient: FAKE_RECIPIENT, enc: ENC }] }], /sops key groups \(sops\.key_groups\)/],
+      // A list sops 3.13 doesn't write is refused too: a newer sops's key type is a list like the rest.
+      ["future_kms", [{ id: "fake", enc: ENC }], /keys of a type hapi doesn't know \(sops\.future_kms\)/],
+    ];
+    const s = setup();
+    for (const [field, value, why] of others) {
+      const text = sopsFileText({ "hapi-a": "enc" }, { [field]: value });
+      const problem = sopsFileProblem(text);
+      expect(problem).toMatch(why);
+      expect(problem).toMatch(/in its sops metadata, besides its age recipients: hapi's store is encrypted to age recipients only, each named in its recipients file, so any other key could open it unseen/);
+      expect(problem).toMatch(/reissue every credential in the store/);
+      // The key's identifier is metadata, not a secret, but sopsFileProblem never quotes the file.
+      expect(problem).not.toMatch(/FAKEFINGERPRINT|arn:aws|projects\/fake|vault\.azure|vault\.example|region:fake/);
+      writeFileSync(s.store.file, text);
+      await expect(s.provider.fetch(["hapi-a"])).rejects.toThrow(why);
+      await expect(s.provider.list()).rejects.toThrow(why);
+    }
+    // Several at once are all named.
+    expect(sopsFileProblem(sopsFileText({ "hapi-a": "enc" }, { pgp: [{ fp: "F" }], kms: [{ arn: "a" }] }))).toMatch(/^has a PGP key \(sops\.pgp\) and an AWS KMS key \(sops\.kms\) in its sops metadata/);
+    // An empty list (older sops wrote `pgp: []` and the like) and sops's scalar metadata are fine.
+    expect(sopsFileProblem(sopsFileText({ "hapi-a": "enc" }, { pgp: [], kms: [], gcp_kms: null, azure_kv: [], hc_vault: [], hckms: [], key_groups: [] }))).toBeUndefined();
+    expect(
+      sopsFileProblem(sopsFileText({ "hapi-a": "enc" }, { lastmodified: "2026-10-26T12:00:00Z", mac: ENC, unencrypted_suffix: "_unencrypted", shamir_threshold: 1, mac_only_encrypted: false })),
+    ).toBeUndefined();
+    // A metadata field name that isn't a plain identifier isn't shown either.
+    expect(sopsFileProblem(sopsFileText({ "hapi-a": "enc" }, { [FAKE]: [{ x: 1 }] }))).toMatch(/keys of a type hapi doesn't know \(a sops metadata field, not shown\)/);
+    expect(sopsFileProblem(sopsFileText({ "hapi-a": "enc" }, { [FAKE]: [{ x: 1 }] }))).not.toContain(FAKE);
     expect(s.store.calls).toEqual([]); // sops never ran
   });
 

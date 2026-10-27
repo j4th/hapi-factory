@@ -21,9 +21,10 @@
  *    file under the HOME it gets, if that exists too: sops 3.13 reads every
  *    key source it finds, not only SOPS_AGE_KEY_FILE (`checkSopsKeys`);
  * 2. parses the raw file and checks its shape before decrypting
- *    (`sopsFileProblem`): a sops block with an age recipient, and every
- *    top-level value encrypted, so a value `unencrypted_suffix` or
- *    `unencrypted_regex` left in plaintext is refused;
+ *    (`sopsFileProblem`): a sops block with an age recipient and no other
+ *    kind of master key (one would open the store unseen by the recipients
+ *    file), and every top-level value encrypted, so a value
+ *    `unencrypted_suffix` or `unencrypted_regex` left in plaintext is refused;
  * 3. runs `sops decrypt --output-type json <file>` through a `SopsRunner`,
  *    with the minimal env of `sopsEnv`. `--config /dev/null` keeps any
  *    .sops.yaml out of it. No value goes through argv; stderr is never echoed
@@ -221,9 +222,60 @@ const AGE_RECIPIENT = /^age1[0-9a-z]+$/;
 const isRecord = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
 
 /**
+ * The master-key lists sops 3.13's metadata can hold besides `age` (its
+ * `mapstructure` tags), each as a message names it. A key in any of them opens
+ * the store as well as an age recipient does, and `sops rotate --add-age` /
+ * `--rm-age` keep it, so hapi's store has none: its decryptors are its age
+ * recipients, each named in the recipients file (../recipients.ts).
+ */
+const OTHER_MASTER_KEYS: Record<string, string> = {
+  pgp: "a PGP key",
+  kms: "an AWS KMS key",
+  gcp_kms: "a GCP KMS key",
+  azure_kv: "an Azure Key Vault key",
+  hc_vault: "a HashiCorp Vault transit key",
+  hckms: "a HuaweiCloud KMS key",
+  key_groups: "sops key groups",
+};
+/** The rest of sops 3.13's metadata: scalars that hold no key. */
+const SCALAR_METADATA = new Set([
+  "lastmodified",
+  "mac",
+  "version",
+  "shamir_threshold",
+  "mac_only_encrypted",
+  "unencrypted_suffix",
+  "encrypted_suffix",
+  "unencrypted_regex",
+  "encrypted_regex",
+  "unencrypted_comment_regex",
+  "encrypted_comment_regex",
+]);
+const isEmpty = (v: unknown) => v === null || v === undefined || v === "" || (Array.isArray(v) && v.length === 0) || (isRecord(v) && Object.keys(v).length === 0);
+
+/**
+ * The master keys in a sops block other than its age recipients, as a message
+ * names them: every non-empty list `OTHER_MASTER_KEYS` names, and any other
+ * non-empty list or mapping too (a newer sops's key type would be one), so
+ * this fails closed. Never quotes a key's identifier.
+ */
+function otherMasterKeys(meta: Record<string, unknown>): string[] {
+  const found: string[] = [];
+  for (const [field, value] of Object.entries(meta)) {
+    if (field === "age" || SCALAR_METADATA.has(field) || isEmpty(value)) continue;
+    const kind = OTHER_MASTER_KEYS[field];
+    if (kind !== undefined) found.push(`${kind} (sops.${field})`);
+    else if (typeof value === "object") found.push(`keys of a type hapi doesn't know (${/^[a-z][a-z0-9_]{0,39}$/.test(field) ? `sops.${field}` : "a sops metadata field, not shown"})`);
+  }
+  return found;
+}
+
+/**
  * Why the raw text of a sops file is not a usable encrypted store, or
  * undefined: it must be a YAML mapping with a `sops` block that lists at least
- * one age recipient, and every other top-level value must be a string sops
+ * one age recipient and no other kind of master key (`otherMasterKeys`: a PGP,
+ * cloud KMS or Vault key, or key groups, would open the store without being in
+ * its recipients file), and every other top-level value must be a string sops
  * encrypted (`ENC[AES256_GCM,...`). The one exception is "": sops leaves an
  * empty string as it is (there is nothing to encrypt), and it holds nothing.
  * Never quotes the file.
@@ -241,6 +293,15 @@ export function sopsFileProblem(text: string): string | undefined {
   const age = meta.age;
   if (!Array.isArray(age) || !age.some((r) => isRecord(r) && typeof r.recipient === "string" && AGE_RECIPIENT.test(r.recipient))) {
     return "has no age recipient in its sops metadata; hapi's sops store is encrypted to an age key (docs/secrets.md)";
+  }
+  const others = otherMasterKeys(meta);
+  if (others.length > 0) {
+    return (
+      `has ${others.join(" and ")} in its sops metadata, besides its age recipients: hapi's store is encrypted to age recipients only, ` +
+      "each named in its recipients file, so any other key could open it unseen. Remove it with sops rotate -i (--rm-pgp, --rm-kms and so on) " +
+      "or restore the store from a commit without it; then, unless you added it yourself, reissue every credential in the store: whoever holds it may have read them " +
+      "(docs/secrets.md#threat-notes)"
+    );
   }
   const plain = Object.entries(doc)
     .filter(([k, v]) => k !== "sops" && v !== "" && !(typeof v === "string" && ENCRYPTED.test(v)))
