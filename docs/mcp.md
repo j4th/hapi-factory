@@ -13,7 +13,7 @@ This page covers:
 - [advisory floors](#advisory-floors) and [the tool-description lock](#the-tool-description-lock);
 - [the CI scanners](#the-ci-scanners).
 
-Every field of `mcp.yaml`, the checks the loader runs and the `hapi mcp` commands are in [docs/policy.md](policy.md#mcpyaml). The generated files are in [docs/generated-configs.md](generated-configs.md#buildmcpmcpjson). The design is spec §10.1; the evidence (pins, integrities, tool names, env vars) is `research_notes/Hapi factory plugins and o11y/mcp_baseline.md`.
+Every field of `mcp.yaml`, the checks the loader runs and the `hapi mcp` commands are in [docs/policy.md](policy.md#mcpyaml). The generated files are in [docs/generated-configs.md](generated-configs.md#buildmcpmcpjson). The design is spec §10.1; the evidence (pins, integrities, tool names, env vars) is the private MCP baseline research ([docs/research](research/README.md)).
 
 ## What each layer gets (v1)
 

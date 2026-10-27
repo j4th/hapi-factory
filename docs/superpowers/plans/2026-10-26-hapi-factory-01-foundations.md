@@ -27,7 +27,7 @@ It also runs the design's "verify early" spikes, whose results shape Plans 02–
 - Hermes Agent v0.22.5 (official image)
 - Archon v0.12.1 (official image + Pi provider)
 
-**Spec:** `docs/superpowers/specs/2026-10-26-hapi-factory-design.md` (approved 2026-10-26). Supporting evidence is in `reports/` and `research_notes/`.
+**Spec:** `docs/superpowers/specs/2026-10-26-hapi-factory-design.md` (approved 2026-10-26). Supporting evidence: [docs/research/README.md](../../research/README.md), which lists the private research and the conclusions the spec adopted.
 
 ## Plan sequence
 

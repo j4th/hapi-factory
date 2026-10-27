@@ -93,7 +93,7 @@ What exists now:
 | `docs/security/threat-model.md` | The threat model, v0: CSA MAESTRO's layers and steps over the Phase 0 stack and the planned Phase 1 flow, each threat with its OWASP and MITRE ATLAS IDs, every control grouped by SANS domain with its status, spec §11.9's six residual risks and the other accepted residuals |
 | `docs/superpowers/specs/` | The design spec. It is the binding authority. |
 | `docs/superpowers/plans/` | Implementation plans. Plan 01 is the current one. |
-| `reports/`, `research_notes/` | The evidence the design rests on: the recon report and the research notes. |
+| `docs/research/` | What the research behind the design covered, and which of its conclusions the spec adopted, by section. The sources themselves are private. |
 
 Still to come in Plan 01:
 
@@ -369,6 +369,5 @@ Task 5 wrote the stack and proved its egress boundary on the build host's own Do
 | [Runbook: Slack](docs/runbooks/slack.md) | The workspace and channels, creating the app from Hermes's manifest, the three Slack secrets, Hermes's Slack settings |
 | [MCP servers](docs/mcp.md) | Which zone gets which MCP server and why, how to add or upgrade one (a planning PR plus a re-pin), the release cooldown and its security-fix exception, advisory floors, the tool-description lock and the CI scanners |
 | [Plan 01: Foundations](docs/superpowers/plans/2026-10-26-hapi-factory-01-foundations.md) | Tasks 1–14: toolchain, policy, generators, secrets, stack, audit, threat model, spikes |
-| [Recon report](reports/Agentic%20software%20factory%20recon.md) | The evidence the design rests on, with sources and versions |
-| [`research_notes/`](research_notes/) | Detailed research notes behind the report |
+| [Research](docs/research/README.md) | What the research behind the design covered, and the conclusions the spec adopted, by section (the sources are private) |
 | `docs/spikes/` | Spike results, which arrive in Plan 01 Tasks 8–14 |

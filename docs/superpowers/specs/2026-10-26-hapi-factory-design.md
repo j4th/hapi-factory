@@ -4,11 +4,7 @@
 - **Status:** draft for review
 - **Owner:** the operator
 - **Repo:** this repository (`factor`) becomes `hapi-factory`. Its name is my assumption: this is where the design was written.
-- **Evidence base** (read it for sources, versions and quotes):
-  - `reports/Agentic software factory recon.md` (the full recon report)
-  - `research_notes/Agentic software factory recon/*.md`
-  - `research_notes/Hapi factory plugins and o11y/*.md` (plugin vetting, observability, Archon integration, Pi extensions)
-  - All facts are as of 2026-10-26.
+- **Evidence base:** a recon report and research notes, kept private; [docs/research/README.md](../../research/README.md) lists them and the conclusions this spec adopted. All facts are as of 2026-10-26.
 
 Tags used throughout:
 - **[user]** — decided by the operator in the brainstorm.
@@ -596,7 +592,7 @@ Who gets which tier:
 
 For the mtg pilot, Hermes confirms the endpoint change **from a first-party source** and records it. The worker never researches it.
 
-### 10.1 MCP servers per layer [user: add an MCP layer with base configs; call: contents, from `research_notes/Hapi factory plugins and o11y/mcp_baseline.md`, 2026-10-26]
+### 10.1 MCP servers per layer [user: add an MCP layer with base configs; call: contents, from the MCP baseline research ([docs/research](../../research/README.md)), 2026-10-26]
 
 MCP servers are packages that put text into an agent's context. Each one is therefore two risks:
 - a **supply-chain** risk: code we run;
@@ -788,7 +784,7 @@ Cost rules:
 - **Handle Anthropic's 429 `enforced_spend_limit_reached`** as terminal. Don't retry it.
 - **[verify early]:** Anthropic rejects edited conversation history for accounts created on or after 2026-08-31. Make sure Hermes compression and Pi compaction don't break on that.
 - **[verify]:** a one-dollar test of whether Claude-provider (Agent SDK) review draws on the API credit. The credits doc says the Agent SDK is covered.
-- **Provider subscriptions: decided after v1, from measured numbers** [call]. the operator may drop to Max 5x and add a cheaper plan for the factory [user]. Findings as of 2026-10-26 are in `research_notes/Hapi factory plugins and o11y/provider_subscriptions.md`:
+- **Provider subscriptions: decided after v1, from measured numbers** [call]. the operator may drop to Max 5x and add a cheaper plan for the factory [user]. Findings as of 2026-10-26 are in the private provider-subscriptions research ([docs/research](../../research/README.md)):
   - **Max 5x** is $100/month with a $100 API credit, against $200/$200 for 20x. It also cuts the operator's interactive Claude Code limits to roughly a quarter.
   - **ChatGPT Plus/Pro through Pi's "Sign in with ChatGPT"** has terms that explicitly allow third-party and unattended use (2026-09-29). Caveats:
     - training is on by default and must be opted out;
