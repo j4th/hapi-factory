@@ -60,12 +60,16 @@ export type FetchSurface = (name: string) => Promise<Surface>;
 
 export interface LockStatus {
   name: string;
-  /** ok: the live surface matches. changed: it doesn't. unpinned: no entry for the server's current pin. */
-  status: "ok" | "changed" | "unpinned";
+  /**
+   * ok: the live surface matches. changed: it doesn't. unpinned: no entry for
+   * the server's current pin. orphaned: an entry for a server the catalog no
+   * longer has.
+   */
+  status: "ok" | "changed" | "unpinned" | "orphaned";
   /** The locked hash (absent when unpinned). */
   expected?: string;
-  /** The live surface's hash. */
-  actual: string;
+  /** The live surface's hash (absent when orphaned: a server outside the catalog is never launched). */
+  actual?: string;
 }
 
 /**
@@ -134,15 +138,22 @@ export function pinOf(s: McpServer): McpPin {
 }
 
 /**
- * Compare every catalog server's live surface with the lock, in name order,
- * o11y-gated servers included. A missing entry, or one recorded for another
- * pin, is `unpinned`. A failed fetch rejects the whole check (fail closed).
+ * Compare every catalog server's live surface with the lock, o11y-gated
+ * servers included. A missing entry, or one recorded for another pin, is
+ * `unpinned`. A lock entry for a server the catalog doesn't have is
+ * `orphaned`, and that server is never fetched. Results are in name order. A
+ * failed fetch rejects the whole check (fail closed).
  */
 export async function verifyLock(p: Pick<Policy, "mcp">, lock: McpLock, fetchSurface: FetchSurface): Promise<LockStatus[]> {
   const results: LockStatus[] = [];
-  for (const name of Object.keys(p.mcp.servers).sort(byString)) {
-    const actual = hashToolSurface(await fetchSurface(name));
+  const names = [...new Set([...Object.keys(p.mcp.servers), ...Object.keys(lock)])].sort(byString);
+  for (const name of names) {
     const entry = Object.hasOwn(lock, name) ? lock[name] : undefined;
+    if (!Object.hasOwn(p.mcp.servers, name)) {
+      results.push({ name, status: "orphaned", expected: entry!.hash });
+      continue;
+    }
+    const actual = hashToolSurface(await fetchSurface(name));
     if (entry === undefined || canonicalJson(entry.pin) !== canonicalJson(pinOf(p.mcp.servers[name]!))) {
       results.push({ name, status: "unpinned", actual });
     } else {
@@ -230,8 +241,9 @@ function parseFlags(args: string[], flags: readonly string[]): Record<string, st
 /**
  * `hapi mcp verify [--policy dir] [--lock file]`: check every catalog server's
  * live surface against the lock (default `<policy>/mcp.lock.json`). Prints one
- * line per server, `ok|changed|unpinned <name> ...`. Exits 0 only if every
- * server is ok; otherwise 1, with the re-pin commands on stderr. A usage error
+ * line per server or lock entry, `ok|changed|unpinned|orphaned <name> ...`.
+ * Exits 0 only if every server is ok and no entry is orphaned; otherwise 1,
+ * with the re-pin commands, or the entries to remove, on stderr. A usage error
  * exits 2.
  */
 export async function mcpVerify(args: string[], deps: McpDeps = NOT_WIRED): Promise<number> {
@@ -242,20 +254,32 @@ export async function mcpVerify(args: string[], deps: McpDeps = NOT_WIRED): Prom
   }
   const dir = flags["--policy"] ?? "policy";
   const p = loadPolicy(dir);
-  const lock = loadLock(flags["--lock"] ?? join(dir, "mcp.lock.json"));
+  const file = flags["--lock"] ?? join(dir, "mcp.lock.json");
+  const lock = loadLock(file);
   const results = await verifyLock(p, lock, deps.fetchSurface);
   for (const r of results) {
     if (r.status === "ok") console.log(`ok ${r.name} ${r.actual}`);
     else if (r.status === "changed") console.log(`changed ${r.name} expected ${r.expected} actual ${r.actual}`);
-    else console.log(`unpinned ${r.name} actual ${r.actual}`);
+    else if (r.status === "unpinned") console.log(`unpinned ${r.name} actual ${r.actual}`);
+    else console.log(`orphaned ${r.name} expected ${r.expected}`);
   }
-  const bad = results.filter((r) => r.status !== "ok");
-  if (bad.length === 0) return 0;
-  console.error(
-    `hapi mcp verify: ${bad.length} of ${results.length} servers changed or were never pinned. Review the new surface ` +
-      `(new_skill_or_mcp: a planning PR), then re-pin: ${bad.map((r) => `hapi mcp pin --server ${r.name}`).join("; ")}`,
-  );
-  return 1;
+  const servers = results.filter((r) => r.status !== "orphaned");
+  const bad = servers.filter((r) => r.status !== "ok");
+  const orphaned = results.filter((r) => r.status === "orphaned");
+  if (bad.length > 0) {
+    console.error(
+      `hapi mcp verify: ${bad.length} of ${servers.length} servers changed or were never pinned. Review the new surface ` +
+        `(new_skill_or_mcp: a planning PR), then re-pin: ${bad.map((r) => `hapi mcp pin --server ${r.name}`).join("; ")}`,
+    );
+  }
+  if (orphaned.length > 0) {
+    const [entries, it] = orphaned.length === 1 ? ["lock entry has", "it"] : ["lock entries have", "them"];
+    console.error(
+      `hapi mcp verify: ${orphaned.length} ${entries} no server in the catalog: ${orphaned.map((r) => r.name).join(", ")}. ` +
+        `Remove ${it} from ${file} in the PR that removes the server.`,
+    );
+  }
+  return bad.length === 0 && orphaned.length === 0 ? 0 : 1;
 }
 
 /**

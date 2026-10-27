@@ -46,14 +46,16 @@ Adding or upgrading a server is `new_skill_or_mcp`, one of the approvals that al
 3. **Read the package** (the tarball, or the tagged source). List every tool it registers:
    - read-only tools go in `tools.include`;
    - write tools, and tools that send data to a third party, go in `tools.deny`;
-   - note any env var that redirects its traffic or loads extra files. The loader already forbids the proxy variables, `CONTEXT7_API_URL` and `DANGEROUSLY_READ_README_FILES`. Never set one of these in `env`.
+   - list every env var it reads, and add the ones it needs to its entry in **`PACKAGE_ENV`** (`src/policy/mcp.ts`), the [env allowlist](policy.md#the-env-allowlist). Each is a `secret` (a bws reference), a `flag` (a literal from the values you list) or an `endpoint` (a literal URL whose host must be one of the entry's `egress` hosts). A server gets only the names listed there, so leave out anything that redirects its traffic or loads extra files. The loader also has a hard denylist for every server (proxies, `NODE_*`, `NPM_*`, `LD_*`, `PATH`, `HOME`, `CONTEXT7_API_URL`, `PHOENIX_CLIENT_HEADERS`, `DANGEROUSLY_READ_README_FILES` and more); never put one of these on an allowlist.
 4. **Add a floor** for any advisory the scanners don't track ([advisory floors](#advisory-floors)).
-5. **Give it its own bws key**, if it needs a secret: `env: { SOME_API_KEY: bws:hapi-mcp-<name> }`. Each key belongs to one server, and the loader rejects a key two servers share. Storing the secret in Bitwarden is a manual step for the operator. The generated configs reference it as `${HAPI_MCP_<NAME>}`. Never write `$` anywhere else in the entry: Hermes expands `${...}` in a server's url, headers, args and env, so it would pull in another secret. The loader rejects `$` in a `url` or an env literal, and the generators reject any `$` in their output other than the server's own references.
+5. **Give it its own bws key**, if it needs a secret: `env: { SOME_API_KEY: bws:hapi-mcp-<name> }`. Never write a secret as a literal: the loader rejects a literal under a `secret` name, and under any name ending in `_KEY`, `_TOKEN`, `_SECRET`, `_PASSWORD` or `_CREDENTIAL(S)`. Each key belongs to one server, and the loader rejects a key two servers share. Storing the secret in Bitwarden is a manual step for the operator. The generated configs reference it as `${HAPI_MCP_<NAME>}`. Never write `$` anywhere else in the entry: Hermes expands `${...}` in a server's url, headers, args and env, so it would pull in another secret. The loader rejects `$` in a `url` or an env literal, and the generators reject any `$` in their output other than the server's own references.
 6. **List its egress hosts.** In v1, egress is per zone, so the zone's proxy is the real boundary. The list is for review, and for per-server isolation in phase 2.
 7. **Check it:** `mise run test && mise run policy:build`. The loader checks every rule on [docs/policy.md](policy.md#mcpyaml).
 8. **Pin its surface:** `hapi mcp pin --server <name>`, and commit `policy/mcp.lock.json` in the same PR. The reviewer reads the recorded tool descriptions, instructions, prompts and resources there. (The live fetch arrives in Plan 01 Task 5. Until then the command exits 1.)
 
-**An upgrade** is the same PR with a new version and integrity. The old lock entry was recorded for the old pin, so the server is `unpinned` until step 8 is done again.
+**An upgrade** is the same PR with a new version and integrity. Re-read the env vars the new version reads (step 3), and update `PACKAGE_ENV` if they changed. The old lock entry was recorded for the old pin, so the server is `unpinned` until step 8 is done again.
+
+**Removing a server** removes its entry from `mcp.yaml`, its `PACKAGE_ENV` entry and its lock entry, in one PR. A lock entry left behind is `orphaned`, and `hapi mcp verify` fails on it.
 
 ## The release cooldown and the security-fix exception
 
@@ -88,7 +90,7 @@ Context7's ContextCrush (CVE-2026-75130, ≤ 2.1.2) was fixed on Upstash's **bac
 A server can change its tool descriptions or instructions in a release, or at any time if it is remote, and the model reads that text. Neither Hermes's schema cache nor Pi pins it. So:
 
 - **`hapi mcp pin --server <name>`** records the server's raw surface (its `tools/list` result, `instructions`, prompts and resources), the pin it was recorded for, and the surface's hash in `policy/mcp.lock.json`.
-- **`hapi mcp verify`** fetches every catalog server's live surface and compares hashes. It exits 1 if any server has `changed` or is `unpinned`, and prints the re-pin commands.
+- **`hapi mcp verify`** fetches every catalog server's live surface and compares hashes. It exits 1 if any server has `changed` or is `unpinned`, and prints the re-pin commands. It also exits 1 if the lock has an `orphaned` entry, for a server no longer in the catalog. It never launches that server; it says to remove the entry.
 - The hash ignores order (tools sorted by name; prompts and resources sorted too) and nothing else. One changed character of a description, a schema or the instructions is a different hash.
 - `fetchSurface` launches the pinned server in a throwaway container on its zone's network. **Plan 01 Task 5** wires it; until then both commands exit 1. Spec §10.1 also has stack start-up and `hapi audit` (Task 6's `mcp.tool-hashes` check) fail closed on drift.
 - Re-approving a change is a planning PR: re-pin, and commit the lock. A remote-only endpoint changes without a release, so each change to one is a review event.
@@ -107,6 +109,11 @@ Plan 05 runs these on every change to `policy/mcp.yaml` or `policy/mcp.lock.json
 
 ## Open items
 
-- **Per-server images.** The generated command is `npx --yes <package>@<version>`. That pins the package but not its dependency tree, and it fetches the package at start-up. Spec §10.1 wants one image per server, built from a committed lockfile and pinned by digest (the entry's `image`). Those images aren't built yet; they belong with the containers that run the servers (the research container is Plan 04's).
+- **Per-server images, and integrity at launch.** The generated command is `npx --yes <package>@<version>`. It pins the package's version, but:
+  - **`package.integrity` is recorded but not yet enforced at launch.** npx resolves `<package>@<version>` from the registry and never compares it with the catalog's integrity.
+  - **It doesn't pin the dependency tree.** The package's own dependencies resolve at start-up, from their semver ranges.
+  - It fetches at start-up, which an internal-only network can't do.
+
+  Spec §10.1 wants one image per server, built from a committed lockfile and pinned by digest (the entry's `image`). **Plan 04's per-server lockfile images are required before Context7 runs for real.** Until image launch lands, the generators refuse an entry that sets `image` (so `hapi policy build` fails), because the npx command would ignore the image: the entry would look pinned by digest and still run unpinned.
 - **The Phoenix endpoint.** The catalog points Phoenix MCP at `http://phoenix.hapi.internal:6006`. The observability profile must serve Phoenix under that name on the hermes network, or change the entry. The hermes proxy refuses private addresses, so the profile also gives the Hermes container a direct route to that one host.
 - **Hermes keys.** The `mcp_servers` keys follow Hermes v0.22.5's docs: `command`, `args`, `env`, `tools.include`, `tools.prompts`, `tools.resources`, `elicitation.enabled` and `sampling.enabled`. `trust` comes from the research notes (`hermes_agent.md`). Task 6's audit checks Hermes's own validation output, which shows any key Hermes ignores.

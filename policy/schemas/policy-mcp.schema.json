@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "policy-mcp.schema.json",
   "title": "policy/mcp.yaml",
-  "description": "The MCP catalog (spec §10.1): every MCP server a zone may load, with an exact pin, the zones that may load it, a read-only tool allowlist, its env by bws key name and its egress hosts, plus a blocklist of package names. The archon zone gets no MCP server. src/policy/mcp.ts adds the checks a schema can't express: the advisory floors, the blocklist, tools.deny, the transport's fields, the env names a server may not set, and one server per bws key. docs/policy.md describes every field.",
+  "description": "The MCP catalog (spec §10.1): every MCP server a zone may load, with an exact pin, the zones that may load it, a read-only tool allowlist, its env by bws key name and its egress hosts, plus a blocklist of package names. The archon zone gets no MCP server. src/policy/mcp.ts adds the checks a schema can't express: the advisory floors, the blocklist, tools.deny, the transport's fields, the env allowlist per package (PACKAGE_ENV), secret-looking names as bws references only, the hard env denylist, and one server per bws key. docs/policy.md describes every field.",
   "type": "object",
   "properties": {
     "servers": {
@@ -44,7 +44,7 @@
           "$ref": "policy-defs.schema.json#/$defs/npmPin"
         },
         "image": {
-          "description": "stdio: the per-server image built from the package and a committed lockfile, pinned by digest (spec §10.1).",
+          "description": "stdio: the per-server image built from the package and a committed lockfile, pinned by digest (spec §10.1). The generators refuse an entry that sets it until image launch lands (Plan 04 builds the images), because the npx command would ignore it.",
           "$ref": "policy-defs.schema.json#/$defs/imagePin"
         },
         "url": {
@@ -86,7 +86,7 @@
           "additionalProperties": false
         },
         "env": {
-          "description": "The server's whole environment: Hermes passes only these (plus a safe baseline) to a stdio server. A value is either bws:hapi-mcp-<name>, the bws key whose secret it gets, or a literal.",
+          "description": "The server's whole environment: Hermes passes only these (plus a safe baseline) to a stdio server. A value is either bws:hapi-mcp-<name>, the bws key whose secret it gets, or a literal. The names must be on the package's env allowlist (PACKAGE_ENV in src/policy/mcp.ts), in the form it says: a secret as a bws reference, a flag as one of its values, an endpoint as an http(s) URL whose host is an egress host. A name ending in _KEY, _TOKEN, _SECRET, _PASSWORD or _CREDENTIAL(S) is always a bws reference, and the hard denylist (launch hijacks such as NODE_OPTIONS, NPM_CONFIG_*, LD_* and PATH; proxies; URL overrides) applies to every server.",
           "type": "object",
           "propertyNames": {
             "type": "string",

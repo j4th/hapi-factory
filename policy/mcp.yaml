@@ -11,6 +11,11 @@
 # The 14-day release cooldown applies; a security fix may skip it with
 # `cooldown_exception`. How-to and reasons: docs/mcp.md. Every field:
 # docs/policy.md.
+#
+# A server's env names must be on its package's env allowlist (PACKAGE_ENV in
+# src/policy/mcp.ts), so an entry can't widen it. A secret is always a bws:
+# reference, never a literal; a literal is only a flag value or an endpoint
+# whose host is one of the entry's egress hosts.
 servers:
   # Library docs, version-addressed (T2). Research zone only: library-owner and
   # teamspace "rules" can't be switched off client-side, so it is quarantined.

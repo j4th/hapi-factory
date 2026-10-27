@@ -40,6 +40,13 @@ function fake(surfaces: Record<string, Surface>): { fetch: (name: string) => Pro
   };
 }
 const entry = (name: string, surface: Surface) => ({ pin: pinOf(p.mcp.servers[name]!), hash: hashToolSurface(surface), surface });
+/** A lock entry for a server the catalog doesn't have (removed, say). */
+const DEEPWIKI: Surface = { tools: [{ name: "read_wiki_structure", description: "Lists a repo's wiki pages." }] };
+const orphan = () => ({
+  pin: { package: { name: "@example/deepwiki-mcp", version: "1.0.0", integrity: p.mcp.servers.context7!.package!.integrity } },
+  hash: hashToolSurface(DEEPWIKI),
+  surface: DEEPWIKI,
+});
 
 let temps: string[] = [];
 let restore: (() => void)[] = [];
@@ -129,6 +136,18 @@ describe("verifyLock", () => {
     expect(result).toEqual({ name: "context7", status: "unpinned", actual: hashToolSurface(CONTEXT7) });
   });
 
+  test("an entry for a server no longer in the catalog is orphaned, and that server is never fetched", async () => {
+    const lock: McpLock = { context7: entry("context7", CONTEXT7), deepwiki: orphan(), phoenix: entry("phoenix", PHOENIX) };
+    const f = fake({ context7: CONTEXT7, phoenix: PHOENIX });
+    expect(await verifyLock(p, lock, f.fetch)).toEqual([
+      { name: "context7", status: "ok", expected: hashToolSurface(CONTEXT7), actual: hashToolSurface(CONTEXT7) },
+      { name: "deepwiki", status: "orphaned", expected: hashToolSurface(DEEPWIKI) },
+      { name: "phoenix", status: "ok", expected: hashToolSurface(PHOENIX), actual: hashToolSurface(PHOENIX) },
+    ]);
+    // Only catalog servers are ever launched.
+    expect(f.asked).toEqual(["context7", "phoenix"]);
+  });
+
   test("a fetch failure fails the whole check", async () => {
     await expect(verifyLock(p, {}, fake({ context7: CONTEXT7 }).fetch)).rejects.toThrow("no fake surface for phoenix");
   });
@@ -201,6 +220,20 @@ describe("hapi mcp verify and pin", () => {
     const drifted = { ...CONTEXT7, instructions: "new rules" };
     expect(await mcpVerify(["--lock", lock], { fetchSurface: fake({ context7: drifted, phoenix: PHOENIX }).fetch })).toBe(1);
     expect(out[0]).toBe(`changed context7 expected ${hashToolSurface(CONTEXT7)} actual ${hashToolSurface(drifted)}`);
+  });
+
+  test("verify fails on an orphaned entry and says to remove it", async () => {
+    const { out, err } = capture();
+    const lock = lockIn(tempDir(), { context7: entry("context7", CONTEXT7), deepwiki: orphan(), phoenix: entry("phoenix", PHOENIX) });
+    expect(await mcpVerify(["--lock", lock], { fetchSurface: fake({ context7: CONTEXT7, phoenix: PHOENIX }).fetch })).toBe(1);
+    expect(out).toEqual([
+      `ok context7 ${hashToolSurface(CONTEXT7)}`,
+      `orphaned deepwiki expected ${hashToolSurface(DEEPWIKI)}`,
+      `ok phoenix ${hashToolSurface(PHOENIX)}`,
+    ]);
+    expect(err).toEqual([
+      `hapi mcp verify: 1 lock entry has no server in the catalog: deepwiki. Remove it from ${lock} in the PR that removes the server.`,
+    ]);
   });
 
   test("pin records the raw surface and its hash for one server, keeping the other entries", async () => {

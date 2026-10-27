@@ -3,7 +3,7 @@ import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadPolicy, PolicyError } from "../../src/policy/load";
-import { blockedBy, compareVersions, secretEnvName, serversForZone } from "../../src/policy/mcp";
+import { blockedBy, compareVersions, forbiddenEnv, PACKAGE_ENV, SECRET_ENV_NAME, secretEnvName, serversForZone } from "../../src/policy/mcp";
 import { zoneHosts } from "../../src/policy/zones";
 
 const p = loadPolicy("policy");
@@ -51,6 +51,20 @@ test("context7 is research-only and hermes has no MCP outside o11y", () => {
   expect(serversForZone(p, "hermes")).toEqual([]);
   expect(serversForZone(p, "hermes", { o11y: true }).map(([n]) => n)).toEqual(["phoenix"]);
   expect(serversForZone(p, "archon")).toEqual([]);
+});
+
+test("serversForZone never returns a server that lists archon, even from a policy built in code", () => {
+  // A policy built in code skips the loader, which would refuse these zones.
+  const q = structuredClone(p);
+  q.mcp.servers.context7!.zones = ["research", "archon"];
+  expect(serversForZone(q, "research")).toEqual([]);
+  expect(serversForZone(q, "archon")).toEqual([]);
+  q.mcp.servers.context7!.zones = ["archon"];
+  expect(serversForZone(q, "archon")).toEqual([]);
+  // A zone outside the MCP zones gets nothing, whatever the catalog says.
+  expect(serversForZone(q, "nope" as never)).toEqual([]);
+  // The other servers are untouched.
+  expect(serversForZone(q, "hermes", { o11y: true }).map(([n]) => n)).toEqual(["phoenix"]);
 });
 
 test("serversForZone defaults o11y to flags.otel.enabled, and an explicit option wins", () => {
@@ -198,6 +212,156 @@ describe("loadPolicy rejects a bad catalog with the file and path", () => {
       const e = policyError(edited('OTEL_SDK_DISABLED: "true"', `OTEL_SDK_DISABLED: "true"\n      ${name}: http://proxy.example.com:3128`));
       expect(e.path).toBe(`/servers/context7/env/${name}`);
     }
+  });
+
+  test("a literal secret-looking value is rejected: a secret's name must hold a bws reference", () => {
+    // The reviewer's probe: a real-looking Context7 key as a literal would be emitted in plaintext.
+    const e = policyError(edited("CONTEXT7_API_KEY: bws:hapi-mcp-context7-api-key", "CONTEXT7_API_KEY: ctx7sk-FAKE-NOT-A-REAL-KEY"));
+    expect(e.file).toEndWith("mcp.yaml");
+    expect(e.issues).toEqual([
+      {
+        path: "/servers/context7/env/CONTEXT7_API_KEY",
+        message:
+          "CONTEXT7_API_KEY names a secret, so its value must be a bws reference (bws:hapi-mcp-<name>), never a literal: a literal is written in plaintext into every generated config (spec §10.1)",
+      },
+    ]);
+    const phoenix = policyError(edited("PHOENIX_API_KEY: bws:hapi-mcp-phoenix-viewer-key", "PHOENIX_API_KEY: phx-FAKE-NOT-A-REAL-KEY"));
+    expect(phoenix.path).toBe("/servers/phoenix/env/PHOENIX_API_KEY");
+    expect(phoenix.message).toContain("must be a bws reference");
+  });
+
+  test("any name ending in _KEY, _TOKEN, _SECRET, _PASSWORD or _CREDENTIAL(S) must be a bws reference", () => {
+    for (const name of ["CONTEXT7_TOKEN", "SERVICE_SECRET", "DB_PASSWORD", "GCP_CREDENTIALS", "GCP_CREDENTIAL", "X_API_KEY"]) {
+      const e = policyError(edited('OTEL_SDK_DISABLED: "true"', `OTEL_SDK_DISABLED: "true"\n      ${name}: s3cr3t-value`));
+      expect({ name, path: e.path }).toEqual({ name, path: `/servers/context7/env/${name}` });
+      expect(e.message).toContain("must be a bws reference");
+    }
+    expect(SECRET_ENV_NAME.test("api_key")).toBe(true);
+    expect(SECRET_ENV_NAME.test("OTEL_SDK_DISABLED")).toBe(false);
+  });
+
+  test("a server receives only the env names its package's allowlist lists", () => {
+    const extra = (line: string) => edited('OTEL_SDK_DISABLED: "true"', `OTEL_SDK_DISABLED: "true"\n      ${line}`);
+    // Not secret-looking, so only the allowlist stops it.
+    const e = policyError(extra("CONTEXT7_AUTH: ctx7sk-FAKE-NOT-A-REAL-KEY"));
+    expect(e.issues).toEqual([
+      {
+        path: "/servers/context7/env/CONTEXT7_AUTH",
+        message:
+          "@upstash/context7-mcp may not receive CONTEXT7_AUTH: its env allowlist (PACKAGE_ENV in src/policy/mcp.ts) is CONTEXT7_API_KEY, OTEL_SDK_DISABLED",
+      },
+    ]);
+    // A bws reference doesn't widen it, and another package's names aren't context7's.
+    expect(policyError(extra("CONTEXT7_AUTH: bws:hapi-mcp-context7-auth")).path).toBe("/servers/context7/env/CONTEXT7_AUTH");
+    expect(policyError(extra('PHOENIX_DISCOVER_CONFIG: "false"')).path).toBe("/servers/context7/env/PHOENIX_DISCOVER_CONFIG");
+    // A package with no allowlist gets no env at all.
+    const fork = policyError(edited('name: "@upstash/context7-mcp"', 'name: "@example/context7-fork"'));
+    expect(fork.issues.map((i) => i.path)).toEqual(["/servers/context7/env/CONTEXT7_API_KEY", "/servers/context7/env/OTEL_SDK_DISABLED"]);
+    expect(fork.message).toContain("@example/context7-fork has no env allowlist");
+  });
+
+  test("a flag is a literal from its allowed values, so it can't carry a secret", () => {
+    for (const value of ["ctx7sk-FAKE-NOT-A-REAL-KEY", "false", "1"]) {
+      const e = policyError(edited('OTEL_SDK_DISABLED: "true"', `OTEL_SDK_DISABLED: "${value}"`));
+      expect(e.issues).toEqual([{ path: "/servers/context7/env/OTEL_SDK_DISABLED", message: 'OTEL_SDK_DISABLED is a flag: its value must be "true"' }]);
+    }
+    expect(policyError(edited('PHOENIX_DISCOVER_CONFIG: "false"', 'PHOENIX_DISCOVER_CONFIG: "true"')).path).toBe("/servers/phoenix/env/PHOENIX_DISCOVER_CONFIG");
+    // A flag or an endpoint is a literal, never a bws reference.
+    const ref = policyError(edited('OTEL_SDK_DISABLED: "true"', "OTEL_SDK_DISABLED: bws:hapi-mcp-context7-otel"));
+    expect(ref.issues).toEqual([{ path: "/servers/context7/env/OTEL_SDK_DISABLED", message: "OTEL_SDK_DISABLED is a flag, not a secret: write its literal value, not a bws reference" }]);
+  });
+
+  test("an endpoint literal is an http(s) URL whose host is one of the server's own egress hosts", () => {
+    const at = "PHOENIX_ENDPOINT: http://phoenix.hapi.internal:6006";
+    const e = policyError(edited(at, "PHOENIX_ENDPOINT: http://evil.example.com:6006"));
+    expect(e.issues).toEqual([
+      {
+        path: "/servers/phoenix/env/PHOENIX_ENDPOINT",
+        message: 'PHOENIX_ENDPOINT is an endpoint: its host "evil.example.com" is not one of this server\'s egress hosts, or under one',
+      },
+    ]);
+    for (const url of [
+      "https://phoenix.hapi.internal.evil.com", // a lookalike suffix is not a subdomain
+      "http://user:pw@phoenix.hapi.internal:6006", // user info could carry a secret
+      "http://phoenix.hapi.internal:6006/?api_key=abc", // so could a query
+      "http://phoenix.hapi.internal:6006/#x",
+      "ftp://phoenix.hapi.internal",
+      "phoenix.hapi.internal:6006", // no scheme: parses as the scheme "phoenix.hapi.internal:"
+      "not a url",
+    ]) {
+      expect({ url, path: policyError(edited(at, `PHOENIX_ENDPOINT: "${url}"`)).path }).toEqual({ url, path: "/servers/phoenix/env/PHOENIX_ENDPOINT" });
+    }
+    // An egress host, or a subdomain of one, over http or https, is fine.
+    expect(() => loadPolicy(withMcp(edited(at, "PHOENIX_ENDPOINT: https://ui.phoenix.hapi.internal/base")))).not.toThrow();
+  });
+
+  test("a hard denylist of launch-hijack, proxy and redirect variables, as literals or bws references (defense in depth)", () => {
+    const names = [
+      "NPM_CONFIG_REGISTRY", // npx fetches the package from another registry; nothing checks its integrity at launch
+      "NPM_CONFIG_USERCONFIG",
+      "NPM_TOKEN",
+      "NODE_OPTIONS", // --require or --import of any code
+      "NODE_PATH",
+      "NODE_EXTRA_CA_CERTS",
+      "NODE_TLS_REJECT_UNAUTHORIZED",
+      "LD_PRELOAD",
+      "LD_LIBRARY_PATH",
+      "LD_AUDIT",
+      "GCONV_PATH",
+      "PATH",
+      "HOME", // npm reads ~/.npmrc
+      "BASH_ENV",
+      "ENV",
+      "BASH_FUNC_X",
+      "UV_INDEX_URL",
+      "UV_DEFAULT_INDEX",
+      "PIP_INDEX_URL",
+      "PYTHONPATH",
+      "PYTHONSTARTUP",
+      "SSL_CERT_FILE",
+      "SSL_CERT_DIR",
+      "HTTP_PROXY",
+      "HTTPS_PROXY",
+      "ALL_PROXY",
+      "NO_PROXY",
+      "FTP_PROXY",
+      "GLOBAL_AGENT_HTTP_PROXY",
+      "OTEL_EXPORTER_OTLP_ENDPOINT",
+      "CONTEXT7_API_URL",
+      "PHOENIX_CLIENT_HEADERS",
+      "DANGEROUSLY_READ_README_FILES",
+    ];
+    for (const name of names) {
+      expect({ name, denied: forbiddenEnv(name) !== undefined }).toEqual({ name, denied: true });
+      for (const value of ["http://proxy.example.com:3128", "bws:hapi-mcp-context7-extra"]) {
+        const e = policyError(edited('OTEL_SDK_DISABLED: "true"', `OTEL_SDK_DISABLED: "true"\n      ${name}: ${value}`));
+        expect({ name, value, issues: e.issues.map((i) => i.path) }).toEqual({ name, value, issues: [`/servers/context7/env/${name}`] });
+        expect(e.message).toContain(`a server may not set ${name}: ${forbiddenEnv(name)} (spec §10.1)`);
+      }
+    }
+    // Case doesn't matter: npm reads npm_config_* in any case.
+    expect(forbiddenEnv("npm_config_registry")).toBe(forbiddenEnv("NPM_CONFIG_REGISTRY"));
+    expect(forbiddenEnv("node_options")).toBeDefined();
+    // The catalog's own names are not on it.
+    for (const name of ["CONTEXT7_API_KEY", "OTEL_SDK_DISABLED", "PHOENIX_API_KEY", "PHOENIX_DISCOVER_CONFIG", "PHOENIX_ENDPOINT", "PATHS"]) {
+      expect({ name, denied: forbiddenEnv(name) }).toEqual({ name, denied: undefined });
+    }
+  });
+
+  test("the allowlist itself: a secret-looking name is always a secret, no name is on the denylist, and it covers the catalog", () => {
+    for (const [pkg, names] of Object.entries(PACKAGE_ENV)) {
+      for (const [name, rule] of Object.entries(names)) {
+        if (SECRET_ENV_NAME.test(name)) expect({ pkg, name, kind: rule.kind }).toEqual({ pkg, name, kind: "secret" });
+        expect({ pkg, name, denied: forbiddenEnv(name) }).toEqual({ pkg, name, denied: undefined });
+        if (rule.kind === "flag") expect(rule.values.length).toBeGreaterThan(0);
+      }
+    }
+    expect(PACKAGE_ENV["@upstash/context7-mcp"]).toEqual({ CONTEXT7_API_KEY: { kind: "secret" }, OTEL_SDK_DISABLED: { kind: "flag", values: ["true"] } });
+    expect(PACKAGE_ENV["@arizeai/phoenix-mcp"]).toEqual({
+      PHOENIX_API_KEY: { kind: "secret" },
+      PHOENIX_DISCOVER_CONFIG: { kind: "flag", values: ["false"] },
+      PHOENIX_ENDPOINT: { kind: "endpoint" },
+    });
   });
 
   test("each bws key belongs to one server", () => {

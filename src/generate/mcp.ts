@@ -16,8 +16,12 @@
  * which the stack fills from bws, and the scanners see only the reference.
  *
  * A stdio server's command is `npx --yes <name>@<version>`. That pins the
- * package but not its dependency tree; the per-server image built from a
- * committed lockfile (the catalog's `image`, Task 5 and Plan 04) replaces it.
+ * package's version, but not its dependency tree, and nothing checks
+ * `package.integrity` at launch. The per-server image built from a committed
+ * lockfile (the catalog's `image`; Plan 04 builds them) replaces it. Until
+ * image launch lands, an entry that sets `image` is refused: an npx command
+ * would silently ignore the image, so the entry would look pinned by digest
+ * and run unpinned.
  *
  * Every function here re-checks the catalog first (schema and `mcpIssues`), so
  * a policy built in code, which skips the loader, can't emit a server the
@@ -25,7 +29,7 @@
  * only `$` in a server's entry is that server's own `${HAPI_MCP_...}` env refs.
  */
 import { check, formatIssue } from "../policy/schema";
-import { MCP_ZONES, type McpOptions, type McpZone, mcpIssues, secretEnvName, secretKey, serversForZone } from "../policy/mcp";
+import { isMcpZone, MCP_ZONES, type McpOptions, type McpZone, mcpIssues, secretEnvName, secretKey, serversForZone } from "../policy/mcp";
 import type { McpServer, Policy } from "../policy/types";
 import { notice } from "./header";
 
@@ -37,13 +41,23 @@ function checkCatalog(p: Policy): void {
 }
 
 function checkZone(zone: string): asserts zone is McpZone {
-  if (!(MCP_ZONES as readonly string[]).includes(zone)) {
+  if (!isMcpZone(zone)) {
     throw new Error(`the ${zone} zone gets no MCP servers (spec §10.1); MCP zones: ${MCP_ZONES.join(", ")}`);
   }
 }
 
-/** A stdio server's launch command, from its exact package pin. */
+/**
+ * A stdio server's launch command, from its exact package pin. Throws for an
+ * entry that sets `image`: launching from the image isn't built yet, and the
+ * npx command would ignore it.
+ */
 function launch(name: string, s: McpServer): { command: string; args: string[] } {
+  if (s.image !== undefined) {
+    throw new Error(
+      `MCP server ${name} sets image ${s.image}, but the generators can't launch a server from its image yet (Plan 04 builds the per-server images). ` +
+        "The npx command would ignore the image and run the package with an unpinned dependency tree and no integrity check, so remove image until image launch lands (spec §10.1)",
+    );
+  }
   if (s.package === undefined) throw new Error(`unreachable: stdio server ${name} has no package`);
   return { command: "npx", args: ["--yes", `${s.package.name}@${s.package.version}`] };
 }

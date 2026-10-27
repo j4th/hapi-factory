@@ -154,7 +154,10 @@ export interface McpServer {
   transport: "stdio" | "http";
   /** stdio: the exact npm pin it runs from. */
   package?: McpPackage;
-  /** stdio: the per-server image built from the package, `name@sha256:...`. */
+  /**
+   * stdio: the per-server image built from the package, `name@sha256:...`. The
+   * generators refuse it until image launch lands (Plan 04): npx would ignore it.
+   */
   image?: string;
   /** http only: the https endpoint; its host is one of `egress` or under one. */
   url?: string;
@@ -164,7 +167,10 @@ export interface McpServer {
   cooldown_exception?: string;
   /** `include`: the read-only tools the agent may call. `deny`: write and third-party tools, which `include` may never list. */
   tools: { include: string[]; deny: string[] };
-  /** ENV -> `bws:hapi-mcp-<name>` (a bws key name) or a literal, e.g. OTEL_SDK_DISABLED: "true". */
+  /**
+   * ENV -> `bws:hapi-mcp-<name>` (a bws key name) or a literal, e.g. OTEL_SDK_DISABLED: "true".
+   * Only names on the package's env allowlist (`PACKAGE_ENV` in ./mcp.ts), in the form it says.
+   */
   env: Record<string, string>;
   /** The hosts it needs; each covers its subdomains. */
   egress: string[];

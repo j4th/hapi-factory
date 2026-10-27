@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { emitHermes } from "../../src/generate/hermes";
 import { checkOwnRefs, emitMcp, emitMcpJson, hermesMcpServers } from "../../src/generate/mcp";
 import { loadPolicy } from "../../src/policy/load";
 
@@ -82,6 +83,32 @@ describe("emitMcpJson", () => {
     const write = structuredClone(p);
     write.mcp.servers.phoenix!.tools.include.push("upsert-prompt");
     expect(() => hermesMcpServers(write, "hermes", { o11y: true })).toThrow(/upsert-prompt/);
+    // A literal secret would be written in plaintext into the Hermes config and research.mcp.json.
+    const literal = structuredClone(p);
+    literal.mcp.servers.context7!.env.CONTEXT7_API_KEY = "ctx7sk-FAKE-NOT-A-REAL-KEY";
+    expect(() => emitMcpJson(literal, "research")).toThrow(/\/servers\/context7\/env\/CONTEXT7_API_KEY: CONTEXT7_API_KEY names a secret/);
+    expect(() => hermesMcpServers(literal, "research")).toThrow(/must be a bws reference/);
+    const hijack = structuredClone(p);
+    hijack.mcp.servers.phoenix!.env.NODE_OPTIONS = "--require /tmp/x.js";
+    expect(() => emitHermes(hijack, { o11y: true })).toThrow(/\/servers\/phoenix\/env\/NODE_OPTIONS: a server may not set NODE_OPTIONS/);
+  });
+
+  test("an entry with an image is refused until image launch lands, because the npx command would ignore it", () => {
+    const image = `ghcr.io/example/context7@sha256:${"a".repeat(64)}`;
+    const q = structuredClone(p);
+    q.mcp.servers.context7!.image = image;
+    const message =
+      `MCP server context7 sets image ${image}, but the generators can't launch a server from its image yet (Plan 04 builds the per-server images). ` +
+      "The npx command would ignore the image and run the package with an unpinned dependency tree and no integrity check, so remove image until image launch lands (spec §10.1)";
+    expect(() => emitMcpJson(q, "research")).toThrow(message);
+    expect(() => hermesMcpServers(q, "research")).toThrow(message);
+    expect(() => emitMcp(q)).toThrow(message);
+    // Phoenix: the Hermes config refuses it with o11y on, and the scanner file always does.
+    const r = structuredClone(p);
+    r.mcp.servers.phoenix!.image = `ghcr.io/example/phoenix-mcp@sha256:${"b".repeat(64)}`;
+    expect(() => emitHermes(r, { o11y: true })).toThrow(/MCP server phoenix sets image/);
+    expect(() => emitMcpJson(r, "hermes")).toThrow(/MCP server phoenix sets image/);
+    expect(() => emitHermes(r)).not.toThrow();
   });
 
   test("an http url holding ${...} is never emitted: it could carry the provider key or another server's key", () => {

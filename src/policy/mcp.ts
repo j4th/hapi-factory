@@ -12,7 +12,12 @@
  * - the blocklist of package names;
  * - `tools.include` never lists a `tools.deny` tool (write and third-party tools);
  * - each transport's fields: `url` is for http only, and its host is an egress host;
- * - env names a server may not set (proxies and URL overrides), and one server per bws key.
+ * - env: a stdio server gets only the names its package's allowlist
+ *   (`PACKAGE_ENV`) lists, each in the form its rule says (a secret as a bws
+ *   reference, a flag as one of its values, an endpoint as a URL whose host is
+ *   an egress host), and any secret-looking name (`SECRET_ENV_NAME`) only as a
+ *   bws reference; no server sets a name on the hard denylist (`forbiddenEnv`:
+ *   launch hijacks, proxies and URL overrides); and one server per bws key.
  * `loadPolicy` runs both; the emitters run them again for a policy built in code.
  */
 import { type Issue, pointerSegment } from "./schema";
@@ -21,6 +26,11 @@ import type { McpCatalog, McpServer, Policy, ZoneName } from "./types";
 /** The zones that may load MCP servers. The archon zone never does (spec §10.1). */
 export const MCP_ZONES = ["hermes", "research"] as const satisfies readonly ZoneName[];
 export type McpZone = (typeof MCP_ZONES)[number];
+
+/** Whether a zone may load MCP servers: hermes and research, never archon. */
+export function isMcpZone(zone: string): zone is McpZone {
+  return (MCP_ZONES as readonly string[]).includes(zone);
+}
 
 export interface McpOptions {
   /** Whether the observability profile runs. Default: the policy's flags.otel.enabled. */
@@ -36,11 +46,16 @@ export function o11yEnabled(p: Pick<Policy, "flags">, opts: McpOptions = {}): bo
  * The servers a zone loads, as [name, server] sorted by name: those that list
  * the zone and are enabled. An `enabled_when: o11y` server is enabled only
  * while o11y is on (see `o11yEnabled`).
+ *
+ * It fails closed even for a policy built in code, which skips the loader: a
+ * zone outside `MCP_ZONES` (archon) gets [], and a server that lists such a
+ * zone is never returned, for any zone.
  */
 export function serversForZone(p: Pick<Policy, "mcp" | "flags">, zone: ZoneName, opts: McpOptions = {}): [string, McpServer][] {
+  if (!isMcpZone(zone)) return [];
   const o11y = o11yEnabled(p, opts);
   return Object.entries(p.mcp.servers)
-    .filter(([, s]) => s.zones.includes(zone) && (s.enabled_when !== "o11y" || o11y))
+    .filter(([, s]) => s.zones.every(isMcpZone) && s.zones.includes(zone) && (s.enabled_when !== "o11y" || o11y))
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
 }
 
@@ -73,29 +88,132 @@ export function compareVersions(a: string, b: string): number {
   return 0;
 }
 
+/** A whole-string pattern: `*` matches any run of characters, everything else is literal. */
+function globRegExp(pattern: string, flags = ""): RegExp {
+  return new RegExp(`^${pattern.split("*").map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*")}$`, `su${flags}`);
+}
+
 /** The first blocked pattern that matches the whole name, or undefined. `*` matches any run of characters. */
 export function blockedBy(name: string, blocked: readonly string[]): string | undefined {
-  const matches = (pattern: string) =>
-    new RegExp(`^${pattern.split("*").map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*")}$`, "su").test(name);
-  return blocked.find(matches);
+  return blocked.find((pattern) => globRegExp(pattern).test(name));
 }
 
 /**
- * Env names no server may set. The zone's proxy settings belong to the stack,
- * and URL overrides would send a server's traffic (and its key) elsewhere
- * (spec §10.1: "no proxy or URL overrides beyond the zone's own").
+ * How a server may receive one env name:
+ * - `secret`: only as a bws reference (`bws:hapi-mcp-<name>`), never a literal;
+ * - `flag`: only as a literal, one of `values`, so it can't carry a secret;
+ * - `endpoint`: only as a literal http(s) URL with no user info, query or
+ *   fragment, whose host is one of the server's egress hosts or under one.
  */
-const FORBIDDEN_ENV: Readonly<Record<string, string>> = {
-  HTTP_PROXY: "the zone's proxy settings come from the stack, never from a server entry",
-  HTTPS_PROXY: "the zone's proxy settings come from the stack, never from a server entry",
-  ALL_PROXY: "the zone's proxy settings come from the stack, never from a server entry",
-  NO_PROXY: "the zone's proxy settings come from the stack, never from a server entry",
-  CONTEXT7_API_URL: "it redirects Context7's traffic and its API key",
-  DANGEROUSLY_READ_README_FILES: "it makes the Phoenix MCP server read files from disk and serve them as tools and resources",
+export type EnvRule = { kind: "secret" } | { kind: "flag"; values: readonly string[] } | { kind: "endpoint" };
+
+/**
+ * The env allowlist (spec §10.1: "env, by bws key name"), by npm package: every
+ * env name the package may receive, and how (`EnvRule`). A stdio server gets
+ * only its package's names, and a package not listed here gets no env. So a
+ * name the package would also read, such as NODE_OPTIONS or
+ * NPM_CONFIG_REGISTRY, can never be declared, and a literal can only be a flag
+ * value or an endpoint, never a secret.
+ *
+ * It lives in code, not in mcp.yaml, so a catalog entry can't widen its own
+ * allowlist. The names come from reading the package's source when it is added
+ * or upgraded (docs/mcp.md, "Adding or upgrading a server").
+ */
+export const PACKAGE_ENV: Readonly<Record<string, Readonly<Record<string, EnvRule>>>> = {
+  "@upstash/context7-mcp": {
+    CONTEXT7_API_KEY: { kind: "secret" },
+    OTEL_SDK_DISABLED: { kind: "flag", values: ["true"] }, // spec §10.1: telemetry off
+  },
+  "@arizeai/phoenix-mcp": {
+    PHOENIX_API_KEY: { kind: "secret" }, // minted by a VIEWER-role user
+    PHOENIX_DISCOVER_CONFIG: { kind: "flag", values: ["false"] }, // no .env.phoenix discovery up the directory tree
+    PHOENIX_ENDPOINT: { kind: "endpoint" }, // explicit, so a planted .env.phoenix can't redirect it
+  },
 };
+
+/** An env name that holds a secret, which only a bws reference may fill, whatever `PACKAGE_ENV` says. */
+export const SECRET_ENV_NAME = /(?:_KEY|_TOKEN|_SECRET|_PASSWORD|_CREDENTIALS?)$/i;
+
+const PROXY = "the zone's proxy settings come from the stack, never from a server entry";
+
+/**
+ * The hard denylist, defense in depth behind `PACKAGE_ENV`: env names no server
+ * may set, as a literal or a bws reference, for any package. Each one hijacks
+ * the launched process (npx, node, the dynamic linker, a shell) or redirects
+ * its traffic (spec §10.1: "no proxy or URL overrides beyond the zone's own").
+ * `*` matches any run of characters; case doesn't count.
+ */
+const FORBIDDEN_ENV: readonly (readonly [pattern: string, reason: string])[] = [
+  ["*_PROXY", PROXY],
+  ["GLOBAL_AGENT_*", PROXY],
+  [
+    "NPM_*",
+    "npm and npx read npm_config_* in any case: NPM_CONFIG_REGISTRY makes npx fetch the package from another registry, and nothing checks its integrity at launch",
+  ],
+  ["NODE_*", "Node reads it at start-up: NODE_OPTIONS can --require or --import any code, and NODE_EXTRA_CA_CERTS or NODE_TLS_REJECT_UNAUTHORIZED weaken TLS"],
+  ["LD_*", "the dynamic linker reads it: LD_PRELOAD and LD_LIBRARY_PATH load other code into the process"],
+  ["GCONV_PATH", "glibc loads iconv modules from the directory it names"],
+  ["PATH", "it chooses which npx and node binaries run"],
+  ["HOME", "npm reads ~/.npmrc from it, which can set the registry"],
+  ["BASH_ENV", "bash sources the file it names before it runs a script"],
+  ["ENV", "sh sources the file it names"],
+  ["BASH_FUNC_*", "bash imports shell functions from it"],
+  ["UV_*", "uv and uvx read it: UV_INDEX_URL and UV_DEFAULT_INDEX fetch packages from another index"],
+  ["PIP_*", "pip reads it: PIP_INDEX_URL fetches packages from another index"],
+  ["PYTHON*", "Python reads it at start-up: PYTHONPATH and PYTHONSTARTUP load other code"],
+  ["SSL_CERT_*", "OpenSSL trusts the CA certificates it names"],
+  ["OTEL_EXPORTER_*", "it sends the server's telemetry to another endpoint"],
+  ["CONTEXT7_API_URL", "it redirects Context7's traffic and its API key"],
+  ["PHOENIX_CLIENT_HEADERS", "it adds headers to every request the Phoenix MCP server sends, such as another credential"],
+  ["DANGEROUSLY_READ_README_FILES", "it makes the Phoenix MCP server read files from disk and serve them as tools and resources"],
+];
+
+/** Why no server may set this env name (the hard denylist, any case), or undefined if it isn't on it. */
+export function forbiddenEnv(name: string): string | undefined {
+  return FORBIDDEN_ENV.find(([pattern]) => globRegExp(pattern, "i").test(name))?.[1];
+}
 
 /** Whether `host` is `domain` or a subdomain of it, as the egress proxy matches. */
 const underDomain = (host: string, domain: string) => host === domain || host.endsWith(`.${domain}`);
+
+/** Why an endpoint literal is refused, or undefined: it must be an http(s) URL with no user info, query or fragment, under one of `egress`. */
+function endpointProblem(value: string, egress: readonly string[]): string | undefined {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return "it must be an http or https URL";
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return "it must be an http or https URL";
+  if (url.username !== "" || url.password !== "") return "it may not hold user info, which could carry a secret";
+  if (/[?#]/.test(value)) return "it may not hold a query or fragment, which could carry a secret";
+  const host = url.hostname.toLowerCase();
+  if (!egress.some((d) => underDomain(host, d))) return `its host ${JSON.stringify(host)} is not one of this server's egress hosts, or under one`;
+  return undefined;
+}
+
+const MUST_BE_BWS = (env: string) =>
+  `${env} names a secret, so its value must be a bws reference (bws:hapi-mcp-<name>), never a literal: a literal is written in plaintext into every generated config (spec §10.1)`;
+
+/** Why a stdio server may not receive `env` with this value, or undefined if it may. */
+function envProblem(env: string, value: string, s: McpServer): string | undefined {
+  const isRef = secretKey(value) !== undefined;
+  if (SECRET_ENV_NAME.test(env) && !isRef) return MUST_BE_BWS(env);
+  const pkg = s.package?.name ?? "(no package)";
+  const names = Object.hasOwn(PACKAGE_ENV, pkg) ? PACKAGE_ENV[pkg]! : undefined;
+  if (names === undefined) {
+    return `${pkg} has no env allowlist (PACKAGE_ENV in src/policy/mcp.ts), so it may not receive ${env}; list the env names it reads there, in the planning PR that adds it`;
+  }
+  const rule = Object.hasOwn(names, env) ? names[env]! : undefined;
+  if (rule === undefined) return `${pkg} may not receive ${env}: its env allowlist (PACKAGE_ENV in src/policy/mcp.ts) is ${Object.keys(names).join(", ")}`;
+  if (rule.kind === "secret") return isRef ? undefined : MUST_BE_BWS(env);
+  if (isRef) return `${env} is a ${rule.kind}, not a secret: write its literal value, not a bws reference`;
+  if (rule.kind === "flag") {
+    return rule.values.includes(value) ? undefined : `${env} is a flag: its value must be ${rule.values.map((v) => JSON.stringify(v)).join(" or ")}`;
+  }
+  const problem = endpointProblem(value, s.egress);
+  return problem === undefined ? undefined : `${env} is an endpoint: ${problem}`;
+}
 
 /** A URL's lowercase host name, or undefined if it doesn't parse. */
 function urlHost(url: string): string | undefined {
@@ -156,8 +274,13 @@ export function mcpIssues(m: McpCatalog): Issue[] {
 
     if (s.transport === "http" && Object.keys(s.env).length > 0) add(at("env"), "env is for stdio servers; an http server gets none");
     for (const [env, value] of Object.entries(s.env)) {
-      const reason = Object.hasOwn(FORBIDDEN_ENV, env) ? FORBIDDEN_ENV[env] : undefined;
+      const reason = forbiddenEnv(env);
       if (reason !== undefined) add(at("env", env), `a server may not set ${env}: ${reason} (spec §10.1)`);
+      else if (s.transport === "stdio") {
+        // An http server's env is refused as a whole, above.
+        const problem = envProblem(env, value, s);
+        if (problem !== undefined) add(at("env", env), problem);
+      }
       const key = secretKey(value);
       if (key === undefined) continue;
       const owner = keyOwner.get(key);
