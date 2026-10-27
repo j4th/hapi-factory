@@ -5,7 +5,7 @@
 # tighten it (src/policy/overlay.ts). This file is itself protected
 # (.factory/**).
 #
-# The two paths below are hapi-factory-specific, so they live here, not in
+# The paths below are hapi-factory-specific, so they live here, not in
 # policy/protected_paths.yaml, whose globs bind every repo the factory works on
 # (many repos have an unrelated policy/ or stack/ directory):
 #   policy/**  the central policy: protected paths, egress allowlists, budgets,
