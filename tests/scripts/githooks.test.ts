@@ -37,7 +37,8 @@ describe("the hook files", () => {
   /** A shellcheck that runs (a mise shim with no version set doesn't). */
   const shellcheck = Bun.which("shellcheck") !== null && Bun.spawnSync(["shellcheck", "--version"], { stdout: "ignore", stderr: "ignore" }).exitCode === 0;
   test.skipIf(!shellcheck)("shellcheck finds nothing (when shellcheck is on PATH)", () => {
-    const r = Bun.spawnSync(["shellcheck", "-x", "pre-commit", "commit-msg", "lib.sh"], { cwd: HOOKS, stdout: "pipe" });
+    // From the repo root: the hooks' `# shellcheck source=.githooks/lib.sh` is relative to it, as scripts/ are.
+    const r = Bun.spawnSync(["shellcheck", "-x", ".githooks/pre-commit", ".githooks/commit-msg", ".githooks/lib.sh"], { cwd: REPO, stdout: "pipe" });
     expect([r.exitCode, r.stdout.toString()]).toEqual([0, ""]);
   });
 });
