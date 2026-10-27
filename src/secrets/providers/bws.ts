@@ -30,11 +30,23 @@ export const isPlaceholderId = (id: string): boolean => PLACEHOLDER.test(id);
 /** What hapi passes to bws as an id: no leading "-" (it would read as a flag), no spaces. */
 const BWS_ID = /^[A-Za-z0-9][A-Za-z0-9-]*$/;
 
+/**
+ * `s` with the bws access token masked: the whole token, and each long piece of
+ * it. A token is `0.<id>.<secret>:<key>`, so text cut at its first colon (as
+ * `scrubToolError` cuts) would otherwise keep `0.<id>.<secret>`. Pieces under 8
+ * characters (the leading `0`) are left alone, since they would mask ordinary text.
+ */
+function maskToken(s: string): string {
+  const token = process.env.BWS_ACCESS_TOKEN;
+  if (!token) return s;
+  let out = s.replaceAll(token, "[BWS_ACCESS_TOKEN]");
+  for (const piece of token.split(/[:.]/)) if (piece.length >= 8) out = out.replaceAll(piece, "[BWS_ACCESS_TOKEN]");
+  return out;
+}
+
 /** One line of at most 300 characters, without ANSI colour codes or the bws access token. */
 function oneLine(e: unknown): string {
-  let s = (e instanceof Error ? e.message : String(e)).replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
-  const token = process.env.BWS_ACCESS_TOKEN;
-  if (token) s = s.replaceAll(token, "[BWS_ACCESS_TOKEN]");
+  let s = maskToken((e instanceof Error ? e.message : String(e)).replace(/\x1b\[[0-9;]*[A-Za-z]/g, ""));
   s = s.replace(/\s+/g, " ").trim();
   return s.length > 300 ? `${s.slice(0, 300)}...` : s;
 }
@@ -61,11 +73,12 @@ export const runBws: BwsRunner = async (args) => {
  * The error for a bws run that failed: its exit status and the start of its
  * stderr, scrubbed as sops's is (`scrubToolError`: the first line up to its
  * first colon, plus any path; what follows a colon could hold a value), with
- * the access token masked. bws's errors end in a source location and backtrace
+ * the access token masked before and after. bws's errors end in a source location and backtrace
  * hints, which go too. Its full message is one manual bws run away.
  */
 export function bwsFailure(code: number, stderr: string): Error {
-  const why = oneLine(scrubToolError(stderr)).replace(/ Location: .*$/, "");
+  // Mask first: the scrubber keeps the text before the first colon, and a token holds one.
+  const why = oneLine(scrubToolError(maskToken(stderr))).replace(/ Location: .*$/, "");
   return new Error(`bws exited with status ${code}${why ? `: ${why}` : ""} (run the same bws command yourself for its full message)`);
 }
 

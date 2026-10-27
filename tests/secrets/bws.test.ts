@@ -82,6 +82,24 @@ describe("the bws provider (optional)", () => {
     expect(bwsFailure(3, "").message).toBe("bws exited with status 3 (run the same bws command yourself for its full message)");
   });
 
+  test("a real-format access token (0.<id>.<secret>:<key>) never survives the scrubbing, whole or in pieces", () => {
+    // Built at run time, so no scan of this repo flags the file.
+    const alnum = (n: number, seed: number) => Array.from({ length: n }, (_, i) => "abcdefghijkLMNOPQRSTUV0123456789"[(i * 7 + seed) % 32]).join("");
+    const [id, secret, key] = ["2a8f3c1e-6b4d-4f7a-9c2e-1d5b8e7f0a3c", alnum(30, 3), alnum(24, 11)];
+    process.env.BWS_ACCESS_TOKEN = `0.${id}.${secret}:${key}`;
+    for (const stderr of [
+      `${process.env.BWS_ACCESS_TOKEN} is not a valid access token`, // the token starts the line, colon and all
+      `0.${id}.${secret} could not be parsed`, // the part before the colon on its own
+      `Error: bad key ${key}`,
+    ]) {
+      const m = bwsFailure(1, stderr).message;
+      for (const part of [id, secret, key]) expect([stderr, m.includes(part)]).toEqual([stderr, false]);
+    }
+    expect(bwsFailure(1, `${process.env.BWS_ACCESS_TOKEN} is not a valid access token`).message).toBe(
+      "bws exited with status 1: [BWS_ACCESS_TOKEN] is not a valid access token (run the same bws command yourself for its full message)",
+    );
+  });
+
   test("a bws failure names the logical name and why, never a value or the access token", async () => {
     process.env.BWS_ACCESS_TOKEN = "fake-access-token-0b1c";
     const failing: BwsRunner = async () => {
