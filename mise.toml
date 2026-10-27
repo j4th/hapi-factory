@@ -59,7 +59,7 @@ description = "Edit your sops secrets store in $EDITOR (`sops edit`; the plainte
 run = "bun run src/cli.ts secrets edit"
 
 [tasks."secrets:check"]
-description = "List every secret in stack/secrets.yaml as found, missing or empty in your store, never a value, and the store's recipients; exits 1 unless all are found, or on recipient drift, a post-quantum/classic mix or a non-age key; warns if there is no recovery key or recovery.age"
+description = "List every secret in stack/secrets.yaml as found, missing or empty in your store, never a value, and the store's recipients; exits 1 unless all are found, or on recipient drift, a post-quantum/classic mix, a non-age key or a recovery.age that doesn't match its recorded SHA-256; warns if there is no recovery key or recovery.age"
 run = "bun run src/cli.ts secrets check"
 
 [tasks."secrets:drill"]
