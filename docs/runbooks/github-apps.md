@@ -18,7 +18,7 @@ This page covers:
 
 ## Before you start
 
-- **Rulesets need a public repo on GitHub's free plan.** On a private repo they need a paid plan. Make `<your-github-login>/hapi-factory` public first (README, Plan 01 Task 1 step 2), then apply the rulesets.
+- **Rulesets need a public repo on GitHub's free plan.** On a private repo they need a paid plan. Make `<your-github-login>/hapi-factory` public first (README, [Publishing, after Task 7b](../../README.md#publishing-after-task-7b-the-remotes-the-rulesets-and-the-apps), step 3), then apply the rulesets.
 - **Never install either App on a repo whose rulesets aren't enforced,** such as a private repo on the free plan. With `contents: write` and no rules, an App could push straight to `main`.
 - You need the `gh` CLI (`mise install` provides it), logged in as the repo admin.
 - The commands on this page use `$OWNER` for the repo's owner. Set it once in the shell you run them in:

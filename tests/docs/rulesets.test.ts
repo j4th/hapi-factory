@@ -1,5 +1,5 @@
 /**
- * The GitHub rulesets are a manual step (README, "Plan 01 Task 1"; docs/runbooks/github-apps.md),
+ * The GitHub rulesets are a manual step (README, "Publishing, after Task 7b"; docs/runbooks/github-apps.md),
  * so the JSON the operator pastes is the only copy of them in the repo until Task 6's audit reads the
  * live ones. These tests hold that JSON to the rules it must keep (spec §5.1, §11.5):
  * - no App is ever a bypass actor;

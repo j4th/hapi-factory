@@ -11,6 +11,11 @@
  * - `git ls-files -z -- ':(icase)private'` lists nothing. Any case, so a
  *   `Private/` that is private/ on a case-insensitive filesystem counts too; a
  *   nested repo added as a gitlink shows as `private` itself;
+ * - `git ls-files -z --others --exclude-per-directory=.gitignore` lists nothing
+ *   under it: no file there that `git add -A` would stage, counting only the
+ *   .gitignore files a clone gets. This catches a partial ignore (`private/*`
+ *   then `!private/keep`), and private/ itself, an embedded repo, when it isn't
+ *   ignored. A negation that matches no file yet passes until such a file exists;
  * - `git check-ignore --no-index -q -- private/` says it is ignored, and the
  *   same with `-v` names the pattern that does it: a non-negated line of the
  *   root `.gitignore`. A local `.git/info/exclude` or a global excludes file
@@ -57,6 +62,15 @@ export async function repoPrivateUntracked(run: AuditRun): Promise<CheckResult[]
     const shown = tracked.slice(0, 3).map((f) => JSON.stringify(f));
     const more = tracked.length > 3 ? ` and ${tracked.length - 3} more` : "";
     problems.push(`it tracks ${tracked.length} path${tracked.length === 1 ? "" : "s"} under private/ (${shown.join(", ")}${more}): \`git rm -r --cached private\` and commit, then make sure no pushed commit holds them`);
+  }
+
+  const others = await git("ls-files", "-z", "--others", "--exclude-per-directory=.gitignore", "--", ":(icase)private");
+  if (others.code !== 0) return failed("ls-files --others", others);
+  const stageable = others.stdout.split("\0").filter((f) => f !== "");
+  if (stageable.length > 0) {
+    const shown = stageable.slice(0, 3).map((f) => JSON.stringify(f));
+    const more = stageable.length > 3 ? ` and ${stageable.length - 3} more` : "";
+    problems.push(`\`git add -A\` would stage ${stageable.length} path${stageable.length === 1 ? "" : "s"} under private/ (${shown.join(", ")}${more}): the root .gitignore must ignore all of private/, with no negation under it`);
   }
 
   const ignored = await git("check-ignore", "--no-index", "-q", "--", "private/");

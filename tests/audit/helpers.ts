@@ -125,9 +125,10 @@ export interface World {
   dockerDown?: boolean;
   /**
    * What git says about the checkout: `rev-parse --show-prefix` (exit 0), `ls-files` (the tracked paths under
-   * private/) and `check-ignore -v` (exit 0 with this source line, or exit 1 when it is undefined).
+   * private/), `ls-files --others` (the untracked ones `git add -A` would stage) and `check-ignore` (exit 0, with
+   * this source line for `-v`, or exit 1 when it is undefined).
    */
-  git: { prefix: string; tracked: string[]; ignoredBy: string | undefined; fail?: { code: number; stderr: string } };
+  git: { prefix: string; tracked: string[]; untracked: string[]; ignoredBy: string | undefined; fail?: { code: number; stderr: string } };
 }
 
 /** The pinned images stack/compose.yaml builds the zone services as. */
@@ -344,7 +345,7 @@ export async function cleanWorld(o: { repos?: boolean; workflows?: Record<string
     calls: [],
     requests: [],
     routes: githubRoutes({ workflows: o.workflows ?? {} }),
-    git: { prefix: "", tracked: [], ignoredBy: ".gitignore:11:private/" },
+    git: { prefix: "", tracked: [], untracked: [], ignoredBy: ".gitignore:11:private/" },
     ctx: undefined as unknown as AuditContext,
   };
   world.ctx = {
@@ -414,7 +415,7 @@ function fakeGit(w: World, args: string[]): ExecResult {
   if (w.git.fail) return { code: w.git.fail.code, stdout: "", stderr: w.git.fail.stderr };
   const sub = args[args.indexOf("core.fsmonitor=false") + 1];
   if (sub === "rev-parse") return ok(`${w.git.prefix}\n`);
-  if (sub === "ls-files") return ok(w.git.tracked.map((f) => `${f}\0`).join(""));
+  if (sub === "ls-files") return ok((args.includes("--others") ? w.git.untracked : w.git.tracked).map((f) => `${f}\0`).join(""));
   if (sub === "check-ignore") {
     if (w.git.ignoredBy === undefined) return { code: 1, stdout: "", stderr: "" };
     return args.includes("-q") ? ok("") : ok(`${w.git.ignoredBy}\tprivate/\n`);

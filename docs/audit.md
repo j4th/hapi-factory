@@ -259,6 +259,7 @@ The whole job counts, not just the agent's step, because a job's steps share one
 
 **Verifies** the checkout the audit runs in, not a `--repo`:
 - nothing under `private/` is tracked, in any case (`git ls-files -- ':(icase)private'`), so a `Private/` counts too, and so does a nested repo added as a gitlink;
+- nothing under it is a file `git add -A` would stage (`git ls-files --others --exclude-per-directory=.gitignore`, so only the `.gitignore` files a clone gets count). This catches a partial ignore, such as `private/*` then `!private/keep`, and `private/` itself as an embedded repo when it isn't ignored. A negation that matches no file yet passes until such a file exists;
 - the checkout's own root `.gitignore` ignores `private/`: `git check-ignore --no-index -q` says it is ignored, and `-v` names the line that does it, which must be a non-negated line of the root `.gitignore`. A `.git/info/exclude` or a global excludes file doesn't count, since a clone doesn't get it.
 
 git runs on the audit's root with `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` and `GIT_COMMON_DIR` unset, so your shell can't point it at another repo, and with fsmonitor off. The root must be the checkout's top level (`mise run audit` runs there).

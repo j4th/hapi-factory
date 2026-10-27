@@ -273,12 +273,14 @@ Set `OWNER` to your GitHub login first (`export OWNER=<your-login>`); the comman
 
 1. **Both repos already exist, private and empty:** `$OWNER/hapi-factory` and `$OWNER/hapi-factory-private`. **Push nothing until Task 7b is done.** Until its history rewrite, the history still holds the research and the personal details that Task 7b removes (H-056), and a push can't be taken back.
 
-2. **Push the cleaned history,** once Task 7b's checks pass. Confirm each first push yourself:
+2. **Push the cleaned history,** once Task 7b's checks pass. Confirm each first push yourself. `private/` already holds the research in its own repo; commit your secrets store there too before its first push, so it is backed up with the repo (it is encrypted, so that's safe):
 
    ```bash
    git remote add origin "https://github.com/$OWNER/hapi-factory.git"
    git push -u origin main
    git push -u origin plan-01-foundations   # then open a PR from it into main
+   git -C private add secrets.enc.yaml secrets.recipients.yaml recovery.age
+   git -C private commit -m "The secrets store, its recipients file and recovery.age"
    git -C private remote add origin "https://github.com/$OWNER/hapi-factory-private.git"
    git -C private push -u origin main
    ```
@@ -287,6 +289,7 @@ Set `OWNER` to your GitHub login first (`export OWNER=<your-login>`); the comman
 
    ```bash
    gh repo edit "$OWNER/hapi-factory" --visibility public --accept-visibility-change-consequences
+   gh repo edit "$OWNER/hapi-factory" --description "Hermes + Archon + Pi: a reference stack for an end-to-end agentic software factory"
    ```
 
 4. **Add two rulesets on `main`.** Together they make the operator the only one who can merge into `main` (always through a PR), require a passing `ci` check for every merge, the operator's included, and block force-pushes and deletion. They are two rulesets, not one, because a ruleset's bypass list covers *every* rule in that ruleset. If the approval bypass and the `ci` check sat in one ruleset, the bypass would also let a merge through with `ci` red or missing. GitHub applies every ruleset that targets a branch, and a bypass in one ruleset doesn't carry over to another.
@@ -352,7 +355,7 @@ Set `OWNER` to your GitHub login first (`export OWNER=<your-login>`); the comman
 
 6. **The GitHub Apps:** `hapi-planner` and `hapi-factory`, with exactly their permissions, installed on selected repos only, their keys in your store under the `host` zone, then the `agent-branch-scope` and `tags-admin-only` rulesets ([GitHub Apps](docs/runbooks/github-apps.md)). Then check that an App's merge call is refused, even with your approval and `ci` green ([Check it](docs/runbooks/github-apps.md#check-it)).
 
-7. **CodeRabbit (optional),** once CODEOWNERS is merged: install it on hapi-factory only, never on hapi-factory-private. Never tick its "Commit the changes to this branch" checkbox or run `@coderabbitai autopilot` on a factory or planning PR: either commits under your own GitHub sign-in, past the factory's checks. The register's H-164 has the checks to run after installing.
+7. **CodeRabbit (optional),** once CODEOWNERS is merged and its threat-model entry and audit checks (H-169) are on `main`: install it on hapi-factory only, never on hapi-factory-private. Never tick its "Commit the changes to this branch" checkbox or run `@coderabbitai autopilot` on a factory or planning PR: either commits under your own GitHub sign-in, past the factory's checks. The register's H-164 has the checks to run after installing.
 
 8. **Task 5's host setup clones from this remote** once it's pushed: `scripts/host-setup.sh` defaults to your checkout's `origin`. Until then, give it your checkout's path ([Plan 01 Task 5](#plan-01-task-5-the-host-and-the-stack-stage-b)).
 
