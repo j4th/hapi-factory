@@ -62,6 +62,30 @@ run = "bun run src/cli.ts secrets edit"
 description = "List every secret in stack/secrets.yaml as found, missing or empty in your store, never a value; exits 1 unless all are found"
 run = "bun run src/cli.ts secrets check"
 
+[tasks."secrets:drill"]
+description = "Prove your 10 recovery words and recovery.age open the store, in an isolated temp dir; prints a count, never a value (docs/secrets.md#keys-and-recovery)"
+run = "bun run src/cli.ts secrets drill"
+
+[tasks."secrets:join"]
+description = "On a new machine or user: make its own age key and config for a copy of the store, and print the add-machine command (e.g. `mise run secrets:join -- --store private/secrets.enc.yaml`)"
+run = "bun run src/cli.ts secrets join"
+
+[tasks."secrets:add-machine"]
+description = "Add a machine's public key to the store with a new data key, and to its recipients file (`mise run secrets:add-machine -- --name <n> --recipient <age1...>`)"
+run = "bun run src/cli.ts secrets add-machine"
+
+[tasks."secrets:recover"]
+description = "With the store, recovery.age, the recipients file and your 10 words: give this machine its own key to the store (`mise run secrets:recover -- --store <file>`)"
+run = "bun run src/cli.ts secrets recover"
+
+[tasks."secrets:revoke"]
+description = "Remove a recipient from the store with a new data key, and from its recipients file (`mise run secrets:revoke -- --name <n>`)"
+run = "bun run src/cli.ts secrets revoke"
+
+[tasks."secrets:new-recovery"]
+description = "Replace the recovery key and its 10 words, when they are lost or exposed; needs a working machine key"
+run = "bun run src/cli.ts secrets new-recovery"
+
 [tasks."policy:build"]
 description = "Compile policy/ into the Hermes, Archon, Pi, egress and MCP configs under build/ (e.g. `mise run policy:build -- --roster budget`)"
 run = "bun run src/cli.ts policy build"

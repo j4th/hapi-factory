@@ -6,20 +6,9 @@ import { PolicyError } from "../../src/policy/load";
 import { secretEnvName } from "../../src/policy/mcp";
 import { envFileText, parseEnvFile } from "../../src/secrets/files";
 import type { Manifest } from "../../src/secrets/manifest";
-import {
-  checkSecrets,
-  configPath,
-  describeSecretsConfig,
-  loadSecretsConfig,
-  providerFor,
-  resolveSecrets,
-  SecretError,
-  type SecretProvider,
-  secretsCheck,
-  secretsEdit,
-  secretsResolve,
-} from "../../src/secrets/provider";
-import { capture, caught, cleanup, fullStore, sopsConfig, sopsStore, tempDir } from "./helpers";
+import { providerFor, secretsCheck, secretsEdit, secretsResolve } from "../../src/secrets/cli";
+import { checkSecrets, configPath, describeSecretsConfig, loadSecretsConfig, resolveSecrets, SecretError, type SecretProvider } from "../../src/secrets/provider";
+import { capture, caught, cleanup, FAKE_AGE_DIR, fullStore, sopsConfig, sopsStore, tempDir } from "./helpers";
 
 // Obviously fake values: none of them is, or looks like, a real credential.
 const FAKE = "sk-SECRET-123";
@@ -277,7 +266,7 @@ describe("hapi secrets resolve, check and edit", () => {
     const store = sopsStore(root, values);
     const config = sopsConfig(root, store);
     const env = { HOME: home, XDG_RUNTIME_DIR: xdg, PATH: "/usr/bin:/bin" };
-    return { root, home, xdg, store, config, env, deps: { env, sops: store.run } };
+    return { root, home, xdg, store, config, env, deps: { env, sops: store.run, ageDir: async () => FAKE_AGE_DIR } };
   }
 
   test("resolve writes $XDG_RUNTIME_DIR/hapi/env/<zone>.env and prints only the paths", async () => {
@@ -318,7 +307,8 @@ describe("hapi secrets resolve, check and edit", () => {
     expect(out).toContain("missing  archon/OPENCODE_API_KEY (hapi-archon-opencode-api-key)");
     expect(out).toContain("empty    research/EXA_API_KEY (hapi-research-exa-api-key)");
     expect(out).toContain("unknown  hapi-old-key (in the store, not in stack/secrets.yaml)");
-    expect(out.length).toBe(16);
+    expect(out.slice(-2)).toEqual(["recipient machine  test-machine (post-quantum, added 2026-10-26)", "recipient recovery recovery (post-quantum, added 2026-10-26)"]);
+    expect(out.length).toBe(18);
     expect(err.join("\n")).toContain("2 of 15 secrets are missing or empty: archon/OPENCODE_API_KEY, research/EXA_API_KEY");
     expect([...out, ...err].join("\n")).not.toContain("fake-hapi");
   });
@@ -437,7 +427,9 @@ describe("hapi secrets resolve, check and edit", () => {
         env: {
           HOME: s.home,
           XDG_RUNTIME_DIR: s.xdg,
-          PATH: "/usr/bin:/bin",
+          // The pinned age first, for any age plugin sops runs; and no gpg-agent.
+          PATH: `${FAKE_AGE_DIR}:/usr/bin:/bin`,
+          GPG_AGENT_INFO: "",
           EDITOR: "vi",
           TERM: "xterm",
           // Every other SOPS_* variable is dropped, so the shell can't add a recipient or a key.
@@ -460,5 +452,15 @@ describe("hapi secrets resolve, check and edit", () => {
     writeFileSync(config, "provider: bws\nbws: { ids: {} }\n");
     await expect(secretsEdit(["--config", config], { ...s.deps, interactive })).rejects.toThrow(/sops provider only/);
     await expect(secretsEdit(["--config", s.config], { ...s.deps, env: { HOME: s.home }, interactive })).rejects.toThrow(/XDG_RUNTIME_DIR/);
+  });
+});
+
+describe("checkSecrets", () => {
+  test("masks an unknown name that isn't a logical name in the API itself, not only in the CLI", async () => {
+    const manifest: Manifest = { hermes: { ANTHROPIC_API_KEY: "hapi-hermes-key" } };
+    const { provider } = fakeProvider({ "hapi-hermes-key": "h", "hapi-old-key": "x", [FAKE]: "y" });
+    const { unknown } = await checkSecrets(manifest, provider);
+    expect(unknown).toEqual(["hapi-old-key", "(a name that is not a logical name, not shown)"]);
+    expect(JSON.stringify(unknown)).not.toContain(FAKE);
   });
 });

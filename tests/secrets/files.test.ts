@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { checkoutProblem, envFileText, isWithin, parseEnvFile, runtimeDir, secureDir, writeSecretFile, writeSecretFiles } from "../../src/secrets/files";
+import { checkoutProblem, envFileText, isWithin, parseEnvFile, repoRoots, runtimeDir, secureDir, writeNewSecretFile, writeSecretFile, writeSecretFiles } from "../../src/secrets/files";
 
 const FAKE = "fake-secret-value-7f3a";
 
@@ -80,6 +80,23 @@ describe("writeSecretFile", () => {
   });
 });
 
+describe("writeNewSecretFile: no-replace", () => {
+  test("writes a new file 0600 through link(), and never replaces one that exists, even one that appears after a check", async () => {
+    const dir = tempDir();
+    const file = join(dir, "secrets.enc.yaml");
+    await writeNewSecretFile(file, "first\n");
+    expect([readFileSync(file, "utf8"), mode(file)]).toEqual(["first\n", 0o600]);
+    const e = await caught(writeNewSecretFile(file, "second\n"));
+    expect((e as NodeJS.ErrnoException).code).toBe("EEXIST");
+    expect(readFileSync(file, "utf8")).toBe("first\n");
+    // A symlink there counts as existing too: link() never follows or replaces it.
+    symlinkSync(join(dir, "elsewhere"), join(dir, "link"));
+    await expect(writeNewSecretFile(join(dir, "link"), "x")).rejects.toThrow();
+    expect(existsSync(join(dir, "elsewhere"))).toBe(false);
+    expect(readdirSync(dir).sort()).toEqual(["link", "secrets.enc.yaml"]);
+  });
+});
+
 describe("writeSecretFiles: the whole set at once", () => {
   test("writes every file 0600 into a fresh 0700 generation directory and points the env symlink at it", async () => {
     const base = tempDir();
@@ -132,6 +149,26 @@ describe("writeSecretFiles: the whole set at once", () => {
     expect(e.message).toMatch(/not hapi's symlink/);
     expect(readdirSync(link)).toEqual(["keep"]);
     expect(readdirSync(base)).toEqual(["env"]);
+  });
+
+  test("writeSecretFiles removes Task 4-era zone files and orphaned generations", async () => {
+    const base = tempDir();
+    const link = join(base, "env");
+    // Task 4 wrote $XDG_RUNTIME_DIR/hapi/<zone>.env directly; a crash can leave a generation the link doesn't point at.
+    for (const z of ["hermes", "archon", "research", "host"]) writeFileSync(join(base, `${z}.env`), `A='${FAKE}'\n`, { mode: 0o600 });
+    const orphan = join(base, "env.0b6c1c9e-5a8e-4a43-9d1e-2d6f8c2a1b3c");
+    mkdirSync(orphan, { mode: 0o700 });
+    writeFileSync(join(orphan, "hermes.env"), `A='${FAKE}'\n`);
+    // Not ours: a directory that isn't a generation, a symlink with a zone file's name, and a file of another name.
+    mkdirSync(join(base, "env.not-a-generation"));
+    symlinkSync(join(base, "keep-target"), join(base, "slack.env"));
+    writeFileSync(join(base, "notes.txt"), "keep\n");
+    await writeSecretFiles(link, { "hermes.env": "A='new'\n" }, { legacy: ["hermes.env", "archon.env", "research.env", "host.env", "slack.env"] });
+    expect(readdirSync(base).sort()).toEqual(["env", readlinkSync(link), "env.not-a-generation", "notes.txt", "slack.env"].sort());
+    expect(readFileSync(join(link, "hermes.env"), "utf8")).toBe("A='new'\n");
+    // And it is idempotent: a second write leaves one generation.
+    await writeSecretFiles(link, { "hermes.env": "A='newer'\n" }, { legacy: ["hermes.env"] });
+    expect(readdirSync(base).filter((n) => /^env\.[0-9a-f-]{36}$/.test(n)).length).toBe(1);
   });
 
   test("an old target that isn't one of hapi's generation directories is never deleted", async () => {
@@ -206,5 +243,39 @@ describe("isWithin and checkoutProblem: the inside-the-checkout boundary", () =>
     const outside = tempDir();
     expect(await checkoutProblem(join(outside, "..agekey"), repo)).toBeUndefined();
     expect(await checkoutProblem(`${repo}-sibling/keys.txt`, repo)).toBeUndefined();
+  });
+});
+
+describe("the checkout boundary", () => {
+  /** Run git quietly, with no user config, in `cwd`. */
+  function git(cwd: string, ...args: string[]) {
+    const r = Bun.spawnSync(["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "init.defaultBranch=main", ...args], {
+      cwd,
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: cwd, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")} failed: ${r.stderr.toString()}`);
+  }
+
+  test("defaultRepoRoot covers the main worktree from a linked worktree and ignores GIT_DIR/GIT_WORK_TREE", async () => {
+    const dir = realpathSync(tempDir());
+    const main = join(dir, "main");
+    mkdirSync(main);
+    git(main, "init", "-q");
+    git(main, "commit", "-q", "--allow-empty", "-m", "init");
+    git(main, "worktree", "add", "-q", join(main, ".worktrees", "task"));
+    const wt = join(main, ".worktrees", "task");
+    mkdirSync(join(wt, "src"));
+    const decoy = join(dir, "decoy");
+    mkdirSync(decoy);
+    git(decoy, "init", "-q");
+    // GIT_DIR and GIT_WORK_TREE from the caller's shell would point git elsewhere: they are cleared.
+    const env = { PATH: process.env.PATH, HOME: dir, GIT_DIR: join(decoy, ".git"), GIT_WORK_TREE: decoy, GIT_CONFIG_GLOBAL: "/dev/null" };
+    expect(await repoRoots({ cwd: join(wt, "src"), env })).toEqual([wt, main]);
+    expect(await repoRoots({ cwd: main, env })).toEqual([main]);
+    // So private/ in the main worktree is inside the checkout, even when hapi runs from the linked one.
+    expect(await checkoutProblem(join(main, "private", "keys.txt"), [wt, main])).toMatch(/inside the hapi-factory checkout/);
+    expect(await checkoutProblem(join(dir, "elsewhere", "keys.txt"), [wt, main])).toBeUndefined();
   });
 });

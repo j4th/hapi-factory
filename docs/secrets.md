@@ -11,7 +11,7 @@ Secrets come in three parts:
 | **The store** | The provider's own data | The values, under their logical names |
 
 The providers:
-- **sops + age, the default for everyone.** One encrypted file and an age key. No service to run, encrypted at rest, and the encrypted file can be backed up in a private repo. Onboarding is `mise run secrets:init`.
+- **sops + age, the default for everyone.** One encrypted file, encrypted to one age key per machine or user plus a recovery key that 10 words unlock ([keys and recovery](#keys-and-recovery)). No service to run, encrypted at rest, and the encrypted file can be backed up in a private repo. Onboarding is `mise run secrets:init`.
 - **Bitwarden Secrets Manager (`bws`), optional.** The config binds each logical name to a bws secret id.
 - **`env-file`, an explicit downgrade.** A plaintext `0600` file outside every checkout. Every run warns about it, and `hapi audit` (Plan 01 Task 6) reports it.
 
@@ -24,9 +24,10 @@ The rules:
 This page covers:
 - [the zones and their keys](#the-zones-and-their-keys) and [the manifest](#the-manifest-stacksecretsyaml);
 - [the local config](#the-local-config);
-- [getting started with sops + age](#getting-started-with-sops--age), [backing up the age key](#backing-up-the-age-key) and [adding a secret](#adding-a-secret);
+- [getting started with sops + age](#getting-started-with-sops--age) and [adding a secret](#adding-a-secret);
+- [keys and recovery](#keys-and-recovery): per-machine keys, the 10 words, post-quantum keys, and `join`, `add-machine`, `recover`, `drill`, `revoke` and `new-recovery`, with [a worked example](#worked-example-a-laptop-a-vm-and-the-hapi-user) and [lost vs compromised keys](#a-lost-key-a-compromised-key-lost-or-exposed-words);
 - the commands: [`hapi secrets init`](#hapi-secrets-init), [`edit`](#hapi-secrets-edit), [`check`](#hapi-secrets-check) and [`resolve`](#hapi-secrets-resolve), and [the env files](#the-env-files);
-- [rotating a secret](#rotating-a-secret) and [rotating the age key](#rotating-the-age-key);
+- [rotating a secret](#rotating-a-secret) and [replacing a machine's key](#replacing-a-machines-key);
 - [optional: Bitwarden](#optional-bitwarden-secrets-manager-bws) and [the env-file downgrade](#the-env-file-downgrade);
 - [`hapi token mint`](#hapi-token-mint), [error messages](#error-messages-name-keys-never-values), [threat notes](#threat-notes) and [open items](#open-items).
 
@@ -120,42 +121,29 @@ sops:     { file: /home/hapi/.config/hapi/secrets.enc.yaml, age_key_file: /home/
 - The schema is [`policy/schemas/secrets-config.schema.json`](../policy/schemas/secrets-config.schema.json).
 - **Exactly the selected provider's block.** It is required, and any other block is refused (`/bws: the provider is sops, so only its sops block may be set; remove bws`), so a config never names two stores and there is nothing to fall back on.
 - **Paths:** a leading `~` is your `$HOME`; a relative path is relative to the config file's directory. `hapi secrets init` writes absolute paths.
-- **`sops.age_key_file` is optional.** Without it, hapi uses sops's own default, `${XDG_CONFIG_HOME:-$HOME/.config}/sops/age/keys.txt`, and tells sops so explicitly.
+- **`sops.age_key_file` is optional.** Without it, hapi uses sops's own default, `${XDG_CONFIG_HOME:-$HOME/.config}/sops/age/keys.txt`, and tells sops so explicitly. It is *this machine's* key; other machines have their own.
+- **Beside `sops.file`** sit its recipients file (`secrets.recipients.yaml` for `secrets.enc.yaml`) and `recovery.age` ([keys and recovery](#keys-and-recovery)). The config doesn't name them: hapi finds them next to the store.
 - **A mistake is never echoed.** An error shows only the config's own keys and logical names; anything else in a JSON Pointer shows as `<key>` or `<name>`.
 
 ## Getting started with sops + age
 
-Do this as the user that runs the stack (`hapi`, from Plan 01 Task 5 on), from the repo root.
+Do this as the user that runs the stack (`hapi`, from Plan 01 Task 5 on), from the repo root, in a terminal.
 
-1. **Install the pinned tools:** `mise install`. It installs `sops` and `age` (with `age-keygen`) at the versions in `mise.toml`.
+1. **Install the pinned tools:** `mise install`. It installs `sops` and `age` (with `age-keygen` and `age-plugin-batchpass`) at the versions in `mise.toml`. hapi uses only that age, never one on your `PATH`: the distro's age 1.1.1 has no post-quantum keys and no batchpass.
 2. **Create your store:**
 
    ```bash
-   mise run secrets:init                                     # the encrypted file in ~/.config/hapi/
+   mise run secrets:init                                     # the store in ~/.config/hapi/
    mise run secrets:init -- --file private/secrets.enc.yaml  # or in private/, to back it up to your private repo
    ```
 
-   It makes an age key (or reuses yours), an encrypted file holding every manifest name with an empty value, and the config. It prints the age public key ([details](#hapi-secrets-init)).
-3. **Back up the age key** now ([how](#backing-up-the-age-key)).
-4. **Fill in each value:** `mise run secrets:edit`. Your editor opens the decrypted file. Replace each `""` with the value from its runbook, then save and quit; sops encrypts it again ([adding a secret](#adding-a-secret)).
-5. **Check it:** `mise run secrets:check`. Every line should say `found`, and it exits 0.
+   It makes this machine's age key (or reuses yours), a recovery key, the encrypted store (every manifest name, empty), its recipients file, `recovery.age` and the config ([details](#hapi-secrets-init)).
+3. **Store the 10 words.** init shows them once, on your terminal, and then asks you to type two of them back. Store them where you keep things you can't lose (a password manager, paper in a safe, or both). With `recovery.age` they open your secrets if every machine is lost ([why](#keys-and-recovery)).
+4. **Prove they work:** `mise run secrets:drill`. Type the words; it says `recovery works: 14 names readable` ([details](#hapi-secrets-drill)).
+5. **Fill in each value:** `mise run secrets:edit`. Your editor opens the decrypted file. Replace each `""` with the value from its runbook, then save and quit; sops encrypts it again ([adding a secret](#adding-a-secret)).
+6. **Check it:** `mise run secrets:check`. Every line should say `found`, the recipients are listed, and it exits 0.
 
-Plan 01 Task 5's `mise run up` runs `hapi secrets resolve` before it starts any container, and aborts if it fails.
-
-### Backing up the age key
-
-**The age key is the master key.** Without it, the encrypted file can't be opened, by you or anyone. With it, anyone who also has a copy of the encrypted file (from `private/`'s remote, say) has every secret. So:
-- keep one copy **offline**, for example as a secure note in your password manager (the key file is three lines of text);
-- never put it in a repo, `private/` included: hapi refuses a key file inside the checkout, and `.gitignore` lists `keys.txt` and `*.agekey` in case one lands there;
-- keep the file mode `0600` (or `0400`): hapi refuses one with any group or other permission bit.
-
-To restore it on a new machine, write it back to the same path without it touching your shell history, then check:
-
-```bash
-mkdir -p -m 0700 ~/.config/sops/age
-(umask 077 && cat > ~/.config/sops/age/keys.txt)   # paste the key, then press Ctrl-D
-mise run secrets:check
-```
+Each further machine or user (a VM, the `hapi` user) gets its own key with `join` and `add-machine`: see [the worked example](#worked-example-a-laptop-a-vm-and-the-hapi-user). Plan 01 Task 5's `mise run up` runs `hapi secrets resolve` before it starts any container, and aborts if it fails.
 
 ### Adding a secret
 
@@ -174,25 +162,192 @@ hapi-host-planner-app-private-key: |
 - **Don't use `sops set` or put a value on any command line:** it ends up in your shell history and in the process list.
 - Then `mise run secrets:check`.
 
+## Keys and recovery
+
+**hapi never backs up a key by copying it.** Every store is encrypted to:
+- **one age key per machine or user**, generated where it lives and never copied: your laptop, the VM and the `hapi` user each have their own;
+- **one recovery (break-glass) recipient**, whose private key is wrapped with **10 words** that hapi generates, and kept as `recovery.age` beside the store.
+
+Any one of them opens the store: sops makes one data key per store and wraps it separately for each recipient. This is the disaster-recovery pattern the sops docs recommend (several master keys, one of them kept offline), and the one age's author and Flux use. A copied key is a master key in a second place you can no longer account for. A key that never leaves its machine dies with it, and that's fine: the other recipients still open the store, and the machine is simply revoked.
+
+**Your one backup job is the 10 words.** Store them where you keep things you can't lose: a password manager, paper in a safe, or both. `recovery.age` is useless without them, so it may sit in `private/` and be backed up with the store. Keep the words apart from it: never in the repo, `private/` or a note beside a copy of `recovery.age`.
+
+What sits where:
+
+| File | Where | What it is |
+|---|---|---|
+| The store, `secrets.enc.yaml` | anywhere (`private/` is fine) | the values, encrypted to every recipient |
+| The recipients file, `secrets.recipients.yaml` | beside the store | each recipient's name, kind and public key: no secret |
+| `recovery.age` | beside the store | the recovery key, wrapped with the 10 words (age's scrypt passphrase format, mode `0600`) |
+| This machine's key, `keys.txt` | `~/.config/sops/age/` by default, **never** in a checkout | this machine's age identity, mode `0600` |
+| The config, `secrets.yaml` | `~/.config/hapi/` by default | which store and which key this machine uses |
+
+### The recipients file
+
+```yaml
+# The age recipients secrets.enc.yaml is encrypted to, written by hapi secrets (docs/secrets.md#keys-and-recovery).
+pq: true
+recipients:
+  - name: laptop-user
+    kind: machine
+    recipient: age1pq1...      # 1959 characters
+    added: 2026-10-26
+  - name: recovery
+    kind: recovery
+    recipient: age1pq1...
+    added: 2026-10-26
+```
+
+- It sits beside the store, at the same basename stem: `private/secrets.enc.yaml` → `private/secrets.recipients.yaml`. The schema is [`policy/schemas/secrets-recipients.schema.json`](../policy/schemas/secrets-recipients.schema.json).
+- A `name` matches `^[a-z0-9][a-z0-9-]{0,62}$`; `recovery` is the recovery recipient's. The default machine name is `<hostname>-<user>`, normalised to that pattern.
+- **It must agree with the store.** `check` and every command below compare it with the recipients in the store's own sops metadata (read without decrypting). Drift either way is an error that names the recipient: `the store is encrypted to age1pq1qxyz…, which the recipients file doesn't list`, or `the recipients file lists vm-hapi (age1pq1…), but the store isn't encrypted to it`. Public keys aren't secret. It means one of the two files was changed outside hapi, or the two come from different commits: restore both from the same commit.
+- Change it only through the commands below. Each one writes the store and the recipients file in step.
+
+### Post-quantum by default
+
+Keys come from `age-keygen -pq`: a hybrid ML-KEM-768 + X25519 key pair (identity `AGE-SECRET-KEY-PQ-1...`, recipient `age1pq1...`), which age's own man page recommends for most uses. The costs:
+- **Size:** each post-quantum recipient adds about 5 KB to the store (a 1959-character public key and its wrapped data key). A store with three machines and the recovery key is about 20 KB.
+- **No P-256 hardware plugins.** The YubiKey and TPM age plugins make P-256 keys only, which can't join a post-quantum set.
+
+**A mix is refused.** sops accepts a store with both post-quantum and classic recipients without a word, and the file is then only as strong as its classic recipient (age itself refuses a mix). So `check` and every command refuse one. `pq: false` makes a store all-classic (X25519) instead: `mise run secrets:init -- --classic`, the trade-off for hardware plugins later. `init` and `join` reuse an existing key only if its kind matches the store's, and otherwise stop and say why.
+
+### The commands
+
+Each is also a mise task: `mise run secrets:<command> -- <flags>`. `--config` picks the config as [above](#the-local-config).
+
+| Command | Run it on | What it does |
+|---|---|---|
+| [`init`](#hapi-secrets-init) | the first machine | this machine's key, the recovery key and its words, the store, its recipients file, `recovery.age` and the config |
+| [`join --store <file>`](#hapi-secrets-join) | a new machine or user | its own key and config; prints the `add-machine` command. It doesn't touch the store. |
+| [`add-machine --name <n> --recipient <age1...>`](#hapi-secrets-add-machine) | a machine whose key opens the store | adds that public key |
+| [`recover [--store <file>]`](#hapi-secrets-recover) | a box with the store, `recovery.age`, the recipients file and the words, but no key that opens them | makes its own key and adds it, with the words |
+| [`drill`](#hapi-secrets-drill) | any machine with the store and `recovery.age` | proves the words open the store |
+| [`revoke --name <n>`](#hapi-secrets-revoke) | a machine whose key opens the store | removes a recipient |
+| [`new-recovery`](#hapi-secrets-new-recovery) | a machine whose key opens the store | new recovery key and words, for lost or exposed ones |
+
+**Every recipient change makes a new data key.** It runs `sops --config /dev/null rotate -i --add-age … / --rm-age …` (never `updatekeys`, which keeps the old data key, so a removed key holder with an old copy could still read secrets added later). sops works on a temp copy beside the store; hapi checks the copy is encrypted to exactly the recipients asked for, renames it over the store in one step, and only then rewrites the recipients file. If anything fails, both stay as they were.
+
+#### `hapi secrets join`
+
+```text
+hapi secrets join --store <file> [--name name] [--config file] [--age-key file]
+```
+
+For a new machine or user, with a copy of `private/` (the store, its recipients file and `recovery.age`), from a pull of the private repo, say. It makes this machine's key (`--age-key`, default sops's own path; an existing key is reused if its kind matches) and its config, and never overwrites either. Then it prints this machine's public key and the exact command to run on a machine that already has access:
+
+```text
+this machine's public key (vm-hapi): age1pq1...
+next, on a machine whose key already opens the store, run:
+  mise run secrets:add-machine -- --name vm-hapi --recipient age1pq1...
+```
+
+A name already in the recipients file is refused. The key is made in memory and written `0600` in a `0700` directory, never inside a checkout.
+
+#### `hapi secrets add-machine`
+
+```text
+hapi secrets add-machine --name <n> --recipient <age1...> [--config file]
+```
+
+It checks the recipient's form (`age1pq1` and 1952 characters, or `age1` and 58) and kind (post-quantum or classic, as the store is), refuses a name or recipient that is already there, then adds it with `rotate -i --add-age` and updates the recipients file. Then bring the updated store and recipients file to the new machine (commit and push `private/`, then pull it there) and run `mise run secrets:check` on it.
+
+#### `hapi secrets recover`
+
+```text
+hapi secrets recover [--store file] [--name name] [--config file] [--age-key file]
+```
+
+For a box that has the store, `recovery.age` and the recipients file, but no key that opens them: a new laptop after the old one died, say. Give `--store` if the box has no config yet.
+1. It joins: this machine's key and config, as `join` would.
+2. It reads the 10 words on the terminal (spaces, hyphens and case don't matter; a word not in the list is named by its position: `word 4 is not in the list`), and unwraps the recovery key **in memory**.
+3. It adds this machine's key with `rotate -i --add-age`, handing the recovery key to that one sops child as `SOPS_AGE_KEY`.
+4. It updates the recipients file.
+
+After that the machine works without the words. Then revoke the machine whose key was lost: `mise run secrets:revoke -- --name <old>`. A name that is already taken (the dead machine's, say) is refused, so pick another `--name`.
+
+#### `hapi secrets drill`
+
+```text
+hapi secrets drill [--config file]
+```
+
+It proves your backup works, without changing anything. It reads the words, unwraps the recovery key, and decrypts the store in a sops child whose `HOME` and `XDG_CONFIG_HOME` are a fresh temp directory under `$XDG_RUNTIME_DIR/hapi/`, so no machine key can be loaded, and whose only key is the recovery one. It prints `recovery works: N names readable`, never a value, and deletes the temp directory. Run it after `init`, after `new-recovery`, and now and then.
+
+#### `hapi secrets revoke`
+
+```text
+hapi secrets revoke --name <n> [--config file]
+```
+
+It removes a recipient with `rotate -i --rm-age` and updates the recipients file. It refuses to remove the last machine key (nothing could open the store) or the only recovery recipient (use `new-recovery`). It ends with sops's documented order for a compromised key: **if this key may be compromised, also reissue every credential in the store: copies of the store in git history stay readable by the removed key forever.**
+
+#### `hapi secrets new-recovery`
+
+```text
+hapi secrets new-recovery [--config file]
+```
+
+For words that are lost or exposed. It needs a working machine key. It makes a new recovery key and 10 new words, with the same show-and-confirm as `init`; adds the new recipient (`rotate -i --add-age`), then removes the old one (`--rm-age`); and replaces `recovery.age` and the recipients file. That replace is the one deliberate one: the old `recovery.age` is kept in memory and put back if any step fails. Then run `mise run secrets:drill` with the new words.
+
+### Worked example: a laptop, a VM and the `hapi` user
+
+The store lives in `private/`, which is its own git repo pushed to your private remote.
+
+1. **On the laptop:** `mise run secrets:init -- --file private/secrets.enc.yaml`. Store the 10 words. `mise run secrets:drill`, then `mise run secrets:edit` to fill in the values. Commit and push `private/`.
+2. **On the VM**, with the repo cloned and `private/` pulled: `mise run secrets:join -- --store private/secrets.enc.yaml`. It prints an `add-machine` command with the VM's public key.
+3. **On the laptop:** run that command (`mise run secrets:add-machine -- --name vm-user --recipient age1pq1...`). Commit and push `private/`.
+4. **On the VM:** pull `private/`, then `mise run secrets:check`.
+5. **The `hapi` user** that runs the stack is another user, so it gets its own key the same way: as `hapi`, in its own checkout with `private/` pulled, `mise run secrets:join -- --store private/secrets.enc.yaml`; then `add-machine` on the VM user's or the laptop's checkout; then pull and `check` as `hapi`. Plan 01 Task 5's stack runbook will use these steps for it.
+
+Now any one of the three keys, or the words with `recovery.age`, opens the store, and none of them was ever copied.
+
+### A lost key, a compromised key, lost or exposed words
+
+- **A lost key** (the machine died, the key file was deleted): nothing leaked. On any machine whose key still opens the store, `revoke --name <lost>`. If none does, `recover` on a new machine with the words, then revoke the lost one.
+- **A compromised key** (copied, stolen, or on a machine you no longer trust): `revoke --name <it>`, which makes a new data key, commit and push the store, then **reissue every credential in the store** at its vendor ([rotating a secret](#rotating-a-secret)). Removing a key doesn't undo the past: it still opens every old copy of the store, in `private/`'s git history, say, forever.
+- **Lost words:** `new-recovery`, on a machine whose key opens the store. If no machine opens it and the words are lost, the store is gone: that is what the words are for.
+- **Exposed words:** `new-recovery`, then treat it as a compromised key: old copies of the store and of `recovery.age` still open with the old words, so reissue every credential.
+
+### Later add-ons
+
+Not built; each would be one more recipient:
+- **Hardware keys** (YubiKey or TPM through age plugins): a key that can't be copied off the device. They are P-256 only, so the store would have to be `pq: false`.
+- **Shamir key groups** (sops `key_groups` with `shamir_threshold`): "any 2 of 3 people" for a team, instead of one set of words.
+- **A cloud KMS key** as a recipient: recovery through a cloud account, at the cost of depending on one (about $1 per key a month on AWS).
+
+### Threat notes: keys and recovery
+
+- **The words plus `recovery.age` are a master key.** Either alone is nothing: the words are 10 words from age's 2048-word list (about 110 bits, drawn by hapi with `crypto.getRandomValues`), behind age's scrypt. Keep them apart.
+- **The words and the recovery key live only in memory.** The words are shown on, and read from, your terminal (`/dev/tty`, echo off), never stdout or stderr. hapi hands the passphrase to age on file descriptor 3 (`AGE_PASSPHRASE_FD`, through the bundled `age-plugin-batchpass`) and the key on stdin: never on a command line, in an environment variable or in a file. Tests check every tool call, file and message for them.
+- **sops never gets a wrapped key.** A passphrase-wrapped key in sops's key sources would make sops prompt through gpg-agent or the terminal, on every decrypt, on every machine. hapi unwraps `recovery.age` itself and hands the plain key to the one sops child that needs it (in `recover` and `drill`), as `SOPS_AGE_KEY`.
+- **No gpg-agent.** sops's gpg-agent client ignores `GNUPGHOME` and `$HOME`, so a sandboxed `HOME` still reaches your real agent. Every sops child hapi runs gets `GPG_AGENT_INFO=` (empty), which keeps sops off any agent.
+- **The pinned age, always.** hapi finds it with `mise where age` and checks `age --version` is at least the pin (1.3.2); its directory leads the `PATH` of every age and sops child (sops runs age plugins from `PATH`).
+- **Without hapi:** `recovery.age` is a standard age passphrase-encrypted file, and its passphrase is the 10 words joined by hyphens (`word-word-...`), like age's own generated ones. `mise exec -- age -d recovery.age` asks for it.
+
 ## `hapi secrets init`
 
 ```text
-hapi secrets init [--config file] [--file file] [--age-key file]
+hapi secrets init [--config file] [--file file] [--age-key file] [--name name] [--classic] [--no-confirm]
 mise run secrets:init [-- flags]
 ```
 
 - `--config`: where to write the config (default as [above](#the-local-config)).
-- `--file`: the encrypted file. Default `${XDG_CONFIG_HOME:-$HOME/.config}/hapi/secrets.enc.yaml`. It may be in the checkout's `private/`.
-- `--age-key`: the age key file. Default sops's own, `${XDG_CONFIG_HOME:-$HOME/.config}/sops/age/keys.txt`. It may **not** be inside the checkout.
+- `--file`: the store. Default `${XDG_CONFIG_HOME:-$HOME/.config}/hapi/secrets.enc.yaml`. It may be in the checkout's `private/`. Its recipients file and `recovery.age` go beside it.
+- `--age-key`: this machine's age key file. Default sops's own, `${XDG_CONFIG_HOME:-$HOME/.config}/sops/age/keys.txt`. It may **not** be inside the checkout.
+- `--name`: this machine's name in the recipients file. Default `<hostname>-<user>`, normalised to `^[a-z0-9][a-z0-9-]{0,62}$`.
+- `--classic`: all-classic (X25519) keys instead of post-quantum ([the trade-off](#post-quantum-by-default)).
+- `--no-confirm`: skip the word check. It exists only for tests and non-interactive CI fixtures, and is refused when a person is at the terminal (stdin is a terminal, or `/dev/tty` opens).
 - A relative path is relative to the current directory; `~` is your `$HOME`.
 
 What it does:
-1. **It never overwrites anything.** If the config or the encrypted file exists, it stops: `<path> already exists, and hapi secrets init never overwrites anything: run \`hapi secrets check\` to see what your store holds`.
-2. **The age key.** If the key file exists, it is reused once it passes the [key checks](#threat-notes). Otherwise `age-keygen -o` makes it, in a directory made or tightened to `0700`, and the file ends up `0600`. The public key comes from `age-keygen -y`.
-3. **The encrypted file.** The template (every logical name in the manifest, each `""`) is built in memory and piped on stdin to `sops encrypt --age <public key> --input-type yaml --output-type yaml --filename-override <file>`, with `--config /dev/null` so no `.sops.yaml` can change it. **Plaintext never touches disk.** sops's output is checked to be encrypted before it is written. (sops leaves an empty string as `""`: there is nothing to encrypt.)
-4. **The config:** `provider: sops`, with both paths absolute.
+1. **It never overwrites anything.** If the config, the store, `recovery.age` or the recipients file exists, it stops: `<path> already exists, and hapi secrets init never overwrites anything: run \`hapi secrets check\` to see what your store holds`. It also refuses two of those paths, or the age key, being the same file.
+2. **This machine's key.** If the key file exists, it is reused once it passes the [key checks](#threat-notes) and its kind matches (post-quantum by default). Otherwise `age-keygen -pq` makes one, in memory for now.
+3. **The recovery key and its 10 words**, in memory: `age-keygen -pq` (its public key read back with `age-keygen -y`, since that can't read a wrapped file later), and 10 words from age's 2048-word list.
+4. **The words, shown once** on your terminal, with what to do with them. Once you say they're stored, the screen is cleared and it asks for 2 of them, at random positions. A mismatch shows them again, up to 3 tries, then it stops. Without a terminal it stops before anything is made.
+5. **Only then:** the recovery key is wrapped with the words (`age -e -a -j batchpass`, the passphrase on a pipe), and the template (every logical name in the manifest, each `""`) is piped on stdin to `sops encrypt --age <this machine>,<recovery> --input-type yaml --output-type yaml --filename-override <file>`, with `--config /dev/null` so no `.sops.yaml` can change it. **Plaintext never touches disk.** sops's output is checked to be encrypted, to exactly those two recipients, before anything is written. (sops leaves an empty string as `""`: there is nothing to encrypt.)
+6. **The writes:** this machine's key (if new), the store, `recovery.age`, the recipients file and the config (`provider: sops`, both paths absolute). Each is mode `0600`, in a directory made or tightened to `0700`, and **no-replace**: written to a temp file and hard-linked into place, so a file that appeared after the checks is never replaced. If one fails, the ones already written are removed.
 
-Each file is written atomically with mode `0600`, in a directory made or tightened to `0700`; so it refuses a new file directly in `$HOME` or `~/.config`, which it won't tighten. Then it prints the age public key, `back up <age key path> offline (e.g. in your password manager): without it the encrypted file can't be opened`, and the next step, `mise run secrets:edit`.
+An abort at any step writes nothing. It refuses a new file directly in `$HOME` or `~/.config`, which it won't tighten to `0700`. Then it lists what it wrote and the next steps, `mise run secrets:drill` and `mise run secrets:edit`.
 
 ## `hapi secrets edit`
 
@@ -204,7 +359,7 @@ mise run secrets:edit
 For the sops provider only. It checks the age key, then runs `sops edit` on the configured file in your terminal, with your `$EDITOR`. sops decrypts the file into a temp file for the editor and encrypts it again when you quit.
 
 - **The temp file is on your tmpfs.** hapi sets `TMPDIR` to `$XDG_RUNTIME_DIR/hapi`, so it needs `XDG_RUNTIME_DIR` ([below](#hapi-secrets-resolve)). Make sure your editor doesn't copy the buffer anywhere else: Neovim, for one, keeps swap files under `~/.local/state/nvim/` by default (run it with `-n` for no swap file).
-- **Your shell's `SOPS_*` variables are dropped**, so they can't add a recipient or a key; hapi sets `SOPS_AGE_KEY_FILE` and `SOPS_DISABLE_VERSION_CHECK=1`. sops runs with `--config /dev/null`.
+- **Your shell's `SOPS_*` variables are dropped**, so they can't add a recipient or a key; hapi sets `SOPS_AGE_KEY_FILE`, `SOPS_DISABLE_VERSION_CHECK=1` and `GPG_AGENT_INFO=`, and puts the pinned age first on `PATH`. sops runs with `--config /dev/null`.
 - If you quit without a change, sops exits 200, which hapi treats as success.
 
 ## `hapi secrets check`
@@ -223,11 +378,15 @@ empty    hermes/SLACK_BOT_TOKEN (hapi-hermes-slack-bot-token)
 missing  archon/OPENCODE_API_KEY (hapi-archon-opencode-api-key)
 invalid  research/EXA_API_KEY (hapi-research-exa-api-key): the value holds a single quote ('), which an env file can't carry literally; rotate the secret to one without
 unknown  hapi-old-key (in the store, not in stack/secrets.yaml)
+recipient machine  laptop-user (post-quantum, added 2026-10-26)
+recipient recovery recovery (post-quantum, added 2026-10-26)
 ```
 
 - `found`: present and usable. `missing`: not in the store. `empty`: `""` or blank. `invalid`: present, but a value `resolve` refuses. A missing [MCP mapping](#mcp-secrets) is a `missing` line too.
 - `unknown`: a name in the store (for bws, in `bws.ids`) that the manifest doesn't list. It doesn't fail the check. A name that isn't a logical name is shown as `(a name that is not a logical name, not shown)`, in case a value was pasted as a key.
-- **It exits 1 if anything is missing, empty or invalid**, and says so on stderr. A provider failure (sops can't decrypt, say) is an error, exit 1.
+- `recipient` (sops only): each of the store's recipients, with its kind and whether the store is post-quantum ([keys and recovery](#keys-and-recovery)).
+- **It exits 1 if anything is missing, empty or invalid**, and says so on stderr. A provider failure (sops can't decrypt, say) is an error, exit 1. For sops, so is a missing or invalid recipients file, [drift](#the-recipients-file) between it and the store, or a post-quantum/classic mix.
+- **It warns, and still exits 0,** when the store has no recovery recipient (`if every machine key is lost, so is the store`) or `recovery.age` is missing beside it.
 
 ## `hapi secrets resolve`
 
@@ -244,7 +403,7 @@ hapi secrets resolve [--config file] [--dry-run]
 | 3. load the config; a missing file, then the schema | a `SecretError` ("no secrets config at ..."), then a `PolicyError` |
 | 4. check the manifest maps every MCP reference (`mcpSecretGaps`) | a `SecretError` |
 | 5. check `XDG_RUNTIME_DIR` is a real directory, yours, mode `0700` as systemd makes it, and make `hapi/` in it (`0700`) | a plain `Error` |
-| 6. fetch every logical name once, from the configured provider only (for sops: the key checks, the file's shape, then `sops decrypt`) | a `SecretError` naming the file, the exit code or the names |
+| 6. fetch every logical name once, from the configured provider only (for sops: the pinned age, the key checks, the file's shape, then `sops decrypt`) | a `SecretError` naming the file, the exit code or the names |
 | 7. check every value: present, not empty or blank, no single quote, no NUL | a `SecretError` naming `zone/ENV (name)` |
 | 8. write the whole set ([the env files](#the-env-files)) and print each path | |
 
@@ -263,7 +422,7 @@ hapi secrets resolve: age key file /home/hapi/.config/sops/age/keys.txt has grou
 
 Consumers read **`$XDG_RUNTIME_DIR/hapi/env/<zone>.env`**: `hermes.env`, `archon.env`, `research.env` and `host.env`.
 
-- **The whole set at once.** `env` is a symlink to a generation directory, `env.<random>/` (`0700`). Each resolve writes every zone file into a fresh generation, then swaps the symlink with one `rename`, then deletes the old generation. A reader sees the old set or the new one, never a mix, and a zone file the manifest no longer has disappears with the old generation. If `env` is a real directory, not hapi's symlink, resolve refuses to touch it.
+- **The whole set at once.** `env` is a symlink to a generation directory, `env.<random>/` (`0700`). Each resolve writes every zone file into a fresh generation, then swaps the symlink with one `rename`, then deletes the old generation, and any other a crash left behind. A reader sees the old set or the new one, never a mix, and a zone file the manifest no longer has disappears with the old generation. If `env` is a real directory, not hapi's symlink, resolve refuses to touch it. It also removes the `<zone>.env` files an earlier version wrote directly in `$XDG_RUNTIME_DIR/hapi/` (regular files only).
 - **Modes:** each file `0600`, whatever the umask; `hapi/` and each generation `0700`. `XDG_RUNTIME_DIR` itself must be yours and exactly `0700`.
 - **Format:** a comment header, then one `NAME='value'` per env var, sorted by name. **Docker Compose reads a single-quoted value literally** in an `env_file`: no `${...}` interpolation, no escapes, and newlines kept. So a value with `$`, `"`, `#`, spaces or backslashes, or a multi-line PEM, arrives exactly as stored. (Checked with Docker Compose v5.6.1, `docker compose config`.) An unquoted `KEY=abc$def` would arrive as `abc`, which is why hapi always quotes. A value can't hold a single quote, so a secret with one is refused by name. Rotate it to one without.
 - **`host.env` is for host tools only.** It holds the GitHub App private keys. Task 5's compose file gives each container its own zone's file and never `host.env`.
@@ -276,22 +435,20 @@ Consumers read **`$XDG_RUNTIME_DIR/hapi/env/<zone>.env`**: `hermes.env`, `archon
 
 To rotate a GitHub App private key, see [the GitHub Apps runbook](runbooks/github-apps.md#rotating-a-private-key).
 
-## Rotating the age key
+## Replacing a machine's key
 
-Do this if the key may have leaked, or to move to a new one. `sops rotate` makes a new data key and re-encrypts every value, and `--add-age` / `--rm-age` swap the recipient. Run the pinned sops through mise, with the old key to decrypt:
+To move one machine to a new key (a fresh start, or a key that may have leaked), add the new key as a recipient, switch to it, then revoke the old one. On that machine:
 
 ```bash
-file=~/.config/hapi/secrets.enc.yaml        # your sops.file
-old=~/.config/sops/age/keys.txt             # your sops.age_key_file
 new=~/.config/sops/age/keys.new.txt
-mise exec -- age-keygen -o "$new"
-mise exec -- env SOPS_AGE_KEY_FILE="$old" sops rotate -i \
-  --add-age "$(mise exec -- age-keygen -y "$new")" --rm-age "$(mise exec -- age-keygen -y "$old")" "$file"
-mv "$new" "$old"                            # or point sops.age_key_file at "$new"
+(umask 077 && mise exec -- age-keygen -pq -o "$new")        # -pq unless the store is pq: false
+mise run secrets:add-machine -- --name "$(hostname)-new" --recipient "$(mise exec -- age-keygen -y "$new")"
+# point sops.age_key_file in ~/.config/hapi/secrets.yaml at "$new", then:
 mise run secrets:check
+mise run secrets:revoke -- --name <the old name>
 ```
 
-Then back up the new key and destroy the old key and its backup. **An old copy of the encrypted file still opens with the old key** (in `private/`'s history, say), so if the old key leaked, also [rotate every secret](#rotating-a-secret). `sops updatekeys` does the same recipient change from a `.sops.yaml`'s creation rules; hapi doesn't use one.
+Then shred the old key file. If the old key may have leaked, also [rotate every secret](#rotating-a-secret): it still opens old copies of the store. Every step makes a new data key; hapi never uses `sops updatekeys`, which doesn't.
 
 ## Optional: Bitwarden Secrets Manager (`bws`)
 
@@ -369,15 +526,15 @@ How it works:
 
 This is a rule for every hapi command (README, "Adding a command"):
 - Name the zone, the env var, the logical name, the file and line, the JSON Pointer or the exit code. Never print the value.
-- Don't pass through text that might hold one: a tool's stdout, `JSON.parse`'s own message (it can quote its input), a GitHub response body other than its `message`. For a tool's stderr (sops, age-keygen, bws), hapi shows only the first line, without ANSI codes, and after each `:` keeps only a segment that is a path, since a parse error can quote the file.
+- Don't pass through text that might hold one: a tool's stdout, `JSON.parse`'s own message (it can quote its input), a GitHub response body other than its `message`. For a tool's stderr (sops, age, age-keygen, bws), hapi shows only the first line, without ANSI codes, and after each `:` keeps only a segment that is a path, since a parse error can quote the file.
 - A name, id or key that fails validation is not echoed either, in case a secret was pasted in its place.
 
 The error kinds: a `PolicyError` when the manifest or the config doesn't match its schema; a plain `Error` for `XDG_RUNTIME_DIR`; a `SecretError` for a missing config, the provider and the store. Tests feed fake values through every failure path and check they never reach a message, stdout or stderr.
 
 ## Threat notes
 
-- **The age key is the master key.** It and any copy of the encrypted file together are every secret. hapi checks the key file before every decrypt and every edit: it must exist, be owned by you, have no group or other permission bit, and sit **outside the hapi-factory checkout, `private/` included**, because `private/` is pushed to the private remote next to the encrypted file. The checkout is found with `git rev-parse --show-toplevel`. sops 3.13 also reads its own default key file (under `$HOME/.config/sops/age/`, or `$XDG_CONFIG_HOME` for `edit`) as well as the one it is told to use, so when that exists it must pass the same checks. (It also tries `~/.ssh/id_ed25519` and `id_rsa`, but only for an SSH recipient, and hapi's store is encrypted to an age recipient.)
-- **Decrypted values exist only in memory and in the `0600` tmpfs files.** `resolve` decrypts into its own memory (sops's output on a pipe, never a file), and writes only the zone env files on `XDG_RUNTIME_DIR`. `sops edit`'s temp file is on the tmpfs too. The sops child gets a minimal environment (`PATH`, `HOME`, `SOPS_AGE_KEY_FILE`, `SOPS_DISABLE_VERSION_CHECK=1`), so no other secret in your shell reaches it, and it can't phone home for a version check.
+- **Each machine's age key opens the store.** It and any copy of the encrypted file together are every secret, which is why keys are never copied and a lost or doubtful one is revoked ([keys and recovery](#keys-and-recovery); the words have [their own notes](#threat-notes-keys-and-recovery)). hapi checks the key file before every decrypt, edit and recipient change: it must exist, be owned by you, have no group or other permission bit, and sit **outside the hapi-factory checkout, `private/` included**, because `private/` is pushed to the private remote next to the encrypted file. The checkout is the worktree hapi runs from (`git rev-parse --show-toplevel`) and the repo's main worktree (the parent of `git rev-parse --git-common-dir`), so a key in the main checkout's `private/` is refused even when hapi runs from a `.worktrees/` worktree; git runs with every `GIT_*` variable cleared. sops 3.13 also reads its own default key file (under `$HOME/.config/sops/age/`, or `$XDG_CONFIG_HOME` for `edit`) as well as the one it is told to use, so when that exists it must pass the same checks. (It also tries `~/.ssh/id_ed25519` and `id_rsa`, but only for an SSH recipient, and hapi's store is encrypted to age recipients.)
+- **Decrypted values exist only in memory and in the `0600` tmpfs files.** `resolve` decrypts into its own memory (sops's output on a pipe, never a file), and writes only the zone env files on `XDG_RUNTIME_DIR`. `sops edit`'s temp file is on the tmpfs too. The sops child gets a minimal environment (`PATH` with the pinned age first, `HOME`, `SOPS_AGE_KEY_FILE`, `SOPS_DISABLE_VERSION_CHECK=1`, `GPG_AGENT_INFO=`), so no other secret in your shell reaches it, it never dials a gpg-agent, and it can't phone home for a version check.
 - **Each container sees its own zone's values.** Task 5 gives each container its zone's env file and no other; `host.env` goes to no container. Model keys are still visible inside their own containers, bounded by spend caps and egress (spec §11.5, residual risk).
 - **The encrypted file is checked before it is decrypted.** Every top-level value must be sops-encrypted (or `""`), and it must be encrypted to an age recipient. A file with a value `unencrypted_suffix` or `unencrypted_regex` left in plaintext is refused, so a plaintext secret never sits in `private/` looking encrypted.
 - **No automatic fallback.** `providerFor` builds exactly the configured provider. If it fails, nothing is written and nothing starts.
@@ -387,4 +544,6 @@ The error kinds: a `PolicyError` when the manifest or the config doesn't match i
 
 - **The research container's model key.** `hapi-research` (Plan 04) runs Hermes, so it needs a model key as well as its search keys. Plan 04 decides which capped key it gets, and adds it to the `research` zone of the manifest.
 - **One store reads every zone.** A key, or a bws machine account, per zone would limit what one leaked key exposes. The resolver uses one store today.
+- **`describeSecretsConfig` lists the config, the store and the age key**, not yet the recipients file and `recovery.age` beside the store. Plan 01 Task 6's audit should check those too.
+- **A store made before recovery keys** (by an earlier `hapi secrets init`) has no recipients file, so `check` and the lifecycle commands refuse it. There is no migration command: make a new store with `mise run secrets:init` at another path and copy the values across with `secrets:edit`.
 - **bws ids aren't cross-checked against secret names.** `bws secret get` returns the secret's name. Checking it against the logical name would catch an id bound to the wrong name.

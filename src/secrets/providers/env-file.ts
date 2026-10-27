@@ -12,7 +12,7 @@
  */
 import { readFile } from "node:fs/promises";
 import { secretEnvName } from "../../policy/mcp";
-import { defaultRepoRoot, parseEnvFile, privateFileProblem } from "../files";
+import { type CheckoutRoots, defaultRepoRoot, parseEnvFile, privateFileProblem } from "../files";
 import { LOGICAL_NAME } from "../manifest";
 import { SecretError, type SecretProvider } from "../provider";
 
@@ -23,7 +23,7 @@ function logicalName(envName: string): string | undefined {
 }
 
 /** The env-file provider over one plaintext file. */
-export function envFileProvider(o: { file: string; repoRoot?: () => Promise<string>; uid?: number }): SecretProvider {
+export function envFileProvider(o: { file: string; repoRoot?: () => Promise<CheckoutRoots>; uid?: number }): SecretProvider {
   const read = async (): Promise<Record<string, string>> => {
     const problem = await privateFileProblem(o.file, {
       repoRoot: await (o.repoRoot ?? defaultRepoRoot)(),

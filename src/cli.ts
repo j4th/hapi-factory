@@ -13,8 +13,18 @@
 import { tokenMint } from "./forge/github/app-token";
 import { policyBuild } from "./generate/index";
 import { mcpPin, mcpVerify } from "./mcp/lock";
-import { secretsInit } from "./secrets/init";
-import { secretsCheck, secretsEdit, secretsResolve } from "./secrets/provider";
+import {
+  secretsAddMachine,
+  secretsCheck,
+  secretsDrill,
+  secretsEdit,
+  secretsInit,
+  secretsJoin,
+  secretsNewRecovery,
+  secretsRecover,
+  secretsResolve,
+  secretsRevoke,
+} from "./secrets/cli";
 import { HAPI_VERSION } from "./version";
 import { workorderValidate } from "./workorder/validate";
 
@@ -115,9 +125,15 @@ register("workorder validate", workorderValidate, "Validate a work order (order.
 register("policy build", policyBuild, "Compile policy/ into Hermes, Archon, Pi, egress and MCP configs under build/");
 register("mcp verify", mcpVerify, "Check every MCP server's live tool surface against policy/mcp.lock.json");
 register("mcp pin", mcpPin, "Record one MCP server's live tool surface in policy/mcp.lock.json");
-register("secrets init", secretsInit, "Set up the default sops + age store: an age key, an encrypted file of every manifest name (empty), and the config");
+register("secrets init", secretsInit, "Set up the default sops + age store: this machine's key, a recovery key wrapped with 10 words you keep, the encrypted store (every name empty) and the config");
+register("secrets join", secretsJoin, "On a new machine or user: make its own age key and config for a copy of the store, and print the add-machine command");
+register("secrets add-machine", secretsAddMachine, "Add a machine's public key to the store (sops rotate --add-age) and to its recipients file");
+register("secrets recover", secretsRecover, "With the store, recovery.age, the recipients file and your 10 words: give this machine its own key to the store");
+register("secrets drill", secretsDrill, "Prove your 10 words and recovery.age open the store, in an isolated temp dir; prints a count, never a value");
+register("secrets revoke", secretsRevoke, "Remove a recipient from the store (sops rotate --rm-age) and its recipients file");
+register("secrets new-recovery", secretsNewRecovery, "Replace the recovery key and its 10 words (lost or exposed words); needs a working machine key");
 register("secrets edit", secretsEdit, "Edit the sops store with `sops edit` (sops provider only)");
-register("secrets check", secretsCheck, "List every secret in stack/secrets.yaml as found, missing or empty in the configured store, never a value");
+register("secrets check", secretsCheck, "List every secret in stack/secrets.yaml as found, missing or empty in the configured store (never a value), and the store's recipients");
 register("secrets resolve", secretsResolve, "Resolve stack/secrets.yaml from the configured provider into $XDG_RUNTIME_DIR/hapi/env/<zone>.env (--dry-run: check)");
 register("token mint", tokenMint, "Mint a 1-hour GitHub App token for one repo into a 0600 file under $XDG_RUNTIME_DIR/hapi/tokens/");
 

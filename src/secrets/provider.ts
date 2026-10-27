@@ -11,40 +11,22 @@
  *   (./providers/sops.ts); bws is optional (./providers/bws.ts); env-file is an
  *   explicit, audited downgrade (./providers/env-file.ts).
  *
- * There is no automatic fallback. `providerFor` builds exactly the configured
- * provider, and if it fails, or any name is missing or empty, `resolveSecrets`
- * writes nothing, so nothing starts.
+ * This module holds the provider contract, the config, and the resolver; it
+ * imports no provider. `providerFor` (./cli.ts) builds exactly the configured
+ * one: there is no automatic fallback. If it fails, or any name is missing or
+ * empty, `resolveSecrets` writes nothing, so nothing starts.
  *
  * Errors name zones, env vars, logical names, files and exit codes, never a
  * value. The kinds: a PolicyError when the manifest or config doesn't match
  * its schema; a plain Error for XDG_RUNTIME_DIR; a SecretError for the config
  * file being absent, the provider and the store.
- *
- * (The providers import `SecretError` from here and this module imports them
- * for `providerFor`: an import cycle that is safe because neither side uses
- * the other's exports until a function runs.)
  */
 import { lstatSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { loadPolicy, PolicyError } from "../policy/load";
+import { PolicyError } from "../policy/load";
 import { check, readYaml } from "../policy/schema";
-import { defaultRepoRoot, ENV_DIR, envFileText, envValueProblem, runtimeDir, secureDir, writeSecretFiles } from "./files";
-import {
-  LOGICAL_NAME,
-  loadManifest,
-  type Manifest,
-  MANIFEST_FILE,
-  type ManifestEntry,
-  manifestEntries,
-  mcpSecretGaps,
-  type McpSecretGap,
-  SECRET_ZONES,
-  type SecretZone,
-  shownName,
-} from "./manifest";
-import { type BwsRunner, bwsProvider } from "./providers/bws";
-import { envFileProvider } from "./providers/env-file";
-import { checkSopsKeys, type SopsRunner, sopsEditInvocation, sopsProvider } from "./providers/sops";
+import { ENV_DIR, envFileText, envValueProblem, secureDir, writeSecretFiles } from "./files";
+import { LOGICAL_NAME, type Manifest, type ManifestEntry, manifestEntries, SECRET_ZONES, type SecretZone, shownName } from "./manifest";
 
 export type Env = Record<string, string | undefined>;
 export type ProviderName = "sops" | "bws" | "env-file";
@@ -195,47 +177,6 @@ export function describeSecretsConfig(cfg: SecretsConfig): { provider: ProviderN
   }
 }
 
-/** Runs a command with stdio inherited (for `sops edit`); resolves to its exit code. */
-export type InteractiveRunner = (cmd: string, args: string[], o: { env: Record<string, string> }) => Promise<number>;
-
-const runInteractive: InteractiveRunner = async (cmd, args, o) => {
-  let proc: Bun.Subprocess;
-  try {
-    proc = Bun.spawn([cmd, ...args], { env: o.env, stdin: "inherit", stdout: "inherit", stderr: "inherit" });
-  } catch {
-    throw new SecretError(`cannot run ${cmd}: is it on PATH? (\`mise install\` provides it)`);
-  }
-  return await proc.exited;
-};
-
-/** What the secrets commands can be given instead of the real thing, for tests. */
-export interface SecretsDeps {
-  env?: Env;
-  cwd?: string;
-  uid?: number;
-  /** The hapi-factory checkout that keys and plaintext stores must stay out of. Default: `defaultRepoRoot`. */
-  repoRoot?: () => Promise<string>;
-  sops?: SopsRunner;
-  ageKeygen?: SopsRunner;
-  bws?: BwsRunner;
-  interactive?: InteractiveRunner;
-  manifestFile?: string;
-  policyDir?: string;
-}
-
-/** Exactly the configured provider. Nothing else is built, so nothing else can be fallen back on. */
-export function providerFor(cfg: SecretsConfig, deps: SecretsDeps = {}): SecretProvider {
-  const common = { ...(deps.repoRoot ? { repoRoot: deps.repoRoot } : {}), ...(deps.uid === undefined ? {} : { uid: deps.uid }) };
-  switch (cfg.provider) {
-    case "sops":
-      return sopsProvider({ file: cfg.sops.file, ageKeyFile: cfg.sops.age_key_file, env: deps.env ?? process.env, ...(deps.sops ? { run: deps.sops } : {}), ...common });
-    case "bws":
-      return bwsProvider({ ids: cfg.bws.ids, ...(deps.bws ? { run: deps.bws } : {}) });
-    case "env-file":
-      return envFileProvider({ file: cfg.env_file.file, ...common });
-  }
-}
-
 /** How to fix `n` missing or empty secrets in each provider's store. */
 function storeHint(provider: ProviderName, problem: "missing" | "empty", n: number): string {
   const it = n === 1 ? "it" : "them";
@@ -252,7 +193,9 @@ function storeHint(provider: ProviderName, problem: "missing" | "empty", n: numb
   }
 }
 
-const where = (e: ManifestEntry) => `${e.zone}/${e.key} (${e.name})`;
+/** An env var of the manifest as errors and `check` show it: `zone/ENV (logical-name)`. */
+export const entryLabel = (e: ManifestEntry) => `${e.zone}/${e.key} (${e.name})`;
+const where = entryLabel;
 const isAre = (n: number) => (n === 1 ? "is" : "are");
 
 /**
@@ -309,7 +252,8 @@ export async function resolveSecrets(manifest: Manifest, provider: SecretProvide
     files[`${zone}.env`] = envFileText(zone, vals);
     paths[zone] = join(envDir, `${zone}.env`);
   }
-  await writeSecretFiles(envDir, files);
+  // Also drops the zone files Task 4 wrote directly in outDir, before env/ existed.
+  await writeSecretFiles(envDir, files, { legacy: SECRET_ZONES.map((z) => `${z}.env`) });
   return paths;
 }
 
@@ -321,8 +265,10 @@ export interface SecretCheck extends ManifestEntry {
 
 /**
  * The dry run: what `resolveSecrets` would find, per env var, plus `unknown`,
- * the store's names that the manifest doesn't list. Values are read only to
- * classify them, and dropped; nothing is written. A provider failure throws.
+ * the store's names that the manifest doesn't list, each as `shownName` shows
+ * it (a name that isn't a logical name may be a pasted value, so it is masked
+ * here, not only when printed). Values are read only to classify them, and
+ * dropped; nothing is written. A provider failure throws.
  */
 export async function checkSecrets(manifest: Manifest, provider: SecretProvider): Promise<{ entries: SecretCheck[]; unknown: string[] }> {
   const entries = manifestEntries(manifest);
@@ -337,126 +283,5 @@ export async function checkSecrets(manifest: Manifest, provider: SecretProvider)
     const problem = envValueProblem(value);
     return problem === undefined ? { ...e, status: "found" } : { ...e, status: "invalid", reason: problem };
   });
-  return { entries: checks, unknown: [...stored].filter((n) => !names.includes(n)).sort() };
-}
-
-/** Parse `--config <file>` and, if allowed, `--dry-run`. Undefined on a usage error. */
-function parseArgs(args: string[], allowDryRun: boolean): { config?: string; dryRun: boolean } | undefined {
-  let config: string | undefined;
-  let dryRun = false;
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i]!;
-    const value = args[i + 1];
-    if (arg === "--dry-run" && allowDryRun) dryRun = true;
-    else if (arg === "--config" && value !== undefined && !value.startsWith("-")) {
-      config = value;
-      i++;
-    } else return undefined;
-  }
-  return { ...(config === undefined ? {} : { config }), dryRun };
-}
-
-const gapReason = (g: McpSecretGap, policyDir: string) =>
-  `${policyDir}/mcp.yaml's ${g.server} server needs secret:${g.name}; map ${g.env} to ${g.name} in the ${g.zone} zone of ${MANIFEST_FILE}`;
-
-/** Load the manifest and check it covers the MCP catalog; load the config and build its provider. */
-function prepare(config: string | undefined, deps: SecretsDeps) {
-  const env = deps.env ?? process.env;
-  const policyDir = deps.policyDir ?? "policy";
-  const manifest = loadManifest(deps.manifestFile ?? MANIFEST_FILE);
-  const gaps = mcpSecretGaps(loadPolicy(policyDir), manifest);
-  const cfg = loadSecretsConfig(configPath({ config, env, ...(deps.cwd ? { cwd: deps.cwd } : {}) }), env);
-  const provider = providerFor(cfg, { ...deps, env });
-  if (provider.downgrade) {
-    console.error(
-      `hapi secrets: warning: the env-file provider is a downgrade (plaintext on disk, in ${describeSecretsConfig(cfg).files[1]}); hapi audit reports it. sops + age is the default (docs/secrets.md).`,
-    );
-  }
-  return { env, policyDir, manifest, gaps, cfg, provider };
-}
-
-const RESOLVE_USAGE = "usage: hapi secrets resolve [--config file] [--dry-run]";
-const CHECK_USAGE = "usage: hapi secrets check [--config file]";
-const EDIT_USAGE = "usage: hapi secrets edit [--config file]";
-
-async function runCheck(config: string | undefined, deps: SecretsDeps): Promise<number> {
-  const { manifest, gaps, provider, policyDir } = prepare(config, deps);
-  const { entries, unknown } = await checkSecrets(manifest, provider);
-  const line = (status: string, what: string, note = "") => console.log(`${status.padEnd(8)} ${what}${note}`);
-  for (const e of entries) line(e.status, where(e), e.reason === undefined ? "" : `: ${e.reason}`);
-  for (const g of gaps) line("missing", `${g.zone}/${g.env}`, ` (${gapReason(g, policyDir)})`);
-  for (const n of unknown) line("unknown", shownName(n), ` (in the store, not in ${MANIFEST_FILE})`);
-  const bad = [...entries.filter((e) => e.status !== "found").map((e) => `${e.zone}/${e.key}`), ...gaps.map((g) => `${g.zone}/${g.env}`)];
-  if (bad.length === 0) return 0;
-  const fix = { sops: "Fill them in with `mise run secrets:edit`", bws: "Add or fill them in Bitwarden, with each id under bws.ids in your secrets config", "env-file": "Add or fill them in your env file" }[provider.name];
-  console.error(`hapi secrets check: ${bad.length} of ${entries.length + gaps.length} secrets are missing or empty: ${bad.join(", ")}. ${fix} (docs/secrets.md).`);
-  return 1;
-}
-
-/**
- * `hapi secrets check [--config file]`: print `found`, `missing`, `empty` or
- * `invalid` for every env var of the manifest, `missing` for an MCP reference
- * the manifest doesn't map, and `unknown` for each store name the manifest
- * doesn't list. Never a value. Exits 1 if anything is missing, empty or
- * invalid. It writes nothing, so it needs no XDG_RUNTIME_DIR.
- */
-export async function secretsCheck(args: string[], deps: SecretsDeps = {}): Promise<number> {
-  const parsed = parseArgs(args, false);
-  if (parsed === undefined) {
-    console.error(CHECK_USAGE);
-    return 2;
-  }
-  return runCheck(parsed.config, deps);
-}
-
-/**
- * `hapi secrets resolve [--config file] [--dry-run]`: resolve the manifest
- * from the configured provider into `$XDG_RUNTIME_DIR/hapi/env/<zone>.env`
- * and print each path. Any failure throws, naming the secret; nothing is
- * written. `--dry-run` is `hapi secrets check`.
- */
-export async function secretsResolve(args: string[], deps: SecretsDeps = {}): Promise<number> {
-  const parsed = parseArgs(args, true);
-  if (parsed === undefined) {
-    console.error(RESOLVE_USAGE);
-    return 2;
-  }
-  if (parsed.dryRun) return runCheck(parsed.config, deps);
-  const env = deps.env ?? process.env;
-  const outDir = runtimeDir(env);
-  const { manifest, gaps, provider, policyDir } = prepare(parsed.config, deps);
-  const gap = gaps[0];
-  if (gap !== undefined) throw new SecretError(`${gap.zone}/${gap.env}: ${gapReason(gap, policyDir)}`);
-  const paths = await resolveSecrets(manifest, provider, { outDir });
-  for (const path of Object.values(paths).sort()) console.log(path);
-  return 0;
-}
-
-/**
- * `hapi secrets edit [--config file]`: sops only. Checks the age key, then
- * runs `sops edit` on the configured file with stdio inherited. sops decrypts
- * into a temp file for the editor, so TMPDIR is `$XDG_RUNTIME_DIR/hapi` (the
- * user's tmpfs): the plaintext never lands on a disk. The editor gets the
- * caller's env minus every SOPS_* variable, plus SOPS_AGE_KEY_FILE and
- * SOPS_DISABLE_VERSION_CHECK=1. sops's exit 200 (file unchanged) counts as success.
- */
-export async function secretsEdit(args: string[], deps: SecretsDeps = {}): Promise<number> {
-  const parsed = parseArgs(args, false);
-  if (parsed === undefined) {
-    console.error(EDIT_USAGE);
-    return 2;
-  }
-  const env = deps.env ?? process.env;
-  const cfg = loadSecretsConfig(configPath({ config: parsed.config, env, ...(deps.cwd ? { cwd: deps.cwd } : {}) }), env);
-  if (cfg.provider !== "sops") {
-    throw new SecretError(`hapi secrets edit works with the sops provider only; ${cfg.path} selects ${cfg.provider}. Edit that store with its own tools (docs/secrets.md)`);
-  }
-  const tmp = runtimeDir(env);
-  await secureDir(tmp, dirname(tmp), deps.uid === undefined ? {} : { uid: deps.uid });
-  const inv = sopsEditInvocation({ file: cfg.sops.file, ageKeyFile: cfg.sops.age_key_file, env, tmpDir: tmp });
-  await checkSopsKeys(cfg.sops.age_key_file, inv.env, { repoRoot: await (deps.repoRoot ?? defaultRepoRoot)(), ...(deps.uid === undefined ? {} : { uid: deps.uid }) });
-  const code = await (deps.interactive ?? runInteractive)("sops", inv.args, { env: inv.env });
-  if (code === 0 || code === 200) return 0;
-  console.error(`hapi secrets edit: sops exited with status ${code}; the file is unchanged unless sops said otherwise`);
-  return 1;
+  return { entries: checks, unknown: [...stored].filter((n) => !names.includes(n)).sort().map(shownName) };
 }

@@ -14,8 +14,13 @@
  *   file 0600), and a symlink swap (`rename` over `env`) makes it current. A
  *   reader sees the old set or the new one, never a mix, and the old
  *   generation is deleted, so a zone file the manifest dropped goes with it.
+ *   Task 4-era zone files and generations a crash orphaned are removed too.
  * - `writeSecretFile`: one file, 0600, written to a temp file and renamed over
- *   the target (a minted token, a config, an encrypted store).
+ *   the target (a minted token; a store, its recipients file or recovery.age
+ *   when a recipient changes).
+ * - `writeNewSecretFile`: one new file, 0600, that never replaces anything:
+ *   `link()` of a temp file, which fails with EEXIST if the path exists, even
+ *   if it appeared after the caller checked (init, join).
  * - `envFileText` and `parseEnvFile`: the env-file format, `NAME='value'`.
  *   Docker Compose reads a single-quoted value literally: no `${...}`
  *   interpolation, no escapes, newlines kept. So a key with `$` or a
@@ -23,13 +28,14 @@
  *   such a value is refused, by key.
  * - `privateFileProblem`, `ensurePrivateDir` and `defaultRepoRoot`: a key or a
  *   plaintext store must be ours, closed to group and other, and outside the
- *   hapi-factory checkout, private/ included.
+ *   hapi-factory checkout, private/ included. The checkout is the worktree
+ *   hapi runs from and the repo's main worktree (`repoRoots`).
  *
  * Every error names a key or a path, never a value. A bad XDG_RUNTIME_DIR is a
  * plain Error; the callers turn a `privateFileProblem` into a SecretError.
  */
 import { randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, open, readlink, realpath, rename, rm, stat, symlink } from "node:fs/promises";
+import { chmod, link as hardLink, lstat, mkdir, open, readdir, readlink, realpath, rename, rm, stat, symlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 /** An env var name, as hapi writes one. */
@@ -100,7 +106,7 @@ export async function secureDir(dir: string, root: string, o: { uid?: number } =
 }
 
 /** Write `content` to a new file `path`, mode exactly 0600 whatever the umask, and fsync it. Fails if `path` exists. */
-async function writeNew(path: string, content: string): Promise<void> {
+async function writeNew(path: string, content: string | Uint8Array): Promise<void> {
   const fh = await open(path, "wx", 0o600);
   try {
     await fh.chmod(0o600);
@@ -116,7 +122,7 @@ async function writeNew(path: string, content: string): Promise<void> {
  * directory, then renamed over `path`. If the write fails, the temp file is
  * removed and `path` is untouched. The directory must exist.
  */
-export async function writeSecretFile(path: string, content: string): Promise<void> {
+export async function writeSecretFile(path: string, content: string | Uint8Array): Promise<void> {
   const tmp = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
   try {
     await writeNew(tmp, content);
@@ -124,6 +130,24 @@ export async function writeSecretFile(path: string, content: string): Promise<vo
   } catch (e) {
     await rm(tmp, { force: true });
     throw e;
+  }
+}
+
+/**
+ * Write one new file with mode 0600 that never replaces anything: the content
+ * goes to a temp file in the same directory, which is then hard-linked to
+ * `path` and unlinked. `link()` fails with EEXIST if `path` exists in any
+ * form (a file, a directory, a dangling symlink), even one that appeared after
+ * the caller checked, so a racing file is never clobbered. The directory must
+ * exist. Rejects with the EEXIST error (code "EEXIST") in that case.
+ */
+export async function writeNewSecretFile(path: string, content: string | Uint8Array): Promise<void> {
+  const tmp = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
+  try {
+    await writeNew(tmp, content);
+    await hardLink(tmp, path);
+  } finally {
+    await rm(tmp, { force: true });
   }
 }
 
@@ -141,8 +165,14 @@ const GENERATION = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
  * the new generation is removed and the old set stays. `link` must be a
  * symlink or absent: a real directory or file there is refused. Its directory
  * must exist (see `secureDir`). Resolves to the paths, `<link>/<name>`.
+ *
+ * After the swap it also removes, beside `link`: every generation directory
+ * of ours that `link` doesn't point at (the old one, and any a crash
+ * orphaned), and each `legacy` name that is a regular file (the zone files
+ * Task 4 wrote directly in `$XDG_RUNTIME_DIR/hapi/`). It never touches a
+ * symlink, or a directory or file of another name.
  */
-export async function writeSecretFiles(link: string, files: Record<string, string>): Promise<string[]> {
+export async function writeSecretFiles(link: string, files: Record<string, string>, o: { legacy?: readonly string[] } = {}): Promise<string[]> {
   const base = dirname(link);
   const linkName = basename(link);
   const names = Object.keys(files).sort();
@@ -154,12 +184,10 @@ export async function writeSecretFiles(link: string, files: Record<string, strin
   const generation = `${linkName}.${randomUUID()}`;
   const genDir = join(base, generation);
   const tmpLink = join(base, `.${linkName}.${randomUUID()}.link`);
-  let old: string | undefined;
   try {
     try {
       const st = await lstat(link);
       if (!st.isSymbolicLink()) throw new Error(`${link} is not hapi's symlink (a real ${st.isDirectory() ? "directory" : "file"}); move it away and run again`);
-      old = await readlink(link);
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
     }
@@ -173,9 +201,20 @@ export async function writeSecretFiles(link: string, files: Record<string, strin
     await rm(genDir, { recursive: true, force: true });
     throw e;
   }
-  // Only a sibling generation of ours is deleted, never whatever else the link pointed at.
-  if (old !== undefined && old !== generation && old.startsWith(`${linkName}.`) && GENERATION.test(old.slice(linkName.length + 1))) {
-    await rm(join(base, old), { recursive: true, force: true });
+  // Only sibling generations of ours (real directories) are deleted, never whatever else the link pointed at,
+  // and never the one it points at now (a concurrent resolve may have swapped in its own).
+  const current = await readlink(link).catch(() => undefined);
+  for (const entry of await readdir(base)) {
+    if (entry === generation || entry === current || !entry.startsWith(`${linkName}.`) || !GENERATION.test(entry.slice(linkName.length + 1))) continue;
+    if ((await lstat(join(base, entry))).isDirectory()) await rm(join(base, entry), { recursive: true, force: true });
+  }
+  for (const name of o.legacy ?? []) {
+    const path = join(base, name);
+    try {
+      if ((await lstat(path)).isFile()) await rm(path, { force: true });
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+    }
   }
   return names.map((name) => join(link, name));
 }
@@ -242,30 +281,55 @@ export function parseEnvFile(text: string): Record<string, string> {
   return out;
 }
 
-let repoRootCache: Promise<string> | undefined;
+/** The checkout a key may not sit in: one root, or several (a linked worktree and its main worktree). */
+export type CheckoutRoots = string | readonly string[];
+
+/** One line of git's output in `cwd`, or undefined if git fails. */
+async function gitLine(args: string[], cwd: string, env: Record<string, string>): Promise<string | undefined> {
+  try {
+    const proc = Bun.spawn(["git", ...args], { cwd, env, stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+    const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    const line = out.trim();
+    return code === 0 && line !== "" ? line : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 /**
- * The hapi-factory checkout this code runs from: `git rev-parse --show-toplevel`
- * in this module's directory, or, if git can't say (no git, not a checkout),
- * the directory two levels up, which holds src/ in a normal layout.
+ * The hapi-factory checkout that `cwd` (default: this module's directory) is
+ * in, as every directory a key must stay out of:
+ * 1. the worktree's top level, `git rev-parse --show-toplevel`;
+ * 2. the repo's main worktree, the parent of
+ *    `git rev-parse --path-format=absolute --git-common-dir`, if it is
+ *    another directory. So when hapi runs from a linked worktree (under
+ *    `.worktrees/`), the main worktree's private/ is still covered.
+ * git runs with every GIT_* variable cleared, so a GIT_DIR or GIT_WORK_TREE in
+ * the caller's shell can't point it at another repo. If git can't say (no git,
+ * not a checkout), it is the directory two levels up from this module, which
+ * holds src/ in a normal layout.
  */
-export function defaultRepoRoot(): Promise<string> {
-  repoRootCache ??= (async () => {
-    const fallback = resolve(import.meta.dir, "..", "..");
-    try {
-      const proc = Bun.spawn(["git", "rev-parse", "--show-toplevel"], { cwd: import.meta.dir, stdin: "ignore", stdout: "pipe", stderr: "ignore" });
-      const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
-      const top = out.trim();
-      return code === 0 && isAbsolute(top) ? top : fallback;
-    } catch {
-      return fallback;
-    }
-  })();
+export async function repoRoots(o: { cwd?: string; env?: Record<string, string | undefined> } = {}): Promise<string[]> {
+  const cwd = o.cwd ?? import.meta.dir;
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(o.env ?? process.env)) if (v !== undefined && !k.startsWith("GIT_")) env[k] = v;
+  const top = await gitLine(["rev-parse", "--show-toplevel"], cwd, env);
+  if (top === undefined || !isAbsolute(top)) return [resolve(import.meta.dir, "..", "..")];
+  const common = await gitLine(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd, env);
+  const main = common !== undefined && isAbsolute(common) ? dirname(common) : undefined;
+  return main === undefined || resolve(main) === resolve(top) ? [top] : [top, main];
+}
+
+let repoRootCache: Promise<string[]> | undefined;
+
+/** `repoRoots()` for this module's own checkout, worked out once per process. */
+export function defaultRepoRoot(): Promise<string[]> {
+  repoRootCache ??= repoRoots();
   return repoRootCache;
 }
 
 /** `path`'s real path, or, if it doesn't exist, its parent's real path joined with its name (so a missing file is still placed). */
-async function realish(path: string): Promise<string> {
+export async function realish(path: string): Promise<string> {
   try {
     return await realpath(path);
   } catch {
@@ -276,14 +340,16 @@ async function realish(path: string): Promise<string> {
 
 /**
  * Why `path` may not hold a key or a plaintext store because of where it is,
- * or undefined: it is inside the checkout `repoRoot`, private/ included, as
- * given or as its real path, whether or not it exists yet. The checkout can be
- * committed, and private/ is pushed to the private remote.
+ * or undefined: it is inside the checkout (any of `repoRoot`), private/
+ * included, as given or as its real path, whether or not it exists yet. The
+ * checkout can be committed, and private/ is pushed to the private remote.
  */
-export async function checkoutProblem(path: string, repoRoot: string): Promise<string | undefined> {
+export async function checkoutProblem(path: string, repoRoot: CheckoutRoots): Promise<string | undefined> {
   const abs = resolve(path);
-  if (isWithin(abs, resolve(repoRoot)) || isWithin(await realish(abs), await realish(resolve(repoRoot)))) {
-    return `is inside the hapi-factory checkout (${repoRoot}), private/ included: the checkout can be committed, and private/ is pushed to the private remote. Move it outside the checkout`;
+  for (const root of typeof repoRoot === "string" ? [repoRoot] : repoRoot) {
+    if (isWithin(abs, resolve(root)) || isWithin(await realish(abs), await realish(resolve(root)))) {
+      return `is inside the hapi-factory checkout (${root}), private/ included: the checkout can be committed, and private/ is pushed to the private remote. Move it outside the checkout`;
+    }
   }
   return undefined;
 }
@@ -295,7 +361,7 @@ export async function checkoutProblem(path: string, repoRoot: string): Promise<s
  * - mode `"private"`: it has any group or other permission bit;
  *   mode `"0600"`: its mode isn't exactly 0600.
  */
-export async function privateFileProblem(path: string, o: { repoRoot: string; mode: "private" | "0600"; uid?: number }): Promise<string | undefined> {
+export async function privateFileProblem(path: string, o: { repoRoot: CheckoutRoots; mode: "private" | "0600"; uid?: number }): Promise<string | undefined> {
   const where = await checkoutProblem(path, o.repoRoot);
   if (where !== undefined) return where;
   const abs = resolve(path);
@@ -318,12 +384,15 @@ export async function privateFileProblem(path: string, o: { repoRoot: string; mo
  * Make `dir` (and any missing parents, 0700) and leave it ours with mode 0700:
  * a looser mode is tightened. Throws if it isn't a directory or isn't ours.
  * For the directories that hold a config, an encrypted store or a key.
+ * Resolves to the first directory it made, if it made any (as `mkdir -p`
+ * reports it), so a caller that rolls back can remove what it made.
  */
-export async function ensurePrivateDir(dir: string, o: { uid?: number } = {}): Promise<void> {
-  await mkdir(dir, { recursive: true, mode: 0o700 });
+export async function ensurePrivateDir(dir: string, o: { uid?: number } = {}): Promise<string | undefined> {
+  const made = await mkdir(dir, { recursive: true, mode: 0o700 });
   const st = await stat(dir);
   if (!st.isDirectory()) throw new Error(`${dir} is not a directory`);
   const uid = currentUid(o.uid);
   if (uid !== undefined && st.uid !== uid) throw new Error(`${dir} is owned by uid ${st.uid}, not you (uid ${uid})`);
   if ((st.mode & 0o777) !== 0o700) await chmod(dir, 0o700);
+  return made;
 }

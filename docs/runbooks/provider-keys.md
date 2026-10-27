@@ -2,7 +2,7 @@
 
 Every model and search key hapi uses, where to get it, the cap to set on it, and where it goes. **Hard caps live at the provider** (spec §12). Archon's budgets and hapi-guard are only the in-run caps. The numbers come from `policy/budgets.yaml` and the Global Constraints of Plan 01. The ceiling is the $200/month Anthropic credit.
 
-These are outward-facing steps, so the operator does them by hand. For each key:
+These are outward-facing steps, so the operator does them by hand. First set up your secrets store once (`mise run secrets:init`, then store its 10 recovery words: [getting started](../secrets.md#getting-started-with-sops--age)); each machine or user that needs the store gets its own key, never a copy ([keys and recovery](../secrets.md#keys-and-recovery)). Then, for each key:
 1. Create it as below, with its cap.
 2. Add it to your secrets store (`mise run secrets:edit`) as the logical name given here ([docs/secrets.md](../secrets.md#adding-a-secret)).
 3. Never paste a key into a chat, an issue or a file in the repo.

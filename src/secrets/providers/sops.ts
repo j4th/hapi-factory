@@ -2,12 +2,19 @@
  * The sops + age provider (spec §11.5): the default for everyone.
  *
  * The store is one sops-encrypted YAML file (`secrets.enc.yaml`): a flat map of
- * logical name -> value, every value encrypted to an age recipient. Its key is
- * an age key file, by default sops's own `${XDG_CONFIG_HOME:-$HOME/.config}/sops/age/keys.txt`.
- * The encrypted file may live anywhere (private/ included: it is backed up to
- * the private remote there). The key may not: it must be ours, closed to group
- * and other, and outside the hapi-factory checkout, private/ included, because
- * the key and the encrypted file together are the plaintext.
+ * logical name -> value, every value encrypted to the store's age recipients
+ * (one key per machine or user, plus a recovery recipient: ../recipients.ts,
+ * ../lifecycle.ts). This machine's key is an age key file, by default sops's
+ * own `${XDG_CONFIG_HOME:-$HOME/.config}/sops/age/keys.txt`. The encrypted
+ * file may live anywhere (private/ included: it is backed up to the private
+ * remote there). The key may not: it must be ours, closed to group and other,
+ * and outside the hapi-factory checkout, private/ included, because the key
+ * and the encrypted file together are the plaintext.
+ *
+ * The age tools are the mise-pinned age (`resolveAgeDir`), never the age on
+ * PATH: the distro age 1.1.1 has no post-quantum keys and no batchpass. Its
+ * install dir leads the PATH of every age and sops child (sops runs age
+ * plugins from PATH).
  *
  * `fetch`:
  * 1. checks the age key file (`checkAgeKeyFile`), and sops's own default key
@@ -17,50 +24,73 @@
  *    (`sopsFileProblem`): a sops block with an age recipient, and every
  *    top-level value encrypted, so a value `unencrypted_suffix` or
  *    `unencrypted_regex` left in plaintext is refused;
- * 3. runs `sops decrypt --output-type json <file>` through a `SopsRunner`.
- *    The child gets a minimal env: PATH, HOME, SOPS_AGE_KEY_FILE (always the
- *    file just checked, the configured one or the default) and
- *    SOPS_DISABLE_VERSION_CHECK=1 (sops otherwise phones home). `--config
- *    /dev/null` keeps any .sops.yaml out of it. No value goes through argv;
- *    stderr is never echoed raw (`scrubToolError`);
+ * 3. runs `sops decrypt --output-type json <file>` through a `SopsRunner`,
+ *    with the minimal env of `sopsEnv`. `--config /dev/null` keeps any
+ *    .sops.yaml out of it. No value goes through argv; stderr is never echoed
+ *    raw (`scrubToolError`);
  * 4. checks the JSON is a flat map of name -> string.
  *
  * `list` reads the names from the encrypted file (sops leaves keys in the
  * clear) without decrypting.
  */
-import { lstat, readFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { access, constants, lstat, readFile } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { parse } from "yaml";
-import { defaultRepoRoot, privateFileProblem } from "../files";
+import { type CheckoutRoots, defaultRepoRoot, privateFileProblem } from "../files";
 import { shownName } from "../manifest";
 import { type Env, SecretError, type SecretProvider } from "../provider";
 
-/** Runs a tool with these args and this whole env (nothing inherited), with `stdin` piped in if given. */
-export type SopsRunner = (args: string[], o: { env: Record<string, string>; stdin?: string }) => Promise<{ code: number; stdout: string; stderr: string }>;
+/**
+ * Runs a tool with these args and this whole env (nothing inherited). `stdin`
+ * is piped in if given (else stdin is closed), and `fd3`, if given, is piped
+ * in on file descriptor 3 and closed: that is how a passphrase reaches
+ * age-plugin-batchpass (AGE_PASSPHRASE_FD=3), never through argv or env.
+ */
+export type SopsRunner = (
+  args: string[],
+  o: { env: Record<string, string>; stdin?: string | Uint8Array; fd3?: string; cwd?: string },
+) => Promise<{ code: number; stdout: string; stderr: string }>;
 
-/** A `SopsRunner` for the binary `cmd` on the env's PATH (mise installs the pinned one). Throws a SecretError if it can't start. */
+/** A `SopsRunner` for the binary `cmd` (a path, or a name looked up on the env's PATH). Rejects with a SecretError if it can't start. */
 export function commandRunner(cmd: string): SopsRunner {
-  return async (args, o) => {
-    let proc: Bun.Subprocess<"pipe" | "ignore", "pipe", "pipe">;
-    try {
-      proc = Bun.spawn([cmd, ...args], {
+  return (args, o) =>
+    new Promise((resolvePromise, reject) => {
+      const child = spawn(cmd, args, {
         env: o.env,
-        stdin: o.stdin === undefined ? "ignore" : new Response(o.stdin),
-        stdout: "pipe",
-        stderr: "pipe",
-      }) as Bun.Subprocess<"pipe" | "ignore", "pipe", "pipe">;
-    } catch {
-      throw new SecretError(`cannot run ${cmd}: is it on PATH? (\`mise install\` provides it)`);
-    }
-    const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
-    return { code, stdout, stderr };
-  };
+        ...(o.cwd === undefined ? {} : { cwd: o.cwd }),
+        stdio: [o.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe", ...(o.fd3 === undefined ? [] : ["pipe" as const])],
+      });
+      const out: Buffer[] = [];
+      const err: Buffer[] = [];
+      let settled = false;
+      child.stdout!.on("data", (d: Buffer) => out.push(d));
+      child.stderr!.on("data", (d: Buffer) => err.push(d));
+      child.on("error", () => {
+        if (settled) return;
+        settled = true;
+        reject(new SecretError(`cannot run ${cmd}: is it on PATH? (\`mise install\` provides it)`));
+      });
+      child.on("close", (code) => {
+        if (settled) return;
+        settled = true;
+        resolvePromise({ code: code ?? 128, stdout: Buffer.concat(out).toString("utf8"), stderr: Buffer.concat(err).toString("utf8") });
+      });
+      // A child that exits without reading its input gets EPIPE here: its exit code tells the story.
+      if (o.stdin !== undefined) {
+        child.stdin!.on("error", () => {});
+        child.stdin!.end(o.stdin);
+      }
+      if (o.fd3 !== undefined) {
+        const fd3 = child.stdio[3] as NodeJS.WritableStream & { on(e: "error", f: () => void): void };
+        fd3.on("error", () => {});
+        fd3.end(o.fd3);
+      }
+    });
 }
 
 /** The pinned `sops` on PATH. */
 export const runSops: SopsRunner = commandRunner("sops");
-/** The pinned `age-keygen` on PATH. */
-export const runAgeKeygen: SopsRunner = commandRunner("age-keygen");
 
 /**
  * The first non-blank line of a tool's stderr, safe to show: ANSI codes
@@ -80,13 +110,109 @@ export function scrubToolError(stderr: string): string {
   return line.length > 300 ? `${line.slice(0, 300)}...` : line;
 }
 
-/** sops's environment: PATH and HOME from `env`, the age key file, and the version check off. Nothing else. */
-export function sopsEnv(env: Env, ageKeyFile: string): Record<string, string> {
-  const out: Record<string, string> = {};
-  if (env.PATH) out.PATH = env.PATH;
+/** The age version mise.toml pins. The age tools must be at least this (a test keeps the two in step). */
+export const AGE_MIN_VERSION = "1.3.2";
+
+const versionParts = (v: string) => /^v?(\d+)\.(\d+)\.(\d+)/.exec(v.trim())?.slice(1).map(Number);
+
+/** Whether `version` (as `age --version` prints it, `v1.3.2`) is at least `min`. */
+function atLeast(version: string, min: string): boolean {
+  const have = versionParts(version);
+  const need = versionParts(min)!;
+  if (have === undefined) return false;
+  for (let i = 0; i < 3; i++) if (have[i]! !== need[i]!) return have[i]! > need[i]!;
+  return true;
+}
+
+const AGE_BINARIES = ["age", "age-keygen", "age-plugin-batchpass"];
+
+/** `mise where age`, run from the checkout with the caller's environment (mise needs its own config and data dirs). */
+async function miseWhereAge(): Promise<string> {
+  const cwd = (await defaultRepoRoot())[0]!;
+  let r: { code: number; stdout: string; stderr: string };
+  try {
+    r = await commandRunner("mise")(["where", "age"], { cwd, env: Object.fromEntries(Object.entries(process.env).filter((e): e is [string, string] => e[1] !== undefined)) });
+  } catch {
+    throw new SecretError("cannot run mise, which pins the age hapi uses: install mise, then `mise install` (README.md)");
+  }
+  if (r.code !== 0) {
+    const why = scrubToolError(r.stderr);
+    throw new SecretError(`\`mise where age\` failed (exit ${r.code})${why ? `: ${why}` : ""}: run \`mise install\` in the hapi-factory checkout`);
+  }
+  return r.stdout;
+}
+
+async function ageVersion(ageBin: string): Promise<string> {
+  const r = await commandRunner(ageBin)(["--version"], { env: {} });
+  return r.code === 0 ? r.stdout : "";
+}
+
+/**
+ * The directory holding the mise-pinned age, age-keygen and
+ * age-plugin-batchpass: `mise where age` (an install dir, with the binaries in
+ * it or in its `age/` or `bin/`), checked with `age --version` against
+ * `AGE_MIN_VERSION`. The age on PATH is never used: the distro age 1.1.1 has
+ * no post-quantum keys and no batchpass. Throws a SecretError naming the fix.
+ */
+export async function resolveAgeDir(o: { where?: () => Promise<string>; version?: (ageBin: string) => Promise<string> } = {}): Promise<string> {
+  const where = (await (o.where ?? miseWhereAge)()).trim();
+  if (!isAbsolute(where)) throw new SecretError(`\`mise where age\` gave no install directory: run \`mise install\` in the hapi-factory checkout`);
+  let dir: string | undefined;
+  for (const candidate of [where, join(where, "age"), join(where, "bin")]) {
+    const found = await Promise.all(AGE_BINARIES.map((b) => access(join(candidate, b), constants.X_OK).then(() => true, () => false)));
+    if (found.every(Boolean)) {
+      dir = candidate;
+      break;
+    }
+  }
+  if (dir === undefined) throw new SecretError(`no age, age-keygen and age-plugin-batchpass under ${where} (mise's age install): run \`mise install\``);
+  const version = (await (o.version ?? ageVersion)(join(dir, "age"))).trim();
+  if (!atLeast(version, AGE_MIN_VERSION)) {
+    throw new SecretError(`the age in ${dir} (${version || "no version"}) is not age ${AGE_MIN_VERSION} or later, which hapi needs for post-quantum keys and batchpass: run \`mise install\``);
+  }
+  return dir;
+}
+
+let ageDirCache: Promise<string> | undefined;
+
+/** `resolveAgeDir()`, worked out once per process. */
+export function pinnedAgeDir(): Promise<string> {
+  ageDirCache ??= resolveAgeDir();
+  ageDirCache.catch(() => {
+    ageDirCache = undefined;
+  });
+  return ageDirCache;
+}
+
+/** PATH with the pinned age's directory first. */
+function agePath(env: Env, ageDir: string): string {
+  return env.PATH ? `${ageDir}:${env.PATH}` : ageDir;
+}
+
+/** An age or age-keygen child's environment: PATH (the pinned age first) and HOME from `env`. Nothing else. */
+export function ageEnv(env: Env, ageDir: string): Record<string, string> {
+  const out: Record<string, string> = { PATH: agePath(env, ageDir) };
   if (env.HOME) out.HOME = env.HOME;
-  out.SOPS_AGE_KEY_FILE = ageKeyFile;
+  return out;
+}
+
+/**
+ * sops's environment: PATH (the pinned age first) and HOME from `env`, the
+ * identity sops may use, the version check off (sops phones home otherwise)
+ * and `GPG_AGENT_INFO=` (empty), so sops never dials a gpg-agent: its client
+ * ignores GNUPGHOME and HOME. Nothing else of `env` reaches sops.
+ * - `{ file }`: this machine's age key file, as SOPS_AGE_KEY_FILE;
+ * - `{ identity }`: an identity held in memory (the unwrapped recovery key),
+ *   as SOPS_AGE_KEY, for that one child only;
+ * - `{}`: no identity (encrypting needs none).
+ */
+export function sopsEnv(env: Env, ageDir: string, key: { file: string } | { identity: string } | Record<string, never> = {}): Record<string, string> {
+  const out: Record<string, string> = { PATH: agePath(env, ageDir) };
+  if (env.HOME) out.HOME = env.HOME;
+  if ("file" in key) out.SOPS_AGE_KEY_FILE = key.file;
+  if ("identity" in key) out.SOPS_AGE_KEY = key.identity;
   out.SOPS_DISABLE_VERSION_CHECK = "1";
+  out.GPG_AGENT_INFO = "";
   return out;
 }
 
@@ -129,7 +255,7 @@ export function sopsFileProblem(text: string): string | undefined {
 }
 
 /** Throw a SecretError unless the age key file is ours, closed to group and other, and outside the checkout. */
-export async function checkAgeKeyFile(path: string, o: { repoRoot?: string; uid?: number } = {}): Promise<void> {
+export async function checkAgeKeyFile(path: string, o: { repoRoot?: CheckoutRoots; uid?: number } = {}): Promise<void> {
   const problem = await privateFileProblem(path, { repoRoot: o.repoRoot ?? (await defaultRepoRoot()), mode: "private", ...(o.uid === undefined ? {} : { uid: o.uid }) });
   if (problem !== undefined) throw new SecretError(`age key file ${path} ${problem}`);
 }
@@ -141,9 +267,9 @@ export async function checkAgeKeyFile(path: string, o: { repoRoot?: string; uid?
  * from `env`, if that is another file and exists. sops 3.13 loads identities
  * from every source it finds, so an unchecked default would be used too.
  * (It also tries ~/.ssh/id_ed25519 and id_rsa, but only for an SSH
- * recipient; hapi's store is encrypted to an age recipient.)
+ * recipient; hapi's store is encrypted to age recipients.)
  */
-export async function checkSopsKeys(ageKeyFile: string, env: Env, o: { repoRoot: string; uid?: number }): Promise<void> {
+export async function checkSopsKeys(ageKeyFile: string, env: Env, o: { repoRoot: CheckoutRoots; uid?: number }): Promise<void> {
   await checkAgeKeyFile(ageKeyFile, o);
   // As Go's os.UserConfigDir, which sops uses: $XDG_CONFIG_HOME if set (a relative one is an error, so no default), else $HOME/.config.
   const xdg = env.XDG_CONFIG_HOME;
@@ -171,13 +297,15 @@ export interface SopsOptions {
   /** Where PATH and HOME come from. Nothing else of it reaches sops. */
   env: Env;
   run?: SopsRunner;
-  repoRoot?: () => Promise<string>;
+  repoRoot?: () => Promise<CheckoutRoots>;
+  /** The pinned age's directory (default `pinnedAgeDir`). */
+  ageDir?: () => Promise<string>;
   uid?: number;
 }
 
 /** The sops + age provider over one encrypted file. */
 export function sopsProvider(o: SopsOptions): SecretProvider {
-  const run = o.run ?? commandRunner("sops");
+  const run = o.run ?? runSops;
   const raw = async (): Promise<string> => {
     let text: string;
     try {
@@ -199,7 +327,7 @@ export function sopsProvider(o: SopsOptions): SecretProvider {
       return Object.keys(doc).filter((k) => k !== "sops");
     },
     async fetch(names) {
-      const env = sopsEnv(o.env, o.ageKeyFile);
+      const env = sopsEnv(o.env, await (o.ageDir ?? pinnedAgeDir)(), { file: o.ageKeyFile });
       await checkSopsKeys(o.ageKeyFile, env, { repoRoot: await (o.repoRoot ?? defaultRepoRoot)(), ...(o.uid === undefined ? {} : { uid: o.uid }) });
       await raw();
       const r = await run(["--config", "/dev/null", "decrypt", "--input-type", "yaml", "--output-type", "json", o.file], { env });
@@ -207,19 +335,7 @@ export function sopsProvider(o: SopsOptions): SecretProvider {
         const why = scrubToolError(r.stderr);
         throw new SecretError(`sops could not decrypt ${o.file} (exit ${r.code})${why ? `: ${why}` : ""}`);
       }
-      let doc: unknown;
-      try {
-        doc = JSON.parse(r.stdout);
-      } catch {
-        // Not JSON.parse's message: it can quote the text, which holds the values.
-        throw new SecretError(`sops printed something for ${o.file} that is not JSON (not shown)`);
-      }
-      if (!isRecord(doc)) throw new SecretError(`${o.file} does not decrypt to a map of name: value`);
-      const values = new Map<string, string>();
-      for (const [k, v] of Object.entries(doc)) {
-        if (typeof v !== "string") throw new SecretError(`${o.file}: ${shownName(k)} is not a string (a hapi sops store is a flat map of name: value)`);
-        values.set(k, v);
-      }
+      const values = decryptedMap(r.stdout, o.file);
       const missing = names.filter((n) => !values.has(n));
       if (missing.length > 0) throw new SecretError(`${o.file} has no ${missing.join(", ")}`, missing);
       return new Map(names.map((n) => [n, values.get(n)!]));
@@ -227,15 +343,36 @@ export function sopsProvider(o: SopsOptions): SecretProvider {
   };
 }
 
+/** sops's decrypted JSON as a map of name -> value, or a SecretError that quotes none of it. */
+export function decryptedMap(stdout: string, file: string): Map<string, string> {
+  let doc: unknown;
+  try {
+    doc = JSON.parse(stdout);
+  } catch {
+    // Not JSON.parse's message: it can quote the text, which holds the values.
+    throw new SecretError(`sops printed something for ${file} that is not JSON (not shown)`);
+  }
+  if (!isRecord(doc)) throw new SecretError(`${file} does not decrypt to a map of name: value`);
+  const values = new Map<string, string>();
+  for (const [k, v] of Object.entries(doc)) {
+    if (typeof v !== "string") throw new SecretError(`${file}: ${shownName(k)} is not a string (a hapi sops store is a flat map of name: value)`);
+    values.set(k, v);
+  }
+  return values;
+}
+
 /**
  * The `sops edit` invocation for `hapi secrets edit`: the args, and the env:
  * the caller's minus every SOPS_* variable (so the shell can't add a recipient
- * or a key), plus the age key file, the version check off, and TMPDIR on the
- * user's tmpfs, where sops writes the plaintext temp file for the editor.
+ * or a key), plus the age key file, the version check off, `GPG_AGENT_INFO=`,
+ * the pinned age first on PATH, and TMPDIR on the user's tmpfs, where sops
+ * writes the plaintext temp file for the editor.
  */
-export function sopsEditInvocation(o: { file: string; ageKeyFile: string; env: Env; tmpDir: string }): { args: string[]; env: Record<string, string> } {
+export function sopsEditInvocation(o: { file: string; ageKeyFile: string; env: Env; tmpDir: string; ageDir: string }): { args: string[]; env: Record<string, string> } {
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(o.env)) if (v !== undefined && !k.startsWith("SOPS_")) env[k] = v;
+  env.PATH = agePath(o.env, o.ageDir);
+  env.GPG_AGENT_INFO = "";
   env.SOPS_AGE_KEY_FILE = o.ageKeyFile;
   env.SOPS_DISABLE_VERSION_CHECK = "1";
   env.TMPDIR = o.tmpDir;

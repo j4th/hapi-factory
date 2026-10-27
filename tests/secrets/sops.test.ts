@@ -2,8 +2,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { SecretError } from "../../src/secrets/provider";
-import { checkAgeKeyFile, type SopsRunner, sopsFileProblem, sopsProvider } from "../../src/secrets/providers/sops";
-import { caught, cleanup, ENC, FAKE_RECIPIENT, sopsFileText, sopsStore, tempDir } from "./helpers";
+import { AGE_MIN_VERSION, checkAgeKeyFile, resolveAgeDir, type SopsRunner, sopsFileProblem, sopsProvider } from "../../src/secrets/providers/sops";
+import { caught, cleanup, ENC, FAKE_AGE_DIR, sopsFileText, sopsStore, tempDir } from "./helpers";
 
 const FAKE = "sk-SECRET-123";
 
@@ -15,7 +15,7 @@ function setup(values: Record<string, string> = { "hapi-a": FAKE, "hapi-b": "" }
   const store = sopsStore(dir, values);
   const checkout = tempDir();
   const env = { PATH: "/usr/bin:/bin", HOME: join(dir, "home"), SOPS_AGE_KEY: "AGE-NOT-A-KEY", BWS_ACCESS_TOKEN: "not-a-token", OTHER: FAKE };
-  const provider = sopsProvider({ file: store.file, ageKeyFile: store.ageKeyFile, run: run ?? store.run, env, repoRoot: async () => checkout });
+  const provider = sopsProvider({ file: store.file, ageKeyFile: store.ageKeyFile, run: run ?? store.run, env, repoRoot: async () => checkout, ageDir: async () => FAKE_AGE_DIR });
   return { dir, store, checkout, env, provider };
 }
 
@@ -32,7 +32,8 @@ describe("the sops provider", () => {
       {
         args: ["--config", "/dev/null", "decrypt", "--input-type", "yaml", "--output-type", "json", s.store.file],
         // Nothing else is inherited: not the shell's SOPS_* settings, not BWS_ACCESS_TOKEN, nothing.
-        env: { PATH: "/usr/bin:/bin", HOME: s.env.HOME, SOPS_AGE_KEY_FILE: s.store.ageKeyFile, SOPS_DISABLE_VERSION_CHECK: "1" },
+        // The pinned age leads PATH (sops runs age plugins from it), and GPG_AGENT_INFO= keeps sops away from any gpg-agent.
+        env: { PATH: `${FAKE_AGE_DIR}:/usr/bin:/bin`, HOME: s.env.HOME, SOPS_AGE_KEY_FILE: s.store.ageKeyFile, SOPS_DISABLE_VERSION_CHECK: "1", GPG_AGENT_INFO: "" },
       },
     ]);
     expect(JSON.stringify(s.store.calls)).not.toContain(FAKE);
@@ -73,7 +74,7 @@ describe("the sops provider", () => {
     await refuse(`hapi-a: ${FAKE}\n`, /no sops metadata/);
     // A sops block with no age recipient (another key type only).
     await refuse(sopsFileText({ "hapi-a": "enc" }).replace(/ {2}age:\n(?: {4}.*\n)+/, "  pgp:\n    - fp: FAKEFINGERPRINT\n"), /no age recipient/);
-    await refuse(sopsFileText({ "hapi-a": "enc" }).replace(FAKE_RECIPIENT, "not-a-recipient"), /no age recipient/);
+    await refuse(sopsFileText({ "hapi-a": "enc" }, {}, ["not-a-recipient"]), /no age recipient/);
     await refuse(`- ${FAKE}\n`, /not a sops-encrypted YAML mapping/);
     await refuse(`hapi-a: [${FAKE}\n`, /not valid YAML \(not shown\)/);
     expect(s.store.calls).toEqual([]); // sops never ran
@@ -111,10 +112,10 @@ describe("the sops provider", () => {
 
   test("no sops file, or no sops binary, fails clearly", async () => {
     const s = setup();
-    const missing = sopsProvider({ file: join(s.dir, "nope.enc.yaml"), ageKeyFile: s.store.ageKeyFile, run: s.store.run, env: s.env, repoRoot: async () => s.checkout });
+    const missing = sopsProvider({ file: join(s.dir, "nope.enc.yaml"), ageKeyFile: s.store.ageKeyFile, run: s.store.run, env: s.env, repoRoot: async () => s.checkout, ageDir: async () => FAKE_AGE_DIR });
     await expect(missing.fetch(["hapi-a"])).rejects.toThrow(/no sops file at .*nope\.enc\.yaml: run `mise run secrets:init`/);
     // The default runner, with a PATH that has no sops: nothing runs.
-    const noBinary = sopsProvider({ file: s.store.file, ageKeyFile: s.store.ageKeyFile, env: { PATH: join(s.dir, "empty-bin") }, repoRoot: async () => s.checkout });
+    const noBinary = sopsProvider({ file: s.store.file, ageKeyFile: s.store.ageKeyFile, env: { PATH: join(s.dir, "empty-bin") }, repoRoot: async () => s.checkout, ageDir: async () => join(s.dir, "no-age") });
     await expect(noBinary.fetch(["hapi-a"])).rejects.toThrow(/cannot run sops: is it on PATH\? \(`mise install` provides it\)/);
   });
 });
@@ -172,5 +173,42 @@ describe("the age key file", () => {
   test("the default checkout is this repo's git top-level, and a path in it is refused before the file is even looked at", async () => {
     // Nothing is created or read: the location check comes first.
     await expect(checkAgeKeyFile(join(process.cwd(), "private", "no-such-dir", "keys.txt"))).rejects.toThrow(/inside the hapi-factory checkout/);
+  });
+});
+
+describe("the pinned age", () => {
+  /** A fake `mise where age` install dir with the three binaries (never run: the version is injected). */
+  function install(layout: "flat" | "nested") {
+    const where = tempDir();
+    const bin = layout === "flat" ? where : join(where, "age");
+    mkdirSync(bin, { recursive: true });
+    for (const b of ["age", "age-keygen", "age-plugin-batchpass"]) writeFileSync(join(bin, b), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    return { where, bin };
+  }
+
+  test("the minimum is mise.toml's pin", async () => {
+    const pin = /^age = "([0-9.]+)"/m.exec(await Bun.file("mise.toml").text())![1];
+    expect(AGE_MIN_VERSION).toBe(pin!);
+  });
+
+  test("resolves the install dir once with `mise where age`, finds the binaries, and refuses an age below the pin", async () => {
+    for (const layout of ["flat", "nested"] as const) {
+      const { where, bin } = install(layout);
+      const seen: string[] = [];
+      const version = async (age: string) => (seen.push(age), "v1.3.2\n");
+      expect(await resolveAgeDir({ where: async () => `${where}\n`, version })).toBe(bin);
+      expect(seen).toEqual([join(bin, "age")]);
+    }
+    const { where } = install("nested");
+    for (const v of ["v1.10.0", "1.3.2", "v2.0.0-rc.1"]) await expect(resolveAgeDir({ where: async () => where, version: async () => v })).resolves.toBeDefined();
+    for (const v of ["v1.3.1", "v1.1.1", "(devel)", ""]) {
+      const e = await caught(resolveAgeDir({ where: async () => where, version: async () => v }));
+      expect(e).toBeInstanceOf(SecretError);
+      expect(e.message).toMatch(/is not age 1\.3\.2 or later.*run `mise install`/);
+    }
+    // No binaries there (the distro age is never a fallback), or mise can't say.
+    const empty = tempDir();
+    await expect(resolveAgeDir({ where: async () => empty, version: async () => "v1.3.2" })).rejects.toThrow(/no age, age-keygen and age-plugin-batchpass under .*: run `mise install`/);
+    await expect(resolveAgeDir({ where: async () => { throw new SecretError("`mise where age` failed (exit 1)"); }, version: async () => "v1.3.2" })).rejects.toThrow(/mise where age/);
   });
 });
