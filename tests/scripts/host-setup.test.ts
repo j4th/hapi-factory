@@ -1,7 +1,7 @@
 /**
  * scripts/host-setup.sh, checked statically: it is never run here (it creates a
- * user and needs root). `bash -n` parses it; shellcheck lints it when it is on
- * PATH (it isn't pinned in mise.toml yet, H-145); the rest reads the text for
+ * user and needs root). `bash -n` parses it; shellcheck, pinned in mise.toml,
+ * lints it (the test skips only where shellcheck isn't installed); the rest reads the text for
  * what the script must do, in the order it must do it.
  */
 import { expect, test } from "bun:test";

@@ -20,6 +20,7 @@ uv = "0.13.5"                         # Python package manager (Hermes-side tool
 python = "3.14.9"                     # the 3.14 line, which Hermes runs
 gh = "2.103.2"                        # GitHub CLI, for the operator's manual setup steps only; factory code uses src/forge/
 gitleaks = "8.30.1"                   # secret scanner
+shellcheck = "0.11.0"                 # shell linter: the script and hook tests run it, here and in CI
 sops = "3.13.3"                       # the default secret provider: one age-encrypted file (spec §11.5, docs/secrets.md)
 age = "1.3.2"                         # provides `age` and `age-keygen`: the key sops encrypts to
 

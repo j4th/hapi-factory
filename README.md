@@ -25,7 +25,7 @@ hapi-factory is a public, best-practices reference stack for an end-to-end agent
 - **Docker Engine with Compose v2.** You need it only for the stack and the integration tests. Linting and unit tests don't need Docker. The stack runs on rootless Docker as a dedicated `hapi` user, which `scripts/host-setup.sh` creates ([docs/runbooks/stack.md](docs/runbooks/stack.md)).
 - **git.**
 
-You don't need to install Bun, Node, Python, uv, gh, gitleaks, sops or age yourself. `mise install` installs them all.
+You don't need to install Bun, Node, Python, uv, gh, gitleaks, shellcheck, sops or age yourself. `mise install` installs them all.
 
 ## Quick start
 
@@ -199,6 +199,7 @@ Here is how commands work:
 | `uv`, `python` | Python tooling on the Hermes side |
 | `gh` | GitHub CLI, used only for the operator's manual setup steps. Factory code calls GitHub through `src/forge/`, never raw `gh` (spec §11). |
 | `gitleaks` | Secret scanning |
+| `shellcheck` | Lints the shell scripts and commit hooks, in their tests |
 | `sops` | The default secret provider: one age-encrypted file, decrypted into memory when the stack starts (spec §11.5, [docs/secrets.md](docs/secrets.md)) |
 | `age` | Provides `age`, `age-keygen` and `age-plugin-batchpass`: the keys the sops file is encrypted to, and the wrapped recovery key. hapi uses this pinned age (`mise where age`, at least 1.3.2), never one on `PATH` |
 
