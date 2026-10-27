@@ -277,6 +277,14 @@ describe("github.app-perms", () => {
     }
   });
 
+  test("a failed read of the rulesets fails, never a skip: the bypass check could not run for a reason that isn't a missing credential", async () => {
+    const w = await withToken();
+    w.routes[`GET ${API}/repos/${OWNER}/${NAME}/rules/branches/main?per_page=100&page=1`] = { status: 500, body: { message: "Server Error" } };
+    const r = await run(w);
+    expect(r.perms.status).toBe("fail");
+    expect(r.perms.detail).toContain("reading the rulesets failed");
+  });
+
   test("an App as a bypass actor fails, naming it", async () => {
     const r = await run(await withToken({ rulesets: mutate((x) => named(x, "tags-admin-only").bypass_actors.push({ actor_id: APP_IDS.factory, actor_type: "Integration", bypass_mode: "always" })) }));
     expect(r.perms.status).toBe("fail");

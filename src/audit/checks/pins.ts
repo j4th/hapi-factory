@@ -47,7 +47,8 @@ const EXACT = /^v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?$/;
 
 /**
  * A Dockerfile's instructions, comments dropped and line continuations joined, in Docker's order: comment lines
- * (and blank lines) go first, so a `#` line inside a continued RUN is neither read as words nor ends the RUN.
+ * (and blank lines) go first, so a `#` line inside a continued RUN is neither read as words nor ends the RUN. A
+ * backslash followed only by spaces or tabs still continues the line, as Docker's parser reads it.
  * A heredoc body (`RUN <<EOF`) is not read as the RUN's command (docs/audit.md, "Not covered yet").
  */
 function instructions(text: string): { op: string; args: string }[] {
@@ -55,7 +56,7 @@ function instructions(text: string): { op: string; args: string }[] {
     .split(/\r?\n/)
     .filter((l) => l.trim() !== "" && !l.trim().startsWith("#"))
     .join("\n")
-    .replace(/\\\n/g, " ")
+    .replace(/\\[ \t]*\n/g, " ")
     .split("\n")
     .map((l) => l.trim())
     .filter((l) => l !== "")
@@ -117,8 +118,12 @@ export function installs(run: string): { installer: string; pkg: string; pinned:
   return out;
 }
 
-/** A shell that runs what it reads on stdin (`sh -c '…'` reads stdin as data, so it doesn't count), behind optional sudo or env. */
-const STDIN_SHELL = String.raw`(?:sudo\s+(?:-\S+\s+)*)?(?:env\s+(?:-\S+\s+|[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*)?(?:\S*\/)?(?:ba|da|z|a|k)?sh(?=$|[\s;&|)'"])(?!\s+-c\b)`;
+/**
+ * A shell that runs what it reads on stdin (`sh -c '…'` reads stdin as data, so it doesn't count), behind optional
+ * sudo or env. sudo's options that take a value (`-u root`, `-Eu root`, `-g`, `-C`, `-D`, `-h`, `-p`, `-R`, `-r`,
+ * `-T`, `-t`, `-U`) are read with their value; a long option's value is joined by `=`.
+ */
+const STDIN_SHELL = String.raw`(?:sudo\s+(?:-[A-Za-z]*[gCDhpRrTtUu]\s+\S+\s+|-\S+\s+)*)?(?:env\s+(?:-\S+\s+|[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*)?(?:\S*\/)?(?:ba|da|z|a|k)?sh(?=$|[\s;&|)'"])(?!\s+-c\b)`;
 /** A download piped into such a shell, through any stages (`curl … | sh`, `wget -qO- … | gunzip | bash -s`). */
 const PIPE_TO_SHELL = new RegExp(String.raw`\b(?:curl|wget)\b[^|;&\n]*(?:\|(?!\|)[^|;&\n]*)*?\|(?!\|)\s*${STDIN_SHELL}`);
 /** A download run through command or process substitution: `sh -c "$(curl …)"`, `bash <(curl …)`, `eval "$(wget …)"`, `. <(curl …)`. */

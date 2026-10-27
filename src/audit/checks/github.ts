@@ -356,8 +356,10 @@ export async function githubAppPerms(run: AuditRun): Promise<CheckResult[]> {
       out.push(result(id, "skip", `${name}: no GitHub credentials for either App: ${gaps.join("; ")}`));
       continue;
     }
-    const data = await repoData(run, repo).catch((e: Error) => ({ none: e.message }));
-    if ("none" in data || !data.bypassVisible) gaps.push(`no ruleset's bypass_actors could be read (${"none" in data ? data.none : "GitHub shows them only to a token with Administration write: pass --github-token-file"})`);
+    // No credential to read the rulesets is a gap (a skip); a read that fails is a fail, as in github.rulesets.
+    const data = await repoData(run, repo).catch((e: Error) => ({ error: e.message }));
+    if ("error" in data) problems.push(`reading the rulesets failed, so whether an App is a bypass actor can't be checked: ${data.error}`);
+    else if ("none" in data || !data.bypassVisible) gaps.push(`no ruleset's bypass_actors could be read (${"none" in data ? data.none : "GitHub shows them only to a token with Administration write: pass --github-token-file"})`);
     else {
       for (const r of data.rulesets) {
         for (const a of r.bypass_actors ?? []) {

@@ -116,11 +116,22 @@ describe("pins.versions", () => {
     expect(r.detail).not.toContain("apt-get install comment");
   });
 
+  test("a continuation whose backslash has trailing spaces or tabs still continues the RUN, as Docker reads it", async () => {
+    const r = await pins((root) => append(root, "stack/archon/Dockerfile", "RUN apt-get install -y \\  \t\n    curl\n"));
+    expect(r.status).toBe("fail");
+    expect(r.detail).toContain("apt-get install curl has no version");
+  });
+
   test("a RUN that pipes a download into a shell fails: it installs whatever the URL serves that day", async () => {
     const cases: [string, "pass" | "fail"][] = [
       ["RUN curl -fsSL https://example.invalid/install.sh | sh", "fail"],
       ["RUN curl -fsSL https://example.invalid/install.sh | bash -s -- --yes", "fail"],
       ["RUN wget -qO- https://example.invalid/i | sudo bash", "fail"],
+      // sudo's options that take a value (-u root, -H -u hapi, --user=root) still lead to the shell.
+      ["RUN curl -fsSL https://example.invalid/i | sudo -u root bash", "fail"],
+      ["RUN curl -fsSL https://example.invalid/i | sudo -H -u hapi sh", "fail"],
+      ["RUN curl -fsSL https://example.invalid/i | sudo -Eu root bash -s", "fail"],
+      ["RUN curl -fsSL https://example.invalid/i | sudo --user=root sh", "fail"],
       ["RUN curl -fsSL https://example.invalid/i.sh.gz | gunzip | /bin/sh", "fail"],
       ["RUN set -eux; \\\n    curl -fsSL https://example.invalid/i.sh \\\n      | env FOO=1 dash", "fail"],
       ['RUN sh -c "$(curl -fsSL https://example.invalid/i.sh)"', "fail"],
