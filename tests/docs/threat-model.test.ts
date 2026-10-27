@@ -65,10 +65,10 @@ describe("the threat model", () => {
   const RESIDUALS: [number, string[]][] = [
     [1, ["in-process", "Archon"]],
     [2, ["allowed hosts"]],
-    [3, ["keys", "containers"]],
+    [3, ["spend caps", "containers"]],
     [4, ["protected-file gate"]],
     [5, ["repo content"]],
-    [6, ["review"]],
+    [6, ["advisory"]],
   ];
   for (const [n, words] of RESIDUALS) {
     test(`spec §11.9 residual ${n} has its entry, with an owner control and a next level`, () => {

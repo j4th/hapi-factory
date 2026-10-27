@@ -1,6 +1,6 @@
 # Runbook: kill switches
 
-These are spec §11.8's four kill switches, **fastest first**. The operator runs them by hand; no agent ever does. Use them when a key or token may have leaked, a run is spending or acting outside policy, or you suspect any part of the stack. They are independent: use as many as the situation needs, in this order. If anything may be sending data out, do 1 and 2 together, then 3. Afterwards, follow [after a kill switch](#after-a-kill-switch).
+These are spec §11.8's four kill switches, **fastest first**. The operator runs them by hand; no agent ever does. Use them when a key or token may have leaked, a run is spending or acting outside policy, or you suspect any part of the stack. They are independent: use as many as the situation needs, in this order. If nothing is sending data out, go in this order. If data may be leaving, do 3 (or 4, if 3 can't run or hangs) at once, alongside 1 and 2: switches 1 and 2 don't stop data leaving through allowed hosts. Afterwards, follow [after a kill switch](#after-a-kill-switch).
 
 | # | Switch | Stops | Doesn't stop | Takes effect |
 |---|---|---|---|---|
@@ -36,10 +36,10 @@ The fastest switch: one browser tab per provider. Each key, its cap and its logi
 
 Do it for **both** Apps, `hapi-planner` and `hapi-factory`, on github.com: your profile picture → **Settings** → under **Integrations**, **Applications** → **Installed GitHub Apps** → **Configure** next to the App → **Suspend**. (GitHub's "Reviewing and modifying installed GitHub Apps", read 2026-10-27; the [GitHub Apps runbook](github-apps.md#kill-switch-suspend-an-installation) uses the same path.)
 
-If you hold App tokens, revoke them too, before or after. Each is a file in `$XDG_RUNTIME_DIR/hapi/tokens/` of the user that minted it (hapi, or you). As that user:
+If you hold App tokens, revoke them **before** you suspend: revoking needs no working installation, while a token's revoke call made after the suspension may be refused **[verify in stage b]** (H-160), leaving it live up to its hour. Each is a file in `$XDG_RUNTIME_DIR/hapi/tokens/` of the user that minted it (hapi, or you). As that user:
 
 ```bash
-for f in "$XDG_RUNTIME_DIR"/hapi/tokens/*.token; do GH_TOKEN="$(cat "$f")" gh api -X DELETE /installation/token && rm "$f"; done
+for f in "$XDG_RUNTIME_DIR"/hapi/tokens/*.token; do [ -e "$f" ] || continue; GH_TOKEN="$(cat "$f")" gh api -X DELETE /installation/token && rm "$f"; done
 ```
 
 - **Stops:** new tokens: `hapi token mint`, and the audit's own read-only token, fail, naming the suspended installation. GitHub "temporarily block[s] it from accessing resources owned by your account" (its docs).
@@ -98,7 +98,7 @@ What to check in stage b: after the first command, as root, `ps -eo user,pid,cmd
   ```
 
   After 3c, see what to check in stage b, above.
-- **Undo:** `mise run up`. After 3c, first `sudo loginctl enable-linger hapi`, which starts hapi's user manager, and with it hapi's Docker, again. Docker then restarts each container that was running when it stopped (`restart: unless-stopped`, in `stack/compose.yaml`), so run 3b at once if you don't want them back yet **[verify in stage b]**.
+- **Undo:** `mise run up`. After the first 3c command only (linger is still on, so hapi's user manager is up), first `sudo systemctl --user -M hapi@ start docker.service`. After the full 3c stop, first `sudo loginctl enable-linger hapi`, which starts hapi's user manager, and with it hapi's Docker, again. Either way Docker then restarts each container that was running when it stopped (`restart: unless-stopped`, in `stack/compose.yaml`), so run 3b at once if you don't want them back yet **[verify in stage b]**.
 - **Takes effect:** seconds. Compose stops each container with SIGTERM, then SIGKILL after its stop timeout (10 seconds by default). 3c waits for systemd's stop timeout for each unit.
 
 ## 4. Firewall-drop the hapi user
@@ -134,6 +134,6 @@ sudo ip6tables -I OUTPUT -m owner --uid-owner hapi -j REJECT
 ## After a kill switch
 
 1. **Keep it stopped until you know what happened.** The volumes survive `compose down`. Read what you saved of the logs, and GitHub's side: branches pushed, PRs opened and comments made by either App.
-2. **Rotate whatever may have leaked:** the provider keys ([rotating a secret](../secrets.md#rotating-a-secret)); an App's private key ([GitHub Apps](github-apps.md#rotating-a-private-key)); and if the store, a machine's age key or the 10 words may be exposed, the store's keys and every credential inside it ([lost or compromised keys](../secrets.md#a-lost-key-a-compromised-key-lost-or-exposed-words)).
+2. **Rotate whatever may have leaked:** the provider keys ([rotating a secret](../secrets.md#rotating-a-secret)); Hermes's Slack bot and app-level tokens, which none of the four switches revokes ([Slack kill switch](slack.md#kill-switch)); an App's private key ([GitHub Apps](github-apps.md#rotating-a-private-key)); and if the store, a machine's age key or the 10 words may be exposed, the store's keys and every credential inside it ([lost or compromised keys](../secrets.md#a-lost-key-a-compromised-key-lost-or-exposed-words)).
 3. **Bring it back in reverse order:** delete the firewall table (4), start the stack (3), unsuspend the Apps (2), re-enable or replace the keys (1). Then, as hapi, `mise run audit -- --strict --repo "$OWNER/hapi-factory" --github-token-file <file>` ([the audit](stack.md#5-the-audit)).
 4. **Record it.** If a control failed or a switch didn't do what this page says, fix this page and the threat model ([docs/security/threat-model.md](../security/threat-model.md)), with an H number for any follow-up.

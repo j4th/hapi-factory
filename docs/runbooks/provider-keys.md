@@ -97,4 +97,4 @@ All three go to the research zone only (spec §10.1): **spend-capped, search-onl
 
 ## Kill switch: zero or revoke the keys
 
-Kill switch 1, the fastest (spec §11.8): set a workspace's spend limit to $0, or revoke its key, in the Anthropic Console. Revoke the OpenCode Go, OpenRouter and search keys in their dashboards. Then rotate ([docs/secrets.md](../secrets.md#rotating-a-secret)).
+Kill switch 1, the fastest (spec §11.8): set a workspace's spend limit as low as it goes (whether it accepts $0 isn't documented **[verify]**), or revoke its key, in the Anthropic Console. Revoke the OpenCode Go, OpenRouter and search keys in their dashboards. Then rotate ([docs/secrets.md](../secrets.md#rotating-a-secret)).
