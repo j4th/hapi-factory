@@ -13,8 +13,12 @@
 #              the rules every guard enforces.
 #   stack/**   the stack's security boundary: the compose file, the egress
 #              proxies and the secrets manifest.
+#   .githooks/** the commit hooks (gitleaks, the personal-strings check). They
+#              run on the operator's machine at every commit, so a change to
+#              them runs its code there, and could switch the checks off.
 # Same modes as AGENTS.md: the operator approves in an interactive session;
 # unattended sessions and workers may not edit them.
 protected_paths:
   "policy/**": { interactive: ask, unattended: deny, workers: deny }
   "stack/**":  { interactive: ask, unattended: deny, workers: deny }
+  ".githooks/**": { interactive: ask, unattended: deny, workers: deny }
