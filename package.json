@@ -2,6 +2,7 @@
   "name": "hapi-factory",
   "version": "0.1.0",
   "description": "Hermes + Archon + Pi: a reference stack for an end-to-end agentic software factory",
+  "license": "MIT",
   "private": true,
   "type": "module",
   "devDependencies": {

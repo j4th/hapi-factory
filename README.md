@@ -16,6 +16,7 @@ hapi-factory is a public, best-practices reference stack for an end-to-end agent
 - [Using hapi-factory with another repo](#using-hapi-factory-with-another-repo)
 - [Manual setup steps (the operator)](#manual-setup-steps-the-operator)
 - [Documentation map](#documentation-map)
+- [License](#license)
 
 ## Prerequisites
 
@@ -65,6 +66,7 @@ What exists now:
 | `.githooks/` | The commit hooks, installed with `git config core.hooksPath .githooks`. `pre-commit` runs gitleaks, at the version `mise.toml` pins, on the staged changes, then stops the commit if a staged line or path holds one of the operator's personal strings (`private/personal-strings.txt`). `commit-msg` checks the message the same way. In a clone without `private/`, the personal-strings check is skipped with a notice. Don't bypass them with `--no-verify`. A protected path in hapi-factory's overlay, since they run on your machine at every commit. |
 | `.coderabbit.yaml` | CodeRabbit's review-only config (spec §9.6): every way it can write to the repo is off, and its tools stay on as a second opinion beside CI. A protected path, since CodeRabbit reviews a PR with that branch's own copy. |
 | `bunfig.toml` | Bun install settings: exact versions and a 3-day release-age cooldown (see [Toolchain and pinning](#toolchain-and-pinning)). |
+| `LICENSE` | MIT. |
 | `tsconfig.json` | Strict TypeScript settings, used only for type-checking. Bun runs the `.ts` files directly. |
 | `src/cli.ts` | The `hapi` CLI: the entry point, the command registry and `main(argv)`. |
 | `src/version.ts` | `HAPI_VERSION`. It must match `version` in `package.json`, and a test checks that it does. |
@@ -396,3 +398,7 @@ Task 5 wrote the stack and proved its egress boundary on the build host's own Do
 | [Plan 01: Foundations](docs/superpowers/plans/2026-10-26-hapi-factory-01-foundations.md) | Tasks 1–14: toolchain, policy, generators, secrets, stack, audit, threat model, spikes |
 | [Research](docs/research/README.md) | What the research behind the design covered, and the conclusions the spec adopted, by section (the sources are private) |
 | `docs/spikes/` | Spike results, which arrive in Plan 01 Tasks 8–14 |
+
+## License
+
+[MIT](LICENSE).

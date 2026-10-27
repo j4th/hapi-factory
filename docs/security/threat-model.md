@@ -584,7 +584,7 @@ Stage a ran everything on the build host's rootful Docker as an ordinary user, w
 <a id="abliteration-ai"></a>
 ### abliteration.ai: a separate trust domain
 
-Spec §2 plans abliteration.ai for the operator's security work, downstream of v1. It is a separate trust domain (spec §4.4): its own Hermes profile and roster, its own capped key and workspace, its own data-boundary review (terms and retention first). It is never available to the default factory rosters, its outputs are untrusted, and its content stays out of public repos unless sanitized.
+Spec §2 plans abliteration.ai for security-research work, downstream of v1. It is a separate trust domain (spec §4.4): its own Hermes profile and roster, its own capped key and workspace, its own data-boundary review (terms and retention first). It is never available to the default factory rosters, its outputs are untrusted, and its content stays out of public repos unless sanitized.
 
 - **Owner control:** AC-15 (planned, Phase 2+, H-127). In v1 it doesn't exist: no roster, manifest entry or allowlist names it.
 - **Next level:** its own threat model, scoped to that domain, before its first key is created.

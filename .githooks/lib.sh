@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # Shared by hapi-factory's git hooks (pre-commit, commit-msg); sourced, never run.
 #
-# The operator's personal strings (their name, logins and the like) live one
+# The operator's personal strings (their name, email, hostnames and the like) live one
 # per line in private/personal-strings.txt, which only the operator's clone
 # has (Task 7b Step 2, H-055). They are matched as fixed strings, ignoring
 # case, as whole words (grep -w): a short name must not match inside a

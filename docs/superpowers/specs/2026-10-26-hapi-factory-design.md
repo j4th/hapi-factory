@@ -25,7 +25,7 @@ hapi-factory is a **public, best-practices reference stack** for an end-to-end a
   - being tied to one harness.
 - The kit was **copied into each repo** that used it. Every upgrade turned into a loop: upgrade in a repo → find problems → file upstream → re-ingest into every downstream repo → repeat [user].
 - The operator wants to be less hands-on: in the loop for intent and review, not for babysitting [user].
-- It doubles as learning and a showcase. The operator is taking SANS SEC545 and wants security designed in, not bolted on [user].
+- It doubles as learning and a showcase: security is designed in from the start, not bolted on, following SANS SEC545 (securing AI systems) [user].
 
 ### Success
 
@@ -67,7 +67,7 @@ hapi-factory is a **public, best-practices reference stack** for an end-to-end a
 - **Team or multi-user operation**, hosted SaaS, or Windows/macOS support.
 - **Archon's bundled SDLC pack and its merge queue.** We write a few small workflows of our own and let GitHub's branch rules do the merging (§9.2).
 - **Parallel runs across one repo.** Runs queue per repo.
-- **Security-research providers.** Connecting **abliteration.ai** for the operator's security work is planned downstream [user, heads-up]. It's not in v1. When added, it needs:
+- **Security-research providers.** Connecting **abliteration.ai** for security-research work is planned downstream [user, heads-up]. It's not in v1. When added, it needs:
   - its own Hermes profile and roster;
   - its own capped key and Console-style workspace;
   - its own data-boundary review (terms and retention checked first).
@@ -89,10 +89,10 @@ hapi-factory is a **public, best-practices reference stack** for an end-to-end a
 ## 3. Constraints
 
 - **Models and money**
-  - The Anthropic Console API key is funded by Max 20x's **$200/month API credit**. It refreshes each cycle, doesn't roll over, and **does not cover Claude Code** [user; verified].
+  - **The budget is a fixed monthly API credit, $200 in the reference setup** [user; verified]. Some Claude subscriptions include a monthly credit for the Anthropic Console API, and the reference setup funds its Console key from one. Such a credit refreshes each cycle, doesn't roll over and **does not cover Claude Code**, so the factory's spend and the operator's own interactive Claude Code use are separate budgets, and cost per run matters.
   - Subscription OAuth is never used in Hermes, Pi or Archon [call; Anthropic terms].
   - A cheap provider (via OpenRouter) is used for end-to-end testing once the base works [user].
-  - **The $200 credit is the hard ceiling for now** [user]. The operator's daily work stays in Claude Code on their subscription.
+  - **The credit is the hard ceiling for now** [user]: an exhausted credit stops requests, so the caps below keep the factory inside it.
   - Workspace limits split it [call; adjust in `budgets.yaml`]:
     - `hapi-hermes` $60
     - `hapi-factory` $100
@@ -405,10 +405,10 @@ protected_paths:
   - `#hapi-intake` for talking to Hermes;
   - `#hapi-alerts` for poller, harvester and flag notices.
 - Messages carry links and summaries, never code or secrets, since Slack is a third party.
-- Signal (the operator's personal app) stays possible later as a DM channel.
+- Signal stays possible later as a DM channel.
 - The record of truth stays on GitHub.
 
-**Coexistence:** the operator's existing personal Hermes (`~/.hermes`, running as their own user with their `gh` credentials) keeps running for personal use. It's never pointed at hapi-managed repos. The hapi Hermes starts **fresh** in the `hapi` zone, with no imported memories or skills [call; confirm at review].
+**Coexistence:** an operator who already runs a personal Hermes (`~/.hermes`, as their own user, with their own `gh` credentials) keeps it for personal use. It's never pointed at hapi-managed repos. The hapi Hermes starts **fresh** in the `hapi` zone, with no imported memories or skills [call; confirm at review].
 
 **Use (vetted)** [call; from `hermes_plugins.md`]:
 - `hermes_otel`, pinned ≥ 1.31 for an inbound `HERMES_OTEL_TRACEPARENT`, with `content_capture` set to preview or off
@@ -549,7 +549,7 @@ Small scripts run by `hapi` (systemd user timers, installed by `mise run up`):
 | **4 Confidence gating:** bash gate, citation check | (a) The **citation check** in `hapi-research-note`: does the source support the claim, and is the quote faithful? Low confidence marks the claim "unverified" in the note. (b) Confidence floor/bar semantics for every gate below. | v1 |
 | **5 Routing:** model router | Archon `prepare`: least-cost tier plus effort for implement, within the roster. Retry still escalates to high. Also picks the review lens. | v1 |
 | **6 Guardrail hooks:** bash gate, write gate, result screen | In **hapi-guard**, layered *after* the deterministic rules. The deterministic protected-path block makes no Jev call. Then three Jev gates: the **bash gate** (irreversible or destructive intent: block), the **write gate** (does the content hold a credential? block) and the **result screen** (tool output carrying instructions gets a data banner). The container stays the real boundary. | v1 |
-| **7 Should I compact** | Context control, the operator's original pain point. (a) Pi steps that run long: turn-end compaction signal and cut point. (b) Long Hermes sessions such as brainstorms: suggest compressing or starting fresh at a natural boundary. Behind a flag; v1 steps are short by design. **[verify]** against Anthropic's history-edit rejection first. | 3 |
+| **7 Should I compact** | Context control, the pain point that started the project. (a) Pi steps that run long: turn-end compaction signal and cut point. (b) Long Hermes sessions such as brainstorms: suggest compressing or starting fresh at a natural boundary. Behind a flag; v1 steps are short by design. **[verify]** against Anthropic's history-edit rejection first. | 3 |
 | **8–9 Cheap reads, files at scale** | **Scout pre-pass** as an Archon script step before implement: ask "is this file relevant to the work order?" over the repo in parallel, pruned in code, capped at 255. Pi gets a short `relevant_files` list instead of exploring, which serves the token-efficiency anti-goal. Optionally, give Pi the `ask_jev_file_*` tools so it can ask a question without reading a file into context. | v1 (pre-pass); 3 (tools) |
 | **10 Agentic Jev:** triage a failure, judge a diff | Placed **in code**, not left to the agent: after a gate fails, classify the failure (bug in code, wrong test, flaky, environment, out of scope, other) to decide between retry, re-running gates, or stop-and-flag. After implement, ask "does the diff stay within the work order's intent?" (flag only). Giving Pi the `ask_jev` tool itself is a phase 3 experiment. | v1 (in code); 3 (tool) |
 | `hapi-heads-up` | "Is there something worth flagging to the operator now?" gates whether a note is posted | 3 |
@@ -784,17 +784,21 @@ Cost rules:
 - **Handle Anthropic's 429 `enforced_spend_limit_reached`** as terminal. Don't retry it.
 - **[verify early]:** Anthropic rejects edited conversation history for accounts created on or after 2026-08-31. Make sure Hermes compression and Pi compaction don't break on that.
 - **[verify]:** a one-dollar test of whether Claude-provider (Agent SDK) review draws on the API credit. The credits doc says the Agent SDK is covered.
-- **Provider subscriptions: decided after v1, from measured numbers** [call]. The operator may drop to Max 5x and add a cheaper plan for the factory [user]. Findings as of 2026-10-26 are in the private provider-subscriptions research ([docs/research](../../research/README.md)):
-  - **Max 5x** is $100/month with a $100 API credit, against $200/$200 for 20x. It also cuts the operator's interactive Claude Code limits to roughly a quarter.
-  - **ChatGPT Plus/Pro through Pi's "Sign in with ChatGPT"** has terms that explicitly allow third-party and unattended use (2026-09-29). Caveats:
-    - training is on by default and must be opted out;
-    - the 5-hour window is shared with personal ChatGPT use.
-    - Archon supports Pi subscription OAuth for non-Anthropic providers.
-  - **OpenCode Go / Go Plus** ($10/$40) carries strong open models such as Kimi K3.1 Pro, with no retention for most of them.
-  - **Z.ai's** plan is second-tier and restricts automation. Its Singapore jurisdiction makes training terms unclear.
-  - **Mistral** has no coding plan.
-  - **Kimi's and Alibaba's** plans forbid third-party-harness use.
-  - **For v1:** the Anthropic credit plus **OpenCode Go ($10/month)** for the `portable` roster [call; the operator prefers trying a provider outside the two main players].
+- **Provider subscriptions: decided after v1, from measured numbers** [call].
+  - **The question** [user]: is the factory better funded by one larger Claude plan's API credit, or by a smaller Claude plan for interactive work plus a cheaper coding plan for the factory?
+  - **How it was evaluated** (2026-10-26, the private provider-subscriptions research, [docs/research](../../research/README.md)): each plan against what an unattended factory needs. Terms that allow unattended, third-party-harness use; data retention and training; the models it serves; and its price against the API credit it would replace.
+  - **How it gets decided:** after v1, from the factory's own numbers: cost per run on each roster (§13), eval pass rates (§14) and how much of the credit the factory actually uses.
+  - **What it found:**
+    - **A smaller Claude plan** halves both the price and the included API credit ($100 a month with a $100 credit, against $200 and $200), and cuts the interactive Claude Code limits to roughly a quarter.
+    - **ChatGPT Plus/Pro through Pi's "Sign in with ChatGPT"** has terms that explicitly allow third-party and unattended use (2026-09-29). Caveats:
+      - training is on by default and must be opted out;
+      - the 5-hour window is shared with personal ChatGPT use.
+      - Archon supports Pi subscription OAuth for non-Anthropic providers.
+    - **OpenCode Go / Go Plus** ($10/$40) carries strong open models such as Kimi K3.1 Pro, with no retention for most of them.
+    - **Z.ai's** plan is second-tier and restricts automation. Its Singapore jurisdiction makes training terms unclear.
+    - **Mistral** has no coding plan.
+    - **Kimi's and Alibaba's** plans forbid third-party-harness use.
+  - **For v1:** the Anthropic credit plus **OpenCode Go ($10/month)** for the `portable` roster [call; to try one provider outside the two largest labs].
     - OpenCode is run by **Anomaly**, the team behind SST; the repo moved from `sst/opencode` to `anomalyco/opencode` (MIT).
     - OpenCode Go serves Kimi K3.1 Pro, GLM-5.3 and others, with no retention for most open models.
     - Pi and Hermes are its validated clients.
