@@ -3,7 +3,7 @@
 Secrets come from **Bitwarden Secrets Manager** (`bws`) when the stack starts, never from `.env` files on disk (spec §11.5). They land in mode-`0600` files on the user's own tmpfs, `$XDG_RUNTIME_DIR/hapi/`, and only once every key has resolved. GitHub tokens are minted outside the agents, for one repo at a time, and last one hour.
 
 The rules:
-- **The repo holds secret ids, never values.** [`stack/secrets.map.yaml`](../stack/secrets.map.yaml) maps each env var to a bws secret id. A test checks every value is an id.
+- **The repo holds placeholder ids, never values and never your real ids.** [`stack/secrets.map.yaml`](../stack/secrets.map.yaml) maps each env var to a bws secret id, and every id in it is a placeholder. Your filled-in copy lives outside the repo, and you pass it with `--map` ([filling in the map](#filling-in-the-map-the operator)). A test checks that the committed map holds only placeholder ids.
 - **Fail closed.** If any secret is missing, empty or unreadable, `hapi secrets resolve` writes nothing and names the key. So the stack never starts with an empty variable.
 - **No value is ever printed.** Not on stdout or stderr, not in an error message, not in a log. Errors name the zone and the key, and say why.
 - **The bws access token stays in your environment.** `bws` reads `BWS_ACCESS_TOKEN` itself. hapi never passes it on a command line and never writes it anywhere.
@@ -65,7 +65,7 @@ host:
 - **Shape:** zone → env var name → bws secret id. The schema is [`policy/schemas/secrets-map.schema.json`](../policy/schemas/secrets-map.schema.json). All four zones are required, and no other key is allowed. A name is `^[A-Z_][A-Z0-9_]*$`. An id is a UUID.
 - **Two names may share one id.** `ANTHROPIC_API_KEY` and `CLAUDE_API_KEY` in `archon` do, and bws is asked once.
 - **Placeholders.** The committed file has placeholder ids, `00000000-0000-0000-0000-...`. `hapi secrets resolve` refuses a placeholder by key, before it calls bws, and `--dry-run` lists it as `placeholder`. A real bws id is a random UUID, so it never looks like one.
-- **Ids aren't secrets.** An id is useless without the machine account's access token. This repo is public, so committing yours shows which secret ids exist and nothing else. A fork replaces them with its own.
+- **Real ids stay out of the repo.** An id is useless without the machine account's access token, so it isn't a secret. But it is specific to your vault, and this repo is public: the committed map is a template, and each deployment keeps its filled-in copy outside the repo. A unit test fails if `stack/secrets.map.yaml` holds anything but placeholders, so `mise run test` and CI catch a real id committed by mistake.
 - **A mistake is never echoed.** If a secret is pasted where an id goes, the loader says `stack/secrets.map.yaml: /hermes/ANTHROPIC_API_KEY: must match pattern ...` without the value. A key that isn't an env name is shown as `(a name that is not an env name, not shown)`.
 
 **MCP references.** `policy/mcp.yaml` names a server's secret by its bws key, as `bws:hapi-mcp-<slug>` ([docs/policy.md](policy.md#mcpyaml)). The generated configs read it from `${HAPI_MCP_<SLUG>}`: the key upper-cased, with `-` as `_` (`secretEnvName`). So the map must have that env var in the server's zone. For Context7 that is `HAPI_MCP_CONTEXT7_API_KEY` in `research`. `hapi secrets resolve` checks every MCP server each zone loads (`mcpSecretGaps`), and so does a unit test against the committed files. A missing one fails, naming it:
@@ -99,14 +99,27 @@ Do this once, in the Bitwarden web app.
 
 ## Filling in the map (the operator)
 
-For each key in [the table](#the-zones-and-their-keys):
+**Never fill in `stack/secrets.map.yaml` itself.** It is the public template. Copy it outside the repo, to hapi's local config directory, and fill in the copy. Do this as the user that runs the stack (`hapi`, from Plan 01 Task 5 on), from the repo root:
+
+```bash
+mkdir -p -m 0700 "${XDG_CONFIG_HOME:-$HOME/.config}/hapi"
+install -m 0600 stack/secrets.map.yaml "${XDG_CONFIG_HOME:-$HOME/.config}/hapi/secrets.map.yaml"
+```
+
+Then, for each key in [the table](#the-zones-and-their-keys):
 
 1. Get the value from its runbook.
 2. In the Bitwarden web app, open the `hapi` project and add a **new secret**. Use the bws key from the table as its name, and paste the value. **Don't use `bws secret create` on the command line:** the value would end up in your shell history and in the process list.
 3. Copy the new secret's **id** from the web app.
-4. Replace that key's placeholder in `stack/secrets.map.yaml` with it.
+4. Replace that key's placeholder **in your copy** with it.
 
-Then run `hapi secrets resolve --dry-run`. Every key should say `found`. Commit the map.
+Then check the copy. Every key should say `found`:
+
+```bash
+hapi secrets resolve --dry-run --map "${XDG_CONFIG_HOME:-$HOME/.config}/hapi/secrets.map.yaml"
+```
+
+Don't commit the copy, and don't copy it back into the repo. If the template changes (a new key in a later task), add the same key to your copy; the dry run names any key your copy lacks that the MCP catalog needs. Back the copy up somewhere private if you like: it holds ids, not values. Plan 01 Task 4b builds its local config on this directory.
 
 ## `hapi secrets resolve`
 
@@ -114,8 +127,10 @@ Then run `hapi secrets resolve --dry-run`. Every key should say `found`. Commit 
 hapi secrets resolve [--dry-run] [--map file] [--policy dir]
 ```
 
-- `--map`: the secrets map. Default `stack/secrets.map.yaml`.
+- `--map`: the secrets map. Pass your filled-in copy, `"${XDG_CONFIG_HOME:-$HOME/.config}/hapi/secrets.map.yaml"`. The default is the committed template, `stack/secrets.map.yaml`, whose placeholders it refuses.
 - `--policy`: the policy directory whose MCP catalog the map must cover. Default `policy`.
+
+Elsewhere in these docs, "run `hapi secrets resolve`" means with `--map` pointing at your copy.
 
 **Without `--dry-run`** it:
 1. loads and checks the map, and checks it covers the MCP catalog;
@@ -162,7 +177,7 @@ hapi token mint --app planner|factory --repo owner/name
 It mints a 1-hour installation token for **one** repo, with the App's fixed permissions, and writes it to `$XDG_RUNTIME_DIR/hapi/tokens/<app>.<owner>.<repo>.token` (mode `0600`, directory `0700`, atomically). It prints the path and the expiry, **never the token**:
 
 ```text
-/run/user/1001/hapi/tokens/planner.j4th.hapi-factory.token (expires 2026-10-26T19:04:11Z)
+/run/user/1001/hapi/tokens/planner.<owner>.hapi-factory.token (expires 2026-10-26T19:04:11Z)
 ```
 
 | `--app` | App | Token permissions |

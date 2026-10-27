@@ -209,7 +209,7 @@ All amounts are in USD.
 | `run_usd` | 3.00 | Target spend per factory run |
 | `hermes_max_turns` | 60 | Hermes `agent.max_turns` |
 
-The monthly caps are enforced at the provider. the operator sets them on the Console workspaces and OpenRouter keys; the [provider-keys runbook](runbooks/provider-keys.md) covers it. The workspaces add up to the $200/month credit, and the default workspace is unused.
+The monthly caps are enforced at the provider. the operator sets them on the Console workspaces and OpenRouter keys; the [provider-keys runbook](runbooks/provider-keys.md) covers it. An OpenRouter key's cap is set as a limit that resets daily, the monthly cap divided by 31 (spec §11.5), so a leaked key can spend only one day's share. The workspaces add up to the $200/month credit, and the default workspace is unused.
 
 ### `approvals.yaml`
 

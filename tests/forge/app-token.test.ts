@@ -57,7 +57,7 @@ const granted = (permissions: Record<string, string>, repositories = ["odoo-mcp"
     expires_at: "2023-11-14T23:13:20Z",
     permissions,
     repository_selection: "selected",
-    repositories: repositories.map((name) => ({ name, full_name: `j4th/${name}` })),
+    repositories: repositories.map((name) => ({ name, full_name: `example-owner/${name}` })),
     ...extra,
   },
 });
@@ -171,7 +171,7 @@ describe("mintInstallationToken", () => {
     }
     // No permissions would mean every permission the installation has.
     await expect(mintInstallationToken({ ...o, permissions: {}, fetch: f.fetch })).rejects.toThrow(TokenScopeError);
-    await expect(mintInstallationToken({ ...o, repositories: ["j4th/odoo-mcp"], fetch: f.fetch })).rejects.toThrow(/name only, without the owner/);
+    await expect(mintInstallationToken({ ...o, repositories: ["example-owner/odoo-mcp"], fetch: f.fetch })).rejects.toThrow(/name only, without the owner/);
     await expect(mintInstallationToken({ ...o, permissions: { contents: "admin" } as never, fetch: f.fetch })).rejects.toThrow(/read or write/);
     await expect(mintInstallationToken({ ...o, installationId: 0, fetch: f.fetch })).rejects.toThrow(/installation id/);
     expect(f.calls).toEqual([]);
@@ -202,15 +202,15 @@ describe("appJwt and findInstallationId", () => {
   });
 
   test("findInstallationId reads the repo's installation with the App JWT", async () => {
-    const f = fakeFetch({ [`GET ${API}/repos/j4th/odoo-mcp/installation`]: { status: 200, body: { id: 987, suspended_at: null } } });
-    expect(await findInstallationId({ appId: "123456", privateKeyPem: PKCS1_PEM, owner: "j4th", repo: "odoo-mcp", fetch: f.fetch, now: () => NOW_MS })).toBe(987);
+    const f = fakeFetch({ [`GET ${API}/repos/example-owner/odoo-mcp/installation`]: { status: 200, body: { id: 987, suspended_at: null } } });
+    expect(await findInstallationId({ appId: "123456", privateKeyPem: PKCS1_PEM, owner: "example-owner", repo: "odoo-mcp", fetch: f.fetch, now: () => NOW_MS })).toBe(987);
     expectAppJwt(f.calls[0]!.headers.authorization);
   });
 
   test("an App that isn't installed on the repo, or a suspended installation, fails clearly", async () => {
-    const args = { appId: "123456", privateKeyPem: PKCS1_PEM, owner: "j4th", repo: "odoo-mcp", now: () => NOW_MS };
-    await expect(findInstallationId({ ...args, fetch: fakeFetch({}).fetch })).rejects.toThrow(/not installed on j4th\/odoo-mcp/);
-    const suspended = fakeFetch({ [`GET ${API}/repos/j4th/odoo-mcp/installation`]: { status: 200, body: { id: 987, suspended_at: "2026-10-26T00:00:00Z" } } });
+    const args = { appId: "123456", privateKeyPem: PKCS1_PEM, owner: "example-owner", repo: "odoo-mcp", now: () => NOW_MS };
+    await expect(findInstallationId({ ...args, fetch: fakeFetch({}).fetch })).rejects.toThrow(/not installed on example-owner\/odoo-mcp/);
+    const suspended = fakeFetch({ [`GET ${API}/repos/example-owner/odoo-mcp/installation`]: { status: 200, body: { id: 987, suspended_at: "2026-10-26T00:00:00Z" } } });
     await expect(findInstallationId({ ...args, fetch: suspended.fetch })).rejects.toThrow(/suspended/);
   });
 });
@@ -259,11 +259,11 @@ describe("hapi token mint", () => {
     const { out } = capture();
     const xdg = xdgWithHostEnv(planner);
     const f = fakeFetch({
-      [`GET ${API}/repos/j4th/odoo-mcp/installation`]: { status: 200, body: { id: 123, suspended_at: null } },
+      [`GET ${API}/repos/example-owner/odoo-mcp/installation`]: { status: 200, body: { id: 123, suspended_at: null } },
       [MINT]: granted({ ...APPS.planner.permissions }),
     });
-    expect(await tokenMint(["--app", "planner", "--repo", "j4th/odoo-mcp"], { fetch: f.fetch, env: { XDG_RUNTIME_DIR: xdg }, now: () => NOW_MS })).toBe(0);
-    const file = join(xdg, "hapi", "tokens", "planner.j4th.odoo-mcp.token");
+    expect(await tokenMint(["--app", "planner", "--repo", "example-owner/odoo-mcp"], { fetch: f.fetch, env: { XDG_RUNTIME_DIR: xdg }, now: () => NOW_MS })).toBe(0);
+    const file = join(xdg, "hapi", "tokens", "planner.example-owner.odoo-mcp.token");
     expect(out).toEqual([`${file} (expires 2023-11-14T23:13:20Z)`]);
     expect(readFileSync(file, "utf8")).toBe(`${TOKEN}\n`);
     expect(statSync(file).mode & 0o777).toBe(0o600);
@@ -275,7 +275,7 @@ describe("hapi token mint", () => {
   test("usage errors exit 2", async () => {
     const { err } = capture();
     const deps = { fetch: fakeFetch({}).fetch, env: {} };
-    for (const args of [[], ["--app", "planner"], ["--app", "admin", "--repo", "j4th/x"], ["--app", "factory", "--repo", "x"], ["--app", "factory", "--repo", "j4th/x/y"], ["--app", "factory", "--repo", "j4th/.."]]) {
+    for (const args of [[], ["--app", "planner"], ["--app", "admin", "--repo", "example-owner/x"], ["--app", "factory", "--repo", "x"], ["--app", "factory", "--repo", "example-owner/x/y"], ["--app", "factory", "--repo", "example-owner/.."]]) {
       expect(await tokenMint(args, deps)).toBe(2);
     }
     expect(err.join("\n")).toContain("usage: hapi token mint --app planner|factory --repo owner/name");
@@ -283,7 +283,7 @@ describe("hapi token mint", () => {
 
   test("needs XDG_RUNTIME_DIR and a resolved host.env with the App's id and key", async () => {
     const f = fakeFetch({});
-    const args = ["--app", "factory", "--repo", "j4th/odoo-mcp"];
+    const args = ["--app", "factory", "--repo", "example-owner/odoo-mcp"];
     await expect(tokenMint(args, { fetch: f.fetch, env: {} })).rejects.toThrow(/XDG_RUNTIME_DIR is not set/);
     await expect(tokenMint(args, { fetch: f.fetch, env: { XDG_RUNTIME_DIR: xdgWithHostEnv(null) } })).rejects.toThrow(/hapi secrets resolve/);
     await expect(tokenMint(args, { fetch: f.fetch, env: { XDG_RUNTIME_DIR: xdgWithHostEnv(planner) } })).rejects.toThrow(/HAPI_FACTORY_APP_ID/);

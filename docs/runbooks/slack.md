@@ -30,7 +30,7 @@ Hermes talks to you through Slack, in Socket Mode, so there is no inbound endpoi
 
 ## The secrets
 
-Store all three in Bitwarden, and put their ids in the `hermes` zone of `stack/secrets.map.yaml` ([docs/secrets.md](../secrets.md#filling-in-the-map-the operator)):
+Store all three in Bitwarden, and put their ids in the `hermes` zone of your copy of the secrets map, outside the repo ([docs/secrets.md](../secrets.md#filling-in-the-map-the operator)):
 
 | Env var | bws key | Value |
 |---|---|---|

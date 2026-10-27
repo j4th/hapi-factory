@@ -250,9 +250,12 @@ describe("stack/secrets.map.yaml", () => {
     expect(map.hermes!.ANTHROPIC_API_KEY).not.toBe(map.archon!.ANTHROPIC_API_KEY!);
   });
 
-  test("every id is still a placeholder until the operator fills them in, and placeholders are unique per secret", () => {
+  test("the committed map is a template: every id is a placeholder, unique per secret (real ids live in a copy outside the repo)", () => {
+    // The repo is public, and a deployment's real bws ids never enter it: the filled-in copy
+    // lives outside the repo and is passed with --map (docs/secrets.md, "Filling in the map").
+    // So this fails if anyone fills in stack/secrets.map.yaml itself.
     const ids = SECRET_ZONES.flatMap((z) => Object.values(map[z]!));
-    expect(ids.every(isPlaceholderId)).toBe(true);
+    expect(ids.filter((id) => !isPlaceholderId(id))).toEqual([]);
     // One secret per id, except CLAUDE_API_KEY, which reuses ANTHROPIC_API_KEY's in the archon zone.
     expect(new Set(ids).size).toBe(ids.length - 1);
   });

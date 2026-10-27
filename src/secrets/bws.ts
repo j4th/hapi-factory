@@ -1,8 +1,10 @@
 /**
  * Secrets from Bitwarden Secrets Manager (spec §11.5), resolved fail-closed.
  *
- * `stack/secrets.map.yaml` (a `SecretMap`) says which bws secret fills which
- * env var in each zone. It holds bws secret ids, never values.
+ * A secrets map (a `SecretMap`) says which bws secret fills which env var in
+ * each zone. It holds bws secret ids, never values. The committed
+ * `stack/secrets.map.yaml` is a template of placeholder ids; a deployment's
+ * filled-in copy lives outside the repo and is passed with `--map`.
  * `resolveSecrets` reads every id with `bws secret get <id> --output json`,
  * all into memory first. Only when every key has a value does it write
  * `<outDir>/<zone>.env` (mode 0600, directory 0700, atomically; see
@@ -274,7 +276,8 @@ export interface SecretsDeps {
 /**
  * `hapi secrets resolve [--dry-run] [--map file] [--policy dir]`.
  *
- * Loads the map (default `stack/secrets.map.yaml`) and checks it covers the MCP
+ * Loads the map (`--map`; the default, `stack/secrets.map.yaml`, is the template,
+ * whose placeholders are refused) and checks it covers the MCP
  * catalog's references (`--policy`, default `policy`). Then:
  * - without `--dry-run`: resolves every secret into `$XDG_RUNTIME_DIR/hapi/<zone>.env`
  *   and prints each path. Any miss throws, naming the key; nothing is written.
@@ -312,7 +315,7 @@ export async function secretsResolve(args: string[], deps: SecretsDeps = {}): Pr
     if (bad.length === 0) return 0;
     console.error(
       `hapi secrets resolve: ${bad.length} of ${results.length + gaps.length} secrets not found: ${bad.join(", ")}. ` +
-        "Store each in Bitwarden and put its id in the secrets map (docs/secrets.md).",
+        "Store each in Bitwarden and put its id in your copy of the secrets map, passed with --map (docs/secrets.md).",
     );
     return 1;
   }

@@ -4,10 +4,10 @@ Every model and search key hapi uses, where to get it, the cap to set on it, and
 
 These are outward-facing steps, so the operator does them by hand. For each key:
 1. Create it as below, with its cap.
-2. Store it in Bitwarden under the bws key named here, and put its id in `stack/secrets.map.yaml` ([docs/secrets.md](../secrets.md#filling-in-the-map-the operator)).
+2. Store it in Bitwarden under the bws key named here, and put its id in your copy of the secrets map, outside the repo ([docs/secrets.md](../secrets.md#filling-in-the-map-the operator)).
 3. Never paste a key into a chat, an issue or a file in the repo.
 
-When every key is stored, run `hapi secrets resolve --dry-run`. Every key should say `found`.
+When every key is stored, run `hapi secrets resolve --dry-run --map <your copy>` ([docs/secrets.md](../secrets.md#filling-in-the-map-the operator)). Every key should say `found`.
 
 | Key | Cap | Zone / env var | bws key |
 |---|---|---|---|
@@ -15,8 +15,8 @@ When every key is stored, run `hapi secrets resolve --dry-run`. Every key should
 | Anthropic, workspace `hapi-factory` | $100/month | `archon` / `ANTHROPIC_API_KEY` and `CLAUDE_API_KEY` | `hapi-archon-anthropic-api-key` |
 | Anthropic, workspace `hapi-evals` | $40/month | Not in the map yet: the evals plan adds it | |
 | OpenCode Go | The plan's monthly limits, Extra Usage off | `archon` / `OPENCODE_API_KEY` | `hapi-archon-opencode-api-key` |
-| OpenRouter `hapi-jev` | $2/month | `archon` / `HAPI_JEV_OPENROUTER_API_KEY` | `hapi-archon-jev-openrouter-api-key` |
-| OpenRouter `hapi-portable` | $20/month | Not needed in v1 ([below](#hapi-portable-20month-not-needed-in-v1)) | |
+| OpenRouter `hapi-jev` | $0.06/day, reset daily (at most $1.86 a month, under the $2 cap); ZDR enforced | `archon` / `HAPI_JEV_OPENROUTER_API_KEY` | `hapi-archon-jev-openrouter-api-key` |
+| OpenRouter `hapi-portable` | $0.64/day, reset daily (at most $19.84 a month, under the $20 cap); ZDR enforced | Not needed in v1 ([below](#hapi-portable-20month-not-needed-in-v1)) | |
 | Brave Search | A spend cap, if your plan has one | `research` / `BRAVE_SEARCH_API_KEY` | `hapi-research-brave-search-api-key` |
 | Exa | A spend cap, if offered | `research` / `EXA_API_KEY` | `hapi-research-exa-api-key` |
 | Context7 | A spend cap, if your plan has one | `research` / `HAPI_MCP_CONTEXT7_API_KEY` | `hapi-mcp-context7-api-key` |
@@ -59,21 +59,32 @@ The plan's 5-hour (20%) and weekly (50%) allowances can run out. Then fall back 
 
 ## OpenRouter
 
+Spec §11.5 sets two rules for every OpenRouter key:
+- **One key per role, with a daily `limit`.** The monthly caps (spec §3, `policy/budgets.yaml`) become a per-key credit limit that **resets daily**: the monthly cap divided by 31, rounded down to the cent. A leaked key can then spend one day's share, not the whole month's at once. OpenRouter resets daily limits at midnight UTC, and refuses a key's requests once it is over its limit, until the reset.
+- **Zero data retention (ZDR) is enforced** for every non-Anthropic model. Enforce it **per key, with a guardrail**, not with the account-wide ZDR switch: a guardrail applies to the keys it's assigned to, so an exception for one key (Jev, below) never weakens another. Leave the account-wide switch off, and give every hapi key its own guardrail when you create it. With ZDR enforced, OpenRouter routes a request only to endpoints with a zero-retention policy, and fails it if there are none.
+
 ### `hapi-jev` ($2/month)
 
 The Jev decision model (spec §9.5) is reached through OpenRouter, on its own key with a tiny cap. The key sits in the Archon zone, where Pi can read it, so the cap bounds what a leak costs.
 
 1. In OpenRouter's **Settings → API Keys**, create a key named **`hapi-jev`**.
-2. Set its **credit limit to $2**, resetting **monthly**.
-3. Store it → bws `hapi-archon-jev-openrouter-api-key`. The map names it `HAPI_JEV_OPENROUTER_API_KEY`, not `OPENROUTER_API_KEY`, so Pi never uses it for model calls ([docs/secrets.md](../secrets.md#the-zones-and-their-keys)).
+2. Set its **credit limit to $0.06**, resetting **daily**. That is at most $1.86 in a 31-day month, under Jev's $2 cap. When a day's limit runs out, `decide()` falls back as on any Jev error: a Haiku 5.5 classifier, then the decision file's default (spec §9.5).
+3. In OpenRouter's **Guardrails** settings, create a guardrail named **`hapi-jev`** and assign it to the `hapi-jev` key:
+   - **allowed models:** only the Jev models (`typesafe/jev-*`) that hapi's decision files use, so a leaked key can't call any other model;
+   - **enforce zero data retention** for every provider group (Anthropic, OpenAI, Google, xAI and other);
+   - **no training on your data:** don't allow paid endpoints that train on prompts.
+4. **Check that Jev has a ZDR endpoint.** Open the Jev model's page on OpenRouter and check its providers' data policies: does any endpoint have zero data retention? (OpenRouter's ZDR preview, `GET /api/v1/endpoints/zdr`, lists every endpoint left under ZDR, but it needs a management key; if you use it, don't put the key on a command line.)
+   - **If a Jev endpoint is zero-retention,** you're done: with ZDR enforced, Jev calls go only there.
+   - **If none is,** ZDR fails every Jev call. Then Jev is a **documented exception** to the ZDR rule: turn off ZDR enforcement in the `hapi-jev` guardrail only, keep its model allowlist and the daily limit, and record the exception in the threat model (`docs/security/threat-model.md`, Plan 01 Task 7). The exception rests on spec §9.5's data boundary: Jev sees decision state (comment text, diff summaries, file contents for the scout pass, failure logs), and in v1 it runs **on public repos only**, whose content is public anyway.
+5. Store the key → bws `hapi-archon-jev-openrouter-api-key`. The map names it `HAPI_JEV_OPENROUTER_API_KEY`, not `OPENROUTER_API_KEY`, so Pi never uses it for model calls ([docs/secrets.md](../secrets.md#the-zones-and-their-keys)).
 
-Jev's retention terms (TypeSafe's and OpenRouter's) are still to verify, so Jev runs on public repos only in v1 (spec §9.5).
+Either way, Jev's retention terms (TypeSafe's and OpenRouter's) must be verified before Jev is enabled on a private repo (spec §9.5).
 
 ### `hapi-portable` ($20/month): not needed in v1
 
 `policy/budgets.yaml` keeps `openrouter_monthly_usd: 20` for an OpenRouter-backed roster. In v1 the `portable` roster runs on OpenCode Go instead, so this key isn't in the map. If a roster ever uses `openrouter/` models:
-1. create a key named **`hapi-portable`** with a **$20/month** credit limit;
-2. enforce zero data retention for it in OpenRouter's privacy settings (spec §11.5: ZDR for every non-Anthropic model);
+1. create a key named **`hapi-portable`** with a **$0.64** credit limit, resetting **daily** (at most $19.84 in a 31-day month, under the $20 cap);
+2. create a guardrail named **`hapi-portable`** that enforces zero data retention for every provider group, allows only the roster's models, and doesn't allow training on prompts, and assign it to the key (spec §11.5: ZDR for every non-Anthropic model). No exception applies to this key;
 3. add `OPENROUTER_API_KEY` to the `archon` zone of the map.
 
 ## Search keys: Brave, Exa, Context7

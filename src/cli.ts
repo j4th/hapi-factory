@@ -114,7 +114,7 @@ register("workorder validate", workorderValidate, "Validate a work order (order.
 register("policy build", policyBuild, "Compile policy/ into Hermes, Archon, Pi, egress and MCP configs under build/");
 register("mcp verify", mcpVerify, "Check every MCP server's live tool surface against policy/mcp.lock.json");
 register("mcp pin", mcpPin, "Record one MCP server's live tool surface in policy/mcp.lock.json");
-register("secrets resolve", secretsResolve, "Resolve stack/secrets.map.yaml from Bitwarden into $XDG_RUNTIME_DIR/hapi/<zone>.env (--dry-run: check only)");
+register("secrets resolve", secretsResolve, "Resolve a secrets map (--map: your copy) from Bitwarden into $XDG_RUNTIME_DIR/hapi/<zone>.env (--dry-run: check only)");
 register("token mint", tokenMint, "Mint a 1-hour GitHub App token for one repo into a 0600 file under $XDG_RUNTIME_DIR/hapi/tokens/");
 
 if (import.meta.main) {
