@@ -1,0 +1,29 @@
+# A control: an AI agent started by anyone who can comment, in a job that holds
+# nothing: no secret, no expression that reads one or github.token, a read-only
+# GITHUB_TOKEN (the job's permissions replace the workflow's write-all), and a
+# checkout that doesn't keep its token in .git/config. repo.ai-workflows passes it.
+name: Triage
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions: write-all
+
+jobs:
+  triage:
+    if: ${{ !github.event.issue.pull_request && contains(github.event.comment.body, '/triage') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Summarise
+        env:
+          TITLE: ${{ github.event.issue.title }}
+          ASKED_ABOUT_SECRETS: ${{ contains(github.event.comment.body, 'secrets.ANTHROPIC_API_KEY') }}
+          STEP_OUTPUT: ${{ steps.secrets.outputs.none }}
+        run: opencode run "Summarise this issue's title, $TITLE"

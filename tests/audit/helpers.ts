@@ -198,6 +198,15 @@ export const APP_KEY = generateKeyPairSync("rsa", {
 
 export const APP_IDS = { planner: 1001, factory: 1002 } as const;
 
+/** Which App a request's JWT is for: the fake JWTs carry the App id in `iss`, readable without the key. */
+export function appOf(c: FetchCall): "planner" | "factory" {
+  const payload = JSON.parse(Buffer.from((c.headers.authorization ?? "").replace(/^Bearer /, "").split(".")[1] ?? "", "base64url").toString() || "{}");
+  return payload.iss === APP_IDS.factory ? "factory" : "planner";
+}
+
+/** The token the fake GitHub mints for the audit (never to be printed). */
+export const MINTED_TOKEN = "fake-installation-token-audit";
+
 /** The routes of a GitHub repo set up as the runbook says, read with a token file or with an App. */
 export function githubRoutes(o: { rulesets?: Record<string, any>[]; workflows?: Record<string, string>; appPermissions?: Record<string, Record<string, string>> } = {}): Record<string, Reply | ((c: FetchCall) => Reply)> {
   const rulesets = o.rulesets ?? goodRulesets();
@@ -219,11 +228,7 @@ export function githubRoutes(o: { rulesets?: Record<string, any>[]; workflows?: 
     planner: { contents: "write", pull_requests: "write", issues: "read", metadata: "read" },
     factory: { contents: "write", pull_requests: "write", metadata: "read" },
   };
-  // Which App a JWT is for: the fake JWTs carry the App id in `iss`, readable without the key.
-  const app = (c: FetchCall): "planner" | "factory" => {
-    const payload = JSON.parse(Buffer.from((c.headers.authorization ?? "").replace(/^Bearer /, "").split(".")[1] ?? "", "base64url").toString() || "{}");
-    return payload.iss === APP_IDS.factory ? "factory" : "planner";
-  };
+  const app = appOf;
   routes[`GET ${API}/app`] = (c) => ({ status: 200, body: { id: APP_IDS[app(c)], slug: `hapi-${app(c)}`, permissions: perms[app(c)], events: [] } });
   routes[`GET ${repo}/installation`] = (c) => ({
     status: 200,
@@ -233,7 +238,7 @@ export function githubRoutes(o: { rulesets?: Record<string, any>[]; workflows?: 
     routes[`POST ${API}/app/installations/${id}/access_tokens`] = {
       status: 201,
       body: {
-        token: "fake-installation-token-audit",
+        token: MINTED_TOKEN,
         expires_at: "2030-01-01T00:00:00Z",
         permissions: { contents: "read", metadata: "read" },
         repository_selection: "selected",

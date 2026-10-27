@@ -9,7 +9,9 @@
  * check (per repo for the github.* and repo.* checks). A check that throws is
  * a fail with the error (an audit fails closed). Every command goes through
  * `ctx.exec` and every request through `ctx.fetch`. Temp dirs are removed and
- * the audit's own GitHub token revoked when it ends.
+ * the audit's own GitHub token revoked when it ends; a revoke GitHub doesn't
+ * confirm prints one warning line on stderr (the App and the HTTP status,
+ * never the token) and doesn't change the exit code.
  *
  * `hapi audit [--repo owner/name ...] [--strict] [--dev] [--github-token-file
  * path] [--build-dir dir] [--policy dir]` prints one line per check and a
@@ -64,7 +66,9 @@ export async function runAudit(ctx: AuditContext): Promise<CheckResult[]> {
       }
     }
   } finally {
-    for (const undo of run.cleanups.splice(0)) await undo().catch(() => {});
+    // Each cleanup reports its own trouble (the App-token revoke prints one warning line naming the App and the HTTP
+    // status, never the token). One that throws anyway gets a warning line too, and never changes the results.
+    for (const undo of run.cleanups.splice(0)) await undo().catch((e: unknown) => console.error(`hapi audit: warning: a cleanup step failed: ${oneLine(e)}`));
     for (const dir of run.temps.splice(0)) await rm(dir, { recursive: true, force: true });
   }
   return ctx.strict ? out.map((r) => (r.status === "skip" ? result(r.id, "fail", `--strict: skipped: ${r.detail}`) : r)) : out;

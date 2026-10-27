@@ -1,18 +1,25 @@
 /**
  * The GitHub checks, once per `--repo` (spec §5.1, §7, §11.5, §11.7; handoffs
- * H-023, H-036). Every read is a GET. The credential:
+ * H-023, H-036). Every read of repo state is a GET. The credential:
  *
  * - `--github-token-file <path>`: the operator's own token (a file only its
  *   owner can read; never printed, logged or put in argv), for every read.
  *   GitHub returns a ruleset's `bypass_actors` only to a token with write
  *   access to that ruleset (repository Administration), and the Apps never
  *   get Administration, so this is the only way the bypass checks run.
- * - else an installation token of one of the Apps (hapi-planner, else
- *   hapi-factory), from the App keys in host.env as `hapi token mint` reads
- *   them, minted for this one repo with `contents: read` and `metadata: read`
- *   only (the one POST), and revoked when the audit ends (the one DELETE).
- *   Metadata read covers the rules and rulesets endpoints; Contents read the
- *   workflow files.
+ * - else an installation token of one of the Apps, from the App keys in
+ *   host.env as `hapi token mint` reads them, minted for this one repo with
+ *   `contents: read` and `metadata: read` only (the one POST), and revoked
+ *   when the audit ends (the one DELETE). The controller's ruling R2 (Task 6
+ *   security fix pass) accepts that POST and DELETE under amendment set 2's
+ *   ruling 5; the reads stay GET-only. hapi-planner is tried first, then
+ *   hapi-factory: an App whose keys aren't in host.env, or whose keys load
+ *   but which can't mint for this repo (not installed there, suspended,
+ *   refused), is passed over with its reason kept. A token GitHub returns
+ *   broader than requested is never passed over: it is a fail. Metadata read
+ *   covers the rules and rulesets endpoints; Contents read the workflow files.
+ *   If GitHub doesn't confirm the revoke (204), one warning line on stderr
+ *   names the App and the HTTP status, never the token.
  * - github.app-perms always uses each App's own JWT (GET /app, GET
  *   /repos/{owner}/{repo}/installation), which needs no permission.
  * With neither, each check is a skip saying what is missing.
@@ -23,31 +30,49 @@
  *   README's JSON: main-protect and main-review, never one ruleset.
  * - github.app-perms: neither App has administration or workflows, or any
  *   permission beyond the runbook's table, on the App or on its installation
- *   (selected repositories only), and neither is a bypass actor anywhere.
+ *   (selected repositories only), and neither is a bypass actor anywhere. A
+ *   response with no permissions object or no App id fails: it can't be
+ *   cleared.
  * - repo.ai-workflows: no workflow runs an AI agent (a known AI action, or an
  *   AI CLI in a `run:`) on a comment, issue or review trigger, or
- *   `pull_request_target`, in a job that holds a credential (a `secrets.*` or
- *   `github.token` reference anywhere in the job, in any step's inputs, env or
- *   script, or the workflow's env; or `id-token: write`): the "Comment and
- *   Control" class (spec §7). The steps of a job share one runner, so a
- *   secret an earlier step exports reaches the agent, and the agent can
- *   rewrite what a later step runs with its secret.
+ *   `pull_request_target`, in a job that holds a credential: the "Comment and
+ *   Control" class (spec §7). A credential is any `${{ }}` expression in the
+ *   job (any field at any depth) or the workflow's env that reads a secret
+ *   (`secrets.NAME`, `secrets['NAME']`, or `secrets` whole, as in
+ *   `toJSON(secrets)`) or the job's token (`github.token`, or the `github`
+ *   context whole); a write grant in the job's effective permissions
+ *   (`write-all`, or any scope at `write`, `id-token: write` included; the
+ *   job's own block replaces the workflow's, and `read-all`, `{}` and read
+ *   scopes grant none); or an `actions/checkout` step without
+ *   `persist-credentials: false`, which writes the GITHUB_TOKEN into
+ *   .git/config. The steps of a job share one runner, so a secret an earlier
+ *   step exports reaches the agent, and the agent can rewrite what a later
+ *   step runs with its secret. It stays a heuristic: what it doesn't follow
+ *   is docs/audit.md's "Not covered yet" and handoffs H-155.
  */
 import { lstat, readFile } from "node:fs/promises";
 import YAML from "yaml";
-import { APPS, type AppName, appCredentials, appJwt, findInstallationId, GITHUB_API, GITHUB_API_VERSION, mintInstallationToken } from "../../forge/github/app-token";
+import { APPS, type AppName, appCredentials, appJwt, findInstallationId, GITHUB_API, GITHUB_API_VERSION, mintInstallationToken, TokenScopeError } from "../../forge/github/app-token";
 import { HAPI_VERSION } from "../../version";
 import { type AuditRun, type CheckResult, type RepoRef, result } from "../types";
 
 const repoName = (r: RepoRef) => `${r.owner}/${r.name}`;
 const repoPath = (r: RepoRef) => `/repos/${encodeURIComponent(r.owner)}/${encodeURIComponent(r.name)}`;
 const asRecord = (v: unknown) => (v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined);
+const headers = (bearer: string) => ({ Accept: "application/vnd.github+json", Authorization: `Bearer ${bearer}`, "X-GitHub-Api-Version": GITHUB_API_VERSION, "User-Agent": `hapi-factory/${HAPI_VERSION}` });
+
+/** An error as one short line, with `secret` (when given) blanked out. */
+function oneLine(e: unknown, secret?: string): string {
+  let s = (e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").trim();
+  if (secret !== undefined && secret !== "") s = s.split(secret).join("[redacted]");
+  return s.slice(0, 300);
+}
 
 /** One GET. Redirects are refused, so a credential never follows one. */
 async function get(run: AuditRun, path: string, bearer: string): Promise<{ status: number; json: unknown }> {
   const res = await run.ctx.fetch(`${GITHUB_API}${path}`, {
     method: "GET",
-    headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${bearer}`, "X-GitHub-Api-Version": GITHUB_API_VERSION, "User-Agent": `hapi-factory/${HAPI_VERSION}` },
+    headers: headers(bearer),
     redirect: "error",
   });
   const text = await res.text();
@@ -101,33 +126,66 @@ async function tokenFromFile(file: string): Promise<string> {
   return token;
 }
 
-/** The credential for a repo's reads (memoized per repo). */
+/**
+ * Revoke the audit's own token when the audit ends. GitHub answers 204 when it revoked it; anything else (another
+ * status, or a request that fails) prints one warning line on stderr naming the App, the repo and the status, never
+ * the token. It never changes the audit's results or exit code: the token expires within the hour regardless.
+ */
+async function revokeAuditToken(run: AuditRun, appName: string, repo: RepoRef, token: string, expiresAt: string): Promise<void> {
+  let why: string;
+  try {
+    const res = await run.ctx.fetch(`${GITHUB_API}/installation/token`, { method: "DELETE", headers: headers(token), redirect: "error" });
+    if (res.status === 204) return;
+    why = `HTTP ${res.status}`;
+  } catch (e) {
+    why = `the request failed: ${oneLine(e, token)}`;
+  }
+  console.error(
+    `hapi audit: warning: GitHub didn't confirm revoking the read-only ${appName} installation token the audit minted for ${repoName(repo)} (DELETE /installation/token: ${why}); ` +
+      `it stays valid until ${expiresAt}, at most an hour; suspend the App's installation to end it sooner (docs/runbooks/github-apps.md)`,
+  );
+}
+
+/**
+ * The credential for a repo's reads (memoized per repo). The operator's token file, else a read-only App token:
+ * hapi-planner first, then hapi-factory. An App whose keys aren't in host.env is passed over (a skip if neither has
+ * them), and so is one whose keys load but which can't mint for this repo (not installed there, suspended, refused),
+ * with its reason kept: if neither App mints, the reasons are a fail. A token broader than requested is a fail at
+ * once (mintInstallationToken has revoked it), never a reason to try the other App. No reason holds a token.
+ */
 function credential(run: AuditRun, repo: RepoRef): Promise<Credential> {
   return run.once(`gh-cred:${repoName(repo)}`, async (): Promise<Credential> => {
     const { ctx } = run;
     if (ctx.githubTokenFile !== undefined) return { token: await tokenFromFile(ctx.githubTokenFile), via: "the operator's token (--github-token-file)" };
-    const missing: string[] = [];
+    const noKeys: string[] = [];
+    const cannotMint: string[] = [];
     for (const app of ["planner", "factory"] as const) {
+      const appName = APPS[app].name;
       let creds;
       try {
         creds = await appCredentials(app, ctx.env);
       } catch (e) {
-        missing.push((e as Error).message);
+        noKeys.push(`${appName}: ${oneLine(e)}`);
         continue;
       }
       const common = { ...creds, fetch: ctx.fetch, now: ctx.now };
-      const installationId = await findInstallationId({ ...common, owner: repo.owner, repo: repo.name });
-      const { token } = await mintInstallationToken({ ...common, installationId, repositories: [repo.name], permissions: { contents: "read", metadata: "read" } });
-      run.cleanups.push(async () => {
-        await ctx.fetch(`${GITHUB_API}/installation/token`, {
-          method: "DELETE",
-          headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${token}`, "X-GitHub-Api-Version": GITHUB_API_VERSION, "User-Agent": `hapi-factory/${HAPI_VERSION}` },
-          redirect: "error",
-        });
-      });
-      return { token, via: `a read-only ${APPS[app].name} installation token (contents and metadata read, revoked when the audit ends)` };
+      let minted: { token: string; expiresAt: string };
+      try {
+        const installationId = await findInstallationId({ ...common, owner: repo.owner, repo: repo.name });
+        minted = await mintInstallationToken({ ...common, installationId, repositories: [repo.name], permissions: { contents: "read", metadata: "read" } });
+      } catch (e) {
+        if (e instanceof TokenScopeError) throw new Error(`${appName}: ${oneLine(e)} The audit tries no other App after a token broader than requested`);
+        cannotMint.push(`${appName}: ${oneLine(e)}`);
+        continue;
+      }
+      const { token, expiresAt } = minted;
+      run.cleanups.push(() => revokeAuditToken(run, appName, repo, token, expiresAt));
+      return { token, via: `a read-only ${appName} installation token (contents and metadata read, revoked when the audit ends)` };
     }
-    return { none: `no GitHub credentials: pass --github-token-file, or let the audit mint a read-only App token from the App keys (${missing[0] ?? "host.env"})` };
+    if (cannotMint.length > 0) {
+      throw new Error(`neither App could mint a read-only token for ${repoName(repo)} (pass --github-token-file, or fix the App): ${[...cannotMint, ...noKeys].join("; ")}`);
+    }
+    return { none: `no GitHub credentials: pass --github-token-file, or let the audit mint a read-only App token from the App keys (${noKeys.join("; ") || "host.env"})` };
   });
 }
 
@@ -247,10 +305,10 @@ export async function githubRulesets(run: AuditRun): Promise<CheckResult[]> {
 const LEVELS: Record<string, number> = { read: 1, write: 2, admin: 3 };
 
 /** What in `granted` goes beyond `app`'s runbook permissions (administration and workflows always do). */
-function beyond(app: AppName, granted: unknown): string[] {
+function beyond(app: AppName, granted: Record<string, unknown>): string[] {
   const allowed: Record<string, string> = APPS[app].permissions;
   const out: string[] = [];
-  for (const [k, v] of Object.entries(asRecord(granted) ?? {})) {
+  for (const [k, v] of Object.entries(granted)) {
     if (k === "administration" || k === "workflows") out.push(`${k}: ${String(v)}`);
     else if (!Object.hasOwn(allowed, k) || (LEVELS[String(v)] ?? Infinity) > LEVELS[allowed[k]!]!) out.push(`${k}: ${String(v)}`);
   }
@@ -280,10 +338,16 @@ export async function githubAppPerms(run: AuditRun): Promise<CheckResult[]> {
       try {
         const self = asRecord(await getOk(run, "/app", jwt));
         const inst = asRecord(await getOk(run, `${repoPath(repo)}/installation`, jwt));
-        for (const p of beyond(app, self?.permissions)) problems.push(`${appName} has ${p}, beyond docs/runbooks/github-apps.md's table`);
-        for (const p of beyond(app, inst?.permissions)) problems.push(`${appName}'s installation on ${name} has ${p}`);
+        // A response with nothing to check fails: an App is never cleared on what GitHub didn't say.
+        const selfPerms = asRecord(self?.permissions);
+        const instPerms = asRecord(inst?.permissions);
+        if (selfPerms === undefined) problems.push(`${appName}: GET /app returned no permissions object, so the App's permissions can't be checked`);
+        else for (const p of beyond(app, selfPerms)) problems.push(`${appName} has ${p}, beyond docs/runbooks/github-apps.md's table`);
+        if (instPerms === undefined) problems.push(`${appName}: GET ${repoPath(repo)}/installation returned no permissions object, so its installation's permissions can't be checked`);
+        else for (const p of beyond(app, instPerms)) problems.push(`${appName}'s installation on ${name} has ${p}`);
         if (inst?.repository_selection !== "selected") problems.push(`${appName}'s installation covers all repositories, not selected ones`);
         if (typeof self?.id === "number") checked.push({ app, id: self.id });
+        else problems.push(`${appName}: GET /app returned no App id, so whether the App is a ruleset bypass actor can't be checked`);
       } catch (e) {
         problems.push(`${appName}: ${(e as Error).message}`);
       }
@@ -322,7 +386,9 @@ const AI_ACTIONS = [
 ];
 /** An AI agent CLI started in a `run:` step. */
 const AI_CLI = /(?:^|[\s;&|(])(?:npx\s+(?:-y\s+)?)?(?:@anthropic-ai\/claude-code|@openai\/codex|@google\/gemini-cli|claude|codex|gemini|aider|opencode)(?:@\S*)?(?=\s|$)/m;
-const CREDENTIAL = /\$\{\{\s*(?:secrets\.[A-Za-z0-9_]+|github\.token)\s*\}\}/g;
+/** actions/checkout, at any ref: by default it writes the job's GITHUB_TOKEN into .git/config (`persist-credentials: true`). */
+const CHECKOUT = /^actions\/checkout(?:@|$)/i;
+const CHECKOUT_TOKEN = "actions/checkout's persisted GITHUB_TOKEN (no persist-credentials: false)";
 
 /** A workflow's triggers, in any spelling of `on`. */
 function triggers(doc: Record<string, unknown>): string[] {
@@ -333,13 +399,101 @@ function triggers(doc: Record<string, unknown>): string[] {
   return Object.keys(asRecord(on) ?? {});
 }
 
-/** The credentials the given parts of a workflow reference, in any field at any depth (secret names, github.token), or grant (`id-token: write` in a permissions block). */
-function credentials(...parts: unknown[]): string[] {
-  const found = new Set<string>();
-  for (const p of parts) {
-    for (const m of JSON.stringify(p ?? null).matchAll(CREDENTIAL)) found.add(m[0].replace(/\$\{\{\s*|\s*\}\}/g, ""));
-    if (asRecord(p)?.["id-token"] === "write") found.add("id-token: write");
+/** Every string in a workflow value, mapping keys included, at any depth. */
+function strings(v: unknown, out: string[] = []): string[] {
+  if (typeof v === "string") out.push(v);
+  else if (Array.isArray(v)) for (const x of v) strings(x, out);
+  else if (v !== null && typeof v === "object") {
+    for (const [k, x] of Object.entries(v)) {
+      out.push(k);
+      strings(x, out);
+    }
   }
+  return out;
+}
+
+/** The bodies of a string's `${{ … }}` expressions. A `}}` inside a quoted string doesn't end one; an unclosed one runs to the end. */
+function expressions(s: string): string[] {
+  const out: string[] = [];
+  for (let i = s.indexOf("${{"); i !== -1; i = s.indexOf("${{", i)) {
+    let j = i + 3;
+    let quoted = false;
+    for (; j < s.length; j++) {
+      // An escaped quote ('') toggles twice, so it stays inside the string.
+      if (s[j] === "'") quoted = !quoted;
+      else if (!quoted && s.startsWith("}}", j)) break;
+    }
+    out.push(s.slice(i + 3, j));
+    i = j + 2;
+  }
+  return out;
+}
+
+/** An expression's tokens: a quoted string, a name (contexts and properties may hold `-`), or one other character. */
+const EXPRESSION_TOKEN = /'(?:[^']|'')*'|[A-Za-z_][A-Za-z0-9_-]*|\S/g;
+
+/**
+ * The credentials one expression reads. Context and property names are matched without regard to case, as GitHub
+ * reads them, and a name inside a quoted string is only text.
+ * - `secrets.NAME` or `secrets['NAME']`: that secret; `secrets[<an expression>]`: a secret by a computed name;
+ *   `secrets` as a whole (as in `toJSON(secrets)`): every secret.
+ * - `github.token` or `github['token']`: the job's token; `github` as a whole (as in `toJSON(github)`), or by a
+ *   computed property: the token too, which the github context holds.
+ */
+function expressionCredentials(body: string): string[] {
+  const t = [...body.matchAll(EXPRESSION_TOKEN)].map((m) => m[0]);
+  const literal = (x: string | undefined) => (x?.startsWith("'") ? x.slice(1, -1).replace(/''/g, "'") : undefined);
+  const out: string[] = [];
+  for (let i = 0; i < t.length; i++) {
+    const context = t[i]!.toLowerCase();
+    // A property (steps.secrets, event.github) isn't the context.
+    if ((context !== "secrets" && context !== "github") || t[i - 1] === ".") continue;
+    let property: string | undefined;
+    let computed = false;
+    if (t[i + 1] === "." && /^[A-Za-z_]/.test(t[i + 2] ?? "")) property = t[i + 2];
+    else if (t[i + 1] === "[") {
+      property = t[i + 3] === "]" ? literal(t[i + 2]) : undefined;
+      computed = property === undefined;
+    }
+    if (context === "secrets") out.push(property !== undefined ? `secrets.${property}` : computed ? "a secret by a computed name (secrets[…])" : "every secret (secrets as a whole)");
+    else if (property === undefined) out.push(computed ? "github.token" : "github.token (the whole github context)");
+    else if (property.toLowerCase() === "token") out.push("github.token");
+  }
+  return out;
+}
+
+/**
+ * What a job's GITHUB_TOKEN permissions grant that counts as a credential: `write-all`, or any scope at `write`
+ * (`id-token: write` lets every step of the job mint an OIDC token). `read-all`, `{}` and read scopes grant none.
+ * A form GitHub doesn't read counts, since it can't be cleared.
+ */
+function permissionGrants(p: unknown): string[] {
+  if (p === undefined || p === null) return [];
+  if (typeof p === "string") return p.trim().toLowerCase() === "read-all" ? [] : p.trim().toLowerCase() === "write-all" ? ["permissions: write-all"] : [`permissions: ${p.trim()} (a form the audit can't read)`];
+  const scopes = asRecord(p);
+  if (scopes === undefined) return [`permissions: ${JSON.stringify(p)} (a form the audit can't read)`];
+  return Object.entries(scopes)
+    .filter(([, level]) => String(level).trim().toLowerCase() === "write")
+    .map(([scope]) => `${scope}: write`);
+}
+
+/** Whether a step is actions/checkout keeping the job's token in .git/config: anything but `persist-credentials: false` does. */
+function persistsToken(step: Record<string, unknown> | undefined): boolean {
+  if (typeof step?.uses !== "string" || !CHECKOUT.test(step.uses.trim())) return false;
+  const persist = asRecord(step.with)?.["persist-credentials"];
+  return !(persist === false || (typeof persist === "string" && persist.trim().toLowerCase() === "false"));
+}
+
+/**
+ * The credentials a job holds: what its expressions read (any field at any depth, and the workflow's env); what its
+ * effective GITHUB_TOKEN permissions grant (the job's own block replaces the workflow's); and an actions/checkout step
+ * that leaves the token in .git/config.
+ */
+function jobCredentials(doc: Record<string, unknown>, job: Record<string, unknown>): string[] {
+  const found = new Set<string>();
+  for (const s of strings([job, doc.env])) for (const body of expressions(s)) for (const c of expressionCredentials(body)) found.add(c);
+  for (const g of permissionGrants(job.permissions ?? doc.permissions)) found.add(g);
+  for (const step of Array.isArray(job.steps) ? job.steps.map(asRecord) : []) if (persistsToken(step)) found.add(CHECKOUT_TOKEN);
   return [...found].sort();
 }
 
@@ -358,9 +512,9 @@ export function aiWorkflowProblems(path: string, text: string): string[] {
   for (const [jobName, job] of Object.entries(asRecord(doc.jobs) ?? {})) {
     const j = asRecord(job) ?? {};
     // Everything the job holds: every field of every step (`run:` included, where a secret can be written inline,
-    // or exported to $GITHUB_ENV for the steps after it), the job's own env, permissions and other fields, and the
-    // workflow's env and permissions.
-    const creds = credentials(j, j.permissions, doc.env, doc.permissions);
+    // or exported to $GITHUB_ENV for the steps after it), the job's own env and other fields, the workflow's env,
+    // the job's effective permissions, and a checkout that keeps its token.
+    const creds = jobCredentials(doc, j);
     if (creds.length === 0) continue;
     for (const step of Array.isArray(j.steps) ? j.steps.map(asRecord) : []) {
       const uses = typeof step?.uses === "string" ? step.uses : undefined;

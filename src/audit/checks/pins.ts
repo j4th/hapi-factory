@@ -45,13 +45,20 @@ export function dockerfileOf(s: ComposeService): string | undefined {
 const DIGEST = /@sha256:[0-9a-f]{64}$/;
 const EXACT = /^v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?$/;
 
-/** A Dockerfile's instructions, line continuations joined and comments dropped. */
+/**
+ * A Dockerfile's instructions, comments dropped and line continuations joined, in Docker's order: comment lines
+ * (and blank lines) go first, so a `#` line inside a continued RUN is neither read as words nor ends the RUN.
+ * A heredoc body (`RUN <<EOF`) is not read as the RUN's command (docs/audit.md, "Not covered yet").
+ */
 function instructions(text: string): { op: string; args: string }[] {
   return text
-    .replace(/\\\r?\n/g, " ")
+    .split(/\r?\n/)
+    .filter((l) => l.trim() !== "" && !l.trim().startsWith("#"))
+    .join("\n")
+    .replace(/\\\n/g, " ")
     .split("\n")
     .map((l) => l.trim())
-    .filter((l) => l !== "" && !l.startsWith("#"))
+    .filter((l) => l !== "")
     .map((l) => {
       const m = /^(\S+)\s*(.*)$/.exec(l)!;
       return { op: m[1]!.toUpperCase(), args: m[2]! };
@@ -110,6 +117,19 @@ export function installs(run: string): { installer: string; pkg: string; pinned:
   return out;
 }
 
+/** A shell that runs what it reads on stdin (`sh -c '…'` reads stdin as data, so it doesn't count), behind optional sudo or env. */
+const STDIN_SHELL = String.raw`(?:sudo\s+(?:-\S+\s+)*)?(?:env\s+(?:-\S+\s+|[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*)?(?:\S*\/)?(?:ba|da|z|a|k)?sh(?=$|[\s;&|)'"])(?!\s+-c\b)`;
+/** A download piped into such a shell, through any stages (`curl … | sh`, `wget -qO- … | gunzip | bash -s`). */
+const PIPE_TO_SHELL = new RegExp(String.raw`\b(?:curl|wget)\b[^|;&\n]*(?:\|(?!\|)[^|;&\n]*)*?\|(?!\|)\s*${STDIN_SHELL}`);
+/** A download run through command or process substitution: `sh -c "$(curl …)"`, `bash <(curl …)`, `eval "$(wget …)"`, `. <(curl …)`. */
+const SUBSTITUTED_DOWNLOAD = /(?:(?:^|[\s;&|(/])(?:ba|da|z|a|k)?sh(?:\s+-\S+)*|\beval|\bsource|(?:^|[\s;&|(])\.)\s+["']?(?:\$\(|`|<\()\s*(?:curl|wget)\b/;
+
+/** Whether a RUN command runs a script it downloads without checking it: whatever the URL serves that day is what gets installed. */
+export function pipesDownloadIntoShell(command: string): boolean {
+  // For the pipe, quoted words are emptied first, so a quoted URL's `&` or a quoted `|` doesn't split the pipeline.
+  return PIPE_TO_SHELL.test(command.replace(/"[^"]*"|'[^']*'/g, '""')) || SUBSTITUTED_DOWNLOAD.test(command);
+}
+
 /** pins.versions */
 export async function pinsVersions(run: AuditRun): Promise<CheckResult[]> {
   const id = "pins.versions";
@@ -160,6 +180,9 @@ export async function pinsVersions(run: AuditRun): Promise<CheckResult[]> {
       for (const i of installs(command)) {
         packages++;
         if (!i.pinned) problems.push(`${file}: ${i.installer} ${i.pkg} has no version (install packages by name at an exact version)`);
+      }
+      if (pipesDownloadIntoShell(command)) {
+        problems.push(`${file}: a RUN pipes a download into a shell (curl or wget into sh, bash or eval), which installs whatever the URL serves that day: download it to a file, check its SHA-256, then run it, or install a pinned package`);
       }
     }
   }

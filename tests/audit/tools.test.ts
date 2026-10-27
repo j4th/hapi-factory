@@ -65,6 +65,33 @@ describe("tools.archon-validate", () => {
     expect(r.detail).toContain("could not read");
   });
 
+  test("a command that exits non-zero fails, naming it, even when it prints clean output", async () => {
+    // validate workflows: clean JSON, but exit 3.
+    let w = await cleanWorld();
+    w.archonValidate = { code: 3, out: readJson("archon-validate-v0.12.1.json") };
+    let r = await check(w, "tools.archon-validate");
+    expect(r.status).toBe("fail");
+    expect(r.detail).toContain("archon validate workflows --json exited 3");
+
+    // ai alias list and ai tier list: every binding read as generated, but a non-zero exit.
+    for (const [nth, command, code] of [
+      [2, "archon ai alias list --json", 1],
+      [3, "archon ai tier list --json", 2],
+    ] as const) {
+      w = await cleanWorld();
+      const real = w.ctx.exec;
+      w.ctx.exec = async (cmd) => {
+        const out = await real(cmd);
+        if (!(cmd[1] === "run" && cmd.includes(ARCHON_IMAGE))) return out;
+        let n = 0;
+        return { ...out, stdout: out.stdout.replace(/@@hapi-audit 0@@/g, (m) => (++n === nth ? `@@hapi-audit ${code}@@` : m)) };
+      };
+      r = await check(w, "tools.archon-validate");
+      expect([command, r.status]).toEqual([command, "fail"]);
+      expect([command, r.detail]).toEqual([command, expect.stringContaining(`${command} exited ${code}`)]);
+    }
+  });
+
   test("an alias Archon doesn't read as generated fails, naming it (H-030)", async () => {
     const w = await cleanWorld();
     const real = w.ctx.exec;

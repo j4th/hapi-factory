@@ -17,8 +17,10 @@ Run it **as hapi, in hapi's checkout**, where the stack runs: it reads hapi's de
 sudo -iu hapi
 export XDG_RUNTIME_DIR=/run/user/$(id -u)
 cd ~/hapi-factory
-mise run audit -- --strict --repo "$OWNER/hapi-factory"
+mise run audit -- --strict --repo "$OWNER/hapi-factory" --github-token-file <file>
 ```
+
+`<file>` holds the operator's own GitHub token, mode `0600`. A strict run needs it: GitHub shows a ruleset's bypass actors only to a token that can write the ruleset, which the Apps never can, so without it the bypass parts of `github.rulesets` and `github.app-perms` skip, and `--strict` turns each skip into a fail ([GitHub credentials](#github-credentials)).
 
 | Flag | What it does |
 |---|---|
@@ -119,13 +121,13 @@ Without the stack and without `--repo`, as on a development machine, most checks
 
 ### pins.versions
 
-**Verifies.** From the checkout's own files: every `[tools]` entry of `mise.toml` is an exact version (`MAJOR.MINOR.PATCH`, optionally with a suffix), never `latest`, a range or a prefix such as `3.14` (which mise reads as "the newest 3.14.x"); every `stack/compose.yaml` service's `image:` is pinned by digest, except a service built here, which must have `pull_policy: build`; every Dockerfile `FROM` and `COPY --from=` image is pinned by digest (an earlier stage's name is fine); and every package a Dockerfile `RUN` installs by name (`apt-get`, `apt`, `apk`, `pip`, `uv pip`, `uv tool`, `uv python`, `npm`, `bun`, `pnpm`, `yarn`, `go install`) names an exact version.
+**Verifies.** From the checkout's own files: every `[tools]` entry of `mise.toml` is an exact version (`MAJOR.MINOR.PATCH`, optionally with a suffix), never `latest`, a range or a prefix such as `3.14` (which mise reads as "the newest 3.14.x"); every `stack/compose.yaml` service's `image:` is pinned by digest, except a service built here, which must have `pull_policy: build`; every Dockerfile `FROM` and `COPY --from=` image is pinned by digest (an earlier stage's name is fine); every package a Dockerfile `RUN` installs by name (`apt-get`, `apt`, `apk`, `pip`, `uv pip`, `uv tool`, `uv python`, `npm`, `bun`, `pnpm`, `yarn`, `go install`) names an exact version; and no `RUN` pipes a download into a shell (`curl … | sh`, `wget -qO- … | sudo bash`, through any stages such as `| gunzip |`; or `sh -c "$(curl …)"`, `bash <(curl …)`, `eval "$(wget …)"`), which installs whatever the URL serves that day. A `curl … | sh -c '…'` doesn't count (`-c` reads stdin as data), nor does a download piped into something other than a shell. The Dockerfile is read as Docker reads it: comment lines are dropped before `\` continuations are joined, so a `#` line inside a multi-line `RUN` is neither taken for package names nor ends the `RUN`.
 
 **Why.** Spec §11.6 and the Global Constraints: pin every tool, image and plugin; never track `main` or `latest`.
 
 **Credential.** None.
 
-**Fix.** Pin it: an exact version in `mise.toml` (README, "Toolchain and pinning"), a tag and digest for an image ([docs/runbooks/stack.md](runbooks/stack.md#pinned-images)), `name=version` / `name==version` / `name@version` for a package.
+**Fix.** Pin it: an exact version in `mise.toml` (README, "Toolchain and pinning"), a tag and digest for an image ([docs/runbooks/stack.md](runbooks/stack.md#pinned-images)), `name=version` / `name==version` / `name@version` for a package. For a piped installer, download it to a file, check its SHA-256 (`echo "<sha256>  /tmp/x.sh" | sha256sum -c`), then run it; or install a pinned package, or `COPY --from=` a pinned image instead.
 
 **Skip.** Never: it needs only the checkout.
 
@@ -134,6 +136,7 @@ Without the stack and without `--repo`, as on a development machine, most checks
 **Verifies.** Archon's own reading of the deployed `archon/config.yaml` and Pi dir, in the image the stack runs:
 - `archon validate workflows --json` reports no error and **no parse warning**. Archon only warns about a key it doesn't know (an `unknown key ... will be ignored` parse warning) and drops it, and exits 0, so the audit treats a parse warning as a failure. Its other warnings are listed in the detail.
 - `archon ai alias list --json` and `ai tier list --json` show every generated alias and tier with its `effective` binding equal to the generated one: the `@<role>-retry` names, the bare claude-provider model ids and the `{provider, model, effort}` syntax are read as generated (H-030). A binding Archon refuses fails the whole run with Archon's error.
+- Each of the three commands exits 0. One that exits non-zero fails, named (`archon validate workflows --json exited 1`), even if what it printed reads as clean.
 
 It runs `docker run --rm --pull never --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true` as the image's user, with only the deployed config and Pi dir mounted read-only, the archon settings of `serviceEnvironment` and no secret, in a scratch git repo inside the container (Archon needs one). The image is the one `mise run up` built (`hapi-factory/archon:0.12.1`), or else `stack/archon/Dockerfile`'s pinned `FROM` if that is here. It never pulls, and never touches the running stack.
 
@@ -224,7 +227,7 @@ Rules in a ruleset in `evaluate` or `disabled` mode don't apply to `main`, so th
 
 ### github.app-perms
 
-**Verifies**, per `--repo`, with each App's own JWT: `GET /app` and `GET /repos/{owner}/{repo}/installation` list no `administration` or `workflows`, and no permission beyond the runbook's table ([the two Apps](runbooks/github-apps.md#the-two-apps)); the installation covers selected repositories only; and neither App (by its App id) is a bypass actor on any ruleset.
+**Verifies**, per `--repo`, with each App's own JWT: `GET /app` and `GET /repos/{owner}/{repo}/installation` list no `administration` or `workflows`, and no permission beyond the runbook's table ([the two Apps](runbooks/github-apps.md#the-two-apps)); the installation covers selected repositories only; and neither App (by its App id) is a bypass actor on any ruleset. A response with no `permissions` object (missing, or not an object), or a `GET /app` with no App id, fails: an App is never cleared on what GitHub didn't say.
 
 **Why.** Spec §11.5: neither App can merge or bypass rulesets; no App ever gets Administration.
 
@@ -236,19 +239,24 @@ Rules in a ruleset in `evaluate` or `disabled` mode don't apply to `main`, so th
 
 ### repo.ai-workflows
 
-**Verifies**, per `--repo`: no `.github/workflows/*.yml` or `*.yaml` runs an AI agent with a credential on `issue_comment`, `issues`, `pull_request_review`, `pull_request_review_comment` or `pull_request_target`. An AI agent is a known AI action (`anthropics/claude-code-action`, `anthropics/claude-code-base-action`, `openai/codex-action`, `google-github-actions/run-gemini-cli`, `google-gemini/gemini-cli-action`, `actions/ai-inference`) or an AI CLI in a `run:` step (`claude`, `@anthropic-ai/claude-code`, `codex`, `gemini`, `aider`, `opencode`). A credential is a `secrets.*` or `github.token` reference anywhere in the agent's job (any field of any step, so a secret written inline in a `run:` line, such as `run: ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }} claude -p "$BODY"`, counts; the job's `env` and other fields) or in the workflow's `env`, or `id-token: write` on the job or the workflow. The whole job counts, not just the agent's step, because a job's steps share one runner: an earlier step can export a secret to `$GITHUB_ENV` for the agent, and the agent can rewrite what a later step runs with its secret. The detail names the action or the CLI, never the rest of a `run:` line. A workflow that doesn't parse fails, since it can't be cleared. The tests use a copy of the mtg repo's comment-triggered `claude.yml` (H-036); no test reads another repo.
+**Verifies**, per `--repo`: no `.github/workflows/*.yml` or `*.yaml` runs an AI agent with a credential on `issue_comment`, `issues`, `pull_request_review`, `pull_request_review_comment` or `pull_request_target`. An AI agent is a known AI action (`anthropics/claude-code-action`, `anthropics/claude-code-base-action`, `openai/codex-action`, `google-github-actions/run-gemini-cli`, `google-gemini/gemini-cli-action`, `actions/ai-inference`) or an AI CLI in a `run:` step (`claude`, `@anthropic-ai/claude-code`, `codex`, `gemini`, `aider`, `opencode`). A credential, in the agent's job, is any of:
+- **an expression that reads a secret or the job's token**, anywhere in the job (any field of any step, so a secret written inline in a `run:` line, such as `run: ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }} claude -p "$BODY"`, counts; the job's `env` and other fields) or in the workflow's `env`. That is any `${{ … }}` expression that names `secrets.NAME` or `secrets['NAME']` (also inside a larger expression, as in `${{ secrets.ANTHROPIC_API_KEY || '' }}`), `secrets` by a computed name, or `secrets` as a whole (as in `${{ toJSON(secrets) }}`, every secret); or `github.token`, `github['token']`, or the `github` context as a whole (`${{ toJSON(github) }}` holds the token). Names are matched without regard to case, as GitHub reads them; a word inside a quoted string (`contains(github.event.comment.body, 'secrets')`) or another context's field (`steps.secrets.outputs.x`) is only text.
+- **a write grant in the job's GITHUB_TOKEN permissions:** `permissions: write-all` (which includes `id-token: write`, so every step of the job can mint an OIDC token, as an OIDC-authenticated AI action does), or any scope at `write`, `id-token: write` included. The job's own `permissions` replace the workflow's, as GitHub applies them; `read-all`, `{}` and read scopes grant none.
+- **an `actions/checkout` step without `persist-credentials: false`:** by default it writes the job's GITHUB_TOKEN into `.git/config`, where the agent can read it, with no expression in sight.
+
+The whole job counts, not just the agent's step, because a job's steps share one runner: an earlier step can export a secret to `$GITHUB_ENV` for the agent, and the agent can rewrite what a later step runs with its secret. The detail names the action or the CLI and each credential, never the rest of a `run:` line. A workflow that doesn't parse fails, since it can't be cleared. The tests use a copy of the mtg repo's comment-triggered `claude.yml` (H-036); no test reads another repo.
 
 **Why.** Spec §7 and §11.7: the onboarding PR removes or hardens any workflow that runs an AI agent with secrets on PR, issue or comment triggers (the "Comment and Control" class), and `mise run audit` fails until that's done. Anyone who can comment can steer such an agent.
 
 **Credential.** The operator's token, or a read-only App installation token (Contents read).
 
-**Fix.** Remove the workflow, or move the agent to a trigger that gets no secrets (`pull_request`, where a fork's PR runs without them).
+**Fix.** Remove the workflow, or move the agent to a trigger that gets no secrets (`pull_request`, where a fork's PR runs without them). If it must stay on its trigger, give its job nothing: no secret, `permissions:` with read scopes only (or `{}`), and `persist-credentials: false` on any checkout.
 
 **Skip.** No `--repo` or no credentials.
 
 ## GitHub credentials
 
-Every GitHub check makes GET requests only. The audit's own App token is the one exception: it is minted (a POST) and revoked when the audit ends (a DELETE).
+Every GitHub check reads repo state with GET requests only. The audit's own App token is the one exception: it is minted (one POST, for one repo, `contents: read` and `metadata: read` only) and revoked when the audit ends (one DELETE). **Ruling (R2, the controller, Task 6 security fix pass):** that POST and that DELETE are accepted under amendment set 2's ruling 5 (GitHub auth: least privilege, read only); every read of the repo's rules, rulesets, App settings and workflow files stays a GET.
 
 | Endpoint | Permission it needs | Source |
 |---|---|---|
@@ -260,7 +268,9 @@ Every GitHub check makes GET requests only. The audit's own App token is the one
 Which credential each check uses:
 
 - **`--github-token-file`, the operator's token,** for `github.rulesets` and `repo.ai-workflows`. Write access to a ruleset is repository Administration, which the Apps never get (spec §11.5; [the runbook](runbooks/github-apps.md#the-two-apps)), so this is the only way the bypass checks run. A fine-grained token scoped to the one repo, with Administration and Metadata read and Contents read, is the narrowest to try first; GitHub's docs say write access, so if `github.rulesets` still says it got no `bypass_actors`, a token with Administration write is needed (the audit uses it for GETs only). The file must be a regular file only its owner can read (`chmod 600`); the token is never printed, logged or put in argv.
-- **Else an App installation token,** minted for the one repo with `contents: read` and `metadata: read` only, from `hapi-planner`'s keys (or `hapi-factory`'s) in `host.env`, the way `hapi token mint` gets them, and checked by `mintInstallationToken` (a broader token is refused and revoked). Metadata read covers the rules and rulesets endpoints and Contents read the workflow files, but not `bypass_actors`, so `github.rulesets` and `github.app-perms` skip their bypass part. The token stays in memory and is revoked when the audit ends.
+- **Else an App installation token,** minted for the one repo with `contents: read` and `metadata: read` only, from the App keys in `host.env`, the way `hapi token mint` gets them, and checked by `mintInstallationToken` (a broader token is refused and revoked). Metadata read covers the rules and rulesets endpoints and Contents read the workflow files, but not `bypass_actors`, so `github.rulesets` and `github.app-perms` skip their bypass part. The token stays in memory and is revoked when the audit ends.
+  - **Which App.** `hapi-planner` first, then `hapi-factory`. An App whose keys aren't in `host.env` is passed over, and so is one whose keys load but which can't mint for this repo (it isn't installed there, its installation is suspended, GitHub refuses the request); its reason is kept. If neither mints, the GitHub checks fail with each App's reason (they skip, "no GitHub credentials", only when neither App's keys are there). A token GitHub returns broader than requested is a fail at once, naming the App: the audit never tries the other App after it. No reason holds a token.
+  - **The revoke.** GitHub confirms a revoke with `204`. Any other answer, or a request that fails, prints one warning line on stderr naming the App, the repo and the HTTP status (or the error), never the token: `hapi audit: warning: GitHub didn't confirm revoking the read-only hapi-planner installation token the audit minted for $OWNER/hapi-factory (DELETE /installation/token: HTTP 500); it stays valid until <expires_at> ...`. The token then lasts until it expires, at most an hour (suspend the App's installation to end it sooner, [the runbook](runbooks/github-apps.md)). The warning doesn't change the results or the exit code.
 - **`github.app-perms` always uses each App's JWT,** which needs no permission.
 - With neither, each GitHub check skips: "no GitHub credentials".
 
@@ -280,4 +290,6 @@ On 2026-10-27, against the pinned images (`ghcr.io/coleam00/archon:0.12.1@sha256
 - **Unknown top-level keys in Archon's config.yaml:** Archon 0.12.1 ignores them without a word, so `tools.archon-validate` can't see them; today the generated file holds only `tiers` and `aliases`, which Archon checks strictly (H-152).
 - **The audit in CI** (spec §11.8: "It runs in CI on hapi-factory"): `.github/workflows/ci.yml` is a protected path (H-154).
 - **Reusable workflows and other triggers:** `repo.ai-workflows` doesn't follow a job that calls a reusable workflow, or flag `workflow_run` (H-155).
+- **A job's default token:** a job with no `permissions` block, in a workflow with none, gets the repository's default GITHUB_TOKEN permissions (read and write under the permissive setting), which `repo.ai-workflows` doesn't read; such a job counts only through its expressions and its checkout. A read-only token (`read-all`, read scopes) doesn't count either, and neither does an action whose own `action.yml` defaults an input to `${{ github.token }}`, since the audit doesn't fetch the action (H-155).
+- **`pins.versions` and the `RUN`s it can't read:** the body of a heredoc `RUN <<EOF`, which isn't read as the `RUN`'s command, so a package it installs isn't checked; and an installer that is downloaded to a file and run without a checksum (`curl -o i.sh … && sh i.sh`), which isn't a pipe into a shell (H-157).
 - **`private/` tracked in this repo:** a check Task 7b adds (H-058). **Active skill forks:** Plan 04 (H-109).

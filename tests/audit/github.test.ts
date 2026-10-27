@@ -9,8 +9,9 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { aiWorkflowProblems } from "../../src/audit/checks/github";
-import { runAudit } from "../../src/audit/index";
-import { API, APP_IDS, cleanup, cleanWorld, FIXTURES, githubRoutes, goodRulesets, hostEnv, NAME, only, OWNER } from "./helpers";
+import { auditCommand, runAudit } from "../../src/audit/index";
+import { API, APP_IDS, APP_KEY, appOf, capture, cleanup, cleanWorld, FIXTURES, githubRoutes, goodRulesets, hostEnv, MINTED_TOKEN, NAME, only, OWNER } from "./helpers";
+import { envFileText } from "../../src/secrets/files";
 
 afterEach(cleanup);
 
@@ -38,6 +39,19 @@ const mutate = (f: (r: Record<string, any>[]) => void) => {
   return r;
 };
 const named = (r: Record<string, any>[], name: string) => r.find((x) => x.name === name)!;
+
+/** A world read with the audit's own App token: the App keys in host.env, no --github-token-file. */
+async function withAppToken(o: Parameters<typeof githubRoutes>[0] = {}): Promise<World> {
+  const w = await withToken(o);
+  delete w.ctx.githubTokenFile;
+  return w;
+}
+const posts = (w: World) => w.requests.filter((c) => c.method === "POST").map((c) => c.url);
+const deletes = (w: World) => w.requests.filter((c) => c.method === "DELETE");
+const INSTALLATION = `GET ${API}/repos/${OWNER}/${NAME}/installation`;
+const MINT = (id: number) => `${API}/app/installations/${id}/access_tokens`;
+type Route = World["routes"][string];
+const call = (route: Route, c: Parameters<Extract<Route, Function>>[0]) => (typeof route === "function" ? route(c) : route);
 
 describe("github.rulesets", () => {
   test("the runbook's rulesets pass, read with the operator's token, GET only", async () => {
@@ -116,6 +130,105 @@ describe("github.rulesets", () => {
   });
 });
 
+describe("the audit's own App token", () => {
+  test("hapi-planner first, then hapi-factory: an App not installed on the repo is passed over, not fatal", async () => {
+    const w = await withAppToken();
+    const real = w.routes[INSTALLATION]!;
+    w.routes[INSTALLATION] = (c) => (appOf(c) === "planner" ? { status: 404, body: { message: "Not Found" } } : call(real, c));
+    const r = await run(w);
+    expect(r.workflows.status).toBe("pass");
+    expect(r.workflows.detail).toContain("a read-only hapi-factory installation token");
+    expect(r.rulesets.status).toBe("pass");
+    expect(r.rulesets.detail).toContain("hapi-factory installation token");
+    expect(posts(w)).toEqual([MINT(12)]);
+    expect(deletes(w).length).toBe(1);
+  });
+
+  test("an App whose token request GitHub refuses is passed over too", async () => {
+    const w = await withAppToken();
+    w.routes[`POST ${MINT(11)}`] = { status: 403, body: { message: "Resource not accessible by integration" } };
+    const r = await run(w);
+    expect(r.workflows.status).toBe("pass");
+    expect(r.workflows.detail).toContain("hapi-factory installation token");
+    expect(posts(w)).toEqual([MINT(11), MINT(12)]);
+  });
+
+  test("an App whose keys aren't in host.env is passed over, as before", async () => {
+    const w = await withAppToken();
+    const file = join(w.ctx.env.XDG_RUNTIME_DIR!, "hapi", "env", "host.env");
+    writeFileSync(file, envFileText("host", { HAPI_FACTORY_APP_ID: String(APP_IDS.factory), HAPI_FACTORY_APP_PRIVATE_KEY: APP_KEY }), { mode: 0o600 });
+    const r = await run(w);
+    expect(r.workflows.status).toBe("pass");
+    expect(r.workflows.detail).toContain("hapi-factory installation token");
+    expect(posts(w)).toEqual([MINT(12)]);
+  });
+
+  test("when neither App can mint, the checks fail naming each App's reason, and never a token", async () => {
+    const w = await withAppToken();
+    w.routes[INSTALLATION] = () => ({ status: 404, body: { message: "Not Found" } });
+    const r = await run(w);
+    for (const x of [r.rulesets, r.workflows]) {
+      expect([x.id, x.status]).toEqual([x.id, "fail"]);
+      expect(x.detail).toContain(`hapi-planner: the App is not installed on ${OWNER}/${NAME}`);
+      expect(x.detail).toContain(`hapi-factory: the App is not installed on ${OWNER}/${NAME}`);
+    }
+    expect(posts(w)).toEqual([]);
+  });
+
+  test("a token broader than requested stops the search: a fail naming the App, and the next App is never tried", async () => {
+    const w = await withAppToken();
+    w.routes[`POST ${MINT(11)}`] = {
+      status: 201,
+      body: { token: MINTED_TOKEN, expires_at: "2030-01-01T00:00:00Z", permissions: { contents: "write", metadata: "read" }, repository_selection: "selected", repositories: [{ name: NAME }] },
+    };
+    const r = await run(w);
+    for (const x of [r.rulesets, r.workflows]) {
+      expect([x.id, x.status]).toEqual([x.id, "fail"]);
+      expect(x.detail).toContain("hapi-planner");
+      expect(x.detail).toContain("broader than requested");
+    }
+    expect(posts(w)).toEqual([MINT(11)]);
+    for (const x of r.all) expect(x.detail).not.toContain(MINTED_TOKEN);
+  });
+
+  test("it is revoked when the audit ends; a revoke GitHub confirms (204) prints nothing", async () => {
+    const w = await withAppToken();
+    const { err } = capture();
+    expect(await auditCommand([], w.ctx)).toBe(0);
+    expect(deletes(w).map((c) => [c.url, c.headers.authorization])).toEqual([[`${API}/installation/token`, `Bearer ${MINTED_TOKEN}`]]);
+    expect(err).toEqual([]);
+  });
+
+  test("a revoke GitHub doesn't confirm prints one warning naming the App and the HTTP status, never the token; the exit code is unchanged", async () => {
+    const { err, out } = capture();
+    for (const status of [500, 404, 200]) {
+      err.length = 0;
+      out.length = 0;
+      const w = await withAppToken();
+      w.routes[`DELETE ${API}/installation/token`] = { status, body: { message: `revoke said ${MINTED_TOKEN}` } };
+      expect([status, await auditCommand([], w.ctx)]).toEqual([status, 0]);
+      expect([status, err.length]).toEqual([status, 1]);
+      expect(err[0]).toContain("hapi-planner");
+      expect(err[0]).toContain(`HTTP ${status}`);
+      expect(err[0]).toContain(`${OWNER}/${NAME}`);
+      expect([...err, ...out].join("\n")).not.toContain(MINTED_TOKEN);
+    }
+  });
+
+  test("a revoke request that fails outright prints the same one warning, and the exit code is unchanged", async () => {
+    const w = await withAppToken();
+    const real = w.ctx.fetch;
+    w.ctx.fetch = (async (input: string | URL | Request, init?: RequestInit) =>
+      init?.method === "DELETE" ? Promise.reject(new Error(`socket hang up (${MINTED_TOKEN})`)) : real(input, init)) as unknown as typeof fetch;
+    const { err, out } = capture();
+    expect(await auditCommand([], w.ctx)).toBe(0);
+    expect(err.length).toBe(1);
+    expect(err[0]).toContain("hapi-planner");
+    expect(err[0]).toContain("socket hang up");
+    expect([...err, ...out].join("\n")).not.toContain(MINTED_TOKEN);
+  });
+});
+
 describe("github.app-perms", () => {
   test("both Apps with exactly the runbook's permissions, selected repos, and no ruleset bypass: pass", async () => {
     const w = await withToken();
@@ -140,6 +253,30 @@ describe("github.app-perms", () => {
     });
   }
 
+  test("a response with no permissions object, or no App id, fails closed: there is nothing to clear", async () => {
+    const cases: [string, (body: Record<string, unknown>) => void, string][] = [
+      [`GET ${API}/app`, (b) => delete b.permissions, "GET /app returned no permissions object"],
+      [`GET ${API}/app`, (b) => (b.permissions = ["contents"]), "GET /app returned no permissions object"],
+      [`GET ${API}/app`, (b) => (b.permissions = null), "GET /app returned no permissions object"],
+      [INSTALLATION, (b) => delete b.permissions, `/installation returned no permissions object`],
+      [INSTALLATION, (b) => (b.permissions = "all"), `/installation returned no permissions object`],
+      [`GET ${API}/app`, (b) => delete b.id, "GET /app returned no App id"],
+    ];
+    for (const [key, edit, says] of cases) {
+      const w = await withToken();
+      const real = w.routes[key]!;
+      w.routes[key] = (c) => {
+        const reply = call(real, c);
+        const body = { ...(reply.body as Record<string, unknown>) };
+        edit(body);
+        return { ...reply, body };
+      };
+      const r = await run(w);
+      expect([key, says, r.perms.status]).toEqual([key, says, "fail"]);
+      expect([key, r.perms.detail]).toEqual([key, expect.stringContaining(says)]);
+    }
+  });
+
   test("an App as a bypass actor fails, naming it", async () => {
     const r = await run(await withToken({ rulesets: mutate((x) => named(x, "tags-admin-only").bypass_actors.push({ actor_id: APP_IDS.factory, actor_type: "Integration", bypass_mode: "always" })) }));
     expect(r.perms.status).toBe("fail");
@@ -156,10 +293,19 @@ describe("github.app-perms", () => {
 });
 
 describe("repo.ai-workflows", () => {
-  test("AI on pull_request, and comment triggers with no AI, pass", async () => {
-    const r = await run(await withToken({ workflows: { "claude-code-review.yml": workflow("claude-code-review.yml"), "ci.yml": workflow("ci.yml") } }));
+  test("AI on pull_request, comment triggers with no AI, and an AI agent on a comment that holds nothing, pass", async () => {
+    const r = await run(
+      await withToken({ workflows: { "claude-code-review.yml": workflow("claude-code-review.yml"), "ci.yml": workflow("ci.yml"), "agent-safe.yml": workflow("agent-safe.yml") } }),
+    );
     expect(r.workflows.status).toBe("pass");
-    expect(r.workflows.detail).toContain("2 workflows");
+    expect(r.workflows.detail).toContain("3 workflows");
+    expect(aiWorkflowProblems(".github/workflows/agent-safe.yml", workflow("agent-safe.yml"))).toEqual([]);
+  });
+
+  test("the mtg-shaped claude.yml names every credential its agent's job holds", () => {
+    const [problem, ...more] = aiWorkflowProblems(".github/workflows/claude.yml", workflow("claude.yml"));
+    expect(more).toEqual([]);
+    for (const c of ["secrets.CLAUDE_CODE_OAUTH_TOKEN", "id-token: write", "actions/checkout's persisted GITHUB_TOKEN"]) expect([c, problem]).toEqual([c, expect.stringContaining(c)]);
   });
 
   test("an AI action with a secret on each forbidden trigger fails, in every spelling of `on`", async () => {
@@ -203,6 +349,109 @@ describe("repo.ai-workflows", () => {
     }
     // The control: the same job with no credential anywhere passes.
     expect(aiWorkflowProblems(".github/workflows/t.yml", job('      - run: codex exec "$TITLE"\n'))).toEqual([]);
+  });
+
+  /** A one-job workflow: `top` goes before `jobs:`, `perms` into the job, then its steps. */
+  const wf = (o: { on?: string; top?: string; perms?: string; steps: string }) => `on: ${o.on ?? "issue_comment"}\n${o.top ?? ""}jobs:\n  a:\n    runs-on: ubuntu-latest\n${o.perms ?? ""}    steps:\n${o.steps}`;
+  const P = ".github/workflows/x.yml";
+  const CLI_WITH = (expr: string) => `      - run: claude -p "$BODY"\n        env:\n          KEY: "${expr}"\n`;
+  const ACTION = "      - uses: anthropics/claude-code-action@v1\n        with:\n          prompt: hi\n";
+
+  test("any expression that reads a secret or the job's token counts, not only one that is exactly `${{ secrets.NAME }}`", async () => {
+    const cases: [string, string][] = [
+      ["${{ secrets.ANTHROPIC_API_KEY || '' }}", "secrets.ANTHROPIC_API_KEY"],
+      ["${{ secrets['ANTHROPIC_API_KEY'] }}", "secrets.ANTHROPIC_API_KEY"],
+      ["${{ secrets [ 'ANTHROPIC_API_KEY' ] }}", "secrets.ANTHROPIC_API_KEY"],
+      ["${{ toJSON(secrets) }}", "every secret (secrets as a whole)"],
+      ["${{ fromJSON(toJSON(secrets)).ANTHROPIC_API_KEY }}", "every secret (secrets as a whole)"],
+      ["${{ secrets[format('{0}_KEY', 'ANTHROPIC')] }}", "a secret by a computed name"],
+      ["${{ SECRETS.anthropic_api_key }}", "secrets.anthropic_api_key"],
+      ["${{ format('{0}}}', secrets.ANTHROPIC_API_KEY) }}", "secrets.ANTHROPIC_API_KEY"],
+      ["prefix-${{ github.event.issue.number }}-${{ secrets.ANTHROPIC_API_KEY }}", "secrets.ANTHROPIC_API_KEY"],
+      ["${{ github.token }}", "github.token"],
+      ["${{ github['token'] }}", "github.token"],
+      ["${{ GitHub.Token }}", "github.token"],
+      ["${{ toJSON(github) }}", "github.token (the whole github context)"],
+    ];
+    for (const [expr, label] of cases) {
+      const problems = aiWorkflowProblems(P, wf({ steps: CLI_WITH(expr) }));
+      expect([expr, problems.length]).toEqual([expr, 1]);
+      expect([expr, problems[0]]).toEqual([expr, expect.stringContaining(`the job holds ${label}`)]);
+    }
+    // The reviewer's case, end to end.
+    const r = await run(await withToken({ workflows: { "x.yml": wf({ steps: CLI_WITH("${{ secrets.ANTHROPIC_API_KEY || '' }}") }) } }));
+    expect(r.workflows.status).toBe("fail");
+    expect(r.workflows.detail).toContain("secrets.ANTHROPIC_API_KEY");
+  });
+
+  test("an expression that only mentions the words does not: a string literal, another context's field, a step named secrets, text outside an expression", () => {
+    for (const expr of [
+      "${{ contains(github.event.comment.body, 'secrets.ANTHROPIC_API_KEY') }}",
+      "${{ contains(github.event.comment.body, 'it''s github.token') }}",
+      "${{ steps.secrets.outputs.value }}",
+      "${{ inputs.secrets_dir }}",
+      "${{ github.event.comment.body }}",
+      "${{ github.token_name }}",
+      "secrets.ANTHROPIC_API_KEY and github.token, outside an expression",
+    ]) {
+      expect([expr, aiWorkflowProblems(P, wf({ steps: CLI_WITH(expr) }))]).toEqual([expr, []]);
+    }
+  });
+
+  test("permissions: write-all, at the workflow or the job, counts: it holds id-token: write and a write GITHUB_TOKEN; so does any write scope", () => {
+    for (const [top, perms, label] of [
+      ["permissions: write-all\n", "", "permissions: write-all"],
+      ["", "    permissions: write-all\n", "permissions: write-all"],
+      ["permissions: {}\n", "    permissions: write-all\n", "permissions: write-all"],
+      ["", "    permissions:\n      contents: write\n", "contents: write"],
+      ["permissions:\n  pull-requests: write\n", "", "pull-requests: write"],
+      ["", "    permissions:\n      id-token: write\n", "id-token: write"],
+    ] as const) {
+      const problems = aiWorkflowProblems(P, wf({ top, perms, steps: ACTION }));
+      expect([top, perms, problems.length]).toEqual([top, perms, 1]);
+      expect([top, perms, problems[0]]).toEqual([top, perms, expect.stringContaining(label)]);
+    }
+  });
+
+  test("read-all, {} and read scopes grant nothing, and a job's permissions replace the workflow's", () => {
+    for (const [top, perms] of [
+      ["permissions: read-all\n", ""],
+      ["permissions: {}\n", ""],
+      ["", "    permissions: read-all\n"],
+      ["", "    permissions: {}\n"],
+      ["", "    permissions:\n      contents: read\n      issues: read\n      id-token: none\n"],
+      ["permissions: write-all\n", "    permissions: {}\n"],
+      ["permissions: write-all\n", "    permissions: read-all\n"],
+      ["permissions:\n  id-token: write\n", "    permissions:\n      contents: read\n"],
+    ] as const) {
+      expect([top, perms, aiWorkflowProblems(P, wf({ top, perms, steps: ACTION }))]).toEqual([top, perms, []]);
+    }
+  });
+
+  test("actions/checkout in the agent's job counts unless persist-credentials is false: by default it writes the GITHUB_TOKEN into .git/config", () => {
+    const checkout = (uses: string, withBlock = "") => `      - uses: ${uses}\n${withBlock}${ACTION}`;
+    for (const step of [
+      checkout("actions/checkout@v6"),
+      checkout("actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955"),
+      checkout("Actions/Checkout@v4"),
+      checkout("actions/checkout@v6", "        with:\n          fetch-depth: 1\n"),
+      checkout("actions/checkout@v6", "        with:\n          persist-credentials: true\n"),
+      checkout("actions/checkout@v6", "        with:\n          persist-credentials: ${{ inputs.keep }}\n"),
+    ]) {
+      const problems = aiWorkflowProblems(P, wf({ steps: step }));
+      expect([step, problems.length]).toEqual([step, 1]);
+      expect([step, problems[0]]).toEqual([step, expect.stringContaining("actions/checkout's persisted GITHUB_TOKEN (no persist-credentials: false)")]);
+    }
+    for (const step of [
+      checkout("actions/checkout@v6", "        with:\n          persist-credentials: false\n"),
+      checkout("actions/checkout@v6", "        with:\n          persist-credentials: 'false'\n"),
+      checkout("actions/checkout-extra@v1"),
+    ]) {
+      expect([step, aiWorkflowProblems(P, wf({ steps: step }))]).toEqual([step, []]);
+    }
+    // A checkout in another job doesn't reach this job's runner.
+    const twoJobs = `on: issue_comment\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v6\n  a:\n    runs-on: ubuntu-latest\n    steps:\n${ACTION}`;
+    expect(aiWorkflowProblems(P, twoJobs)).toEqual([]);
   });
 
   test("no .github/workflows at all passes", async () => {

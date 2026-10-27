@@ -12,7 +12,8 @@
  *   on any parse warning. It also reads `archon ai alias list --json` and
  *   `ai tier list --json`, so it shows whether Archon read every generated
  *   alias (the `@<role>-retry` names, bare claude-provider model ids) and
- *   tier as generated (H-030).
+ *   tier as generated (H-030). Each of the three commands must exit 0: one
+ *   that exits non-zero fails, named, whatever it printed.
  * - tools.hermes-validate: Hermes's own config code, in its image: every key
  *   of the deployed config must be one Hermes knows (its DEFAULT_CONFIG, or a
  *   reviewed key it reads outside it), every value must read back as the
@@ -72,10 +73,13 @@ function mountable(path: string): string {
   return path;
 }
 
+/** The three read-only Archon commands the validation run makes, in order. */
+const ARCHON_COMMANDS = ["validate workflows --json", "ai alias list --json", "ai tier list --json"] as const;
+
 /** Runs in the Archon image: a scratch git repo (Archon needs one), then the three read-only commands, each followed by its exit code. Fixed text. */
 const ARCHON_SCRIPT =
   'd=$(mktemp -d) || exit 1; cd "$d" && git init -q . && git -c user.name=hapi-audit -c user.email=audit@hapi.invalid commit -q --allow-empty -m audit || exit 1; ' +
-  'for c in "validate workflows --json" "ai alias list --json" "ai tier list --json"; do bun /app/packages/cli/src/cli.ts $c; printf "\\n@@hapi-audit %s@@\\n" "$?"; done';
+  `for c in ${ARCHON_COMMANDS.map((c) => `"${c}"`).join(" ")}; do bun /app/packages/cli/src/cli.ts $c; printf "\\n@@hapi-audit %s@@\\n" "$?"; done`;
 
 const asRecord = (v: unknown) => (v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined);
 const text = (v: unknown) => (typeof v === "string" ? v : typeof asRecord(v)?.message === "string" ? (asRecord(v)!.message as string) : JSON.stringify(v));
@@ -154,8 +158,10 @@ export async function archonValidate(run: AuditRun): Promise<CheckResult[]> {
   if (r.code !== 0) return [result(id, "fail", `the Archon validation run (${img.image}) exited ${r.code}: ${firstLine(r.stderr) || "no error output"}`)];
   const parts = r.stdout.split(/\n?@@hapi-audit (\d+)@@\n?/);
   if (parts.length < 7) return [result(id, "fail", `could not read the Archon validation run's output (${img.image})`)];
+  // parts: [validate's output, its exit code, alias list's output, its exit code, tier list's output, its exit code, ...].
+  // A command that exits non-zero fails whatever it printed: its output can't be taken as its verdict.
+  const exits = ARCHON_COMMANDS.map((command, i) => ({ command, code: parts[2 * i + 1]! })).filter((x) => x.code !== "0");
   const v = readValidate(parts[0]!);
-  if ("unreadable" in v) return [result(id, "fail", v.unreadable)];
   const generated = (YAML.parse(await readFile(config, "utf8")) ?? {}) as { aliases?: Record<string, unknown>; tiers?: Record<string, unknown> };
   const json = (s: string): unknown => {
     try {
@@ -165,13 +171,14 @@ export async function archonValidate(run: AuditRun): Promise<CheckResult[]> {
     }
   };
   const problems = [
-    ...v.errors.map((e) => `error: ${e}`),
-    ...v.warnings.map((w) => `parse warning: ${w}`),
+    ...exits.map((x) => `archon ${x.command} exited ${x.code}`),
+    ...("unreadable" in v ? [v.unreadable] : [...v.errors.map((e) => `error: ${e}`), ...v.warnings.map((w) => `parse warning: ${w}`)]),
     ...bindingProblems("alias", generated.aliases ?? {}, json(parts[2]!)),
     ...bindingProblems("tier", generated.tiers ?? {}, json(parts[4]!)),
   ];
-  const notes = v.notes.length > 0 ? `; other warnings: ${v.notes.join("; ")}` : "";
-  if (problems.length > 0) {
+  const notes = !("unreadable" in v) && v.notes.length > 0 ? `; other warnings: ${v.notes.join("; ")}` : "";
+  // Unreadable output is always a problem; the second test only narrows v for the pass below.
+  if (problems.length > 0 || "unreadable" in v) {
     return [result(id, "fail", `${problems.join("; ")}${notes}. Archon drops a key it doesn't know and only warns: fix the generator (src/generate/archon.ts) or the workflow, then \`mise run up\``)];
   }
   const aliases = Object.keys(generated.aliases ?? {}).length;

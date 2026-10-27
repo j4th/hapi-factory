@@ -102,4 +102,42 @@ describe("pins.versions", () => {
       if (says !== undefined) expect([line, r.detail]).toEqual([line, expect.stringContaining(says)]);
     }
   });
+
+  test("a comment line inside a continued RUN is dropped first, as Docker drops it: never read as packages, never ending the RUN", async () => {
+    let r = await pins((root) => append(root, "stack/archon/Dockerfile", "RUN apt-get install -y \\\n    # the pinned tools\n    curl=8.5.0-2ubuntu10.6 \\\n  # and one more\n    jq=1.7.1-3build1\n"));
+    expect(r.status).toBe("pass");
+    expect(r.detail).toContain("3 installed packages");
+
+    // The package after the comment is still part of the RUN, so its missing version is seen.
+    r = await pins((root) => append(root, "stack/archon/Dockerfile", "RUN apt-get install -y \\\n    # a comment\n    curl\n"));
+    expect(r.status).toBe("fail");
+    expect(r.detail).toContain("apt-get install curl has no version");
+    expect(r.detail).not.toContain("apt-get install #");
+    expect(r.detail).not.toContain("apt-get install comment");
+  });
+
+  test("a RUN that pipes a download into a shell fails: it installs whatever the URL serves that day", async () => {
+    const cases: [string, "pass" | "fail"][] = [
+      ["RUN curl -fsSL https://example.invalid/install.sh | sh", "fail"],
+      ["RUN curl -fsSL https://example.invalid/install.sh | bash -s -- --yes", "fail"],
+      ["RUN wget -qO- https://example.invalid/i | sudo bash", "fail"],
+      ["RUN curl -fsSL https://example.invalid/i.sh.gz | gunzip | /bin/sh", "fail"],
+      ["RUN set -eux; \\\n    curl -fsSL https://example.invalid/i.sh \\\n      | env FOO=1 dash", "fail"],
+      ['RUN sh -c "$(curl -fsSL https://example.invalid/i.sh)"', "fail"],
+      ["RUN bash <(curl -s https://example.invalid/i.sh)", "fail"],
+      ['RUN eval "$(wget -qO- https://example.invalid/env.sh)"', "fail"],
+      ['RUN curl -fsSL "https://example.invalid/i?os=linux&arch=x64" | sh', "fail"],
+      ['RUN curl -fsS https://example.invalid/list | grep -q "x|sh"', "pass"],
+      // Controls: downloaded to a file and checked, or piped into something that reads data, not code.
+      ['RUN curl -fsSLo /tmp/i.sh https://example.invalid/i.sh && echo "0123  /tmp/i.sh" | sha256sum -c && sh /tmp/i.sh', "pass"],
+      ["RUN curl -fsS https://example.invalid/v.json | python3 -c 'import json,sys; print(json.load(sys.stdin))'", "pass"],
+      ["RUN curl -fsS https://example.invalid/ok | grep -q ok || echo down | sh -c 'cat >&2'", "pass"],
+      ["RUN curl -fsSL https://example.invalid/x | shasum -a 256", "pass"],
+    ];
+    for (const [line, status] of cases) {
+      const r = await pins((root) => append(root, "stack/archon/Dockerfile", `${line}\n`));
+      expect([line, r.status]).toEqual([line, status]);
+      if (status === "fail") expect([line, r.detail]).toEqual([line, expect.stringContaining("stack/archon/Dockerfile: a RUN pipes a download into a shell")]);
+    }
+  });
 });
