@@ -131,7 +131,7 @@ Spec §11.2, in substance: no stage should hold all three of untrusted input, se
 |---|---|---|---|---|---|
 | Hermes main session | Yes (chat, PR comments, briefs) | Minimal (planning token, capped key) | Yes (planning branch, messages) | Protected paths, cmd allowlist, PR review | Filename rules IS-2 enforced; hapi-path-guard IS-3 and the allowlist hook IS-4 planned (Plan 04, H-093, H-095); PR review AC-7 documented, not verified live (H-078); the planning token AC-10 planned (Plan 04, H-098) |
 | hapi-research | Yes (T3 web) | None | None (returns a brief) | Quarantine and schema | Planned (Plan 04, H-099). It holds spend-capped search keys, so its sensitive access is minimal, not none (H-042, H-083) |
-| Archon implement | Repo contents, work order | Capped model keys | Worktree only | Container, egress allowlist, hapi-guard, scope checks, no forge creds | Container DS-6, egress DS-2 and no forge route AC-9 enforced; hapi-guard DS-16 planned (Plan 02, H-087); scope checks planned (Plan 03, H-161) |
+| Archon implement | Repo contents, work order | Capped model keys | Worktree only | Container, egress allowlist, hapi-guard, scope checks, no forge creds | Container DS-6, egress DS-2 and no forge route AC-9 enforced in config and on rootful Docker (stage a); as hapi on rootless, not verified live (H-146(c)); hapi-guard DS-16 planned (Plan 02, H-087); scope checks planned (Plan 03, H-161) |
 | Review | The diff | Read-only | None | Separate session and model | Planned (Plan 03, H-161) |
 | Harvester and merge | Indirect | Forge write | Yes | Deterministic code; the operator's approval; required checks | The harvester is planned (Plan 03, H-161); the approval and `ci` gate AC-7 documented, not verified live (H-075, H-078) |
 
@@ -317,7 +317,7 @@ The six domains, as SANS's post on its Critical AI Security Guidelines (the v1.1
 | MO-1 | `hapi audit`, the detective control and spec §11.8's "worse controls" measure: config drift, the running containers, pins, Archon's and Hermes's own validation, the MCP lock, the secrets setup, and each repo's rulesets, App permissions and AI workflows. A skip is never a pass, `--strict` fails every skip, and a check that throws fails | §11.8 | `src/audit/`; `tests/audit/` (`audit detects drift from generated config`, `audit fails on archon parseWarnings`) | enforced |
 | MO-2 | The audit run live, as hapi, against the running stack and the real repo (stage b's last step). Until H-101, its one expected fail is `mcp.tool-hashes`, a skip that `--strict` fails (ruling R1: no "expected skip" flag) | §11.8, §15 | `docs/runbooks/stack.md`, `docs/audit.md` | documented, not verified live (H-080) |
 | MO-3 | The audit's known gaps | §11.8 | [their entry](#audit-gaps) | accepted residual |
-| MO-4 | Without the operator's token, the audit mints one repo-scoped, read-only installation token (`contents: read`, `metadata: read`), uses it for GETs only, and revokes it (its one POST (mint) and one DELETE (revoke) accepted under ruling R2, least privilege) | §11.5 | `src/audit/checks/github.ts`; `tests/audit/github.test.ts` | enforced |
+| MO-4 | Without the operator's token, the audit mints one repo-scoped, read-only installation token (`contents: read`, `metadata: read`), uses it for GETs only, and revokes it (its one POST (mint) and one DELETE (revoke) accepted under ruling R2, least privilege) | §11.5 | `src/audit/checks/github.ts`; `tests/audit/github.test.ts` | enforced (it mints through `mintInstallationToken`, as AC-6: the first live mint, H-079, checks GitHub's response shape) |
 | MO-5 | The kill switches, fastest first, each with what it stops and doesn't, how to confirm and undo it | §11.8 | `docs/runbooks/kill-switches.md` | documented, not verified live (H-146(b), H-160) |
 | MO-6 | Run events and traces off the box, in a store the agents can't write (the o11y profile, under its own Unix user) | §4.3, §13.4 | — | planned (Phase 3, H-122) |
 
@@ -361,7 +361,7 @@ Impact if exploited, likelihood in v0, and the decision. "Low" likelihood means 
 
 Spec §11.9 #1: Pi runs in-process with Archon. It can read Archon state, answer Archon approvals and alter local run records. (Spec §4.3: any local process can answer Archon's approvals, a Pi step through `ARCHON_CLI_COMMAND` included.)
 
-- **Owner control:** the human boundary is on GitHub, and the archon zone holds no forge credentials. Only the operator merges (AC-7: documented, not verified live, H-078), and the archon zone has no forge credential or route (AC-9: enforced). So a Pi step that approves its own Archon gate, or rewrites a run record, still can't get anything onto `main`. No Archon approval node is a security control (spec §9.2).
+- **Owner control:** the human boundary is on GitHub, and the archon zone holds no forge credentials. Only the operator merges (AC-7: documented, not verified live, H-078), and the archon zone has no forge credential or route (AC-9: enforced in config and on rootful Docker (stage a); as hapi on rootless, not verified live (H-146(c))). So a Pi step that approves its own Archon gate, or rewrites a run record, still can't get anything onto `main`. No Archon approval node is a security control (spec §9.2).
 - **Next level:** ship run events off-box, to a store the archon zone can't write (MO-6: the o11y collector under its own Unix user, Phase 3, H-122), so a rewritten local record no longer matches the copy.
 - **Catalog:** ASI07, ASI10; AML.T0081. **Status:** accepted residual.
 
@@ -370,7 +370,7 @@ Spec §11.9 #1: Pi runs in-process with Archon. It can read Archon state, answer
 
 Spec §11.9 #2 and §11.4: allowed hosts (package registries, smoke hosts, model APIs; for Hermes, GitHub and Slack too) are exfiltration channels. Publishing to a registry would need a token the attacker supplies.
 
-- **Owner control:** default-deny allowlists per zone, generated from `policy/trusted_sources.yaml` (DS-2: enforced). The archon zone reaches only the model APIs and three registry hosts, by name, HTTPS only, with no forge route (AC-9); `ip_literal` and `to_localnet` close the address tricks (DS-4, DS-5). No zone holds a registry publish token. A work order adds hosts only through `egress_extra`, which refuses forge hosts (GR-5).
+- **Owner control:** default-deny allowlists per zone, generated from `policy/trusted_sources.yaml` (DS-2: enforced in config and on rootful Docker (stage a); as hapi on rootless, not verified live (H-146(c))). The archon zone reaches only the model APIs and three registry hosts, by name, HTTPS only, with no forge route (AC-9); `ip_literal` and `to_localnet` close the address tricks (DS-4, DS-5). No zone holds a registry publish token. A work order adds hosts only through `egress_extra`, which refuses forge hosts (GR-5).
 - **Next level:** a read-only method filter on the registries, or pull-through caches (spec §11.4); per-server egress for MCP servers (spec §10.1, phase 2). Unscheduled.
 - **Related:** [H-044](#h-044) (the hermes zone reaches the registries too) and [H-045](#h-045) (DNS rebinding). **Catalog:** ASI02; LLM02:2025; AML.T0086, AML.T0025. **Status:** accepted residual.
 
@@ -473,7 +473,7 @@ Context7's ContextCrush (CVE-2026-75130, up to 2.1.2) was fixed on Upstash's bac
 
 A zone's allowlist is its own `hosts` plus its tiers' hosts, so the hermes zone also reaches the T1 package registries: wider than Hermes's original host list. (T2 was later dropped from hermes.)
 
-- **Owner control:** HTTPS only, by name, with IP literals and private ranges refused (DS-2, DS-4, DS-5: enforced); Hermes holds no registry publish token; no T2 or T3 for hermes (`tests/policy/mcp.test.ts`, "hermes zone has no T2 sources").
+- **Owner control:** HTTPS only, by name, with IP literals and private ranges refused (DS-2, DS-4, DS-5: enforced in config and on rootful Docker (stage a); as hapi on rootless, not verified live (H-146(c))); Hermes holds no registry publish token; no T2 or T3 for hermes (`tests/policy/mcp.test.ts`, "hermes zone has no T2 sources").
 - **Next level:** a hermes allowlist without T1's registries, if planning turns out to need none, or residual 2's read-only method filter. Unscheduled.
 - **Catalog:** LLM02:2025; AML.T0086. **Status:** accepted residual.
 

@@ -1,6 +1,6 @@
 # Runbook: kill switches
 
-These are spec §11.8's four kill switches, **fastest first**. The operator runs them by hand; no agent ever does. Use them when a key or token may have leaked, a run is spending or acting outside policy, or you suspect any part of the stack. They are independent: use as many as the situation needs, in this order. If nothing is sending data out, go in this order. If data may be leaving, do 3 (or 4, if 3 can't run or hangs) at once, alongside 1 and 2: switches 1 and 2 don't stop data leaving through allowed hosts. Afterwards, follow [after a kill switch](#after-a-kill-switch).
+These are spec §11.8's four kill switches, **fastest first**. The operator runs them by hand; no agent ever does. Use them when a key or token may have leaked, a run is spending or acting outside policy, or you suspect any part of the stack. They are independent: use as many as the situation needs. If nothing is sending data out, go in this order. If data may be leaving, do 3 (or 4, if 3 can't run or hangs) at once, alongside 1 and 2: switches 1 and 2 don't stop data leaving through allowed hosts. Afterwards, follow [after a kill switch](#after-a-kill-switch).
 
 | # | Switch | Stops | Doesn't stop | Takes effect |
 |---|---|---|---|---|
@@ -36,11 +36,13 @@ The fastest switch: one browser tab per provider. Each key, its cap and its logi
 
 Do it for **both** Apps, `hapi-planner` and `hapi-factory`, on github.com: your profile picture → **Settings** → under **Integrations**, **Applications** → **Installed GitHub Apps** → **Configure** next to the App → **Suspend**. (GitHub's "Reviewing and modifying installed GitHub Apps", read 2026-10-27; the [GitHub Apps runbook](github-apps.md#kill-switch-suspend-an-installation) uses the same path.)
 
-If you hold App tokens, revoke them **before** you suspend: revoking needs no working installation, while a token's revoke call made after the suspension may be refused **[verify in stage b]** (H-160), leaving it live up to its hour. Each is a file in `$XDG_RUNTIME_DIR/hapi/tokens/` of the user that minted it (hapi, or you). As that user:
+If you hold App tokens, revoke them **before** you suspend: while the installation is active, GitHub accepts the token, so its own revoke call works; after the suspension that call may be refused **[verify in stage b]** (H-160(b)), leaving the token live up to its hour. Each is a file in `$XDG_RUNTIME_DIR/hapi/tokens/` of the user that minted it (hapi, or you). As that user:
 
 ```bash
-for f in "$XDG_RUNTIME_DIR"/hapi/tokens/*.token; do [ -e "$f" ] || continue; GH_TOKEN="$(cat "$f")" gh api -X DELETE /installation/token && rm "$f"; done
+for f in "$XDG_RUNTIME_DIR"/hapi/tokens/*.token; do [ -s "$f" ] || continue; GH_TOKEN="$(cat "$f")" gh api -X DELETE /installation/token && rm "$f"; done
 ```
+
+The `[ -s … ]` guard skips a missing or empty file: with an empty `GH_TOKEN`, `gh` would fall back to your own stored credentials.
 
 - **Stops:** new tokens: `hapi token mint`, and the audit's own read-only token, fail, naming the suspended installation. GitHub "temporarily block[s] it from accessing resources owned by your account" (its docs).
 - **Doesn't stop:** a token minted before the suspension may keep working until it expires, one hour after it was minted. GitHub's docs say a suspended App is blocked from your resources, but not in so many words that its unexpired tokens are refused **[verify in stage b]** (H-160): revoke the ones you hold, as above. Nor does it undo what is already on GitHub (a pushed `plan/**` or `factory/**` branch, an opened PR: close and delete them yourself; only you can merge), or stop the containers or your own credentials.

@@ -198,7 +198,7 @@ Run these with `$OWNER` set ([before you start](#before-you-start)).
 
 ## Kill switch: suspend an installation
 
-Kill switch 2 (spec §11.8). Open **GitHub → Settings → Applications → Installed GitHub Apps → the App → Configure → Suspend**. GitHub then refuses the App's tokens, and `hapi token mint` fails with "the App's installation ... is suspended". Unsuspend it on the same page.
+Kill switch 2 (spec §11.8; the full steps are in [kill switches](kill-switches.md#2-suspend-the-github-app-installations)). First revoke any App token you hold: whether GitHub refuses a token minted before the suspension at once is unverified **[verify in stage b]** (H-160(b)). Then open **GitHub → Settings → Applications → Installed GitHub Apps → the App → Configure → Suspend**. GitHub then blocks the App from your resources and refuses new tokens, and `hapi token mint` fails with "the App's installation ... is suspended". Unsuspend it on the same page.
 
 ## Rotating a private key
 
