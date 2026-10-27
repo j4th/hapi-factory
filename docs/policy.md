@@ -24,7 +24,7 @@
 | `rosters/{budget,anthropic,portable}.yaml` | `policy-roster` | Tier → provider, model and effort, one file per roster | See `roles.yaml` |
 | `flags.yaml` | `policy-flags` | Metrics and observability switches, signal switches, run thresholds | Metrics, observability and run flagging (spec §13; later plans). `otel.enabled` also turns on the o11y-gated MCP servers. |
 | `mcp.yaml` | `policy-mcp` | The MCP catalog: every MCP server a zone may load, pinned, with its tools, env and egress (spec §10.1) | Hermes `mcp_servers`; `build/mcp/<zone>.mcp.json` for the CI scanners; later, the hapi-research profile (Plan 04) and the Claude Code lane |
-| `mcp.lock.json` | `mcp-lock` | Each MCP server's recorded tool surface and its hash (JSON, written by `hapi mcp pin`) | `hapi mcp verify`; later, `hapi audit` (`mcp.tool-hashes`) and stack start-up |
+| `mcp.lock.json` | `mcp-lock` | Each MCP server's recorded tool surface and its hash (JSON, written by `hapi mcp pin`) | `hapi mcp verify`; `hapi audit` (`mcp.tool-hashes`, [docs/audit.md](audit.md#mcptool-hashes)); later, stack start-up |
 
 The schemas are in `policy/schemas/`, named `<schema>.schema.json`. `policy-defs.schema.json` holds the definitions they share: modes, tiers, risk, host names, forge hosts, repo paths and globs, exact versions, advisory ids and package and image pins. Each policy file starts with a `# yaml-language-server: $schema=...` line, so an editor with the YAML language server checks it as you type.
 
@@ -308,7 +308,7 @@ Server names are lowercase slugs. Each entry has these fields:
 | `transport` | Yes | `stdio`: a local process inside the zone's container, so the zone's egress proxy binds it. `http`: a remote endpoint. |
 | `package` | For `stdio` | `{name, version, integrity}`. `version` is exact, `MAJOR.MINOR.PATCH` (calendar versions too): never a range (`^4.3.0`), a tag (`latest`) or a prerelease. `integrity` is the registry's `dist.integrity` for that version, an SRI `sha512-...`. **It is recorded, but not yet enforced at launch:** the generated `npx --yes <name>@<version>` doesn't check it, and doesn't pin the dependency tree either. Plan 04's per-server lockfile images are required before Context7 runs for real ([docs/mcp.md](mcp.md#open-items)). |
 | `image` | No; `stdio` only | The per-server image built from the package and a committed lockfile, pinned by digest: `name[:tag]@sha256:<64 hex>`. A tag alone is rejected. **The generators refuse an entry that sets it** (so `hapi policy build` fails) until image launch lands: Plan 04 builds the images, and the `npx` command would silently ignore it, so the entry would look pinned by digest and still run unpinned. |
-| `url` | For `http`; `http` only | An `https://` URL with no user info and **no `$`**: Hermes expands `${...}` and `${env:...}` in a url, so one could carry Hermes's provider key or another server's key to the host. Its host must be one of `egress`, or a subdomain of one. |
+| `url` | For `http`; `http` only | An `https://` URL with no user info, **no `$`**, and no query or fragment (**no `?` or `#`**). Hermes expands `${...}` and `${env:...}` in a url, so a `$` could carry Hermes's provider key or another server's key to the host; a query could hold a literal credential (`?key=...`), which every generated config would then hold in plaintext. Its host must be one of `egress`, or a subdomain of one. |
 | `floor` | No | `{min, advisory}`: our own advisory floor. `package.version` must be at least `min`. For advisories the scanners don't track ([docs/mcp.md](mcp.md#advisory-floors)). It needs a `package`. |
 | `cooldown_exception` | No | The advisory id (CVE or GHSA) whose fix lets this pin skip the 14-day release cooldown ([docs/mcp.md](mcp.md#the-release-cooldown-and-the-security-fix-exception)) |
 | `tools.include` | Yes | At least one exact MCP tool name: letters, digits, `_`, `-` and `.`. **Read-only tools only.** No `*`, `?` or `[`: Hermes would read them as fnmatch patterns. |
@@ -326,7 +326,8 @@ Server names are lowercase slugs. Each entry has these fields:
 - a blocked package;
 - a `tools.include` entry that is also in `tools.deny`;
 - `url` on a `stdio` server, `package` or `image` on an `http` server, or a `url` whose host isn't an egress host;
-- an env name that isn't on the package's [env allowlist](#the-env-allowlist), or isn't in the form it says: a secret as a literal, a flag with another value, an endpoint whose host isn't one of the server's egress hosts;
+- an env name that isn't on the package's [env allowlist](#the-env-allowlist), or isn't in the form it says: a secret as a literal, a flag with another value, an endpoint whose host isn't one of the server's egress hosts or whose path isn't plain segments;
+- a name the allowlist marks **required** that the entry leaves out;
 - a literal under any name ending in `_KEY`, `_TOKEN`, `_SECRET`, `_PASSWORD`, `_CREDENTIAL` or `_CREDENTIALS` (any case): such a name only ever holds a secret reference;
 - an env name on the [hard denylist](#the-env-allowlist), for any server, as a literal or a secret reference;
 - a secret that two servers share. Each server gets only its own key.
@@ -340,7 +341,8 @@ These are the real messages:
 | `zones: [archon]` | `policy/mcp.yaml: /servers/context7/zones/0: must be one of: hermes, research` |
 | `name: "@modelcontextprotocol/server-brave-search"` | `policy/mcp.yaml: /servers/context7/package/name: "@modelcontextprotocol/server-brave-search" is blocked (matches "@modelcontextprotocol/server-brave-search" in blocked)` |
 | `upsert-prompt` added to phoenix's `tools.include` | `policy/mcp.yaml: /servers/phoenix/tools/include/23: "upsert-prompt" is on phoenix's tools.deny list (a write or third-party tool); include read-only tools only` |
-| `url: "https://mcp.context7.com/mcp?k=${ANTHROPIC_API_KEY}"` on an `http` server | `policy/mcp.yaml: /servers/context7/url: must match pattern "^[^$]+$"` |
+| `url: "https://mcp.context7.com/mcp?k=${ANTHROPIC_API_KEY}"` (or `?key=abc`) on an `http` server | `policy/mcp.yaml: /servers/context7/url: must match pattern "^[^$?#]+$"` |
+| `OTEL_SDK_DISABLED` left out of context7's `env` | `policy/mcp.yaml: /servers/context7/env: @upstash/context7-mcp must set OTEL_SDK_DISABLED (PACKAGE_ENV in src/policy/mcp.ts marks it required, spec §10.1)` |
 | `CONTEXT7_API_KEY: ctx7sk-...` (a literal secret) | `policy/mcp.yaml: /servers/context7/env/CONTEXT7_API_KEY: CONTEXT7_API_KEY names a secret, so its value must be a secret reference (secret:hapi-mcp-<name>), never a literal: a literal is written in plaintext into every generated config (spec §10.1)` |
 | `CONTEXT7_AUTH: abc` added to context7's `env` | `policy/mcp.yaml: /servers/context7/env/CONTEXT7_AUTH: @upstash/context7-mcp may not receive CONTEXT7_AUTH: its env allowlist (PACKAGE_ENV in src/policy/mcp.ts) is CONTEXT7_API_KEY, OTEL_SDK_DISABLED` |
 | `OTEL_SDK_DISABLED: "false"` | `policy/mcp.yaml: /servers/context7/env/OTEL_SDK_DISABLED: OTEL_SDK_DISABLED is a flag: its value must be "true"` |
@@ -359,15 +361,16 @@ Spec §10.1 says a server's `env` is by secret name, and each server gets only i
 
 | Package | Name | Kind | Allowed value |
 |---|---|---|---|
-| `@upstash/context7-mcp` | `CONTEXT7_API_KEY` | secret | a secret reference |
-| | `OTEL_SDK_DISABLED` | flag | `"true"` |
-| `@arizeai/phoenix-mcp` | `PHOENIX_API_KEY` | secret | a secret reference (a VIEWER-role key) |
-| | `PHOENIX_DISCOVER_CONFIG` | flag | `"false"` |
-| | `PHOENIX_ENDPOINT` | endpoint | an `http` or `https` URL with no user info, query or fragment, whose host is one of the server's `egress` hosts or under one |
+| `@upstash/context7-mcp` | `CONTEXT7_API_KEY` | secret, required | a secret reference |
+| | `OTEL_SDK_DISABLED` | flag, required | `"true"` |
+| `@arizeai/phoenix-mcp` | `PHOENIX_API_KEY` | secret, required | a secret reference (a VIEWER-role key) |
+| | `PHOENIX_DISCOVER_CONFIG` | flag, required | `"false"` |
+| | `PHOENIX_ENDPOINT` | endpoint, required | an `http` or `https` URL with no user info, query or fragment, whose host is one of the server's `egress` hosts or under one, and whose path is plain segments (letters, digits and `. _ ~ -`; no percent-encoding or dot segment) |
 
 - A **secret** is only ever a secret reference, so its value never reaches a generated file.
 - A **flag** is only ever a literal from its allowed values. So a literal can't carry a secret, and a flag can't be turned the unsafe way (`OTEL_SDK_DISABLED: "false"` is refused).
 - An **endpoint** is only ever a literal URL, held to the server's own `egress`, so it can't send the server's traffic, or its key, anywhere else.
+- A **required** name must be in every entry for the package: spec §10.1 says it is set (Context7 always keyed with telemetry off; Phoenix with a VIEWER key, no config discovery, which is on by default, and an explicit endpoint). Left out, the package would fall back to its own default.
 
 **2. Secret-looking names.** Any name ending in `_KEY`, `_TOKEN`, `_SECRET`, `_PASSWORD`, `_CREDENTIAL` or `_CREDENTIALS`, in any case (`SECRET_ENV_NAME`), must be a secret reference, whatever the allowlist says.
 
@@ -609,7 +612,7 @@ Later plans build on these functions:
 | `secretKey(value)`, `secretEnvName(name): string` | `src/policy/mcp.ts` | The logical name in a `secret:<name>` env value (or `undefined` for a literal), and the env var that secret goes in, referenced as `${NAME}`: `hapi-mcp-context7-api-key` → `HAPI_MCP_CONTEXT7_API_KEY` |
 | `blockedBy(name, blocked)`, `compareVersions(a, b)` | `src/policy/mcp.ts` | The blocklist match (whole name, `*` for any run) and the numeric version order the floors use |
 | `hashToolSurface(surface): string` | `src/mcp/lock.ts` | `sha256:<hex>` of a surface's canonical JSON, order-independent ([the lock](#mcplockjson)) |
-| `verifyLock(p, lock, fetchSurface): Promise<{name, status, expected?, actual?}[]>` | `src/mcp/lock.ts` | Every catalog server's live surface against the lock: `ok`, `changed` or `unpinned`; and `orphaned` (no `actual`; never fetched) for a lock entry whose server isn't in the catalog |
+| `verifyLock(p, lock, fetchSurface): Promise<{name, status, expected?, actual?}[]>` | `src/mcp/lock.ts` | Every catalog server's live surface against the lock: `ok`, `changed` or `unpinned`; and `orphaned` (no `actual`; never fetched) for a lock entry whose server isn't in the catalog. It rejects, fetching nothing, if any server lists a zone outside `MCP_ZONES`, as a policy built in code could |
 | `loadLock(file): McpLock` | `src/mcp/lock.ts` | Reads and checks a lock file. Throws `PolicyError`. |
 | `pinOf(server)`, `canonicalJson(value)`, `lockJson(lock)` | `src/mcp/lock.ts` | A server's pin fields as a lock entry records them; the canonical JSON the hash uses; the lock as written to disk |
 | `validateWorkOrder(obj): WorkOrder` | `src/workorder/validate.ts` | Validates a parsed work order. Throws `WorkOrderError { path, message, issues }`. |

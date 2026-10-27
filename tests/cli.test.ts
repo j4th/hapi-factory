@@ -48,6 +48,20 @@ test("--help prints usage to stdout and exits 0", async () => {
   expect(out.join("\n")).toContain("Usage: hapi <command>");
 });
 
+test("-h is --help: usage to stdout, exit 0", async () => {
+  const { out, err } = capture();
+  expect(await main(["-h"])).toBe(0);
+  expect(out.join("\n")).toContain("Usage: hapi <command>");
+  expect(err).toEqual([]);
+});
+
+test("an unknown multi-word command is named in full", async () => {
+  const { err } = capture();
+  register("t-only2 sub", () => 0);
+  expect(await main(["t-only2", "nope"])).toBe(2);
+  expect(err.join("\n")).toContain("unknown command 't-only2 nope'");
+});
+
 test("registered multi-word command gets the remaining args and sets the exit code", async () => {
   capture();
   let got: string[] | undefined;

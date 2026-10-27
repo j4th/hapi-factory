@@ -304,6 +304,44 @@ const USAGE = "usage: hapi token mint --app planner|factory --repo owner/name";
 /** owner/name: a GitHub login (letters, digits, hyphens) and a repository name. */
 const OWNER_REPO = /^([A-Za-z0-9][A-Za-z0-9-]{0,38})\/([A-Za-z0-9._-]{1,100})$/;
 
+/** `owner/name` as { owner, name }, or undefined if it isn't one (`.` and `..` aren't repository names). */
+export function parseOwnerRepo(s: string): { owner: string; name: string } | undefined {
+  const m = OWNER_REPO.exec(s);
+  return m && m[2] !== "." && m[2] !== ".." ? { owner: m[1]!, name: m[2]! } : undefined;
+}
+
+/**
+ * An App's id and private key, from `$XDG_RUNTIME_DIR/hapi/env/host.env` (which `hapi secrets resolve`
+ * writes), after checking XDG_RUNTIME_DIR is ours and 0700. `hapi token mint` and `hapi audit` read them
+ * this way. Errors name the file and the variable, never a value.
+ */
+export async function appCredentials(app: AppName, env: Record<string, string | undefined>): Promise<{ appId: string; privateKeyPem: string }> {
+  const spec = APPS[app];
+  const dir = runtimeDir(env);
+  await secureDir(dir, dirname(dir));
+  const hostEnv = join(dir, ENV_DIR, "host.env");
+  let text: string;
+  try {
+    text = await readFile(hostEnv, "utf8");
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") throw new Error(`no ${hostEnv}: run \`hapi secrets resolve\` first; it writes the App keys there`);
+    throw new Error(`cannot read ${hostEnv}${code ? ` (${code})` : ""}`);
+  }
+  let values: Record<string, string>;
+  try {
+    values = parseEnvFile(text);
+  } catch (e) {
+    throw new Error(`${hostEnv}: ${(e as Error).message}; run \`hapi secrets resolve\` to rewrite it`);
+  }
+  const idName = `${spec.envPrefix}_APP_ID`;
+  const keyName = `${spec.envPrefix}_APP_PRIVATE_KEY`;
+  for (const name of [idName, keyName]) {
+    if (!values[name]) throw new Error(`${hostEnv} has no ${name}: it is in the host zone of stack/secrets.yaml, so run \`hapi secrets resolve\` to rewrite it`);
+  }
+  return { appId: values[idName]!, privateKeyPem: values[keyName]! };
+}
+
 export interface TokenDeps {
   fetch?: typeof fetch;
   env?: Record<string, string | undefined>;
@@ -332,40 +370,18 @@ export async function tokenMint(args: string[], deps: TokenDeps = {}): Promise<n
     flags[flag] = value;
   }
   const app = flags["--app"];
-  const m = OWNER_REPO.exec(flags["--repo"] ?? "");
-  if ((app !== "planner" && app !== "factory") || !m || m[2] === "." || m[2] === "..") {
+  const target = parseOwnerRepo(flags["--repo"] ?? "");
+  if ((app !== "planner" && app !== "factory") || target === undefined) {
     console.error(USAGE);
     return 2;
   }
-  const owner = m[1]!;
-  const repo = m[2]!;
+  const { owner, name: repo } = target;
   const spec = APPS[app];
 
-  const dir = runtimeDir(deps.env ?? process.env);
-  await secureDir(dir, dirname(dir));
-  const hostEnv = join(dir, ENV_DIR, "host.env");
-  let text: string;
-  try {
-    text = await readFile(hostEnv, "utf8");
-  } catch (e) {
-    const code = (e as NodeJS.ErrnoException).code;
-    if (code === "ENOENT") throw new Error(`no ${hostEnv}: run \`hapi secrets resolve\` first; it writes the App keys there`);
-    throw new Error(`cannot read ${hostEnv}${code ? ` (${code})` : ""}`);
-  }
-  let values: Record<string, string>;
-  try {
-    values = parseEnvFile(text);
-  } catch (e) {
-    throw new Error(`${hostEnv}: ${(e as Error).message}; run \`hapi secrets resolve\` to rewrite it`);
-  }
-  const idName = `${spec.envPrefix}_APP_ID`;
-  const keyName = `${spec.envPrefix}_APP_PRIVATE_KEY`;
-  for (const name of [idName, keyName]) {
-    if (!values[name]) throw new Error(`${hostEnv} has no ${name}: it is in the host zone of stack/secrets.yaml, so run \`hapi secrets resolve\` to rewrite it`);
-  }
+  const env = deps.env ?? process.env;
+  const dir = runtimeDir(env);
   const common = {
-    appId: values[idName]!,
-    privateKeyPem: values[keyName]!,
+    ...(await appCredentials(app, env)),
     ...(deps.fetch ? { fetch: deps.fetch } : {}),
     ...(deps.now ? { now: deps.now } : {}),
   };

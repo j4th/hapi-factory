@@ -10,6 +10,7 @@
  * Exit codes (as in README.md): 0 success, 1 the command failed, 2 a usage error:
  * an unknown command, no command at all, or the wrong arguments for a command.
  */
+import { auditCommand } from "./audit/index";
 import { tokenMint } from "./forge/github/app-token";
 import { policyBuild } from "./generate/index";
 import { mcpPin, mcpVerify } from "./mcp/lock";
@@ -141,6 +142,7 @@ register("secrets resolve", secretsResolve, "Resolve stack/secrets.yaml from the
 register("stack up", stackUp, "Build policy, resolve secrets and start the stack as the hapi user (stack/compose.yaml); see docs/runbooks/stack.md");
 register("stack down", stackDown, "Stop the stack and remove its containers and networks, keeping its volumes (kill switch 3)");
 register("token mint", tokenMint, "Mint a 1-hour GitHub App token for one repo into a 0600 file under $XDG_RUNTIME_DIR/hapi/tokens/");
+register("audit", (args) => auditCommand(args), "Check the deployed config, pins, running stack, secrets setup and each --repo's GitHub settings against policy (docs/audit.md)");
 
 if (import.meta.main) {
   process.exitCode = await main(process.argv.slice(2));

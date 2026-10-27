@@ -1,0 +1,280 @@
+# hapi audit
+
+`mise run audit` (`hapi audit`) checks that what is deployed and running matches policy: the generated configs, the pins, the running stack's settings, the secrets setup, and each repo's GitHub settings. It is spec §11.8's "worse controls" measure: Phase 0 is done when `mise run audit` passes (spec §15). The code is `src/audit/`; the tests are `tests/audit/`.
+
+- [Running it](#running-it): as hapi, the flags, the output and exit codes.
+- [pass, fail and skip](#pass-fail-and-skip), `--strict` and `--dev`.
+- [The checks](#the-checks), one section each: what it verifies, why, its credential, how to fix a failure, what its skip means.
+- [GitHub credentials](#github-credentials): which endpoint needs which permission, and which token the audit uses.
+- [What the tool checks were checked against](#what-the-tool-checks-were-checked-against).
+- [Not covered yet](#not-covered-yet).
+
+## Running it
+
+Run it **as hapi, in hapi's checkout**, where the stack runs: it reads hapi's deployed `build/`, hapi's rootless Docker, hapi's secrets config and hapi's `host.env`, none of which another user can read.
+
+```bash
+sudo -iu hapi
+export XDG_RUNTIME_DIR=/run/user/$(id -u)
+cd ~/hapi-factory
+mise run audit -- --strict --repo "$OWNER/hapi-factory"
+```
+
+| Flag | What it does |
+|---|---|
+| `--repo owner/name` | A repo for the `github.*` and `repo.*` checks. Give it more than once for several repos. Without it, those checks skip. |
+| `--strict` | Every skip becomes a fail, its detail starting `--strict: skipped:`. Use it for stage b and any scheduled audit, where a check that couldn't be made must not look fine. |
+| `--dev` | The dev-only downgrades (the dev bypass, the env-file secrets provider) are reported as a skip instead of a fail. For development only. |
+| `--github-token-file path` | The operator's GitHub token, in a file only its owner can read (mode `0600`). It is read once and never printed, logged or put in a command line. Needed for the bypass-actor checks ([below](#github-credentials)). |
+| `--build-dir dir` | Compare another deployed build/ instead of hapi's `~hapi/hapi-factory/build`. |
+| `--policy dir` | The policy a fresh build is made from (default `policy/` of the checkout you run it in). |
+
+It prints one line per check, then a summary:
+
+```text
+pass  generated.drift         /home/hapi/hapi-factory/build equals a fresh build of /home/hapi/hapi-factory/policy (roster anthropic, 10 files); 5 running containers were started from it (org.hapi.build-sha256)
+skip  github.rulesets         no --repo given
+...
+hapi audit: 10 pass, 0 fail, 3 skip
+```
+
+**Exit codes:** `0` when no check fails, `1` when any check fails (after `--strict`), `2` on a usage error (an unknown flag, a missing value, a `--repo` that isn't `owner/name`, a flag given twice). A check that throws is a fail naming the error: the audit fails closed.
+
+Every detail names files, keys, containers and env var names. None prints a secret, a token or a deployed value that differs from policy.
+
+## pass, fail and skip
+
+- **pass:** the check verified what it says.
+- **fail:** it found a problem, or it hit an error.
+- **skip:** it couldn't be made, and the detail says why: the stack isn't running, there is no `--repo`, there are no GitHub credentials, Docker isn't available, the image isn't built here. **A skip is never a pass.** `--strict` turns every skip into a fail.
+
+Without the stack and without `--repo`, as on a development machine, most checks skip: run `mise run audit` there to see the pins and the MCP lock checked, and the rest skip with their reasons.
+
+## The checks
+
+| Check | Verifies | Spec | Needs |
+|---|---|---|---|
+| [`generated.drift`](#generateddrift) | The deployed build/ equals a fresh build of policy/, and every running container was started from it | §8.1, §11.8 | The deployed build/; Docker for the labels |
+| [`runtime.archon-env`](#runtimearchon-env) | The running archon's environment and read-only mounts | §9.2, §9.3 | Docker, the stack up |
+| [`runtime.hermes-no-yolo`](#runtimehermes-no-yolo) | No yolo, and approvals not off, in Hermes's effective config | §9.1 | Docker, the stack up |
+| [`runtime.dev-override`](#runtimedev-override) | The stack was started by `hapi stack up` as hapi, without the dev bypass | §4.3, §11.3 | Docker, the stack up |
+| [`pins.versions`](#pinsversions) | Every tool, image and installed package pinned exactly | §11.6 | The checkout |
+| [`tools.archon-validate`](#toolsarchon-validate) | Archon's own validation of the deployed config: no errors, no parse warnings, every alias and tier read as generated | §9.2 | Docker, the Archon image |
+| [`tools.hermes-validate`](#toolshermes-validate) | Hermes's own reading of the deployed config: every key known, every value read as written | §9.1 | Docker, the Hermes image |
+| [`mcp.tool-hashes`](#mcptool-hashes) | The MCP lock, its read-only tools, and the servers the stack runs | §10.1 | policy/ |
+| [`secrets.provider`](#secretsprovider) | The secrets provider (not the env-file downgrade), and for sops the recipients file and `recovery.age` | §11.5 | The secrets config |
+| [`secrets.check`](#secretscheck) | Every secret `resolve` needs is found, none empty or invalid | §11.5 | The secrets config and store |
+| [`github.rulesets`](#githubrulesets) | The two `main` rulesets, per `--repo` | §5.1, §11.5 | `--repo`; a token ([below](#github-credentials)) |
+| [`github.app-perms`](#githubapp-perms) | Neither App has administration, workflows or a bypass, per `--repo` | §11.5 | `--repo`; the App keys |
+| [`repo.ai-workflows`](#repoai-workflows) | No workflow runs an AI agent with secrets on comment, issue or review triggers, per `--repo` | §7, §11.7 | `--repo`; a token |
+
+### generated.drift
+
+**Verifies.** The deployed build/ (the one `hapi stack up` writes and the containers bind-mount: hapi's `~hapi/hapi-factory/build`, found from hapi's passwd entry; this checkout's `build/` when this shell sets `HAPI_ALLOW_CURRENT_USER=1`; or `--build-dir`) is byte for byte a fresh `buildAll` of `--policy`, for one of the three rosters (`up --roster` picks one; the detail names it). The fresh builds go into temp dirs the audit removes; the deployed build/ is never written. Then each running container's `org.hapi.build-sha256` label must be that build's digest (`buildDigest`, `src/stack/up.ts`), the label `up` sets.
+
+**Why.** The generators are deterministic ([docs/generated-configs.md](generated-configs.md)), so a difference is a hand edit, a stale build, or a policy change not yet deployed (spec §8.1; Review Focus 4: `approvals.mode: off` or `HOST=0.0.0.0` in a deployed file). Compose recreates a container whose config changed, not one whose bind-mounted file changed, so a container with another build's label may still run an older config.
+
+**Credential.** None: local files, and `docker inspect` for the labels.
+
+**Fix.** Never edit build/ by hand. Change policy/ in a PR, then `mise run up` rebuilds build/ and restarts what changed. The detail names each differing file and key (YAML, JSON, `archon.env`) or line (`squid.conf`), never the deployed value; "missing" means a generated file is gone.
+
+**Skip.** No hapi user on this host (pass `--build-dir`), no deployed build yet (`mise run up` writes it), or a build/ you can't read (run the audit as hapi). With the stack down it still compares the files and says the labels weren't checked.
+
+### runtime.archon-env
+
+**Verifies.** The running `archon` container's environment (from `docker inspect`) has every value of `serviceEnvironment("archon")` (`src/stack/env.ts`): `HOST=127.0.0.1`, `ARCHON_TELEMETRY_DISABLED=1`, `DO_NOT_TRACK=1`, `PI_OFFLINE=1`, `PI_TELEMETRY=0`, `PI_CODING_AGENT_DIR=/opt/hapi/pi-agent`, `ARCHON_DOCKER=true` and its proxy variables. And `/opt/hapi/pi-agent` and `/.archon/config.yaml` are mounted read-only.
+
+**Why.** These are the Global Constraints' Archon and Pi settings (spec §9.2: Archon's server has no auth and must listen on loopback; §9.3: `PI_OFFLINE=1` is critical, and the agent dir is read-only).
+
+**Credential.** None: `docker inspect`.
+
+**Fix.** A missing or different value means the container wasn't started from `stack/compose.yaml` as committed: restore the file and run `mise run up`. The detail names the variable and the value policy sets, never the running one.
+
+**Skip.** The stack isn't running, archon isn't running, or Docker isn't available.
+
+### runtime.hermes-no-yolo
+
+**Verifies.** Hermes's effective approval settings, from the running `hermes` container: no `--yolo` in its command line; no `HERMES_YOLO_MODE` or `HERMES_YOLO` set (to anything but empty, `0`, `false`, `no` or `off`) in its env; `HERMES_HOME` is `/opt/data`; and the config mounted read-only at `$HERMES_HOME/config.yaml` has `approvals.mode` not off, and no `cron_mode`, `unattended_mode` or `single_query_mode` that approves. The config is read as YAML 1.1, as Hermes reads it, where a bare `off` or `no` is `false`, which Hermes treats as `mode: off`.
+
+**Why.** Spec §9.1: yolo and `approvals.mode: off` are forbidden by policy, and an audit check enforces it.
+
+**Credential.** None: `docker inspect`, and the mounted config's file on the host.
+
+**Fix.** Remove the flag or variable (it would have to come from a changed `stack/compose.yaml`, since no secret may use a `HERMES_` name), and restore build/ with `mise run up`.
+
+**Skip.** The stack or hermes isn't running, Docker isn't available, or the mounted config can't be read (run the audit as hapi).
+
+### runtime.dev-override
+
+**Verifies.** The labels `hapi stack up` puts on every container: `org.hapi.dev-override=0` and `org.hapi.started-by=hapi` on every running one. `1` is the dev bypass (`HAPI_ALLOW_CURRENT_USER=1`); `unknown` or an empty value means a stack not started through `hapi stack up` (a raw `docker compose up`), never "no bypass". It also fails when this shell itself sets the bypass as a user other than hapi (`currentUserOverride`, `src/stack/up.ts`), since `mise run up` from it would run the stack as that user.
+
+**Why.** The bypass is a dev-only downgrade: no dedicated user and no rootless Docker (spec §4.3, §11.3). It must never pass a normal audit.
+
+**Credential.** None: `docker inspect`.
+
+**Fix.** Stop the stack (`mise run down`) and start it with `mise run up` as hapi, without `HAPI_ALLOW_CURRENT_USER` ([the dev bypass](runbooks/stack.md#the-dev-bypass-hapi_allow_current_user1)).
+
+**Skip.** The stack isn't running or Docker isn't available, and this shell sets no bypass. With `--dev`, a bypass is a skip saying what was found.
+
+### pins.versions
+
+**Verifies.** From the checkout's own files: every `[tools]` entry of `mise.toml` is an exact version (`MAJOR.MINOR.PATCH`, optionally with a suffix), never `latest`, a range or a prefix such as `3.14` (which mise reads as "the newest 3.14.x"); every `stack/compose.yaml` service's `image:` is pinned by digest, except a service built here, which must have `pull_policy: build`; every Dockerfile `FROM` and `COPY --from=` image is pinned by digest (an earlier stage's name is fine); and every package a Dockerfile `RUN` installs by name (`apt-get`, `apt`, `apk`, `pip`, `uv pip`, `uv tool`, `uv python`, `npm`, `bun`, `pnpm`, `yarn`, `go install`) names an exact version.
+
+**Why.** Spec §11.6 and the Global Constraints: pin every tool, image and plugin; never track `main` or `latest`.
+
+**Credential.** None.
+
+**Fix.** Pin it: an exact version in `mise.toml` (README, "Toolchain and pinning"), a tag and digest for an image ([docs/runbooks/stack.md](runbooks/stack.md#pinned-images)), `name=version` / `name==version` / `name@version` for a package.
+
+**Skip.** Never: it needs only the checkout.
+
+### tools.archon-validate
+
+**Verifies.** Archon's own reading of the deployed `archon/config.yaml` and Pi dir, in the image the stack runs:
+- `archon validate workflows --json` reports no error and **no parse warning**. Archon only warns about a key it doesn't know (an `unknown key ... will be ignored` parse warning) and drops it, and exits 0, so the audit treats a parse warning as a failure. Its other warnings are listed in the detail.
+- `archon ai alias list --json` and `ai tier list --json` show every generated alias and tier with its `effective` binding equal to the generated one: the `@<role>-retry` names, the bare claude-provider model ids and the `{provider, model, effort}` syntax are read as generated (H-030). A binding Archon refuses fails the whole run with Archon's error.
+
+It runs `docker run --rm --pull never --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true` as the image's user, with only the deployed config and Pi dir mounted read-only, the archon settings of `serviceEnvironment` and no secret, in a scratch git repo inside the container (Archon needs one). The image is the one `mise run up` built (`hapi-factory/archon:0.12.1`), or else `stack/archon/Dockerfile`'s pinned `FROM` if that is here. It never pulls, and never touches the running stack.
+
+**Why.** Spec §9.2: fail on parse warnings, since unknown keys are otherwise dropped silently. Review Focus 5: an upstream that ignores a generated key after an upgrade.
+
+**Credential.** None: no network, no secret.
+
+**Fix.** Fix the generator (`src/generate/archon.ts`) or the workflow, against the pinned Archon, then `mise run up`.
+
+**Skip.** No deployed build, Docker isn't available, or neither image is here (`mise run up` builds it).
+
+### tools.hermes-validate
+
+**Verifies.** Hermes's own reading of the deployed `hermes/config.yaml`, with its own Python in the image the stack runs (`hapi-factory/hermes:v0.22.5`, or the Dockerfile's pinned `FROM`), offline and read-only like `tools.archon-validate`:
+- every key of the deployed config is one Hermes knows: a key of its `DEFAULT_CONFIG`, or a reviewed key it reads outside it (`HERMES_KEYS_OUTSIDE_DEFAULTS` in `src/audit/checks/tools.ts`: today only `agent.reasoning_effort`, which `hermes_cli/cli_commands_mixin.py`, `hermes_cli/setup.py` and `tools/delegate_tool_config.py` read). An `mcp_servers` entry is held to the keys Hermes reads for a server (`HERMES_MCP_SERVER_KEYS`);
+- every value reads back through Hermes's `load_config` as the file says. That catches a YAML 1.1 reading (a bare `off` as `false`) and a value Hermes renames or normalizes. `load_config` deep-merges a partial block, such as an `auxiliary` slot that sets only `provider` and `model`, with Hermes's defaults;
+- Hermes's `validate_config_structure` reports nothing.
+The detail also gives the config's `_config_version` stamp: the generated config has none, which Hermes reads as 0 ("a never-stamped current-schema file", in its own words), and only `hermes update` or `hermes doctor --fix` would migrate it.
+
+**Why.** Hermes never warns about a key it doesn't know, so a renamed or ignored safety key would read as enforced (spec §9.1; H-029; Review Focus 5).
+
+**Credential.** None: no network, no secret.
+
+**Fix.** Fix the generator (`src/generate/hermes.ts`) against the pinned tag. If Hermes reads a key the audit doesn't know, check the source at the tag and add it to the reviewed list with where it is read.
+
+**Skip.** No deployed build, Docker isn't available, or neither image is here.
+
+### mcp.tool-hashes
+
+**Verifies.** From policy/ (`loadPolicy`, so a server listing the archon zone is refused first):
+- the lock `policy/mcp.lock.json` loads: its schema, and every hash matches its stored surface, so a hand edit shows;
+- no lock entry is orphaned;
+- for each server pinned at its current pin, every allowlisted tool (`tools.include`) is in the locked surface with `readOnlyHint: true` (H-035);
+- every server the stack runs (the zone services' enabled servers) has a lock entry for its pin.
+
+What it can't do yet is compare a running server's live surface with the lock: that needs the live fetch Plan 04 wires (H-101). Today no MCP server runs (the hermes zone enables Phoenix only with o11y on, archon never loads one, and the research container arrives in Plan 04), so there is nothing live to compare, and the check passes saying so.
+
+**Why.** Spec §10.1, the rug-pull defense: `hapi audit` (`mcp.tool-hashes`) fails closed on drift.
+
+**Credential.** None.
+
+**Fix.** Remove an orphaned entry in the PR that removed its server; re-pin a server whose surface changed, through a planning PR (`new_skill_or_mcp`); never allowlist a tool that isn't read-only.
+
+**Skip.** A server runs in the stack (o11y on), but its live surface can't be fetched until Plan 04.
+
+### secrets.provider
+
+**Verifies.** The secrets config (`$HAPI_SECRETS_CONFIG` or `~/.config/hapi/secrets.yaml` of the user running the audit) and its files (`describeSecretsConfig`). The env-file provider is a downgrade (plaintext on disk) and fails. For sops, the store's recipients file and `recovery.age` beside it, as `hapi secrets check` reads them: drift between the recipients file and the store, a post-quantum/classic mix, a `recovery.age` that doesn't match its recorded SHA-256, no recovery recipient, or no `recovery.age` all fail.
+
+**Why.** Spec §11.5: the env-file downgrade is explicit and audited (H-027); a store you can't recover, or one a key outside the recipients file can open, is a weaker control.
+
+**Credential.** None: it reads files, never a value.
+
+**Fix.** Move to sops + age ([docs/secrets.md](secrets.md#the-env-file-downgrade)); for a recipients problem, follow what `mise run secrets:check` says ([docs/secrets.md](secrets.md#keys-and-recovery)).
+
+**Skip.** There is no secrets config (run the audit as the user the stack runs as). With `--dev`, the env-file downgrade is a skip.
+
+### secrets.check
+
+**Verifies.** What `hapi secrets resolve` would find, through the provider contract (`checkSecrets`): every env var of `stack/secrets.yaml` found in the store, none missing, empty or invalid (a value `resolve` would refuse), and every MCP secret reference mapped in the manifest (H-028). A provider that fails (sops can't decrypt, say) is a fail: the check never passes where `resolve` would fail. Values are read only to classify them, never printed.
+
+**Why.** Spec §11.5: fail closed; nothing starts with a missing or empty secret.
+
+**Credential.** The user's own secrets provider (for sops, this machine's age key), as `hapi secrets check` uses it.
+
+**Fix.** Fill them in (`mise run secrets:edit`); `mise run secrets:check` lists each.
+
+**Skip.** There is no secrets config.
+
+### github.rulesets
+
+**Verifies**, per `--repo`, from the effective rules on `main` (`GET /repos/{owner}/{repo}/rules/branches/main`) and every ruleset (`GET .../rulesets`, then each by id), held to [docs/runbooks/github-apps.md](runbooks/github-apps.md) as `tests/docs/rulesets.test.ts` holds the README's JSON (H-023):
+- `main` has a `pull_request` rule with `required_approving_review_count` ≥ 1, a `required_status_checks` rule with `ci` from GitHub Actions (`integration_id` 15368), and `deletion` and `non_fast_forward` rules;
+- `main-review` applies to `main`, with the `update` rule (Restrict updates), `require_code_owner_review: true`, and exactly the Admin role's PR-only bypass (`actor_id` 5, `bypass_mode: pull_request`);
+- no ruleset holding `required_status_checks` has a bypass actor; no ruleset without bypass actors has `update`; no ruleset has an `Integration` (GitHub App) bypass actor.
+
+Rules in a ruleset in `evaluate` or `disabled` mode don't apply to `main`, so they don't count.
+
+**Why.** Spec §5.1 and §11.5: every lane gets the same CI gates, and no App can merge or bypass. `main` is guarded by two rulesets, because one ruleset's owner bypass would also bypass `ci`.
+
+**Credential.** The operator's token (`--github-token-file`), or else a read-only App installation token ([below](#github-credentials)). GitHub returns `bypass_actors` only to a token with write access to the ruleset, so with an App token the bypass checks can't be made.
+
+**Fix.** Set the rulesets as the runbook does ([GitHub Apps runbook](runbooks/github-apps.md#the-rulesets)).
+
+**Skip.** No `--repo`; no credentials; or the rules pass but GitHub returned no `bypass_actors` (pass `--github-token-file`).
+
+### github.app-perms
+
+**Verifies**, per `--repo`, with each App's own JWT: `GET /app` and `GET /repos/{owner}/{repo}/installation` list no `administration` or `workflows`, and no permission beyond the runbook's table ([the two Apps](runbooks/github-apps.md#the-two-apps)); the installation covers selected repositories only; and neither App (by its App id) is a bypass actor on any ruleset.
+
+**Why.** Spec §11.5: neither App can merge or bypass rulesets; no App ever gets Administration.
+
+**Credential.** The App ids and keys from `$XDG_RUNTIME_DIR/hapi/env/host.env`, read as `hapi token mint` reads them; a JWT needs no permission. The bypass part needs the ruleset data `github.rulesets` reads.
+
+**Fix.** Set each App's permissions exactly as the runbook says (then accept the new permissions on the installation), and remove the App from any ruleset's bypass list.
+
+**Skip.** No `--repo`; no App keys (`hapi secrets resolve` writes `host.env`); or the permissions pass but no ruleset's `bypass_actors` could be read.
+
+### repo.ai-workflows
+
+**Verifies**, per `--repo`: no `.github/workflows/*.yml` or `*.yaml` runs an AI agent with a credential on `issue_comment`, `issues`, `pull_request_review`, `pull_request_review_comment` or `pull_request_target`. An AI agent is a known AI action (`anthropics/claude-code-action`, `anthropics/claude-code-base-action`, `openai/codex-action`, `google-github-actions/run-gemini-cli`, `google-gemini/gemini-cli-action`, `actions/ai-inference`) or an AI CLI in a `run:` step (`claude`, `@anthropic-ai/claude-code`, `codex`, `gemini`, `aider`, `opencode`). A credential is a `secrets.*` or `github.token` reference in the step, its job's or the workflow's `env`, or `id-token: write`. A workflow that doesn't parse fails, since it can't be cleared. The tests use a copy of the mtg repo's comment-triggered `claude.yml` (H-036); no test reads another repo.
+
+**Why.** Spec §7 and §11.7: the onboarding PR removes or hardens any workflow that runs an AI agent with secrets on PR, issue or comment triggers (the "Comment and Control" class), and `mise run audit` fails until that's done. Anyone who can comment can steer such an agent.
+
+**Credential.** The operator's token, or a read-only App installation token (Contents read).
+
+**Fix.** Remove the workflow, or move the agent to a trigger that gets no secrets (`pull_request`, where a fork's PR runs without them).
+
+**Skip.** No `--repo` or no credentials.
+
+## GitHub credentials
+
+Every GitHub check makes GET requests only. The audit's own App token is the one exception: it is minted (a POST) and revoked when the audit ends (a DELETE).
+
+| Endpoint | Permission it needs | Source |
+|---|---|---|
+| `GET /repos/{owner}/{repo}/rules/branches/main` | Metadata: read | [Permissions required for GitHub Apps](https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps), "Repository permissions for Metadata" (checked 2026-10-27) |
+| `GET /repos/{owner}/{repo}/rulesets`, `.../rulesets/{id}` | Metadata: read; but `bypass_actors` "is only returned if the user making the API request has write access to the ruleset" | The same page; [Get a repository ruleset](https://docs.github.com/en/rest/repos/rules#get-a-repository-ruleset) |
+| `GET /repos/{owner}/{repo}/contents/{path}` | Contents: read | Permissions required for GitHub Apps, "Repository permissions for Contents" |
+| `GET /app`, `GET /repos/{owner}/{repo}/installation` | None: "You must use a JWT to access this endpoint"; each response holds the App's or installation's `permissions` | [REST API endpoints for GitHub Apps](https://docs.github.com/en/rest/apps/apps) (checked 2026-10-27) |
+
+Which credential each check uses:
+
+- **`--github-token-file`, the operator's token,** for `github.rulesets` and `repo.ai-workflows`. Write access to a ruleset is repository Administration, which the Apps never get (spec §11.5; [the runbook](runbooks/github-apps.md#the-two-apps)), so this is the only way the bypass checks run. A fine-grained token scoped to the one repo, with Administration and Metadata read and Contents read, is the narrowest to try first; GitHub's docs say write access, so if `github.rulesets` still says it got no `bypass_actors`, a token with Administration write is needed (the audit uses it for GETs only). The file must be a regular file only its owner can read (`chmod 600`); the token is never printed, logged or put in argv.
+- **Else an App installation token,** minted for the one repo with `contents: read` and `metadata: read` only, from `hapi-planner`'s keys (or `hapi-factory`'s) in `host.env`, the way `hapi token mint` gets them, and checked by `mintInstallationToken` (a broader token is refused and revoked). Metadata read covers the rules and rulesets endpoints and Contents read the workflow files, but not `bypass_actors`, so `github.rulesets` and `github.app-perms` skip their bypass part. The token stays in memory and is revoked when the audit ends.
+- **`github.app-perms` always uses each App's JWT,** which needs no permission.
+- With neither, each GitHub check skips: "no GitHub credentials".
+
+## What the tool checks were checked against
+
+On 2026-10-27, against the pinned images (`ghcr.io/coleam00/archon:0.12.1@sha256:eea19d4d…`, `nousresearch/hermes-agent:v0.22.5@sha256:9c556157…`), run offline (`--network none`) on a fresh build:
+
+- **Archon 0.12.1** validates its 24 bundled workflows with no issue, and reads every generated alias (`@implement-retry` and `@planner-retry` included, the claude-provider ones with bare model ids) and tier with its `effective` binding equal to the generated one (H-030). Its `tiers` and `aliases` are schema-checked strictly: an invalid `effort` fails every command with `Invalid model binding config`. An unknown key in a workflow is a parse warning (`Node 'a': unknown key 'bogus_node_key' will be ignored.`), and `validate` still exits 0. An unknown top-level key in `config.yaml` produces nothing at all (see [not covered yet](#not-covered-yet)).
+- **Hermes v0.22.5** knows every generated key but `agent.reasoning_effort`, which it reads outside `DEFAULT_CONFIG`; reads each value back as generated; deep-merges each partial `auxiliary` slot with its defaults; and reports no structure issue (H-029). Its source reads every `mcp_servers` key the generator writes: `trust` (`tools/mcp_tool_registration.py`), `elicitation.enabled` and `sampling.enabled` (`tools/mcp_tool_server_run.py`), `tools.include`, `tools.prompts` and `tools.resources` (`tools/mcp_tool_registration.py`). A YAML `mode: off` reaches Hermes as `false`, which it treats as `off`.
+
+`tests/audit/fixtures/` holds the outputs the unit tests replay: Archon's `validate workflows --json` (clean, and with parse warnings) and Hermes's `DEFAULT_CONFIG`. After an upgrade, capture them again from the new images.
+
+## Not covered yet
+
+- **Spend limits** (spec §11.8 lists them with the audit): provider-side caps aren't read by any check (H-151).
+- **Live MCP surfaces:** `mcp.tool-hashes` compares the lock with a running server's surface once Plan 04 wires the fetch (H-101).
+- **Unknown top-level keys in Archon's config.yaml:** Archon 0.12.1 ignores them without a word, so `tools.archon-validate` can't see them; today the generated file holds only `tiers` and `aliases`, which Archon checks strictly (H-152).
+- **The audit in CI** (spec §11.8: "It runs in CI on hapi-factory"): `.github/workflows/ci.yml` is a protected path (H-154).
+- **Reusable workflows and other triggers:** `repo.ai-workflows` doesn't follow a job that calls a reusable workflow, or flag `workflow_run` (H-155).
+- **`private/` tracked in this repo:** a check Task 7b adds (H-058). **Active skill forks:** Plan 04 (H-109).

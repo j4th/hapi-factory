@@ -91,11 +91,11 @@ description = "Compile policy/ into the Hermes, Archon, Pi, egress and MCP confi
 run = "bun run src/cli.ts policy build"
 
 [tasks.audit]
-description = "Check deployed config, pins and settings against policy (arrives in Plan 01 Task 6)"
-run = "echo 'audit is not implemented yet (arrives in Plan 01 Task 6)' >&2; exit 1"
+description = "Check the deployed config, pins, running stack, secrets setup and each --repo's GitHub settings against policy; exits 1 on any fail, and `--strict` fails every skip too (e.g. `mise run audit -- --strict --repo <owner>/<name>`, as hapi; docs/audit.md)"
+run = "bun run src/cli.ts audit"
 
 [tasks.up]
-description = "Build policy, resolve secrets, then start the stack and wait until it is healthy, as the hapi user (re-execs with sudo -iu hapi; HAPI_ALLOW_CURRENT_USER=1 is a dev-only bypass). Flags after --, e.g. `mise run up -- --roster budget` (docs/runbooks/stack.md)"
+description = "Build policy, resolve secrets, then start the stack and wait until it is healthy, as the hapi user (re-execs with sudo -u hapi -H; HAPI_ALLOW_CURRENT_USER=1 is a dev-only bypass). Flags after --, e.g. `mise run up -- --roster budget` (docs/runbooks/stack.md)"
 run = "bun run src/cli.ts stack up"
 
 [tasks.down]

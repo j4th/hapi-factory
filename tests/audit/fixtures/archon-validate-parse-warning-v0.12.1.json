@@ -1,0 +1,26 @@
+{
+ "results": [
+  {
+   "workflowName": "hapi-probe",
+   "valid": true,
+   "issues": [
+    {
+     "level": "warning",
+     "field": "parse_warning",
+     "message": "Node 'a': unknown key 'bogus_node_key' will be ignored."
+    },
+    {
+     "level": "warning",
+     "field": "parse_warning",
+     "message": "Workflow 'hapi-probe': unknown key 'unknown_top' will be ignored."
+    }
+   ]
+  }
+ ],
+ "summary": {
+  "total": 1,
+  "valid": 1,
+  "errors": 0,
+  "warnings": 1
+ }
+}

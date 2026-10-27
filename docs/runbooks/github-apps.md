@@ -70,7 +70,7 @@ Do this twice: once for `hapi-planner`, once for `hapi-factory`.
 
 ## The rulesets
 
-Rulesets are where the "no merge" rule lives. Neither App is a bypass actor in any of them. Task 6's `hapi audit` checks this (`github.rulesets`, `github.app-perms`), and `tests/docs/rulesets.test.ts` holds the JSON on this page and in the README to the same rules.
+Rulesets are where the "no merge" rule lives. Neither App is a bypass actor in any of them. `hapi audit --repo $OWNER/hapi-factory` checks the live rulesets and both Apps against this page (`github.rulesets`, `github.app-perms`, [docs/audit.md](../audit.md#githubrulesets)), and `tests/docs/rulesets.test.ts` holds the JSON on this page and in the README to the same rules. GitHub shows a ruleset's bypass actors only to a token with write access to it, so the audit's bypass checks use your own token (`--github-token-file`), never an App's: the Apps never get Administration.
 
 ### The two rulesets on `main` (Plan 01 Task 1)
 

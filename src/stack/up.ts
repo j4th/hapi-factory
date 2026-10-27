@@ -40,6 +40,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { userInfo } from "node:os";
+import { join } from "node:path";
 import { CLIENT_RANGES } from "../generate/egress";
 import { buildAll, ROSTERS } from "../generate/index";
 import { loadPolicy } from "../policy/load";
@@ -140,10 +141,14 @@ async function zoneNetworks(run: Runner, env: Record<string, string>): Promise<u
   return parsed;
 }
 
-/** A SHA-256 over the generated files, each path and its contents, in path order. */
-export function buildDigest(paths: string[]): string {
+/**
+ * A SHA-256 over the generated files, each path (as given) and its contents, in path order. `up` passes the
+ * paths `buildAll` wrote (`build/...`, relative to the checkout). With `root`, each path is read under it but
+ * hashed as given, so the audit can compute the same digest for a build it made in a temp dir.
+ */
+export function buildDigest(paths: string[], root?: string): string {
   const h = createHash("sha256");
-  for (const p of [...paths].sort()) h.update(`${p}\0`).update(readFileSync(p)).update("\0");
+  for (const p of [...paths].sort()) h.update(`${p}\0`).update(readFileSync(root === undefined ? p : join(root, p))).update("\0");
   return h.digest("hex");
 }
 

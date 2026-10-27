@@ -20,6 +20,7 @@ import { createHash } from "node:crypto";
 import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadPolicy, PolicyError } from "../policy/load";
+import { isMcpZone } from "../policy/mcp";
 import { check, type Issue, pointerSegment } from "../policy/schema";
 import type { McpPackage, McpServer, Policy } from "../policy/types";
 
@@ -144,8 +145,16 @@ export function pinOf(s: McpServer): McpPin {
  * `unpinned`. A lock entry for a server the catalog doesn't have is
  * `orphaned`, and that server is never fetched. Results are in name order. A
  * failed fetch rejects the whole check (fail closed).
+ *
+ * A server that lists a zone outside MCP_ZONES (archon) rejects the check
+ * before anything is fetched: `loadPolicy` refuses such a catalog, but a
+ * policy built in code skips the loader, and fetching would launch the server.
  */
 export async function verifyLock(p: Pick<Policy, "mcp">, lock: McpLock, fetchSurface: FetchSurface): Promise<LockStatus[]> {
+  for (const [name, s] of Object.entries(p.mcp.servers)) {
+    const bad = s.zones.find((z) => !isMcpZone(z));
+    if (bad !== undefined) throw new Error(`MCP server ${name} lists the ${bad} zone, which never loads MCP servers (spec §10.1); it is never launched`);
+  }
   const results: LockStatus[] = [];
   const names = [...new Set([...Object.keys(p.mcp.servers), ...Object.keys(lock)])].sort(byString);
   for (const name of names) {

@@ -7,6 +7,7 @@ This runbook covers running the hapi-factory stack (spec §4.3, §9, §10, §11.
 - [2. the `hapi` user's toolchain](#2-the-hapi-users-toolchain);
 - [3. the `hapi` user's secrets](#3-the-hapi-users-secrets), and [re-syncing after an edit](#re-syncing-after-you-edit-the-store);
 - [4. `mise run up` and `mise run down`](#4-mise-run-up-and-mise-run-down), and [the dev bypass](#the-dev-bypass-hapi_allow_current_user1);
+- [5. the audit](#5-the-audit), the last step of stage b;
 - [the kill switches](#kill-switches);
 - [the pinned images](#pinned-images) and [the hardening](#hardening);
 - [troubleshooting](#troubleshooting);
@@ -15,7 +16,7 @@ This runbook covers running the hapi-factory stack (spec §4.3, §9, §10, §11.
 It runs in two stages:
 
 - **Stage a (done in Plan 01 Task 5):** the files below were written, and the integration tests ran on the build host's rootful Docker as an ordinary user. That run covered the egress proxies and networks, plus Hermes and Archon started with fake secrets. No real secret was used, and `scripts/host-setup.sh` was not run.
-- **Stage b (the operator, later):** first the Slack app ([docs/runbooks/slack.md](slack.md)), with its three values in your store: `mise run up` refuses an empty secret, and the app's manifest needs no stack (a one-off `docker run` of the pinned Hermes image with no network). Then sections 1–4 on the real host, as the `hapi` user on rootless Docker, then `mise run test:int` there. It may run while the stack is up, because it never touches the running stack or the checkout's `build/` ([what the tests prove](#what-the-tests-prove)).
+- **Stage b (the operator, later):** first the Slack app ([docs/runbooks/slack.md](slack.md)), with its three values in your store: `mise run up` refuses an empty secret, and the app's manifest needs no stack (a one-off `docker run` of the pinned Hermes image with no network). Then sections 1–4 on the real host, as the `hapi` user on rootless Docker, then `mise run test:int` there. It may run while the stack is up, because it never touches the running stack or the checkout's `build/` ([what the tests prove](#what-the-tests-prove)). Stage b ends with [the audit](#5-the-audit), as hapi, with the stack up: `mise run audit -- --strict --repo <owner>/<name>`.
 
 Every command marked *as hapi* runs in a shell of the `hapi` user (`sudo -iu hapi`). The other commands run as the operator, from the operator's own checkout.
 
@@ -166,10 +167,20 @@ With this set, `up` and `down` skip the re-exec and run the stack as **you**, on
 
 - `up` prints a warning.
 - Every container is labelled `org.hapi.dev-override=1` and `org.hapi.started-by=<you>`. (`up` as hapi sets `0` and `hapi`; a stack started some other way, such as a raw `docker compose up`, says `unknown` for both.)
-- `hapi audit` (Plan 01 Task 6) reports it, through `currentUserOverride(env)` in `src/stack/up.ts`.
+- `hapi audit` fails on it (`runtime.dev-override`): it reads those labels, and this shell's own setting through `currentUserOverride(env)` in `src/stack/up.ts`. `--dev` makes it a skip ([docs/audit.md](../audit.md#runtimedev-override)).
 - Only exactly `1` turns it on. It means nothing for the hapi user itself.
 
 Never use it for the real stack.
+
+## 5. The audit
+
+The last step of stage b, and whenever you want to know the stack still matches policy: as hapi, in hapi's checkout, with the stack up and `XDG_RUNTIME_DIR` exported (so the GitHub checks can read the App keys from `host.env`):
+
+```bash
+mise run audit -- --strict --repo <owner>/<name>
+```
+
+It checks that the deployed `build/` is what policy builds and that the containers were started from it, Archon's environment and Hermes's approval settings in the running containers, that the stack was started by `hapi stack up` without the dev bypass, the pins, Archon's and Hermes's own reading of the deployed configs (offline, in the stack's own images), the MCP lock, the secrets setup, and the repo's rulesets, App permissions and AI workflows. `--strict` makes every check that couldn't be made fail, so stage b passes only when every check passed: expect exit 0 and `0 fail`. Add `--github-token-file <file>` (the operator's token, mode `0600`): GitHub shows a ruleset's bypass actors only to a token that can write the ruleset, which the Apps never can, so without it the bypass parts of `github.rulesets` and `github.app-perms` skip, and `--strict` fails them. Every check, its credential, its fix and its skip: [docs/audit.md](../audit.md).
 
 ## Kill switches
 
@@ -272,7 +283,7 @@ Spike T12 re-checks these settings under rootless Docker. If it relaxes one, it 
 
 ### Open items
 
-- **Not yet run on the real host:** host setup, rootless Docker, the subordinate ID range, lingering, kill switch 4, `up`'s re-exec through the host's real sudo, and the whole stack under hapi. That is stage b, and spike T12 runs alongside it.
+- **Not yet run on the real host:** host setup, rootless Docker, the subordinate ID range, lingering, kill switch 4, `up`'s re-exec through the host's real sudo, the whole stack under hapi, and the audit against it and the real GitHub repo. That is stage b, and spike T12 runs alongside it.
 
 ## What the tests prove
 
@@ -285,6 +296,7 @@ Spike T12 re-checks these settings under rootless Docker. If it relaxes one, it 
 | `tests/stack/cidr.test.ts` | The CIDR maths behind the network check and the `to_localnet` overlap check. |
 | `tests/scripts/host-setup.test.ts` | It never runs the script. `bash -n` parses it, and shellcheck lints it when on PATH. It is in strict mode, and every step runs after the root check. Each step checks before it acts. The subordinate ID range covers uid 584792. Docker is rootless and lingering is on. mise is pinned to `min_version`, checked by SHA-256, never piped to a shell, and reaches hapi on stdin, at `~/.local/bin/mise`, where `up`'s re-exec runs it. The checkout goes where `up` re-execs, made by hapi. The next steps are printed, with the secrets helper. |
 | `tests/scripts/hapi-home.test.ts` | [Root never acts on hapi's home](#hardening). The root-side code of `host-setup.sh` and `copy-secrets-to-hapi.sh` (everything but the snippets they hand to hapi's `sh`) names no path in hapi's home and runs no `install`, `chown`, `chmod`, `mkdir`, `>>` or the like; every sudo runs as hapi; nothing given to `sudo -i` holds a `$`. No doc (README, `docs/secrets.md`, the runbooks) has a root `sudo` on a hapi-home path, or an `install` or `chown` that hands a file to hapi. The controls: the old lines are caught. Then the snippets hapi runs are run as this user in a temp `HOME`: the checkout refuses a dangling symlink and follows nothing; a failed clone leaves nothing; mise is renamed into place at `0755`; the activate line is added once; the helper, with `sudo` and `id` stood in, writes the three files at `0600` in a `0700` dir. |
+| `tests/audit/*.test.ts` | Every audit check over a world of fakes (no Docker, network or secret): a hand edit to the deployed build (`approvals.mode: off`, `HOST=0.0.0.0`) and a container started from another build fail `generated.drift`; the running containers' env, yolo flags and dev-bypass labels; the pins; Archon's parse warnings (in the shape the pinned image prints) and Hermes's unknown keys; the MCP lock; the secrets provider and store; the rulesets, App permissions and a comment-triggered AI workflow on a fake GitHub. See [docs/audit.md](../audit.md). |
 | `tests/docs/slack-manifest.test.ts` | The Slack runbook's manifest command runs exactly `stack/hermes/Dockerfile`'s pinned image, with `--network none`, as its user, read-only, and prints to stdout. |
 | `tests/secrets/manifest.test.ts` (the reserved names) | A manifest env name hapi sets itself (`HOST`, `HTTPS_PROXY`, `PI_OFFLINE`, `ALL_PROXY`, ...) is refused in any zone, naming each, by `loadManifest` and for a manifest built in code, before resolve fetches anything. So is a process-control or trust-store name, exact (`PATH`, `SSL_CERT_FILE`, `GIT_SSH_COMMAND`, every name of `CONTROL_ENV_NAMES`) by prefix (`LD_PRELOAD`, `NODE_OPTIONS`, every prefix of `CONTROL_ENV_PREFIXES`) or an endpoint override by suffix (`ANTHROPIC_BASE_URL`, `OTEL_EXPORTER_OTLP_ENDPOINT`, every suffix of `CONTROL_ENV_SUFFIXES`), with the rule in the message. Lookalikes (`LDAP_PASSWORD`, `NODEPING_API_KEY`, `PIPELINE_KEY`, `SLACK_WEBHOOK_URL`) pass. `RESERVED_ENV_NAMES` and the prefixes are pinned, and the committed manifest uses none of them. |
 | `tests/generate/egress.test.ts` | The proxies' new `to_localnet` ranges (`::/96`, `2002::/16`, `2001::/32`, `100::/64`, `fec0::/10`). No range covers another, so `squid -k parse` stays clean. `pinger_enable off` is set, and the NAT64 trade-off is noted. Every zone, the research zone included, refuses IP literals (`ip_literal`) before any allow. |

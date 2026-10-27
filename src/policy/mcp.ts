@@ -15,7 +15,8 @@
  * - env: a stdio server gets only the names its package's allowlist
  *   (`PACKAGE_ENV`) lists, each in the form its rule says (a secret as a
  *   `secret:` reference, a flag as one of its values, an endpoint as a URL
- *   whose host is an egress host), and any secret-looking name
+ *   whose host is an egress host), and every name a rule marks `required`;
+ *   any secret-looking name
  *   (`SECRET_ENV_NAME`) only as a secret reference; no server sets a name on
  *   the hard denylist (`forbiddenEnv`: launch hijacks, proxies and URL
  *   overrides); and one server per secret.
@@ -106,9 +107,12 @@ export function blockedBy(name: string, blocked: readonly string[]): string | un
  * - `secret`: only as a secret reference (`secret:hapi-mcp-<name>`), never a literal;
  * - `flag`: only as a literal, one of `values`, so it can't carry a secret;
  * - `endpoint`: only as a literal http(s) URL with no user info, query or
- *   fragment, whose host is one of the server's egress hosts or under one.
+ *   fragment, whose host is one of the server's egress hosts or under one,
+ *   and whose path is plain segments.
+ * `required`: every entry for the package must set it (spec §10.1 says it is
+ * set); a missing one is refused, not merely allowed.
  */
-export type EnvRule = { kind: "secret" } | { kind: "flag"; values: readonly string[] } | { kind: "endpoint" };
+export type EnvRule = ({ kind: "secret" } | { kind: "flag"; values: readonly string[] } | { kind: "endpoint" }) & { required?: true };
 
 /**
  * The env allowlist (spec §10.1: "env, by secret name"), by npm package: every
@@ -124,13 +128,13 @@ export type EnvRule = { kind: "secret" } | { kind: "flag"; values: readonly stri
  */
 export const PACKAGE_ENV: Readonly<Record<string, Readonly<Record<string, EnvRule>>>> = {
   "@upstash/context7-mcp": {
-    CONTEXT7_API_KEY: { kind: "secret" },
-    OTEL_SDK_DISABLED: { kind: "flag", values: ["true"] }, // spec §10.1: telemetry off
+    CONTEXT7_API_KEY: { kind: "secret", required: true }, // spec §10.1: always with an API key
+    OTEL_SDK_DISABLED: { kind: "flag", values: ["true"], required: true }, // spec §10.1: telemetry off
   },
   "@arizeai/phoenix-mcp": {
-    PHOENIX_API_KEY: { kind: "secret" }, // minted by a VIEWER-role user
-    PHOENIX_DISCOVER_CONFIG: { kind: "flag", values: ["false"] }, // no .env.phoenix discovery up the directory tree
-    PHOENIX_ENDPOINT: { kind: "endpoint" }, // explicit, so a planted .env.phoenix can't redirect it
+    PHOENIX_API_KEY: { kind: "secret", required: true }, // minted by a VIEWER-role user
+    PHOENIX_DISCOVER_CONFIG: { kind: "flag", values: ["false"], required: true }, // no .env.phoenix discovery up the directory tree (on by default)
+    PHOENIX_ENDPOINT: { kind: "endpoint", required: true }, // explicit, so a planted .env.phoenix can't redirect it
   },
 };
 
@@ -179,7 +183,14 @@ export function forbiddenEnv(name: string): string | undefined {
 /** Whether `host` is `domain` or a subdomain of it, as the egress proxy matches. */
 const underDomain = (host: string, domain: string) => host === domain || host.endsWith(`.${domain}`);
 
-/** Why an endpoint literal is refused, or undefined: it must be an http(s) URL with no user info, query or fragment, under one of `egress`. */
+/** An endpoint's path, as written: plain segments of unreserved characters, no dot segment. */
+const PLAIN_PATH = /^(?:\/(?!\.{1,2}(?:\/|$))[A-Za-z0-9._~-]*)*$/;
+
+/**
+ * Why an endpoint literal is refused, or undefined: it must be an http(s) URL with no user info, query or
+ * fragment, under one of `egress`, whose path (as written, before URL normalization) is plain segments: no
+ * percent-encoding, dot segment or other punctuation that could reshape the request.
+ */
 function endpointProblem(value: string, egress: readonly string[]): string | undefined {
   let url: URL;
   try {
@@ -192,6 +203,8 @@ function endpointProblem(value: string, egress: readonly string[]): string | und
   if (/[?#]/.test(value)) return "it may not hold a query or fragment, which could carry a secret";
   const host = url.hostname.toLowerCase();
   if (!egress.some((d) => underDomain(host, d))) return `its host ${JSON.stringify(host)} is not one of this server's egress hosts, or under one`;
+  const path = /^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/]*(.*)$/s.exec(value)?.[1] ?? "";
+  if (!PLAIN_PATH.test(path)) return "its path may hold only plain segments (letters, digits and . _ ~ -), with no percent-encoding or dot segment";
   return undefined;
 }
 
@@ -276,6 +289,12 @@ export function mcpIssues(m: McpCatalog): Issue[] {
     });
 
     if (s.transport === "http" && Object.keys(s.env).length > 0) add(at("env"), "env is for stdio servers; an http server gets none");
+    const rules = s.transport === "stdio" && s.package !== undefined && Object.hasOwn(PACKAGE_ENV, s.package.name) ? PACKAGE_ENV[s.package.name]! : {};
+    for (const [env, rule] of Object.entries(rules)) {
+      if (rule.required === true && !Object.hasOwn(s.env, env)) {
+        add(at("env"), `${s.package!.name} must set ${env} (PACKAGE_ENV in src/policy/mcp.ts marks it required, spec §10.1)`);
+      }
+    }
     for (const [env, value] of Object.entries(s.env)) {
       const reason = forbiddenEnv(env);
       if (reason !== undefined) add(at("env", env), `a server may not set ${env}: ${reason} (spec §10.1)`);

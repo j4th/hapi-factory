@@ -8,7 +8,7 @@
  * plaintext there could be committed, or pushed to the private remote.
  *
  * `downgrade` is true: `hapi secrets resolve` and `check` warn on every run,
- * and `hapi audit` (Plan 01 Task 6) reports it. Use sops + age instead.
+ * and `hapi audit` fails on it (secrets.provider). Use sops + age instead.
  */
 import { readFile } from "node:fs/promises";
 import { secretEnvName } from "../../policy/mcp";

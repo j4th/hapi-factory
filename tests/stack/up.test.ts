@@ -136,6 +136,19 @@ describe("hapi stack up", () => {
     expect(buildDigest([a])).not.toBe(buildDigest([b]));
   });
 
+  test("buildDigest with a root hashes the paths as given and reads them under the root, so the audit can recompute up's label for a build elsewhere", () => {
+    const [one, two, other] = [tempDir("hapi-stack-digest-"), tempDir("hapi-stack-digest-"), tempDir("hapi-stack-digest-")];
+    for (const [root, text] of [[one, "same bytes"], [two, "same bytes"], [other, "other bytes"]] as const) {
+      mkdirSync(join(root, "build", "egress"), { recursive: true });
+      writeFileSync(join(root, "build", "egress", "hermes.squid.conf"), text);
+    }
+    const paths = ["build/egress/hermes.squid.conf"];
+    expect(buildDigest(paths, one)).toBe(buildDigest(paths, two));
+    expect(buildDigest(paths, one)).not.toBe(buildDigest(paths, other));
+    // The path is part of the digest: the same bytes at another path differ.
+    expect(buildDigest(paths, one)).not.toBe(buildDigest([join(one, paths[0]!)]));
+  });
+
   test("--config reaches the secrets step; the default roster is anthropic", async () => {
     capture();
     const f = fakes();

@@ -128,10 +128,10 @@
       "maxLength": 2048
     },
     "mcpUrl": {
-      "description": "An MCP server's endpoint: an httpsUrl with no '$'. Hermes expands ${VAR} and ${env:VAR} in a server entry's url, headers, args and env, so a '$' here could put Hermes's provider key, or another server's key, into a request to this host. A headers field, if one is ever added, gets the same ban. Shared by policy/mcp.yaml and policy/mcp.lock.json.",
+      "description": "An MCP server's endpoint: an httpsUrl with no '$', query or fragment. Hermes expands ${VAR} and ${env:VAR} in a server entry's url, headers, args and env, so a '$' here could put Hermes's provider key, or another server's key, into a request to this host. A headers field, if one is ever added, gets the same ban. A query or fragment ('?', '#') could hold a literal credential (?key=...), which would be written in plaintext into every generated config. Shared by policy/mcp.yaml and policy/mcp.lock.json.",
       "type": "string",
       "allOf": [{ "$ref": "#/$defs/httpsUrl" }],
-      "pattern": "^[^$]+$"
+      "pattern": "^[^$?#]+$"
     }
   }
 }

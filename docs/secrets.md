@@ -13,7 +13,7 @@ Secrets come in three parts:
 The providers:
 - **sops + age, the default for everyone.** One encrypted file, encrypted to one age key per machine or user plus a recovery key that 10 words unlock ([keys and recovery](#keys-and-recovery)). No service to run, encrypted at rest, and the encrypted file can be backed up in a private repo. Onboarding is `mise run secrets:init`.
 - **Bitwarden Secrets Manager (`bws`), optional.** The config binds each logical name to a bws secret id.
-- **`env-file`, an explicit downgrade.** A plaintext `0600` file outside every checkout. Every run warns about it, and `hapi audit` (Plan 01 Task 6) reports it.
+- **`env-file`, an explicit downgrade.** A plaintext `0600` file outside every checkout. Every run warns about it, and `hapi audit` fails on it (`secrets.provider`, [docs/audit.md](audit.md#secretsprovider)).
 
 The rules:
 - **The repo holds logical names only.** Never a value, and never an id or a path from your deployment.
@@ -533,7 +533,7 @@ env_file: { file: ~/.config/hapi/secrets.env }
 
 The store is one plaintext file of `NAME='value'` lines, NAME being the logical name upper-cased with `-` as `_` (`hapi-hermes-anthropic-api-key` → `HAPI_HERMES_ANTHROPIC_API_KEY`). It exists for a host that can't run sops. It must be mode `0600`, yours, and **outside the hapi-factory checkout, `private/` included**: plaintext there could be committed, or pushed to the private remote. hapi refuses it otherwise.
 
-**Why it is audited:** the values sit on disk in plaintext, readable by anything that runs as you and by any backup of your home directory. So `resolve` and `check` print a warning on every run, and `hapi audit` (Plan 01 Task 6) reports the config as a downgrade (`describeSecretsConfig` returns `downgrade: true`). Move to sops + age when you can: `mise run secrets:init`, copy each value across with `mise run secrets:edit`, then shred the env file.
+**Why it is audited:** the values sit on disk in plaintext, readable by anything that runs as you and by any backup of your home directory. So `resolve` and `check` print a warning on every run, and `hapi audit` fails on the config as a downgrade (`secrets.provider`: `describeSecretsConfig` returns `downgrade: true`; `--dev` makes it a skip, [docs/audit.md](audit.md#secretsprovider)). Move to sops + age when you can: `mise run secrets:init`, copy each value across with `mise run secrets:edit`, then shred the env file.
 
 ## `hapi token mint`
 
@@ -586,6 +586,5 @@ The error kinds: a `PolicyError` when the manifest or the config doesn't match i
 
 - **The research container's model key.** `hapi-research` (Plan 04) runs Hermes, so it needs a model key as well as its search keys. Plan 04 decides which capped key it gets, and adds it to the `research` zone of the manifest.
 - **One store reads every zone.** A key, or a bws machine account, per zone would limit what one leaked key exposes. The resolver uses one store today.
-- **`describeSecretsConfig` lists the config, the store and the age key**, not yet the recipients file and `recovery.age` beside the store. Plan 01 Task 6's audit should check those too.
 - **A store made before recovery keys** (by an earlier `hapi secrets init`) has no recipients file, so `check`, `edit` and the lifecycle commands refuse it. There is no migration command: make a new store with `mise run secrets:init` at another path, read the old values with raw sops and the old age key, in your terminal, `GPG_AGENT_INFO= SOPS_AGE_KEY_FILE=<the old age key> mise exec -- sops --config /dev/null decrypt <the old store>` (it prints every value: never redirect it to a file), and type or paste each into the new store with `mise run secrets:edit`. Then delete the old store, and its key once nothing else uses it.
 - **bws ids aren't cross-checked against secret names.** `bws secret get` returns the secret's name. Checking it against the logical name would catch an id bound to the wrong name.

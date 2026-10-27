@@ -148,6 +148,15 @@ describe("verifyLock", () => {
     expect(f.asked).toEqual(["context7", "phoenix"]);
   });
 
+  test("a server listing a zone that may not load MCP servers is never fetched, even from a policy built in code (H-031)", async () => {
+    // A policy built in code skips the loader, which would refuse the archon zone.
+    const q = structuredClone(p);
+    q.mcp.servers.context7!.zones = ["research", "archon"];
+    const f = fake({ context7: CONTEXT7, phoenix: PHOENIX });
+    await expect(verifyLock(q, {}, f.fetch)).rejects.toThrow("MCP server context7 lists the archon zone, which never loads MCP servers");
+    expect(f.asked).toEqual([]);
+  });
+
   test("a fetch failure fails the whole check", async () => {
     await expect(verifyLock(p, {}, fake({ context7: CONTEXT7 }).fetch)).rejects.toThrow("no fake surface for phoenix");
   });

@@ -55,7 +55,7 @@ export class SecretError extends Error {
  */
 export interface SecretProvider {
   readonly name: ProviderName;
-  /** True for env-file: plaintext on disk. `hapi audit` (Plan 01 Task 6) reports it. */
+  /** True for env-file: plaintext on disk. `hapi audit` fails on it (secrets.provider; --dev: a skip). */
   readonly downgrade: boolean;
   fetch(names: string[]): Promise<Map<string, string>>;
   list(): Promise<string[]>;
@@ -165,7 +165,11 @@ export function loadSecretsConfig(path: string, env: Env): SecretsConfig {
   }
 }
 
-/** What `hapi audit` needs to know about a config: the provider, whether it is a downgrade, and every file it uses (the config first). */
+/**
+ * What `hapi audit` needs to know about a config: the provider, whether it is a downgrade, and every file it
+ * uses (the config first). The sops store's recipients file and recovery.age, beside the store, aren't listed
+ * here (./recipients.ts imports this module); `hapi audit` (secrets.provider) checks them with `recipientReport`.
+ */
 export function describeSecretsConfig(cfg: SecretsConfig): { provider: ProviderName; downgrade: boolean; files: string[] } {
   switch (cfg.provider) {
     case "sops":

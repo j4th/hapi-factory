@@ -28,7 +28,7 @@ mise run hapi -- policy build --policy policy --out build --roster portable
 
 It prints each path it wrote, one per line, and exits 0. A usage error (an unknown flag or roster, or a missing value) exits 2. A policy file that fails to load exits 1 with `hapi policy build: <file>: <problem>`.
 
-**Builds are deterministic.** Keys come out in a fixed order, lists are sorted, and nothing holds a timestamp, so building twice from the same policy gives byte-identical files. That is how Task 6's `mise run audit` will detect a hand edit to a deployed file: it compares the deployed file with a fresh build. Every emitter runs before anything is written, so a policy that an emitter refuses leaves the existing files untouched. `buildAll` only writes files; it never deletes any.
+**Builds are deterministic.** Keys come out in a fixed order, lists are sorted, and nothing holds a timestamp, so building twice from the same policy gives byte-identical files. That is how `mise run audit` detects a hand edit to a deployed file: `generated.drift` compares the deployed build/ with a fresh build ([docs/audit.md](audit.md#generateddrift)). Every emitter runs before anything is written, so a policy that an emitter refuses leaves the existing files untouched. `buildAll` only writes files; it never deletes any.
 
 **From code**, `buildAll(policy, outDir, { roster, o11y })` in `src/generate/index.ts` writes the files and returns their paths. `o11y` says whether the observability profile runs, which turns on the o11y-gated MCP servers in Hermes's config. It defaults to the policy's `flags.otel.enabled` (off), so to build with Phoenix MCP set that flag, or pass `o11y: true` from code. The emitters are pure functions that return `{ filename: contents }`: `emitHermes(p, { o11y })`, `emitArchon(p, roster)`, `emitPi(p, roster)`, `emitEgress(p)` and `emitMcp(p)`, in `src/generate/{hermes,archon,pi,egress,mcp}.ts`. `src/generate/mcp.ts` also has `hermesMcpServers(p, zone, { o11y })`, a zone's Hermes `mcp_servers`, which Plan 04's hapi-research profile uses for the research zone. Apply a repo overlay first (`applyOverlay`, [docs/policy.md](policy.md#repo-overlays-factoryconfigyaml)) to build for that repo.
 
@@ -38,7 +38,7 @@ It prints each path it wrote, one per line, and exits 0. A usage error (an unkno
 |---|---|---|---|
 | `build/hermes/config.yaml` | Hermes's `config.yaml` (Hermes v0.22.5 keys) | `budgets.yaml`, `flags.yaml`, `mcp.yaml`, `protected_paths.yaml`, `roles.yaml`, `rosters/anthropic.yaml` | Mounted read-only at `/opt/data/config.yaml` (`$HERMES_HOME`) in the `hermes` container |
 | `build/archon/config.yaml` | Archon's global config, `~/.archon/config.yaml` (Archon v0.12.1): model tiers and aliases | `roles.yaml`, `rosters/<roster>.yaml` | Mounted read-only at `/.archon/config.yaml` (Archon's home in its container) in `archon` |
-| `build/archon/archon.env` | The Archon container's environment | Spec §9.2 and §9.3 (no policy file) | The record of the six settings the `archon` service's `environment:` sets, and what Task 6's audit compares the running container with. Compose doesn't read the file ([below](#buildarchonarchonenv)) |
+| `build/archon/archon.env` | The Archon container's environment | Spec §9.2 and §9.3 (no policy file) | The record of the six settings the `archon` service's `environment:` sets, and what the audit's `runtime.archon-env` holds the running container to. Compose doesn't read the file ([below](#buildarchonarchonenv)) |
 | `build/pi/models.json` | Pi 1.3.0's model registry: `maxTokens` caps | `rosters/<roster>.yaml` | Mounted read-only at `PI_CODING_AGENT_DIR` |
 | `build/pi/hapi-guard.json` | Settings for Plan 02's hapi-guard Pi extension | `protected_paths.yaml`, `budgets.yaml` | Mounted read-only at `PI_CODING_AGENT_DIR` |
 | `build/egress/hermes.squid.conf` | Squid config for the `hermes` zone's egress proxy | `trusted_sources.yaml` | The `egress-hermes` container, read-only |
@@ -63,7 +63,7 @@ Hermes runs as the coordinator (spec §9.1). These are the "defaults to flip on 
 | `model.provider`, `model.default` | `anthropic`, `claude-opus-5-5` | The main model: `roles.yaml`'s `hermes_main` tier in the anthropic roster (spec §12). An Anthropic Console key, never subscription OAuth (Global Constraints). |
 | `agent.reasoning_effort` | `low` | That tier's effort (spec §12: Opus 5.5 at low–medium effort). |
 | `agent.max_turns` | `60` | `budgets.yaml`'s `hermes_max_turns`. The default is unlimited (spec §9.1: 30–100). |
-| `approvals.mode` | `manual` | Every dangerous command waits for the operator. Yolo and `mode: off` are forbidden by policy (spec §9.1); Task 6's audit checks it. |
+| `approvals.mode` | `manual` | Every dangerous command waits for the operator. Yolo and `mode: off` are forbidden by policy (spec §9.1); the audit's `runtime.hermes-no-yolo` checks it. |
 | `approvals.cron_mode`, `unattended_mode`, `single_query_mode` | `deny` | Cron, webhook/API and `-q` runs have nobody to ask, so a dangerous command is refused at once (spec §9.1). These are Hermes's defaults; pinning them here lets the audit catch a change. |
 | `skills.write_approval` | `true` | Every `skill_manage` write is staged for review (`/skills pending`). Without it, a prompt-injected session could persist instructions into future sessions (spec §9.1). |
 | `skills.guard_agent_created` | `true` | Scans skills the agent writes. A scanner, not a boundary (spec §9.1). |
@@ -152,7 +152,7 @@ aliases:          # one per Archon role, at its roles.yaml tier
 | `PI_TELEMETRY` | `0` | No Pi install telemetry (spec §9.3). |
 | `PI_CODING_AGENT_DIR` | `/opt/hapi/pi-agent` | Pi's agent directory. Task 5 mounts `build/pi` there **read-only**, so Pi reads this `models.json` and nothing in the container can change it (spec §9.3). The path is `PI_AGENT_DIR` in `src/generate/archon.ts`. |
 
-These are the Global Constraints' Archon and Pi values; Task 6's audit checks the running container's environment against them.
+These are the Global Constraints' Archon and Pi values; the audit's `runtime.archon-env` checks the running container's environment against them ([docs/audit.md](audit.md#runtimearchon-env)).
 
 **They reach the container through `stack/compose.yaml`'s `environment:`, not this file.** Compose puts `environment:` above `env_file`, and the archon service's only `env_file` is the archon zone's secrets, so a secret named `HOST` or `PI_OFFLINE` could never override one; the secrets manifest refuses those names anyway ([docs/secrets.md](secrets.md#the-manifest-stacksecretsyaml)). The list lives in `ARCHON_ENV` (`src/generate/archon.ts`), which writes this file and which `serviceEnvironment` in `src/stack/env.ts` puts in the service's environment; `tests/stack/compose.test.ts` fails if the compose file and this file disagree on a single name or value. (Until Plan 01 Task 5's security fix pass, this file was the service's first `env_file`, where the zone's secrets file, read after it, could override it.)
 
@@ -311,4 +311,4 @@ Emitters follow the **pinned** versions: Hermes v0.22.5, Archon v0.12.1, Pi 1.3.
 2. Update the emitter and its test.
 3. Note the change in the commit message.
 
-A tool may ignore a renamed key or only warn about it (Archon reports unknown workflow keys as parse warnings, for example), so Task 6's audit also checks each tool's own validation output, not only our files.
+A tool may ignore a renamed key or only warn about it (Archon reports unknown workflow keys as parse warnings, for example, and Hermes says nothing at all), so the audit also checks each tool's own reading of the deployed files, not only our files: `tools.archon-validate` and `tools.hermes-validate` ([docs/audit.md](audit.md#what-the-tool-checks-were-checked-against), which records what the pinned images said on 2026-10-27). Re-run them, and re-capture `tests/audit/fixtures/`, after an upgrade.

@@ -295,6 +295,34 @@ describe("loadPolicy rejects a bad catalog with the file and path", () => {
     expect(() => loadPolicy(withMcp(edited(at, "PHOENIX_ENDPOINT: https://ui.phoenix.hapi.internal/base")))).not.toThrow();
   });
 
+  test("an endpoint literal's path is plain segments: no percent-encoding, dot segments or other punctuation (H-034)", () => {
+    const at = "PHOENIX_ENDPOINT: http://phoenix.hapi.internal:6006";
+    for (const path of ["/a%2Fb", "/a/../b", "/./a", "/a;b=c", "/a,b", "/a@b", "/a b", "/~user/../.."]) {
+      const e = policyError(edited(at, `PHOENIX_ENDPOINT: "http://phoenix.hapi.internal:6006${path}"`));
+      expect({ path, issues: e.issues }).toEqual({
+        path,
+        issues: [{ path: "/servers/phoenix/env/PHOENIX_ENDPOINT", message: expect.stringContaining("its path may hold only plain segments") }],
+      });
+    }
+    for (const path of ["", "/", "/base", "/v1/", "/a.b/c-d_e~f"]) {
+      expect(() => loadPolicy(withMcp(edited(at, `PHOENIX_ENDPOINT: "http://phoenix.hapi.internal:6006${path}"`)))).not.toThrow();
+    }
+  });
+
+  test("the names a package must be given are required, not merely allowed (H-032)", () => {
+    // spec §10.1: Context7 always keyed with telemetry off; Phoenix with a VIEWER key, no config discovery and an explicit endpoint.
+    for (const [line, server, name] of [
+      ["      OTEL_SDK_DISABLED: \"true\"\n", "context7", "OTEL_SDK_DISABLED"],
+      ["      CONTEXT7_API_KEY: secret:hapi-mcp-context7-api-key   # always keyed: anonymous callers can get a setup elicitation\n", "context7", "CONTEXT7_API_KEY"],
+      ["      PHOENIX_DISCOVER_CONFIG: \"false\"                   # no .env.phoenix discovery up the directory tree\n", "phoenix", "PHOENIX_DISCOVER_CONFIG"],
+      ["      PHOENIX_API_KEY: secret:hapi-mcp-phoenix-viewer-key   # minted by a VIEWER-role user\n", "phoenix", "PHOENIX_API_KEY"],
+      ["      PHOENIX_ENDPOINT: http://phoenix.hapi.internal:6006\n", "phoenix", "PHOENIX_ENDPOINT"],
+    ] as const) {
+      const e = policyError(edited(line, ""));
+      expect({ name, issues: e.issues }).toEqual({ name, issues: [{ path: `/servers/${server}/env`, message: expect.stringContaining(`must set ${name}`) }] });
+    }
+  });
+
   test("a hard denylist of launch-hijack, proxy and redirect variables, as literals or secret references (defense in depth)", () => {
     const names = [
       "NPM_CONFIG_REGISTRY", // npx fetches the package from another registry; nothing checks its integrity at launch
@@ -356,11 +384,12 @@ describe("loadPolicy rejects a bad catalog with the file and path", () => {
         if (rule.kind === "flag") expect(rule.values.length).toBeGreaterThan(0);
       }
     }
-    expect(PACKAGE_ENV["@upstash/context7-mcp"]).toEqual({ CONTEXT7_API_KEY: { kind: "secret" }, OTEL_SDK_DISABLED: { kind: "flag", values: ["true"] } });
+    // Every name spec §10.1 says is set is required (H-032).
+    expect(PACKAGE_ENV["@upstash/context7-mcp"]).toEqual({ CONTEXT7_API_KEY: { kind: "secret", required: true }, OTEL_SDK_DISABLED: { kind: "flag", values: ["true"], required: true } });
     expect(PACKAGE_ENV["@arizeai/phoenix-mcp"]).toEqual({
-      PHOENIX_API_KEY: { kind: "secret" },
-      PHOENIX_DISCOVER_CONFIG: { kind: "flag", values: ["false"] },
-      PHOENIX_ENDPOINT: { kind: "endpoint" },
+      PHOENIX_API_KEY: { kind: "secret", required: true },
+      PHOENIX_DISCOVER_CONFIG: { kind: "flag", values: ["false"], required: true },
+      PHOENIX_ENDPOINT: { kind: "endpoint", required: true },
     });
   });
 
@@ -413,7 +442,20 @@ describe("loadPolicy rejects a bad catalog with the file and path", () => {
     ]) {
       const e = policyError(remote.replace("url: https://mcp.context7.com/mcp", `url: ${JSON.stringify(url)}`));
       expect(e.file).toEndWith("mcp.yaml");
-      expect(e.issues).toEqual([{ path: "/servers/context7/url", message: 'must match pattern "^[^$]+$"' }]);
+      expect(e.issues).toEqual([{ path: "/servers/context7/url", message: 'must match pattern "^[^$?#]+$"' }]);
+    }
+  });
+
+  test("a url never holds a query or a fragment, which could carry a literal credential into every generated config (H-033)", () => {
+    const remote = MCP_YAML.replace(/    package:\n      name: "@upstash\/context7-mcp"\n(?:      .*\n)*?      integrity: "[^"]+"\n/, "")
+      .replace("    transport: stdio\n", "    transport: http\n    url: https://mcp.context7.com/mcp\n")
+      .replace(/    floor: .*\n/, "")
+      .replace(/    env:\n      CONTEXT7_API_KEY: .*\n      OTEL_SDK_DISABLED: .*\n/, "    env: {}\n");
+    for (const url of ["https://mcp.context7.com/mcp?key=abc123", "https://mcp.context7.com/mcp#key=abc123", "https://mcp.context7.com/mcp?"]) {
+      expect({ url, issues: policyError(remote.replace("url: https://mcp.context7.com/mcp", `url: ${JSON.stringify(url)}`)).issues }).toEqual({
+        url,
+        issues: [{ path: "/servers/context7/url", message: 'must match pattern "^[^$?#]+$"' }],
+      });
     }
   });
 
