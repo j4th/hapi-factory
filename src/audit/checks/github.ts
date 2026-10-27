@@ -255,6 +255,10 @@ export async function githubRulesets(run: AuditRun): Promise<CheckResult[]> {
     const ci = checks.filter((c) => c.context === "ci");
     if (ci.length === 0) problems.push("main has no required_status_checks rule with the ci check");
     else if (!ci.some((c) => c.integration_id === ACTIONS)) problems.push(`main's ci check isn't tied to GitHub Actions (integration_id ${ACTIONS}), so another integration could satisfy it`);
+    // Only ci gates a merge. A third-party App's check (CodeRabbit's, spec §9.6) is never a required one: an advisory
+    // reviewer that could block or, once green, stand in for a gate.
+    const others = [...new Set(checks.filter((c) => c.context !== "ci").map((c) => String(c.context)))];
+    if (others.length > 0) problems.push(`main requires status checks other than ci (${others.join(", ")}): only GitHub Actions' ci gates a merge, and no third-party reviewer's check, such as CodeRabbit's, is ever a required one`);
     for (const t of ["deletion", "non_fast_forward"]) if (of(t).length === 0) problems.push(`main has no ${t} rule`);
 
     const onMain = new Set(rules.map((r) => r.ruleset_id));
@@ -294,7 +298,7 @@ export async function githubRulesets(run: AuditRun): Promise<CheckResult[]> {
         result(
           id,
           "pass",
-          `${name}: main requires the ci check from GitHub Actions with no bypass, blocks force-pushes and deletion, and main-review requires 1 code-owner approval with Restrict updates and only the Admin PR-only bypass; no ruleset without bypass actors restricts updates, and no App is a bypass actor (read with ${data.via})`,
+          `${name}: main requires only the ci check, from GitHub Actions, with no bypass, blocks force-pushes and deletion, and main-review requires 1 code-owner approval with Restrict updates and only the Admin PR-only bypass; no ruleset without bypass actors restricts updates, and no App is a bypass actor (read with ${data.via})`,
         ),
       );
     }

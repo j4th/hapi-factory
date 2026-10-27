@@ -1,0 +1,5 @@
+# Every path is owned by the operator. main-review requires a code owner's
+# review, and no GitHub App is a code owner, so no App's approval counts toward
+# a merge (docs/runbooks/github-apps.md, H-076). GitHub reads this file from
+# main, so it takes effect once merged.
+* @j4th

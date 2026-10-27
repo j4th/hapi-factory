@@ -212,9 +212,9 @@ Under `--strict` that skip is a fail, like any other. So until H-101 closes, a s
 ### github.rulesets
 
 **Verifies**, per `--repo`, from the effective rules on `main` (`GET /repos/{owner}/{repo}/rules/branches/main`) and every ruleset (`GET .../rulesets`, then each by id), held to [docs/runbooks/github-apps.md](runbooks/github-apps.md) as `tests/docs/rulesets.test.ts` holds the README's JSON (H-023):
-- `main` has a `pull_request` rule with `required_approving_review_count` ≥ 1, a `required_status_checks` rule with `ci` from GitHub Actions (`integration_id` 15368), and `deletion` and `non_fast_forward` rules;
+- `main` has a `pull_request` rule with `required_approving_review_count` ≥ 1, a `required_status_checks` rule with `ci` from GitHub Actions (`integration_id` 15368) and no other required check, and `deletion` and `non_fast_forward` rules. A third-party reviewer's check, such as CodeRabbit's, is never required (spec §9.6): it would let an advisory reviewer block a merge, or stand in for a gate once green;
 - `main-review` applies to `main`, with the `update` rule (Restrict updates), `require_code_owner_review: true`, and exactly the Admin role's PR-only bypass (`actor_id` 5, `bypass_mode: pull_request`);
-- no ruleset holding `required_status_checks` has a bypass actor; no ruleset without bypass actors has `update`; no ruleset has an `Integration` (GitHub App) bypass actor.
+- no ruleset holding `required_status_checks` has a bypass actor; no ruleset without bypass actors has `update`; no ruleset has an `Integration` (GitHub App) bypass actor, ours or a third party's such as CodeRabbit.
 
 Rules in a ruleset in `evaluate` or `disabled` mode don't apply to `main`, so they don't count.
 

@@ -68,6 +68,9 @@ describe("github.rulesets", () => {
     ["no approval required", mutate((r) => (named(r, "main-review").rules[0].parameters.required_approving_review_count = 0)), "required_approving_review_count"],
     ["no ci check", mutate((r) => (named(r, "main-protect").rules = named(r, "main-protect").rules.filter((x: any) => x.type !== "required_status_checks"))), "ci"],
     ["ci from any integration", mutate((r) => (named(r, "main-protect").rules[2].parameters.required_status_checks = [{ context: "ci" }])), "15368"],
+    // CodeRabbit's App id is 347564; its check run is named "CodeRabbit".
+    ["a third-party reviewer's check required too", mutate((r) => named(r, "main-protect").rules[2].parameters.required_status_checks.push({ context: "CodeRabbit", integration_id: 347564 })), "other than ci (CodeRabbit)"],
+    ["CodeRabbit as a bypass actor", mutate((r) => named(r, "main-review").bypass_actors.push({ actor_id: 347564, actor_type: "Integration", bypass_mode: "pull_request" })), "Integration"],
     ["a bypass on the ci ruleset", mutate((r) => named(r, "main-protect").bypass_actors.push({ actor_id: 5, actor_type: "RepositoryRole", bypass_mode: "always" })), "main-protect holds required_status_checks and has bypass actors"],
     ["no Restrict updates on main-review", mutate((r) => (named(r, "main-review").rules = named(r, "main-review").rules.filter((x: any) => x.type !== "update"))), "main-review has no update"],
     ["code owners off", mutate((r) => (named(r, "main-review").rules[0].parameters.require_code_owner_review = false)), "require_code_owner_review"],

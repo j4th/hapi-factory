@@ -50,6 +50,8 @@ The `[ -s … ]` guard skips a missing or empty file: with an empty `GH_TOKEN`, 
 - **Undo:** the same page → **Unsuspend**.
 - **Takes effect:** at once for new tokens; up to an hour for a token minted before it, unless you revoked it.
 
+**CodeRabbit too,** when it's installed: the same page, **Configure** next to CodeRabbit → **Suspend**, or uninstall it there. It holds write access to the repo's contents and workflows, so suspend it with the Apps when you suspect anything that touches the repo. It stops its reviews, chat and every write it can make; it doesn't touch the factory's own Apps or tokens.
+
 ## 3. Stop the stack
 
 Three ways, gentlest first. `compose down` removes the containers and their logs with them: if there is time, save the logs first, as hapi (`docker compose -p hapi logs --no-color > ~/hapi-incident.log`). 3c keeps the containers, and so their logs.

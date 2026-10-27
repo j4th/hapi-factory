@@ -97,7 +97,7 @@ This is hapi-factory's threat model, the `docs/security/threat-model.md` that sp
 | L4 Deployment and Infrastructure | the host, the `hapi` user, rootless Docker, `stack/compose.yaml`, the zone networks and proxies, the tmpfs env files, the images and pins |
 | L5 Evaluation and Observability | `hapi audit`; container logs; metrics and evals (Plan 06); the o11y profile (Phase 3) |
 | L6 Security and Compliance (vertical) | `policy/` (protected paths, commands, approvals, budgets, trusted sources); the rulesets and CODEOWNERS; secrets management; CI gates; this document |
-| L7 Agent Ecosystem | GitHub and the two Apps; Slack; the model and search providers; MCP servers; CodeRabbit (Plan 05); other trust domains |
+| L7 Agent Ecosystem | GitHub and the two Apps; Slack; the model and search providers; MCP servers; CodeRabbit (installed on hapi-factory, H-164); other trust domains |
 
 ## 2. Method and catalogs
 
@@ -219,6 +219,7 @@ Each row: the threat, its catalog IDs, the controls that answer it ([section 6](
 | L7.6 | The operator trusts a plausible but wrong PR | ASI09; LLM09:2025; AML.T0067 | AC-7, IS-10, GR-6 | [residual 6](#residual-6) |
 | L7.7 | A leaked provider key is used from outside | AML.T0012; LLM10:2025 | GR-7, MO-5 | [residual 3](#residual-3) |
 | L7.8 | Hermes and Archon exchange anything but a merged work order | ASI07; AML.T0118.000 | DS-1, AC-16 | [residual 1](#residual-1) |
+| L7.9 | CodeRabbit, a third-party App that can write to the repo, is steered or compromised: a PR edits the config it reviews with, an outsider drives its commands, chat learnings bias later reviews, or its own App key leaks | ASI04, ASI09; LLM01:2025; AML.T0010 | AC-17, GR-9, IS-7 | [CodeRabbit](#coderabbit) |
 
 ## 5. Cross-layer threats
 
@@ -255,6 +256,7 @@ The six domains, as SANS's post on its Critical AI Security Guidelines (the v1.1
 | AC-14 | A work order belongs to exactly one repo (it lives in that repo's `.factory/work/<id>/`); runs queue per repo; no run spans two repos | §4.4 | — | planned (Plan 03, H-090) |
 | AC-15 | Segment by trust domain: a new domain gets its own Hermes profile, Archon container and zone, workspace and cap, and Slack channel | §4.4 | — | planned (Phase 2+, H-127) |
 | AC-16 | Hermes can't answer Archon approvals or start runs (`hapi-status` is fixed-argv); runs start only from merges, through the poller | §9.1 #6, §9.4 | — | planned (Plan 03, H-161; Plan 04, H-162) |
+| AC-17 | CodeRabbit is never a merge authority: installed on hapi-factory only (selected repos, never hapi-factory-private), never a ruleset bypass actor or a required check; a merge still needs the operator (Restrict updates, a code owner's review) | §9.6 | The audit's `github.rulesets` fails on any required check but `ci` and on any `Integration` bypass actor; the install scope is the operator's step (H-164) | enforced by the audit once run with `--repo`; the install: documented (H-164) |
 
 ### 6.2 Data Protections
 
@@ -304,7 +306,7 @@ The six domains, as SANS's post on its Critical AI Security Guidelines (the v1.1
 | IS-4 | hapi-cmd-allow: a default-deny, fail-closed shell hook on argv-exact rules. The rules and their matcher exist and are tested (`policy/commands.yaml`, `src/policy/commands.ts`, `tests/policy/commands.test.ts`, `tests/fixtures/command-vectors.json`); Plan 01 emits no hook | §9.1 #2 | — | planned (Plan 04, H-095) |
 | IS-5 | Workers have no web: the archon zone is T0–T1 plus model APIs and registries, and gets no MCP server, ever | §10, §10.1 | `policy/trusted_sources.yaml`, `src/policy/mcp.ts`; `tests/generate/egress.test.ts`, `tests/policy/mcp.test.ts` ("rejects any server enabled for the archon zone") | enforced |
 | IS-6 | The research quarantine: its own container, web tools only, no terminal, no repo write, a schema-validated brief | §9.1 #4, §10 | — | planned (Plan 04, H-099) |
-| IS-7 | Untrusted text (queued PR comments, rework comments, briefs) is screened and wrapped as quoted data with a warning banner; a signal, never a boundary | §9.5 | — | planned (Plan 04, H-162) |
+| IS-7 | Untrusted text (queued PR comments, rework comments, CodeRabbit's comments, briefs) is screened and wrapped as quoted data with a warning banner; a signal, never a boundary | §9.5 | — | planned (Plan 04, H-162) |
 | IS-8 | MCP servers run `trust: untrusted`, with include-only tool lists, prompts and resources off, elicitation and sampling off | §10.1 | `src/generate/mcp.ts`, `policy/mcp.yaml`; `tests/generate/hermes.test.ts`, `tests/generate/mcp.test.ts` | enforced |
 | IS-9 | In-run caps: Archon's per-run budget and hapi-guard's, beside Hermes's `max_turns` (IS-1) and Pi's `maxTokens` (DS-11) | §9.2, §9.3 | `policy/budgets.yaml` | planned (Plan 02, H-087; Plan 03, H-161) |
 | IS-10 | The independent review: a separate session, a different model, read-only, advisory | §9.2 | — | planned (Plan 03, H-161) |
@@ -333,6 +335,7 @@ The six domains, as SANS's post on its Critical AI Security Guidelines (the v1.1
 | GR-6 | CI gates: gitleaks, Semgrep or Opengrep, OSV-Scanner, zizmor; Actions pinned to SHAs; no AI agent with secrets on PR or issue triggers; the work-order schema; trailers and lane labels on `lane:factory`; the protected-path diff; the MCP scanners | §11.7 | `.github/workflows/ci.yml` (this repo's own CI today) | planned (Plan 05, H-111, H-112, H-113, H-163) |
 | GR-7 | Hard spend caps at the providers: `hapi-hermes` $60, `hapi-factory` $100, `hapi-evals` $40, the default workspace unused; OpenRouter limits that reset daily | §3, §11.5, §12 | `policy/budgets.yaml`, `docs/runbooks/provider-keys.md` | documented, not verified live (H-071; the audit doesn't read them yet, H-151) |
 | GR-8 | CODEOWNERS: the operator is the only code owner, so no App's approval counts | §7, §11.9 | `docs/runbooks/github-apps.md` | documented, not verified live (H-076) |
+| GR-9 | CodeRabbit is review-only: `.coderabbit.yaml` turns off every way it writes (approvals, finishing touches, labels, auto-replies, issue features) and keeps chat learnings local and delayed 30 days; the file is a protected path, as are agent instruction files at any depth, since it reviews a PR with that PR's own config and reads them as guidelines | §8.2, §9.6 | `.coderabbit.yaml`, `policy/protected_paths.yaml`; `tests/policy/load.test.ts`, `tests/policy/paths.test.ts` | enforced in config; CodeRabbit's own behaviour: documented, not verified live (H-164) |
 
 ## 7. Spec §11.9 residual risks
 
@@ -406,13 +409,13 @@ Spec §11.9 #5: text in a target repo (`AGENTS.md`, `.pi/`, `.agents/`, code, co
 
 Spec §11.9 #6: the in-run review (and CodeRabbit, later) reads a diff that the worker wrote and that repo content may have steered, so the review can be manipulated.
 
-- **Owner control:** the review is advisory; the operator merges (AC-7: documented, not verified live, H-075, H-078), with `ci` required and no bypass (`main-protect`). The review runs in a separate session, with a different model, read-only (IS-10: planned, Plan 03, H-161). CodeRabbit is never a merge authority or a required check (spec §9.6).
-- **Next level:** evals that measure what the review catches against seeded defects (Plan 06's evals and calibration records), and a second vendor's review (CodeRabbit, Plan 05), still advisory.
+- **Owner control:** the review is advisory; the operator merges (AC-7: documented, not verified live, H-075, H-078), with `ci` required and no bypass (`main-protect`). The review runs in a separate session, with a different model, read-only (IS-10: planned, Plan 03, H-161). CodeRabbit is never a merge authority or a required check (spec §9.6; AC-17, which the audit checks).
+- **Next level:** evals that measure what the review catches against seeded defects (Plan 06's evals and calibration records, H-168), and a second vendor's review (CodeRabbit on hapi-factory since 2026-10-27, H-164; its place in the run loop is H-166), still advisory.
 - **Catalog:** ASI09; LLM01:2025; AML.T0051.001, AML.T0067. **Status:** accepted residual.
 
 ## 8. Other accepted residuals
 
-The items the handoffs register sent to Plan 01 Task 7 (H-038–H-052, H-137), then the residuals Tasks 5 and 6 left: [the audit's gaps](#audit-gaps), [what isn't verified live yet](#not-yet-verified-live) and [abliteration.ai](#abliteration-ai).
+The items the handoffs register sent to Plan 01 Task 7 (H-038–H-052, H-137), then the residuals Tasks 5 and 6 left: [the audit's gaps](#audit-gaps), [what isn't verified live yet](#not-yet-verified-live), [CodeRabbit](#coderabbit) and [abliteration.ai](#abliteration-ai).
 
 <a id="h-038"></a>
 ### H-038: either App can push either prefix
@@ -580,6 +583,15 @@ Stage a ran everything on the build host's rootful Docker as an ordinary user, w
 - **H-074 to H-079:** the public repo, rulesets, CODEOWNERS, the Apps and the App-merge-refusal check (AC-7, AC-8, GR-8).
 
 **Owner control:** the controls stay documented, not enforced, until each check passes, and stage b ends with the strict audit. **Next level:** run them, then mark each control here. **Status:** documented, not verified live.
+
+<a id="coderabbit"></a>
+### CodeRabbit: a third-party reviewer that can write
+
+CodeRabbit's GitHub App (`coderabbitai`, App ID 347564) holds write access to contents, pull requests, issues, checks, statuses and workflows. It reviews a same-repo PR with that PR branch's own `.coderabbit.yaml`, reads `AGENTS.md`-style files as review guidelines, learns from chat comments, and on a personal-account repo anyone on GitHub can talk to it. In 2025 a researcher ran code on its servers through a PR's linter config and reached its App private key (Kudelski Security, fixed the same day). Two of its writes can't be turned off in config: the "Commit the changes to this branch" checkbox and `@coderabbitai autopilot`, which commit under the GitHub authorization of whoever asked.
+
+- **Owner control:** it can't merge or gate: no bypass, no required check, and the operator's merge needs Restrict updates' bypass and a code owner (AC-17, AC-7). It is review-only, its config and the instruction files it reads are protected paths (GR-9), and its comments are untrusted text (IS-7). It never sees hapi-factory-private. The operator never ticks the commit checkbox or runs `autopilot` on a factory or planning PR, and CI's trailer check (H-113) catches such a commit. Kill switch 2 suspends it ([docs/runbooks/kill-switches.md](../runbooks/kill-switches.md#2-suspend-the-github-app-installations)).
+- **Next level:** H-164's check, with a second account, of which commands an outsider can run; H-168's calibration before any automatic rework round (H-166).
+- **Catalog:** ASI04, ASI09; LLM01:2025; AML.T0010. **Status:** accepted residual.
 
 <a id="abliteration-ai"></a>
 ### abliteration.ai: a separate trust domain
