@@ -8,14 +8,14 @@ Snapshot: built from Plan 01's ledger, task reports and review outputs, and chec
 
 **Sources.** `ledger L<n>` is line n of Plan 01's SDD ledger (`progress.md`). `T<n> brief am.<k>` is controller amendment k in task n's brief. `T<n> report` is task n's implementer report. `T<n> review` and `T<n> fix review` are the review outputs of that task's workflow runs (T1 wbhxevp9c; T2 w6hmq9d68, fix pass wie5pfbpz; T3 whqfw7hso, fix pass wtglrdx97; T3b wu4t21iky, fix pass wg06ewemv; T4 wno79cf0l; T4b wreoafj4i; T4c wyk6wr87l). `HEAD <path>` is the committed file at `07f8583`. Everything except `HEAD` lives in the gitignored workspace, so each item here is written to stand alone. "Assigned:" marks an item that arrived with no destination, with the reason for the one it got.
 
-## Plan 01 Task 4c (security fix pass in flight)
+## Plan 01 Task 4c
 
 H-001 and H-002 closed when Task 4c's review passed (see [Closed](#closed)).
 
 
 ## Plan 01 Task 5
 
-Task 5 (stage a) closed H-003–H-020, H-022, H-134, H-135 and H-141 (see [Closed](#closed)); H-021 moved to [Phase 2+](#phase-2), since Task 5 has no `o11y:up`. Stage b is H-080, with H-146. Task 5's security fix pass closed H-144 (the Slack app comes first) and added H-148. Its second fix pass closed H-148 (the re-exec passes your arguments as argv, never through a login shell) and added H-149.
+Task 5 (stage a) closed H-003–H-020, H-022, H-134, H-135 and H-141 (see [Closed](#closed)); H-021 moved to [Phase 2+](#phase-2), since Task 5 has no `o11y:up`. Stage b is H-080, with H-146. Task 5's security fix pass closed H-144 (the Slack app comes first) and added H-148. Its second fix pass closed H-148 (the re-exec passes your arguments as argv, never through a login shell) and added H-149. The controller's follow-up (`fix(secrets): refuse endpoint-override env names …`) added the `CONTROL_ENV_SUFFIXES` rule and kept `CLAUDE_CODE_` as a refused prefix, since it also keeps `CLAUDE_CODE_OAUTH_TOKEN` out. H-145 and H-149, the two mise.toml edits, wait for the operator's approval.
 
 
 ## Plan 01 Task 6
