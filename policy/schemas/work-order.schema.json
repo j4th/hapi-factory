@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "work-order.schema.json",
+  "title": ".factory/work/<id>/order.yaml",
+  "description": "The machine-readable contract for one factory run (spec §6). Written by deterministic code, immutable once merged.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "description": "A sequence number of at least 4 digits, then a slug, e.g. 0002-search-partners-tool. It names the work-order directory and the factory/<id> branch.",
+      "type": "string",
+      "pattern": "^[0-9]{4,}-[a-z0-9]+(?:-[a-z0-9]+)*$",
+      "maxLength": 80
+    },
+    "lane": {
+      "description": "The lane label (spec §5.1).",
+      "enum": ["planning", "factory", "direct"]
+    },
+    "workflow": {
+      "description": "The Archon workflow name, from the home-scoped pack.",
+      "$ref": "policy-defs.schema.json#/$defs/slug"
+    },
+    "risk": {
+      "description": "Drives review depth and thresholds.",
+      "$ref": "policy-defs.schema.json#/$defs/risk"
+    },
+    "roles": {
+      "description": "Abstract tiers per role, never model ids. The run's roster maps them to models.",
+      "type": "object",
+      "properties": {
+        "implement": { "$ref": "policy-defs.schema.json#/$defs/tier" },
+        "review": { "$ref": "policy-defs.schema.json#/$defs/tier" }
+      },
+      "required": ["implement", "review"],
+      "additionalProperties": false
+    },
+    "budget": {
+      "type": "object",
+      "properties": {
+        "usd": { "$ref": "policy-defs.schema.json#/$defs/usd" },
+        "turns": { "$ref": "policy-defs.schema.json#/$defs/count" },
+        "minutes": { "$ref": "policy-defs.schema.json#/$defs/count" }
+      },
+      "required": ["usd", "turns", "minutes"],
+      "additionalProperties": false
+    },
+    "pieces": {
+      "description": "The pieces Hermes proposes, each with its declared file scope (spec §5.4). Piece ids must be unique.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": { "$ref": "policy-defs.schema.json#/$defs/slug" },
+          "files": {
+            "type": "array",
+            "items": { "$ref": "policy-defs.schema.json#/$defs/repoPath" },
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "size": { "$ref": "policy-defs.schema.json#/$defs/tier" }
+        },
+        "required": ["id", "files", "size"],
+        "additionalProperties": false
+      },
+      "minItems": 1
+    },
+    "verify": {
+      "type": "object",
+      "properties": {
+        "smoke": {
+          "description": "Run `mise run smoke` as a gate.",
+          "type": "boolean"
+        }
+      },
+      "required": ["smoke"],
+      "additionalProperties": false
+    },
+    "egress_extra": {
+      "description": "Extra hosts this run needs, e.g. a private sidecar for the smoke check. They join the archon zone for the run (spec §10), so a forge host is rejected: that zone has no forge route (spec §4.3).",
+      "$ref": "policy-defs.schema.json#/$defs/nonForgeHostList"
+    },
+    "trace": {
+      "type": "object",
+      "properties": {
+        "traceparent": {
+          "description": "A W3C traceparent, minted by a script when the order is created.",
+          "type": "string",
+          "pattern": "^00-[0-9a-f]{32}-[0-9a-f]{16}-0[01]$"
+        }
+      },
+      "required": ["traceparent"],
+      "additionalProperties": false
+    },
+    "sources": {
+      "description": "Repo files the order rests on: research notes and designs.",
+      "type": "array",
+      "items": { "$ref": "policy-defs.schema.json#/$defs/repoPath" },
+      "uniqueItems": true
+    }
+  },
+  "required": ["id", "lane", "workflow", "risk", "roles", "budget", "pieces", "verify", "egress_extra", "trace", "sources"],
+  "additionalProperties": false
+}

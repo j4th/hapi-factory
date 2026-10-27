@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "policy-approvals.schema.json",
+  "title": "policy/approvals.yaml",
+  "description": "The fixed short list of actions that always need the operator (spec §8.1).",
+  "type": "array",
+  "items": {
+    "enum": [
+      "merge",
+      "new_dependency",
+      "new_skill_or_mcp",
+      "ci_workflow_change",
+      "outbound_message",
+      "spend_above_threshold"
+    ]
+  },
+  "minItems": 1,
+  "uniqueItems": true
+}

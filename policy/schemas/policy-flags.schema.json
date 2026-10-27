@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "policy-flags.schema.json",
+  "title": "policy/flags.yaml",
+  "description": "Metrics and observability switches, decision-signal switches, and the thresholds that flag a run (spec §13.3).",
+  "type": "object",
+  "properties": {
+    "metrics": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "merge_outcomes": { "type": "boolean" }
+      },
+      "required": ["enabled", "merge_outcomes"],
+      "additionalProperties": false
+    },
+    "otel": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "content_capture": { "enum": ["off", "preview"] }
+      },
+      "required": ["enabled", "content_capture"],
+      "additionalProperties": false
+    },
+    "jev": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "fallback": { "enum": ["haiku", "none"] },
+        "via": { "enum": ["openrouter"] }
+      },
+      "required": ["enabled", "fallback", "via"],
+      "additionalProperties": false
+    },
+    "coderabbit": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "include_in_rework": { "type": "boolean" }
+      },
+      "required": ["enabled", "include_in_rework"],
+      "additionalProperties": false
+    },
+    "thresholds": {
+      "description": "Crossing any one flags the run.",
+      "type": "object",
+      "properties": {
+        "run_usd": { "$ref": "policy-defs.schema.json#/$defs/usd" },
+        "interventions": { "type": "integer", "minimum": 0 },
+        "review_rounds": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["run_usd", "interventions", "review_rounds"],
+      "additionalProperties": false
+    },
+    "on_flag": {
+      "description": "What happens to a flagged run.",
+      "type": "array",
+      "items": { "enum": ["label_pr", "chat_alert"] },
+      "uniqueItems": true
+    }
+  },
+  "required": ["metrics", "otel", "jev", "coderabbit", "thresholds", "on_flag"],
+  "additionalProperties": false
+}

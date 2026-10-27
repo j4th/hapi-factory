@@ -4,11 +4,7 @@
 - **Status:** draft for review
 - **Owner:** the operator
 - **Repo:** this repository (`factor`) becomes `hapi-factory`. Its name is my assumption: this is where the design was written.
-- **Evidence base** (read it for sources, versions and quotes):
-  - `reports/Agentic software factory recon.md` (the full recon report)
-  - `research_notes/Agentic software factory recon/*.md`
-  - `research_notes/Hapi factory plugins and o11y/*.md` (plugin vetting, observability, Archon integration, Pi extensions)
-  - All facts are as of 2026-10-26.
+- **Evidence base:** a recon report and research notes, kept private; [docs/research/README.md](../../research/README.md) lists them and the conclusions this spec adopted. All facts are as of 2026-10-26.
 
 Tags used throughout:
 - **[user]** — decided by the operator in the brainstorm.
@@ -23,18 +19,18 @@ hapi-factory is a **public, best-practices reference stack** for an end-to-end a
 
 ### Why
 
-- the operator's earlier home-rolled kit worked, but it became a maintenance job [user]:
+- The operator's earlier home-rolled kit worked, but it became a maintenance job [user]:
   - keeping up with new models and upstream changes;
   - context ballooning;
   - being tied to one harness.
 - The kit was **copied into each repo** that used it. Every upgrade turned into a loop: upgrade in a repo → find problems → file upstream → re-ingest into every downstream repo → repeat [user].
-- the operator wants to be less hands-on: in the loop for intent and review, not for babysitting [user].
-- It doubles as learning and a showcase. the operator is taking SANS SEC545 and wants security designed in, not bolted on [user].
+- The operator wants to be less hands-on: in the loop for intent and review, not for babysitting [user].
+- It doubles as learning and a showcase: security is designed in from the start, not bolted on, following SANS SEC545 (securing AI systems) [user].
 
 ### Success
 
 - **v1** is a **net-new, minimal Odoo MCP server** (CRM and finance), taken from a Hermes conversation through research, architecture, threat model and work orders to merged PRs through the full stack.
-  - the operator chose net-new over his existing mtg repo [user]. That repo already carries so much context and old-kit instructions that "drop this into other repos" would become a rabbit hole before the core loop works.
+  - The operator chose net-new over their existing mtg repo [user]. That repo already carries so much context and old-kit instructions that "drop this into other repos" would become a rabbit hole before the core loop works.
   - The designer chose Odoo as the net-new project and set its v1 scope [call].
   - Section 15 gives the definition of done.
 - **Phase 2** is the existing mtg MCP server [user]. Retire the old kit, have Hermes triage its open issues, then do one full run-through as a bundled PR (or a single PR if one issue merits it).
@@ -71,7 +67,7 @@ hapi-factory is a **public, best-practices reference stack** for an end-to-end a
 - **Team or multi-user operation**, hosted SaaS, or Windows/macOS support.
 - **Archon's bundled SDLC pack and its merge queue.** We write a few small workflows of our own and let GitHub's branch rules do the merging (§9.2).
 - **Parallel runs across one repo.** Runs queue per repo.
-- **Security-research providers.** Connecting **abliteration.ai** for the operator's security work is planned downstream [user, heads-up]. It's not in v1. When added, it needs:
+- **Security-research providers.** Connecting **abliteration.ai** for security-research work is planned downstream [user, heads-up]. It's not in v1. When added, it needs:
   - its own Hermes profile and roster;
   - its own capped key and Console-style workspace;
   - its own data-boundary review (terms and retention checked first).
@@ -93,10 +89,10 @@ hapi-factory is a **public, best-practices reference stack** for an end-to-end a
 ## 3. Constraints
 
 - **Models and money**
-  - The Anthropic Console API key is funded by Max 20x's **$200/month API credit**. It refreshes each cycle, doesn't roll over, and **does not cover Claude Code** [user; verified].
+  - **The budget is a fixed monthly API credit, $200 in the reference setup** [user; verified]. Some Claude subscriptions include a monthly credit for the Anthropic Console API, and the reference setup funds its Console key from one. Such a credit refreshes each cycle, doesn't roll over and **does not cover Claude Code**, so the factory's spend and the operator's own interactive Claude Code use are separate budgets, and cost per run matters.
   - Subscription OAuth is never used in Hermes, Pi or Archon [call; Anthropic terms].
   - A cheap provider (via OpenRouter) is used for end-to-end testing once the base works [user].
-  - **The $200 credit is the hard ceiling for now** [user]. the operator's daily work stays in Claude Code on his subscription.
+  - **The credit is the hard ceiling for now** [user]: an exhausted credit stops requests, so the caps below keep the factory inside it.
   - Workspace limits split it [call; adjust in `budgets.yaml`]:
     - `hapi-hermes` $60
     - `hapi-factory` $100
@@ -150,7 +146,7 @@ You ── chat / TUI ──► HERMES  (container, user `hapi`)
 
 | Zone | Runs as | Has | Lacks |
 |---|---|---|---|
-| Host admin | the operator | Org/repo admin, kill switches, key management | — |
+| Host admin | The operator | Org/repo admin, kill switches, key management | — |
 | `hapi` host user | Dedicated Linux user running rootless containers, the poller and the harvester | GitHub App private keys (to mint short-lived tokens), container control | Your personal credentials and sessions |
 | Hermes container | `hapi` | A capped Anthropic key (Hermes workspace), search API key, chat gateway token, a 1-hour `hapi-planner` GitHub token minted per session | Merge rights, Archon or Pi keys, write access to protected branches |
 | Archon container | `hapi` | Capped model keys (factory workspace), read-only local git mirror, run DB | **Any forge write credential.** No egress to the forge. |
@@ -161,6 +157,18 @@ Two facts drive this layout:
 2. Pi runs in-process with Archon.
 
 So **nothing inside the Archon container is a human-approval boundary**. The boundary is GitHub's ruleset plus the operator's review, and the Archon zone has no forge write credentials at all.
+
+### 4.4 Many repos, trust domains [user asked; call]
+
+**Segment by trust domain, not by repo.**
+- **Inside one trust domain:** one Hermes profile (its own config, `.env`, memory, sessions, skills, cron and state DB) and one Archon instance serve many repos, through registered codebases, per-repo worktrees and the shared home-scoped workflow pack. Per-repo isolation within a domain:
+  - a work order names exactly **one** repo;
+  - GitHub tokens are minted for that repo only;
+  - each repo has its own overlay and egress;
+  - each repo has its own run queue (resource `github:<owner>/<repo>:factory`).
+- **A new trust domain** gets its own Hermes profile, Archon container and zone, model workspace and spend cap, and Slack channel. Examples: the downstream abliteration.ai security work, or any client or private code. This stops memory and skill bleed between domains: a poisoned memory in one domain can't steer another.
+- **No run ever spans two repos.** A cross-repo feature is one work order per repo, coordinated by Hermes.
+- **v1 has one domain** ("oss": hapi-factory, odoo-mcp, later mtg).
 
 ---
 
@@ -174,11 +182,11 @@ Lanes are routed by **PR labels**. The **work-order file** says what to build.
 |---|---|---|
 | `lane:planning` | Hermes only | Research, designs, threat models, work orders, context files, doc-only tweaks |
 | `lane:factory` | Archon + Pi | Building a merged work order |
-| `lane:direct` | the operator, hands-on in Pi (later Claude Code; later still, Hermes driving Pi for one-off work) | Work he wants to drive himself |
+| `lane:direct` | The operator, hands-on in Pi (later Claude Code; later still, Hermes driving Pi for one-off work) | Work he wants to drive himself |
 
 All lanes share:
 - the same CI gates;
-- the operator's approval at merge;
+- The operator's approval at merge;
 - commit trailers recording the lane (§13.2).
 
 Git tags are only for releasing and pinning hapi-factory itself.
@@ -199,7 +207,7 @@ Review comments or "request changes" on a planning PR go back to Hermes, which r
 A **lightweight lane** exists for tiny changes: a `lane:planning` doc-only PR with no design doc [call].
 
 **Rework on delivery PRs** [user chose the label option]:
-- the operator requests changes and adds `hapi:rework`. Adding labels needs at least triage permission, so it's a trusted human act.
+- The operator requests changes and adds `hapi:rework`. Adding labels needs at least triage permission, so it's a trusted human act.
 - The poller starts a **follow-up run on the same `factory/<id>` branch**. Inputs:
   - the unchanged work order;
   - **review comments from maintainers only** (untrusted text, passed as data to the planning step of the run, never as instructions to tools).
@@ -290,10 +298,10 @@ A target repo needs only these files [user: central engine, small contract]:
 | `.factory/work/<id>/` | Work orders (§6) |
 | `docs/research/`, `docs/design/` | Hermes's dated research notes, designs and threat models |
 | `.github/workflows/hapi-gates.yml` | A thin wrapper calling hapi-factory's **reusable workflow, pinned by tag**: runs `mise run check` and the secret, SAST and dependency scans, validates work-order schemas, enforces commit trailers |
-| `.github/CODEOWNERS` | the operator owns `AGENTS.md`, `.factory/**`, `.github/**`, `mise.toml` |
+| `.github/CODEOWNERS` | The operator owns every protected path (§8.2): the agent instruction files at any depth, `.factory/**`, `.github/**`, `mise.toml`, `.coderabbit.yaml` |
 | Ruleset (forge setting, not a file) | `main` protected; one approving review required, and the PR author can't approve; required checks; no bypass for the Apps |
 
-**New repos (v1):** `mise run new-repo -- <name>`, run by the operator with his own credentials, creates the repo from `templates/repo-contract/` [call]. That template holds:
+**New repos (v1):** `mise run new-repo -- <name>`, run by the operator with their own credentials, creates the repo from `templates/repo-contract/` [call]. That template holds:
 - `AGENTS.md`, `mise.toml` tasks, `.factory/config.yaml`, CODEOWNERS, the CI wrapper;
 - the ruleset, applied by API;
 - installation of both GitHub Apps on the repo.
@@ -328,21 +336,42 @@ The onboarding PR must also **remove or harden any CI workflow that runs an AI a
 
 ```yaml
 protected_paths:
-  "AGENTS.md":   { interactive: ask, unattended: deny, workers: deny }
+  "**/AGENTS.md":       { interactive: ask, unattended: deny, workers: deny }
+  "**/AGENTS.override.md": { interactive: ask, unattended: deny, workers: deny }
+  "**/AGENT.md":        { interactive: ask, unattended: deny, workers: deny }
+  "**/CLAUDE.md":       { interactive: ask, unattended: deny, workers: deny }
+  "**/CLAUDE.local.md": { interactive: ask, unattended: deny, workers: deny }
+  "**/GEMINI.md":       { interactive: ask, unattended: deny, workers: deny }
+  "**/HERMES.md":       { interactive: ask, unattended: deny, workers: deny }
+  "**/.hermes.md":      { interactive: ask, unattended: deny, workers: deny }
+  "**/SOUL.md":         { interactive: ask, unattended: deny, workers: deny }
+  "**/REVIEW.md":       { interactive: ask, unattended: deny, workers: deny }
+  "**/.cursorrules":    { interactive: ask, unattended: deny, workers: deny }
+  "**/.windsurfrules":  { interactive: ask, unattended: deny, workers: deny }
+  "**/.claude/**":      { interactive: ask, unattended: deny, workers: deny }
+  "**/.hermes/**":      { interactive: ask, unattended: deny, workers: deny }
+  "**/.cursor/**":      { interactive: ask, unattended: deny, workers: deny }
+  "**/.clinerules/**":  { interactive: ask, unattended: deny, workers: deny }
+  "**/.rules/**":       { interactive: ask, unattended: deny, workers: deny }
   ".factory/**": { interactive: ask, unattended: deny, workers: deny }
   ".github/**":  { interactive: ask, unattended: deny, workers: deny }
   "mise.toml":   { interactive: ask, unattended: deny, workers: deny }
   ".pi/**":      { interactive: deny, unattended: deny, workers: deny }
   ".agents/**":  { interactive: ask, unattended: deny, workers: deny }
   ".archon/**":  { interactive: deny, unattended: deny, workers: deny }
+  ".coderabbit.yaml":      { interactive: ask, unattended: deny, workers: deny }
+  ".coderabbit.yml":       { interactive: ask, unattended: deny, workers: deny }
+  ".coderabbit.config.ts": { interactive: ask, unattended: deny, workers: deny }
 ```
 
 - **interactive** means the operator is in a Hermes session (or later a direct-lane Pi session).
-  - `ask` puts the diff in front of him to approve.
+  - `ask` puts the diff in front of them to approve.
   - Hermes's built-in protected-instruction gate already asks on `AGENTS.md`.
   - hapi-path-guard extends it to globs.
 - **unattended** covers Hermes cron, webhook and API surfaces. Always deny.
 - **workers** covers Pi or Claude Code inside Archon. Always deny.
+- **Agent instruction files at any depth** (added 2026-10-27, the operator's ruling; it replaced the root-only `AGENTS.md`): Pi, Hermes, the later Claude Code lane and CodeRabbit read nested `AGENTS.md`, `CLAUDE.md` and the rest as instructions for that subtree, so a write persists into every later session there. Matching ignores case (Pi also loads `AGENTS.MD` and `CLAUDE.MD`, Hermes's own gate ignores case, and on a case-insensitive filesystem `Agents.md` is `AGENTS.md`). Workers read them and never need to write one: a work order that needs one says so in its PR, and the operator adds it.
+- **`.coderabbit.*`** (added 2026-10-27, the operator's ruling): CodeRabbit reviews a same-repo PR with that PR branch's own config, so a PR that edits it could weaken its own review (§9.6).
 - **Backstop:** CODEOWNERS plus the ruleset. A guard failing locally can't land a change.
 
 ---
@@ -376,10 +405,10 @@ protected_paths:
   - `#hapi-intake` for talking to Hermes;
   - `#hapi-alerts` for poller, harvester and flag notices.
 - Messages carry links and summaries, never code or secrets, since Slack is a third party.
-- Signal (the operator's personal app) stays possible later as a DM channel.
+- Signal stays possible later as a DM channel.
 - The record of truth stays on GitHub.
 
-**Coexistence:** the operator's existing personal Hermes (`~/.hermes`, running as his own user with his `gh` credentials) keeps running for personal use. It's never pointed at hapi-managed repos. The hapi Hermes starts **fresh** in the `hapi` zone, with no imported memories or skills [call; confirm at review].
+**Coexistence:** an operator who already runs a personal Hermes (`~/.hermes`, as their own user, with their own `gh` credentials) keeps it for personal use. It's never pointed at hapi-managed repos. The hapi Hermes starts **fresh** in the `hapi` zone, with no imported memories or skills [call; confirm at review].
 
 **Use (vetted)** [call; from `hermes_plugins.md`]:
 - `hermes_otel`, pinned ≥ 1.31 for an inbound `HERMES_OTEL_TRACEPARENT`, with `content_capture` set to preview or off
@@ -389,14 +418,14 @@ protected_paths:
 - `skill-integrity`
 - `custom-dangerous-patterns`
 - the bundled `grounded-citations` skill, extended with retrieval dates
-- one search plugin (Tavily or Linkup, or a core backend)
+- Hermes **native** web backends in the research zone: Brave (search) + Exa contents (extract), with keyless fallback off (§10.1)
 - Archon's `archon-cli` skill, vendored and pinned, for status only (§9.2)
 
 **Build** [call]:
 1. **`hapi-path-guard`**, a Python plugin. Prompts on glob matches in interactive sessions and blocks in unattended ones (via `ctx.current_cron_execution()` and `ctx.session_surface()`); blocks under yolo. It must also cover shell writes, since the core gate misses them (#143266) [verify].
 2. **`hapi-cmd-allow`**, a default-deny `pre_tool_call` shell hook with `fail_closed: true`.
 3. **`hapi-planning` skill**: brainstorm → research brief → design and threat model → work orders → planning PR. It uses `new-work-order` (deterministic id and `traceparent`, schema validation).
-4. **`hapi-research` profile**, quarantined: web tools only, no terminal, no repo write, no secrets. It returns a schema-validated brief, and the **`hapi-research-note` skill** writes `docs/research/<topic>.md` with retrieval dates, source hashes and a `recheck_by` date.
+4. **`hapi-research` profile**, quarantined in **its own container**: web tools only, no terminal, no repo write, no secrets except spend-capped, search-only keys (§10.1). It returns a schema-validated brief, and the **`hapi-research-note` skill** writes `docs/research/<topic>.md` with retrieval dates, source hashes and a `recheck_by` date.
 5. **Freshness job**: a cron pre-run script that checks `recheck_by` dates and wakes the agent only when something is stale, so it costs nothing otherwise. It opens `lane:planning` update PRs.
 6. **`hapi-status` tool**, fixed-argv: `archon workflow status/list/cancel/resume`.
    - `resume` re-drives a run that a merge already approved, with no new inputs. It's also available to the operator as `mise run factory:resume -- <run-id>` [call].
@@ -430,7 +459,7 @@ protected_paths:
 4. **`review`**: separate session, different model, read-only (`mutates_checkout: false`), with an output schema `{verdict, findings}`.
    - Default: the **Claude provider** on the Anthropic roster. It gets enforced schemas, a sandbox and `maxBudgetUsd`.
    - On the portable roster: Pi with a different model family.
-   - The review is advisory. the operator's merge decides.
+   - The review is advisory. The operator's merge decides.
 5. **`commit`** (script): commit per piece with trailers (§13.2), then update the local mirror ref `refs/hapi/<run-id>`.
 
 **Budgets:** `budget: {max_spend_usd, max_work_units}` sits on `factory-task`, which has no loops. A dispatcher with `fan_out` can't carry a budget, so each child carries its own.
@@ -520,7 +549,7 @@ Small scripts run by `hapi` (systemd user timers, installed by `mise run up`):
 | **4 Confidence gating:** bash gate, citation check | (a) The **citation check** in `hapi-research-note`: does the source support the claim, and is the quote faithful? Low confidence marks the claim "unverified" in the note. (b) Confidence floor/bar semantics for every gate below. | v1 |
 | **5 Routing:** model router | Archon `prepare`: least-cost tier plus effort for implement, within the roster. Retry still escalates to high. Also picks the review lens. | v1 |
 | **6 Guardrail hooks:** bash gate, write gate, result screen | In **hapi-guard**, layered *after* the deterministic rules. The deterministic protected-path block makes no Jev call. Then three Jev gates: the **bash gate** (irreversible or destructive intent: block), the **write gate** (does the content hold a credential? block) and the **result screen** (tool output carrying instructions gets a data banner). The container stays the real boundary. | v1 |
-| **7 Should I compact** | Context control, the operator's original pain point. (a) Pi steps that run long: turn-end compaction signal and cut point. (b) Long Hermes sessions such as brainstorms: suggest compressing or starting fresh at a natural boundary. Behind a flag; v1 steps are short by design. **[verify]** against Anthropic's history-edit rejection first. | 3 |
+| **7 Should I compact** | Context control, the pain point that started the project. (a) Pi steps that run long: turn-end compaction signal and cut point. (b) Long Hermes sessions such as brainstorms: suggest compressing or starting fresh at a natural boundary. Behind a flag; v1 steps are short by design. **[verify]** against Anthropic's history-edit rejection first. | 3 |
 | **8–9 Cheap reads, files at scale** | **Scout pre-pass** as an Archon script step before implement: ask "is this file relevant to the work order?" over the repo in parallel, pruned in code, capped at 255. Pi gets a short `relevant_files` list instead of exploring, which serves the token-efficiency anti-goal. Optionally, give Pi the `ask_jev_file_*` tools so it can ask a question without reading a file into context. | v1 (pre-pass); 3 (tools) |
 | **10 Agentic Jev:** triage a failure, judge a diff | Placed **in code**, not left to the agent: after a gate fails, classify the failure (bug in code, wrong test, flaky, environment, out of scope, other) to decide between retry, re-running gates, or stop-and-flag. After implement, ask "does the diff stay within the work order's intent?" (flag only). Giving Pi the `ask_jev` tool itself is a phase 3 experiment. | v1 (in code); 3 (tool) |
 | `hapi-heads-up` | "Is there something worth flagging to the operator now?" gates whether a note is posted | 3 |
@@ -539,7 +568,7 @@ Small scripts run by `hapi` (systemd user timers, installed by `mise run up`):
 - **On delivery and planning PRs:** its findings go into the PR record. The harvester's PR summary also links them.
 - **Rework:** when the operator applies `hapi:rework`, CodeRabbit's comments are included alongside maintainer comments, as **data** from an allowlisted bot identity.
 - **Metrics:** its finding counts per PR are recorded, which feeds the "poor output" measure.
-- **Never a merge authority or a required check in v1.** Like any LLM reviewer, its output can be steered by PR content. the operator's merge decides.
+- **Never a merge authority or a required check in v1.** Like any LLM reviewer, its output can be steered by PR content. The operator's merge decides.
 - **Cost lever** [call]: on `risk: low` work orders, the in-run review may drop to a cheaper tier, leaning on CodeRabbit plus the operator. Evals must show this doesn't raise rework.
 - **[verify]:**
   - which features the free open-source tier includes;
@@ -552,16 +581,79 @@ Small scripts run by `hapi` (systemd user timers, installed by `mise run up`):
 `policy/trusted_sources.yaml` has four tiers [call; from report]:
 - **T0:** pinned local snapshots
 - **T1:** first-party domains and package registries
-- **T2:** curated aggregators, such as Context7 at ≥ the patched MCP `@upstash/context7-mcp` 2.1.3, and DeepWiki
+- **T2:** curated aggregators, such as Context7 (pinned 4.x client; ContextCrush was fixed server-side, see §10.1) and DeepWiki
 - **T3:** the open web
 
 Who gets which tier:
 - **Only `hapi-research`** touches T3. It returns schema-validated briefs; nothing raw goes downstream.
-- **The Hermes main session** gets T0–T2.
+- **The Hermes main session** gets T0–T1. T2 and T3 content reaches it only as schema-validated briefs from `hapi-research` (amended 2026-10-26 after the MCP research, §10.1).
 - **Pi workers** get T0–T1, and in practice no web tools at all. Their egress is model APIs, the local mirror, package registries and the work order's `egress_extra` hosts.
 - Enforcement lives below the agent: a default-deny egress proxy per container. The builder picks the tool, such as sandbox-runtime, iron-proxy (Docker backend only) or Smokescreen.
 
 For the mtg pilot, Hermes confirms the endpoint change **from a first-party source** and records it. The worker never researches it.
+
+### 10.1 MCP servers per layer [user: add an MCP layer with base configs; call: contents, from the MCP baseline research ([docs/research](../../research/README.md)), 2026-10-26]
+
+MCP servers are packages that put text into an agent's context. Each one is therefore two risks:
+- a **supply-chain** risk: code we run;
+- an **untrusted-input** source: text the model reads.
+
+**Single source of truth:**
+- **`policy/mcp.yaml`,** the catalog of approved servers. Each entry gives:
+  - the zone(s) that may load it;
+  - its transport;
+  - an **exact pin** (version + registry integrity, or OCI digest);
+  - an advisory **version floor** our own check enforces, because some advisories, like Context7's, have no OSV record and scanners stay silent;
+  - a `tools.include` allowlist (read-only tools only);
+  - `env`, by secret name (`secret:<name>`, resolved by the secret provider, §11.5): each server gets only its own key;
+  - its allowed egress hosts;
+  - `trust: untrusted`;
+  - elicitation `deny`.
+- **`policy/mcp.lock.json`** stores each server's raw `tools/list` output, `instructions`, prompts and resources, plus their hash.
+
+**Who gets what (v1):**
+
+| Layer / zone | MCP servers | Notes |
+|---|---|---|
+| `hapi-research` (`research` zone, **its own container**) | **Context7** (`@upstash/context7-mcp`, T2) | The only general docs server with version-addressed library ids and a pinnable local client. Library-owner and teamspace "rules" can't be switched off client-side, so it stays quarantined: egress `context7.com` only, always with an API key, `OTEL_SDK_DISABLED=true`, no proxy or URL overrides beyond the zone's own. |
+| Hermes main session (`hermes` zone) | **None in v1.** Optional: **Arize Phoenix MCP** (`@arizeai/phoenix-mcp`, stdio) whenever the o11y profile runs | Phoenix needs a VIEWER-role key, `PHOENIX_DISCOVER_CONFIG=false`, an explicit `PHOENIX_ENDPOINT`, the 23 read-only tools only, and `phoenix-support` excluded (it forwards queries to a third party). |
+| Archon Pi workers / Claude review nodes | **None** | Workers see T0–T1 only. Docs reach them as research notes and reviewed, hashed snapshots. |
+| Claude Code lane (phase 4) | Generated from the same catalog, with `--strict-mcp-config` | Context7 only under research-zone quarantine. |
+
+**Web search is NOT an MCP server.** The research zone uses Hermes's **native** `web_search` / `web_extract`:
+- **Brave** for search, **Exa contents** (or Firecrawl) for extract;
+- `keyless_fallback: false`, never `web.backend: nous`;
+- `security.allow_private_urls: false`;
+- vendor extras pre-installed at image build, from Hermes's own exact pins.
+
+Why native beats an MCP server here:
+- The native path exposes a fixed, Hermes-owned two-tool schema, so there's no vendor tool text to rug-pull.
+- It has a fail-closed SSRF guard.
+- The four leading search APIs (Brave, Firecrawl, Exa, Parallel) were statistically tied on the only independent benchmark. Brave is fastest and cheapest per search, and Exa contents is $1 per 1k pages.
+
+**Research-zone keys:** `hapi-research` holds only **spend-capped, search-only** keys: Brave, Exa and Context7 [call]. That's a deliberate exception to "no secrets": low value and capped, with no repo or forge access.
+
+**Deliberately not used in v1** (one line each; reasons in the research note):
+- **GitHub MCP:** forge actions go through `src/forge/`. A read-only GitHub MCP is a phase-2 candidate for mtg triage.
+- **Firecrawl, Tavily, Perplexity and other search MCPs:** native backends cover them.
+- **Reference servers** (filesystem, git, memory, time, sequential-thinking): native tools cover them, and git and filesystem would bypass our command and path policies.
+- **Playwright MCP:** Microsoft now recommends its CLI plus skills.
+- **MCP gateways** (Docker MCP Gateway, etc.): they need the Docker socket, have heavy advisory histories, and none defends against tool poisoning.
+- **Lookalike packages** are blocked by name, e.g. `@modelcontextprotocol/server-brave-search`, Crawl4AI and `ai.smithery/*`.
+
+**Controls:**
+- **Pin:** one image per server, built from a committed lockfile and pinned by digest. A bare `npx`/`uvx pkg@x.y.z` doesn't pin the dependency tree.
+- **Cooldown:** 14-day release cooldown, with a **security-fix exception** recorded in the catalog.
+- **Run stdio servers inside their zone's container,** so the zone's Squid allowlist binds them. Egress is per zone, not per server, in v1. Accepted, because no research-zone server holds a second secret. Per-server isolation (e.g. ToolHive with explicit deny-by-default profiles) is a phase-2 option.
+- **Rug-pull defense:** `hapi mcp pin` records `mcp.lock.json`. Every connect, `hapi audit` (`mcp.tool-hashes`) and stack start-up fail closed on drift. Re-approval is a planning PR, since `new_skill_or_mcp` is on the approvals list. Remote-only endpoints count as review events.
+- **CI scanning** on every change to the catalog or lockfile:
+  1. Cisco `mcp-scanner` (offline YARA and static checks over the lockfile; never runs servers);
+  2. Snyk Agent Scan (sandboxed; it runs servers and uploads their descriptions);
+  3. our advisory-floor check.
+
+  Scanners are a floor, not a verdict.
+- **Untrusted output:** **[verify in Plan 04]** whether a Hermes post-tool hook can run the injection screen (§9.5, L1) over MCP results. Either way, the human gate is the planning PR, since nothing from the research zone reaches workers without it.
+- **Context7 security note:** ContextCrush (CVE-2026-75130, ≤ 2.1.2) was fixed on Upstash's **backend** on 2026-02-23, so a client pin can't enforce it. We pin a current 4.x client and enforce a floor above 2.1.2 ourselves, but the rules channel stays a live injection path. That's the reason for the quarantine.
 
 ---
 
@@ -617,7 +709,13 @@ Default-deny proxy per container, generated from policy.
   - Both use 1-hour installation tokens minted outside the agents. Neither can merge or bypass rulesets.
 - **Console workspaces with spend limits:** `hapi-hermes`, `hapi-factory`, `hapi-evals`. The default workspace can't be capped, so it's unused.
 - **OpenRouter:** one key per role and environment, with a daily `limit`. Zero-data-retention is enforced (`zdr`) for every non-Anthropic model.
-- **Secrets** live in a vault, injected at start. That's **Bitwarden Secrets Manager**: `bws` is already installed, and Hermes supports it in core [call]. Never in `.env` once the vault works (Hermes's 1Password integration falls back to `.env`, which fails open).
+- **Secrets** come from a pluggable **secret provider** at start, injected per zone as `0600` env files on the host's tmpfs [user: "portable across secret managers"; "sops and age to start", 2026-10-26]. **Fail closed:** if the configured provider fails or any name is missing or empty, nothing starts. There is no automatic fallback.
+  - The repo ships **logical names only** (`stack/secrets.yaml`: zone → env var → name). Provider bindings and values live outside the public repo.
+  - **Default: sops + age.** One encrypted file (`secrets.enc.yaml`) and an age key in the standard place for the user that runs the stack. No service; encrypted at rest; the encrypted file can be backed up in a private repo, the key never. Onboarding is `mise run secrets:init`.
+  - **Keys and recovery:** every store is encrypted to one age key per machine or user (generated where it lives, never copied) plus one **recovery recipient**, whose identity is wrapped with a tool-generated 10-word passphrase (`recovery.age`). The user's backup job is the 10 words. Recipient changes re-key the data key. Removing a key doesn't undo old copies in git history, so a compromised key also means reissuing the credentials inside. Recipients are post-quantum by default, and mixing PQ and classic recipients is refused [call, from the 2026-10-26 key-recovery research].
+  - **Optional: Bitwarden Secrets Manager** (`bws`), bound by name → id in the local config.
+  - **Explicit downgrade: `env-file`** (plaintext, `0600`, outside every checkout). `hapi audit` reports it.
+  - Never in a repo `.env` (Hermes's 1Password integration falls back to `.env`, which fails open).
 - **Residual risk:** model keys are visible inside their containers, bounded by spend caps and egress. **Next level:** a credential-injecting proxy.
 
 ### 11.6 Supply chain
@@ -686,17 +784,21 @@ Cost rules:
 - **Handle Anthropic's 429 `enforced_spend_limit_reached`** as terminal. Don't retry it.
 - **[verify early]:** Anthropic rejects edited conversation history for accounts created on or after 2026-08-31. Make sure Hermes compression and Pi compaction don't break on that.
 - **[verify]:** a one-dollar test of whether Claude-provider (Agent SDK) review draws on the API credit. The credits doc says the Agent SDK is covered.
-- **Provider subscriptions: decided after v1, from measured numbers** [call]. the operator may drop to Max 5x and add a cheaper plan for the factory [user]. Findings as of 2026-10-26 are in `research_notes/Hapi factory plugins and o11y/provider_subscriptions.md`:
-  - **Max 5x** is $100/month with a $100 API credit, against $200/$200 for 20x. It also cuts the operator's interactive Claude Code limits to roughly a quarter.
-  - **ChatGPT Plus/Pro through Pi's "Sign in with ChatGPT"** has terms that explicitly allow third-party and unattended use (2026-09-29). Caveats:
-    - training is on by default and must be opted out;
-    - the 5-hour window is shared with personal ChatGPT use.
-    - Archon supports Pi subscription OAuth for non-Anthropic providers.
-  - **OpenCode Go / Go Plus** ($10/$40) carries strong open models such as Kimi K3.1 Pro, with no retention for most of them.
-  - **Z.ai's** plan is second-tier and restricts automation. Its Singapore jurisdiction makes training terms unclear.
-  - **Mistral** has no coding plan.
-  - **Kimi's and Alibaba's** plans forbid third-party-harness use.
-  - **For v1:** the Anthropic credit plus **OpenCode Go ($10/month)** for the `portable` roster [call; the operator prefers trying a provider outside the two main players].
+- **Provider subscriptions: decided after v1, from measured numbers** [call].
+  - **The question** [user]: is the factory better funded by one larger Claude plan's API credit, or by a smaller Claude plan for interactive work plus a cheaper coding plan for the factory?
+  - **How it was evaluated** (2026-10-26, the private provider-subscriptions research, [docs/research](../../research/README.md)): each plan against what an unattended factory needs. Terms that allow unattended, third-party-harness use; data retention and training; the models it serves; and its price against the API credit it would replace.
+  - **How it gets decided:** after v1, from the factory's own numbers: cost per run on each roster (§13), eval pass rates (§14) and how much of the credit the factory actually uses.
+  - **What it found:**
+    - **A smaller Claude plan** halves both the price and the included API credit ($100 a month with a $100 credit, against $200 and $200), and cuts the interactive Claude Code limits to roughly a quarter.
+    - **ChatGPT Plus/Pro through Pi's "Sign in with ChatGPT"** has terms that explicitly allow third-party and unattended use (2026-09-29). Caveats:
+      - training is on by default and must be opted out;
+      - the 5-hour window is shared with personal ChatGPT use.
+      - Archon supports Pi subscription OAuth for non-Anthropic providers.
+    - **OpenCode Go / Go Plus** ($10/$40) carries strong open models such as Kimi K3.1 Pro, with no retention for most of them.
+    - **Z.ai's** plan is second-tier and restricts automation. Its Singapore jurisdiction makes training terms unclear.
+    - **Mistral** has no coding plan.
+    - **Kimi's and Alibaba's** plans forbid third-party-harness use.
+  - **For v1:** the Anthropic credit plus **OpenCode Go ($10/month)** for the `portable` roster [call; to try one provider outside the two largest labs].
     - OpenCode is run by **Anomaly**, the team behind SST; the repo moved from `sst/opencode` to `anomalyco/opencode` (MIT).
     - OpenCode Go serves Kimi K3.1 Pro, GLM-5.3 and others, with no retention for most open models.
     - Pi and Hermes are its validated clients.
@@ -823,12 +925,12 @@ A flagged run gets `hapi:flagged` on its PR and an alert in `#hapi-alerts`.
 - Hermes decides the exact cut during planning, and the operator approves it at the planning PR.
 
 **v1 definition of done** [user scope; call specifics]:
-1. the operator runs `mise run new-repo -- odoo-mcp`. The repo exists with the contract, ruleset and both Apps installed.
+1. The operator runs `mise run new-repo -- odoo-mcp`. The repo exists with the contract, ruleset and both Apps installed.
 2. In Slack (`#hapi-intake`), the operator brainstorms the Odoo MCP server with Hermes.
    - `hapi-research` produces dated, first-party-sourced notes on Odoo's external API and the MCP spec.
    - Hermes drafts `docs/design/odoo-mcp.md`, `docs/security/threat-model.md` (MAESTRO, scoped to this server) and the work orders on `plan/odoo-mcp`.
    - Hermes opens a `lane:planning` PR.
-3. the operator merges it. Exactly **one** Archon run per work order starts within the poll interval, without the operator touching Archon.
+3. The operator merges it. Exactly **one** Archon run per work order starts within the poll interval, without the operator touching Archon.
 4. Each run:
    - Pi builds inside the container, with `.pi/` stripped and hapi-guard active.
    - `mise run check` and `mise run smoke` pass against the Odoo sidecar.
@@ -836,7 +938,7 @@ A flagged run gets `hapi:flagged` on its PR and an alert in `#hapi-alerts`.
    - The independent review returns `ready`.
 5. The harvester opens one `lane:factory` PR per work order, with trailers and the run summary.
    - The rework label is exercised at least once.
-   - the operator merges the PRs.
+   - The operator merges the PRs.
 6. `metrics.json` and `metrics.jsonl` record cost, turns, interventions and merge outcomes. Targets: ≤ $3 per run on the `anthropic` roster, total v1 build ≤ $25 [call].
 7. Eval case 1 (a frozen work order) passes on the `budget` roster, and once on `portable`. Planning eval 1 (the recorded intake) passes.
    - Jev decisions are recorded in run metrics.
@@ -886,8 +988,7 @@ Because v1 keeps Archon off the forge (§9.4), hapi-factory may need little or n
 - Whether to upstream the Archon Pi-trust fix during phase 1 or later.
 - Deduplicating the trigger key when one merge carries several work orders.
 - The toolchain mise installs inside the Archon container.
-- Giving `hapi-research` its own container, since egress policy is per container.
-- How the ruleset lets the operator merge PRs he authored himself (`lane:direct`). Rulesets don't let an author approve their own PR. Use an owner-only bypass that the Apps and agents can never use.
+- How the ruleset lets the operator merge PRs they authored themselves (`lane:direct`). Rulesets don't let an author approve their own PR. Use an owner-only bypass that the Apps and agents can never use.
 
 ## 19. Verify early (spikes)
 

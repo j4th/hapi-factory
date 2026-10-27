@@ -1,0 +1,52 @@
+# yaml-language-server: $schema=schemas/policy-trusted-sources.schema.json
+#
+# Trusted sources and egress zones (spec §10).
+#
+# Hosts are plain domains. The egress generator allows each domain and its
+# subdomains (Squid `.slack.com` also covers wss-primary.slack.com).
+# A zone's allowlist is its own `hosts` plus the hosts of every tier it lists.
+# The egress proxy built from this file is the real boundary; the agents'
+# own settings are a second layer.
+tiers:
+  T0:                     # pinned local snapshots: no network access needed
+    hosts: []
+  T1:                     # first-party domains and package registries
+    hosts:
+      - registry.npmjs.org
+      - pypi.org
+      - files.pythonhosted.org
+  # T2, curated aggregators: Context7 and DeepWiki, for the research zone only (spec §10.1).
+  # Context7's ContextCrush fix (CVE-2026-75130) was deployed on Upstash's backend on
+  # 2026-02-23, so a client version can't enforce it. mcp.yaml pins a 4.x client and
+  # checks our own floor above 2.1.2; the research-zone quarantine is the control.
+  T2:
+    hosts:
+      - context7.com
+      - deepwiki.com
+  T3:                     # the open web: not a list; only a zone with openWeb reaches it
+    hosts: []
+
+zones:
+  # The Hermes main session: T0-T1, model APIs, GitHub, Slack. T2 and T3 content reaches
+  # it only as schema-validated briefs from hapi-research (spec §10, amended by §10.1).
+  hermes:
+    tiers: [T0, T1]
+    hosts:
+      - api.anthropic.com
+      - openrouter.ai
+      - api.github.com
+      - github.com
+      - slack.com
+  archon:                 # Archon and its Pi workers: T0-T1, model APIs, registries. No forge route (spec §4.3).
+    tiers: [T0, T1]
+    hosts:
+      - api.anthropic.com
+      - openrouter.ai
+      - opencode.ai
+      - registry.npmjs.org
+      - pypi.org
+      - files.pythonhosted.org
+  research:               # hapi-research, the only role that touches T3; private ranges stay blocked
+    tiers: [T0, T1, T2, T3]
+    hosts: []
+    openWeb: true

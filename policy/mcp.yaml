@@ -1,0 +1,113 @@
+# yaml-language-server: $schema=schemas/policy-mcp.schema.json
+#
+# The MCP catalog (spec §10.1): every MCP server a zone may load. An MCP server
+# is two risks at once: code we run (supply chain) and text the model reads
+# (untrusted input). So each entry is pinned exactly, allowlists read-only
+# tools only, gets only its own secret, and is untrusted with elicitation
+# denied. The archon zone (Pi workers, Claude review nodes) gets none.
+#
+# Adding or upgrading a server is `new_skill_or_mcp`: a planning PR, then
+# `hapi mcp pin --server <name>` to re-record its surface in mcp.lock.json.
+# The 14-day release cooldown applies; a security fix may skip it with
+# `cooldown_exception`. How-to and reasons: docs/mcp.md. Every field:
+# docs/policy.md.
+#
+# A server's env names must be on its package's env allowlist (PACKAGE_ENV in
+# src/policy/mcp.ts), so an entry can't widen it. A secret is always a
+# secret:<name> reference, resolved by the secret provider from the logical
+# name stack/secrets.yaml maps to HAPI_MCP_<NAME> (docs/secrets.md), never a
+# literal; a literal is only a flag value or an endpoint whose host is one of
+# the entry's egress hosts.
+servers:
+  # Library docs, version-addressed (T2). Research zone only: library-owner and
+  # teamspace "rules" can't be switched off client-side, so it is quarantined.
+  context7:
+    zones: [research]
+    transport: stdio
+    package:
+      name: "@upstash/context7-mcp"
+      # 4.3.0 (2026-10-09) is the newest release past the 14-day cooldown on
+      # 2026-10-26 (4.4.0 is 2026-10-13). Integrity checked against
+      # registry.npmjs.org and the tarball's own sha512.
+      version: "4.3.0"
+      integrity: "sha512-fuDt5nWjE5JkAPLjU0m+m0LlJphxyegAvAmcwHoA5jrzAhKo/rVV0RFA8TOwODGdDVdt/nPxNslkxeDIDp/rPA=="
+    # ContextCrush (GHSA-97r6-3rgm-v39r) affects <= 2.1.2 and has no OSV
+    # record. Its fix is on Upstash's backend, so this floor is a check, not
+    # the control; the quarantine is.
+    floor: { min: "2.1.3", advisory: CVE-2026-75130 }
+    tools:
+      include: [resolve-library-id, query-docs]   # both annotated read-only
+      deny: []
+    env:
+      CONTEXT7_API_KEY: secret:hapi-mcp-context7-api-key   # always keyed: anonymous callers can get a setup elicitation
+      OTEL_SDK_DISABLED: "true"
+    egress: [context7.com]
+    trust: untrusted
+    elicitation: deny
+    enabled_when: always
+
+  # Reads traces, datasets, experiments and prompts from Arize Phoenix, only
+  # while the observability profile runs (flags.otel.enabled). Trace text can
+  # hold T3-derived content, so it is untrusted like everything else.
+  phoenix:
+    zones: [hermes]
+    transport: stdio
+    package:
+      name: "@arizeai/phoenix-mcp"
+      # 4.3.16 (2026-10-09, SLSA provenance) is the newest release past the
+      # 14-day cooldown on 2026-10-26 (4.3.17 is 2026-10-21). Integrity checked
+      # against registry.npmjs.org and the tarball's own sha512.
+      version: "4.3.16"
+      integrity: "sha512-S0k63JMke9hj7A7xehr3Ut7QmrHd9nI4hS2lQSe9zIuREyFvXctckhg1pred6Fmo4FRCgV6h1TK/vLFO5zeNcQ=="
+    tools:
+      include:   # the 23 read-only tools
+        - list-projects
+        - get-project
+        - list-traces
+        - get-trace
+        - get-spans
+        - get-span-annotations
+        - list-sessions
+        - get-session
+        - list-annotation-configs
+        - list-datasets
+        - get-dataset
+        - get-dataset-examples
+        - get-dataset-experiments
+        - list-experiments-for-dataset
+        - get-experiment-by-id
+        - list-prompts
+        - get-prompt
+        - get-latest-prompt
+        - get-prompt-by-identifier
+        - get-prompt-version
+        - list-prompt-versions
+        - get-prompt-version-by-tag
+        - list-prompt-version-tags
+      deny:
+        - upsert-prompt            # writes
+        - add-prompt-version-tag   # writes
+        - add-dataset-examples     # writes
+        - phoenix-support          # forwards the query to a third party (mcp.runllm.com)
+        - list-readmes             # read local files; registered only with DANGEROUSLY_READ_README_FILES
+        - get-readme
+    env:
+      PHOENIX_API_KEY: secret:hapi-mcp-phoenix-viewer-key   # minted by a VIEWER-role user
+      PHOENIX_DISCOVER_CONFIG: "false"                   # no .env.phoenix discovery up the directory tree
+      # Explicit, so a planted .env.phoenix can't redirect it. The o11y profile
+      # serves Phoenix under this name on the hermes network.
+      PHOENIX_ENDPOINT: http://phoenix.hapi.internal:6006
+    egress: [phoenix.hapi.internal]
+    trust: untrusted
+    elicitation: deny
+    enabled_when: o11y
+
+# Package names no server may use: lookalikes of the vendors' own packages, and
+# packages we chose not to run. A pattern matches a whole name; * matches any
+# run of characters.
+blocked:
+  - "@modelcontextprotocol/server-brave-search"   # deprecated lookalike of Brave's own server
+  - crawl4ai                                      # JS execution; critical RCE and SSRF history
+  - "ai.smithery/*"                               # third-party hosting of servers and their keys
+  - "@upstash/context7-pi"                        # Context7 inside Pi: workers get T0-T1 only
+  - "@upstash/context7-admin-mcp"                 # admin tools from the same repo as Context7

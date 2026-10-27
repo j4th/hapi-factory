@@ -1,0 +1,10 @@
+# policy/budgets.yaml with `workspaces` misspelled. Every other file in this
+# fixture is a symlink to the real policy/ file, so only this one can fail.
+wokspaces:
+  hapi-hermes: 60
+  hapi-factory: 100
+  hapi-evals: 40
+openrouter_monthly_usd: 20
+jev_monthly_usd: 2
+run_usd: 3.00
+hermes_max_turns: 60

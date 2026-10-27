@@ -1,0 +1,9 @@
+# yaml-language-server: $schema=schemas/policy-approvals.schema.json
+#
+# Actions that always need the operator (spec §5.2, §8.1). A fixed short list.
+- merge
+- new_dependency
+- new_skill_or_mcp
+- ci_workflow_change
+- outbound_message
+- spend_above_threshold

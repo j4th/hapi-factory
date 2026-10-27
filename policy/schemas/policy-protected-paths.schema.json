@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "policy-protected-paths.schema.json",
+  "title": "policy/protected_paths.yaml",
+  "description": "Paths agents may not change freely, with a mode per session kind (spec §8.2).",
+  "type": "object",
+  "properties": {
+    "protected_paths": {
+      "description": "Repo-relative glob -> {interactive, unattended, workers}. A file's mode, per session kind, is the strictest across every glob that matches it: never the first, last or most specific match.",
+      "type": "object",
+      "propertyNames": { "$ref": "policy-defs.schema.json#/$defs/pathGlob" },
+      "additionalProperties": { "$ref": "policy-defs.schema.json#/$defs/pathModes" }
+    }
+  },
+  "required": ["protected_paths"],
+  "additionalProperties": false
+}

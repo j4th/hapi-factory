@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# hapi-factory's commit-msg hook (Task 7b Step 5, H-057): the commit message
+# holds none of the operator's personal strings (private/personal-strings.txt,
+# .githooks/lib.sh), since messages are published with the history. It names
+# the line, never the string. Skipped with a notice in a clone without
+# private/. git passes the message's file as $1.
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
+# shellcheck source=.githooks/lib.sh
+. "$root/.githooks/lib.sh"
+
+patterns="$(personal_patterns)"
+if [[ -z "$patterns" ]]; then
+  skip_notice
+  exit 0
+fi
+trap 'rm -f "$patterns"' EXIT
+
+# Every line up to git's scissors line (`commit -v` puts the diff below it, and git
+# always cuts there). "#" lines count too: git strips them only when it cleans up an
+# edited message, and `commit -m` keeps them.
+hits="$(sed '/^# -\{24\} >8 -\{24\}$/,$d' "$1" | grep -n -F -i -w -f "$patterns" | cut -d: -f1 || true)"
+if [[ -n "$hits" ]]; then
+  echo "commit-msg: the commit message holds a personal string from $PERSONAL_STRINGS, on line $(echo "$hits" | paste -sd, -)." >&2
+  echo "Replace it (\"the operator\", \$OWNER or <owner>) and commit again; your message is in .git/COMMIT_EDITMSG." >&2
+  exit 1
+fi

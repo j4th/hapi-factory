@@ -1,0 +1,16 @@
+# yaml-language-server: $schema=schemas/policy-budgets.schema.json
+#
+# Budgets (spec §3, §8.1). All amounts are USD.
+#
+# The monthly caps live at the provider: set them on the Anthropic Console
+# workspaces and the OpenRouter keys by hand or API (Plan 01 Task 4 runbook).
+# run_usd and hermes_max_turns are compiled into Hermes, Archon and hapi-guard.
+# The total stays within the $200/month credit; the default workspace is unused.
+workspaces:               # monthly spend limit per Anthropic Console workspace
+  hapi-hermes: 60
+  hapi-factory: 100
+  hapi-evals: 40
+openrouter_monthly_usd: 20
+jev_monthly_usd: 2        # Jev's own OpenRouter key
+run_usd: 3.00             # per-run target
+hermes_max_turns: 60      # Hermes agent.max_turns

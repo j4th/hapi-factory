@@ -1,0 +1,25 @@
+{
+  // Type-check only (`mise run lint` = `bunx tsc --noEmit`). Bun runs the .ts files directly.
+  // Based on Bun's recommended config for TypeScript 6/7: https://bun.com/docs/typescript
+  "compilerOptions": {
+    "lib": ["ESNext"],
+    "target": "ESNext",
+    "module": "Preserve",
+    "moduleDetection": "force",
+    "moduleResolution": "bundler",
+    "types": ["bun"],
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "resolveJsonModule": true,
+    "noEmit": true,
+
+    "strict": true,
+    "skipLibCheck": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noImplicitReturns": true,
+    "exactOptionalPropertyTypes": true
+  },
+  "include": ["src", "tests"]
+}

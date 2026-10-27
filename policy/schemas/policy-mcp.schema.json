@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "policy-mcp.schema.json",
+  "title": "policy/mcp.yaml",
+  "description": "The MCP catalog (spec §10.1): every MCP server a zone may load, with an exact pin, the zones that may load it, a read-only tool allowlist, its env by secret name and its egress hosts, plus a blocklist of package names. The archon zone gets no MCP server. src/policy/mcp.ts adds the checks a schema can't express: the advisory floors, the blocklist, tools.deny, the transport's fields, the env allowlist per package (PACKAGE_ENV), secret-looking names as secret references only, the hard env denylist, and one server per secret. docs/policy.md describes every field.",
+  "type": "object",
+  "properties": {
+    "servers": {
+      "description": "Server name -> entry. The name is the key Hermes registers the server under and the key in policy/mcp.lock.json.",
+      "type": "object",
+      "propertyNames": { "$ref": "policy-defs.schema.json#/$defs/slug" },
+      "additionalProperties": { "$ref": "#/$defs/server" }
+    },
+    "blocked": {
+      "description": "Package-name patterns no server may use, e.g. lookalikes of the vendors' own packages. A pattern matches a whole name; '*' matches any run of characters.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9@*][a-z0-9@._/*-]*$",
+        "maxLength": 214
+      },
+      "uniqueItems": true
+    }
+  },
+  "required": ["servers", "blocked"],
+  "additionalProperties": false,
+  "$defs": {
+    "server": {
+      "type": "object",
+      "properties": {
+        "zones": {
+          "description": "The zones whose containers may run this server. Never archon: Pi workers and Claude review nodes get no MCP server (spec §10.1).",
+          "type": "array",
+          "items": { "enum": ["hermes", "research"] },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "transport": {
+          "description": "stdio: a local process inside the zone's container, so the zone's egress proxy binds it. http: a remote endpoint (url).",
+          "enum": ["stdio", "http"]
+        },
+        "package": {
+          "description": "stdio: the exact npm pin the server runs from.",
+          "$ref": "policy-defs.schema.json#/$defs/npmPin"
+        },
+        "image": {
+          "description": "stdio: the per-server image built from the package and a committed lockfile, pinned by digest (spec §10.1). The generators refuse an entry that sets it until image launch lands (Plan 04 builds the images), because the npx command would ignore it.",
+          "$ref": "policy-defs.schema.json#/$defs/imagePin"
+        },
+        "url": {
+          "description": "http only: the server's https endpoint, with no '$' (Hermes expands ${...} in it). Its host must be one of `egress` or a subdomain of one.",
+          "$ref": "policy-defs.schema.json#/$defs/mcpUrl"
+        },
+        "floor": {
+          "description": "Our own advisory floor: package.version must be at least `min`. For advisories that OSV and the scanners don't track (spec §10.1).",
+          "type": "object",
+          "properties": {
+            "min": { "$ref": "policy-defs.schema.json#/$defs/exactVersion" },
+            "advisory": { "$ref": "policy-defs.schema.json#/$defs/advisoryId" }
+          },
+          "required": ["min", "advisory"],
+          "additionalProperties": false
+        },
+        "cooldown_exception": {
+          "description": "The advisory whose fix lets this pin skip the 14-day release cooldown (the security-fix exception, spec §10.1).",
+          "$ref": "policy-defs.schema.json#/$defs/advisoryId"
+        },
+        "tools": {
+          "type": "object",
+          "properties": {
+            "include": {
+              "description": "The tools the agent may call: read-only tools only. Exact MCP tool names, never fnmatch patterns (Hermes expands *, ? and [ in include entries).",
+              "type": "array",
+              "items": { "$ref": "#/$defs/toolName" },
+              "minItems": 1,
+              "uniqueItems": true
+            },
+            "deny": {
+              "description": "The server's write tools, and tools that reach a third party. `include` may never list one.",
+              "type": "array",
+              "items": { "$ref": "#/$defs/toolName" },
+              "uniqueItems": true
+            }
+          },
+          "required": ["include", "deny"],
+          "additionalProperties": false
+        },
+        "env": {
+          "description": "The server's whole environment: Hermes passes only these (plus a safe baseline) to a stdio server. A value is either secret:hapi-mcp-<name>, the logical name of the secret it gets (resolved by the secret provider), or a literal. The names must be on the package's env allowlist (PACKAGE_ENV in src/policy/mcp.ts), in the form it says: a secret as a secret reference, a flag as one of its values, an endpoint as an http(s) URL whose host is an egress host. A name ending in _KEY, _TOKEN, _SECRET, _PASSWORD or _CREDENTIAL(S) is always a secret reference, and the hard denylist (launch hijacks such as NODE_OPTIONS, NPM_CONFIG_*, LD_* and PATH; proxies; URL overrides) applies to every server.",
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "pattern": "^[A-Z_][A-Z0-9_]*$",
+            "maxLength": 128
+          },
+          "additionalProperties": { "$ref": "#/$defs/envValue" }
+        },
+        "egress": {
+          "description": "The hosts this server needs (each covers its subdomains). In v1 egress is per zone: the zone's proxy is the boundary, and this list is for review and phase-2 per-server isolation.",
+          "$ref": "policy-defs.schema.json#/$defs/hostList"
+        },
+        "trust": {
+          "description": "Every server's output is untrusted input (spec §10.1).",
+          "enum": ["untrusted"]
+        },
+        "elicitation": {
+          "description": "A server may never ask the user for input (spec §10.1).",
+          "enum": ["deny"]
+        },
+        "enabled_when": {
+          "description": "always (the default), or o11y: only while the observability profile runs (flags.otel.enabled, or the build's o11y option).",
+          "enum": ["always", "o11y"]
+        }
+      },
+      "required": ["zones", "transport", "tools", "env", "egress", "trust", "elicitation"],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "transport": { "const": "stdio" } }, "required": ["transport"] },
+          "then": { "properties": { "package": {} }, "required": ["package"] }
+        },
+        {
+          "if": { "properties": { "transport": { "const": "http" } }, "required": ["transport"] },
+          "then": { "properties": { "url": {} }, "required": ["url"] }
+        }
+      ]
+    },
+    "toolName": {
+      "description": "An MCP tool name: letters, digits, '_', '-' and '.', 1 to 128 characters.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]{1,128}$"
+    },
+    "envValue": {
+      "description": "secret:hapi-mcp-<name> names a secret by its logical name, which the generated configs reference as ${HAPI_MCP_<NAME>}. Anything else is a literal, which may not start with secret: or contain $ (Hermes would expand ${...} in it) or a control character.",
+      "type": "string",
+      "pattern": "^(?:secret:hapi-mcp-[a-z0-9]+(?:-[a-z0-9]+)*|(?!secret:)[^$\\u0000-\\u001f\\u007f]+)$",
+      "maxLength": 2048
+    }
+  }
+}

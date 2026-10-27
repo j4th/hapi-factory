@@ -1,0 +1,15 @@
+# A control: comment-triggered, with a secret, but no AI agent.
+name: ci
+on:
+  issue_comment:
+    types: [created]
+  push:
+    branches: [main]
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: mise run test
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

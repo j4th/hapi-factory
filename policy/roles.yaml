@@ -1,0 +1,13 @@
+# yaml-language-server: $schema=schemas/policy-roles.schema.json
+#
+# The default model tier per role (spec §12). The roster selected for a run
+# (policy/rosters/) maps each tier to a provider, model and effort. A work
+# order may pick another tier for implement and review; it never names a model.
+hermes_main: large        # the Hermes main session
+hermes_auxiliary: small   # every Hermes auxiliary slot, delegation and cron
+planner: large
+implement: large
+review: medium
+scout: small              # the scout pre-pass over files (spec §9.5)
+router: small             # the model router in Archon's prepare step
+eval_judge: medium

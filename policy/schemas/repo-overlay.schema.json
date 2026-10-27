@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "repo-overlay.schema.json",
+  "title": ".factory/config.yaml",
+  "description": "A target repo's overlay on the central policy (spec §7, §8.1). It may add or tighten protected paths, add egress_extra hosts and lower budgets, and it may set the repo's default_risk and workflow, which are repo settings rather than policy. Any other key is rejected. Loosening is caught by applyOverlay, which needs the base policy to compare against.",
+  "type": "object",
+  "properties": {
+    "protected_paths": {
+      "description": "Repo-relative glob -> the modes to tighten. For a glob in the base policy, unnamed modes keep the base value. A new glob may name only ask or deny (applyOverlay rejects allow), and its unnamed modes add no rule. A file's mode is the strictest across every glob that matches it, so a new glob never loosens another. null means removal, which applyOverlay always rejects.",
+      "type": "object",
+      "propertyNames": { "$ref": "policy-defs.schema.json#/$defs/pathGlob" },
+      "additionalProperties": {
+        "type": ["object", "null"],
+        "properties": {
+          "interactive": { "$ref": "policy-defs.schema.json#/$defs/mode" },
+          "unattended": { "$ref": "policy-defs.schema.json#/$defs/mode" },
+          "workers": { "$ref": "policy-defs.schema.json#/$defs/mode" }
+        },
+        "minProperties": 1,
+        "additionalProperties": false
+      }
+    },
+    "egress_extra": {
+      "description": "Hosts added to the archon zone's allowlist. Never a forge host.",
+      "$ref": "policy-defs.schema.json#/$defs/hostList"
+    },
+    "budgets": {
+      "description": "Budgets to lower. Each value must be at most the base value.",
+      "type": "object",
+      "properties": {
+        "workspaces": {
+          "type": "object",
+          "properties": {
+            "hapi-hermes": { "$ref": "policy-defs.schema.json#/$defs/usd" },
+            "hapi-factory": { "$ref": "policy-defs.schema.json#/$defs/usd" },
+            "hapi-evals": { "$ref": "policy-defs.schema.json#/$defs/usd" }
+          },
+          "additionalProperties": false
+        },
+        "openrouter_monthly_usd": { "$ref": "policy-defs.schema.json#/$defs/usd" },
+        "jev_monthly_usd": { "$ref": "policy-defs.schema.json#/$defs/usd" },
+        "run_usd": { "$ref": "policy-defs.schema.json#/$defs/usd" },
+        "hermes_max_turns": { "$ref": "policy-defs.schema.json#/$defs/count" }
+      },
+      "additionalProperties": false
+    },
+    "default_risk": {
+      "description": "The risk new work orders for this repo start from (spec §7). A repo setting, not policy: tighten-only doesn't apply. applyOverlay exposes it as repo.default_risk.",
+      "$ref": "policy-defs.schema.json#/$defs/risk"
+    },
+    "workflow": {
+      "description": "The Archon workflow this repo's work orders use by default (spec §7), a slug like a work order's workflow. A repo setting, not policy: tighten-only doesn't apply. applyOverlay exposes it as repo.workflow.",
+      "$ref": "policy-defs.schema.json#/$defs/slug"
+    }
+  },
+  "additionalProperties": false
+}

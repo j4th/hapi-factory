@@ -1,0 +1,4 @@
+# A repo overlay that tries to remove a protected path. The schema allows null
+# here so that applyOverlay can reject it with a PolicyLoosenError naming the path.
+protected_paths:
+  "AGENTS.md": null

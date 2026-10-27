@@ -1,0 +1,113 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# CodeRabbit's config for hapi-factory: a second-vendor reviewer, advisory
+# only (spec §9.6). It adds to the in-run review, CI and the operator's merge
+# and never replaces them: never a merge authority, never a required check.
+#
+# Review-only. Every way CodeRabbit can write to the repo is off here:
+# approvals, the finishing touches (Fix comments, docstrings, unit tests,
+# simplify, fix-CI, merge conflicts), labels, reviewer assignment, chat
+# auto-replies and issue features. Its tools stay on as a second opinion
+# beside CI. No key here turns off `@coderabbitai autopilot`; who can run it
+# is checked when CodeRabbit is installed (handoffs register H-164).
+#
+# CodeRabbit reviews a same-repo PR with that PR branch's own copy of this
+# file, so a PR could weaken its own review: this file is a protected path
+# (policy/protected_paths.yaml, spec §8.2). Validate a change against the
+# schema above, and once installed with `@coderabbitai configuration` (the
+# schema doesn't catch typos in nested keys).
+language: en-US
+early_access: false
+tone_instructions: "Be terse and technical. Lead with the security or correctness impact, then the fix. No praise, no restating the diff, no style nits a linter would catch. If unsure, say nothing."
+reviews:
+  profile: chill
+  auto_approvals:
+    enabled: false
+    allow_author_approval: false
+  high_level_summary: true
+  high_level_summary_in_walkthrough: true
+  poem: false
+  in_progress_fortune: false
+  review_status: true
+  review_details: false
+  sequence_diagrams: false
+  suggested_reviewers: false
+  auto_assign_reviewers: false
+  auto_apply_labels: false
+  enable_prompt_for_ai_agents: true
+  fail_commit_status: false
+  path_filters:
+    - "!build/**"
+  path_instructions:
+    - path: "src/secrets/**"
+      instructions: "Secret handling. Flag any secret value written to disk outside the tmpfs runtime dir, logged, put in an error message, or passed in argv; any fallback that resolves a secret when the store fails; any weakening of the sops + age setup. See docs/secrets.md."
+    - path: "policy/**"
+      instructions: "Policy. Flag anything that loosens a protected path, an egress allowlist, a budget or an approval."
+    - path: "src/policy/**"
+      instructions: "The policy loader. Flag anything that loosens validation or changes the strictest-wins rule for globs (src/policy/paths.ts)."
+    - path: "src/forge/**"
+      instructions: "GitHub tokens. Flag any token minted broader than requested, kept past its use, logged, or not revoked; any App getting administration or workflows permissions."
+    - path: "stack/**"
+      instructions: "The stack. Flag any container gaining a capability, a writable root, a published port, a route out around its zone's egress proxy, or another zone's env file; any unpinned image."
+    - path: "scripts/**"
+      instructions: "Host setup, run as root. Flag any unpinned or unchecked download, unquoted expansion, or step that isn't safe to re-run."
+    - path: ".github/workflows/**"
+      instructions: "Every uses: pinned to a full commit SHA with a tag comment; least-privilege permissions; persist-credentials: false; no pull_request_target that checks out the PR head; no AI agent given secrets on a PR- or issue-triggered workflow."
+  auto_review:
+    enabled: true
+    drafts: false
+    auto_incremental_review: true
+    auto_pause_after_reviewed_commits: 2
+    ignore_title_keywords: ["WIP", "[skip review]"]
+  slop_detection:
+    enabled: true
+    include_all_authors: false
+  finishing_touches:
+    docstrings: { enabled: false }
+    unit_tests: { enabled: false }
+    simplify: { enabled: false }
+    autofix: { enabled: false }
+    fix_ci: { enabled: false }
+    resolve_merge_conflict: { enabled: false }
+  pre_merge_checks:
+    override_requested_reviewers_only: true
+    docstrings: { mode: "off" }
+    title: { mode: warning, requirements: "Conventional Commits: type(scope): imperative summary, under 72 characters." }
+    description: { mode: warning }
+    issue_assessment: { mode: warning }
+    custom_checks:
+      - name: "Protected paths declared"
+        mode: warning
+        instructions: "Fail if the PR changes a protected path (an agent instruction file at any depth and in any case: AGENTS.md, AGENTS.override.md, AGENT.md, CLAUDE.md, CLAUDE.local.md, GEMINI.md, HERMES.md, .hermes.md, SOUL.md, REVIEW.md, .cursorrules, .windsurfrules, or anything under .claude/, .hermes/, .cursor/, .clinerules/ or .rules/; or .factory/**, .github/**, mise.toml, .pi/**, .agents/**, .archon/**, .coderabbit.yaml, .coderabbit.yml, .coderabbit.config.ts) or policy/protected_paths.yaml, and its description has no section titled 'Protected-path change' saying why. Pass otherwise."
+  tools:
+    gitleaks: { enabled: true }
+    osvScanner: { enabled: true }
+    zizmor: { enabled: true }
+    actionlint: { enabled: true }
+    shellcheck: { enabled: true }
+    hadolint: { enabled: true }
+    yamllint: { enabled: true }
+    opengrep: { enabled: true }
+    languagetool: { enabled: false }
+chat:
+  auto_reply: false
+  # Applies only to organization repos; hapi-factory is a personal account's.
+  allow_non_org_members: false
+knowledge_base:
+  opt_out: false
+  web_search: { enabled: true }
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - files: "docs/secrets.md"
+        applyTo: "src/secrets/**"
+  # Learnings from chat wait 30 days for review, since on a public repo anyone can chat.
+  learnings: { scope: local, approval_delay: 30 }
+  issues: { scope: local }
+  pull_requests: { scope: local }
+  mcp: { usage: disabled }
+  automatic_linking_mode: disabled
+issue_enrichment:
+  auto_enrich: { enabled: false }
+  planning:
+    auto_planning: { enabled: false }

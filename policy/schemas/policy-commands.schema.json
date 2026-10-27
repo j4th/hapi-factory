@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "policy-commands.schema.json",
+  "title": "policy/commands.yaml",
+  "description": "What commands Hermes may run, as argv-exact rules, and which built-in tools Pi workers get (spec §8.1). The matching semantics are in docs/policy.md and src/policy/commands.ts.",
+  "type": "object",
+  "properties": {
+    "hermes": {
+      "type": "object",
+      "properties": {
+        "allow": {
+          "description": "Rule id -> an argv-exact rule. A command is allowed only if some rule matches its whole argv; everything else is denied (default-deny, fail-closed). Compiled into the hapi-cmd-allow hook (Plan 04), which must tokenize shell-aware and refuse shell operators before matching.",
+          "type": "object",
+          "propertyNames": {
+            "description": "A rule id: a slug that starts with a letter, so every implementation keeps the rules in file order.",
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+            "maxLength": 64
+          },
+          "additionalProperties": { "$ref": "#/$defs/rule" },
+          "minProperties": 1
+        }
+      },
+      "required": ["allow"],
+      "additionalProperties": false
+    },
+    "workers": {
+      "type": "object",
+      "properties": {
+        "tools": {
+          "description": "Pi's built-in tools that worker nodes may use (Archon `allowed_tools`).",
+          "type": "array",
+          "items": { "enum": ["read", "bash", "edit", "write", "grep", "find", "ls"] },
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      },
+      "required": ["tools"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["hermes", "workers"],
+  "additionalProperties": false,
+  "$defs": {
+    "rule": {
+      "description": "An argv-exact rule. argv must start with exactly `command`. Every later token that starts with '-' is a flag and must be named in `flags`, spelled exactly; a flag with a `value` pattern takes the next token as its value. The other tokens are positionals: one per `args` pattern, in order, then up to `rest.max` more that match `rest.pattern`.",
+      "type": "object",
+      "properties": {
+        "command": {
+          "description": "The exact leading tokens, e.g. [git, push, origin]. Anything before or between them, such as git's global options (`git -c ...`), means the rule doesn't match.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^(?:[A-Za-z0-9_][A-Za-z0-9_./:@%+,=-]*|-[A-Za-z0-9]|--[a-z0-9][a-z0-9-]*)$",
+            "maxLength": 64
+          },
+          "minItems": 1
+        },
+        "args": {
+          "description": "One pattern per required positional argument, in order.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/pattern" }
+        },
+        "rest": {
+          "description": "Optional positionals after `args`: at most `max` more, each matching `pattern`. Without `rest`, no extra positional is allowed.",
+          "type": "object",
+          "properties": {
+            "pattern": { "$ref": "#/$defs/pattern" },
+            "max": { "type": "integer", "minimum": 1, "maximum": 1000 }
+          },
+          "required": ["pattern", "max"],
+          "additionalProperties": false
+        },
+        "flags": {
+          "description": "Flag -> {} for a flag without a value, or {value: pattern} for a flag whose value is the next token. Every other flag is denied, including --flag=value and bundled short flags (-abc).",
+          "type": "object",
+          "propertyNames": {
+            "description": "A single dash and one letter or digit, or two dashes and a lowercase word.",
+            "type": "string",
+            "pattern": "^(?:-[A-Za-z0-9]|--[a-z0-9][a-z0-9-]*)$",
+            "maxLength": 64
+          },
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "value": { "$ref": "#/$defs/pattern" }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["command", "args", "flags"],
+      "additionalProperties": false
+    },
+    "pattern": {
+      "description": "A regular expression a whole token must match, written ^...$ and in the subset JavaScript (flags 'su') and Python (re.fullmatch, re.DOTALL) read the same way: no \\d \\w \\s \\b (or their capitals), \\A \\Z \\z \\p \\k \\g \\c, backreferences, lookbehind, named groups or inline flags. Groups are (...), (?:...), (?=...) or (?!...); escapes are \\n \\r \\t \\f \\v \\xHH \\uHHHH or a backslash before a non-alphanumeric character.",
+      "type": "string",
+      "pattern": "^\\^(?:[^\\\\()\\u0000-\\u001f]|\\\\[^0-9A-Za-z\\u0000-\\u001f]|\\\\[nrtfv]|\\\\x[0-9A-Fa-f]{2}|\\\\u[0-9A-Fa-f]{4}|\\((?!\\?)|\\(\\?[:=!]|\\))*\\$$",
+      "maxLength": 500
+    }
+  }
+}

@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "policy-trusted-sources.schema.json",
+  "title": "policy/trusted_sources.yaml",
+  "description": "Trusted-source tiers and the egress zones that use them (spec §10). A zone's allowlist is its own hosts plus the hosts of every tier it lists. The archon zone has no forge route (spec §4.3), so neither its hosts nor the tiers it may list (T0, T1) may name a forge host.",
+  "type": "object",
+  "properties": {
+    "tiers": {
+      "type": "object",
+      "properties": {
+        "T0": { "$ref": "#/$defs/forgeFreeTier" },
+        "T1": { "$ref": "#/$defs/forgeFreeTier" },
+        "T2": { "$ref": "#/$defs/tier" },
+        "T3": { "$ref": "#/$defs/tier" }
+      },
+      "required": ["T0", "T1", "T2", "T3"],
+      "additionalProperties": false
+    },
+    "zones": {
+      "type": "object",
+      "properties": {
+        "hermes": {
+          "description": "The Hermes main session: T0-T1 only. T2 aggregators and the T3 open web reach it only as schema-validated briefs from hapi-research (spec §10, amended by §10.1).",
+          "type": "object",
+          "properties": {
+            "tiers": { "type": "array", "$ref": "#/$defs/zoneTiers", "items": { "enum": ["T0", "T1"] } },
+            "hosts": { "$ref": "policy-defs.schema.json#/$defs/hostList" }
+          },
+          "required": ["tiers", "hosts"],
+          "additionalProperties": false
+        },
+        "archon": {
+          "description": "Archon and its Pi workers: T0-T1 only, and no forge route (spec §4.3, §10).",
+          "type": "object",
+          "properties": {
+            "tiers": { "type": "array", "$ref": "#/$defs/zoneTiers", "items": { "enum": ["T0", "T1"] } },
+            "hosts": { "$ref": "policy-defs.schema.json#/$defs/nonForgeHostList" }
+          },
+          "required": ["tiers", "hosts"],
+          "additionalProperties": false
+        },
+        "research": {
+          "description": "hapi-research, the only zone that touches T3, the open web (spec §10).",
+          "type": "object",
+          "properties": {
+            "tiers": { "$ref": "#/$defs/zoneTiers" },
+            "hosts": { "$ref": "policy-defs.schema.json#/$defs/hostList" },
+            "openWeb": {
+              "description": "true: any public host is allowed (private ranges stay blocked).",
+              "type": "boolean"
+            }
+          },
+          "required": ["tiers", "hosts"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["hermes", "archon", "research"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["tiers", "zones"],
+  "additionalProperties": false,
+  "$defs": {
+    "tier": {
+      "type": "object",
+      "properties": {
+        "hosts": { "$ref": "policy-defs.schema.json#/$defs/hostList" }
+      },
+      "required": ["hosts"],
+      "additionalProperties": false
+    },
+    "forgeFreeTier": {
+      "description": "A tier the archon zone may list (T0, T1): no forge host (spec §4.3).",
+      "type": "object",
+      "properties": {
+        "hosts": { "$ref": "policy-defs.schema.json#/$defs/nonForgeHostList" }
+      },
+      "required": ["hosts"],
+      "additionalProperties": false
+    },
+    "zoneTiers": {
+      "type": "array",
+      "items": { "$ref": "policy-defs.schema.json#/$defs/sourceTier" },
+      "uniqueItems": true
+    }
+  }
+}

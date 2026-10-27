@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "policy-roles.schema.json",
+  "title": "policy/roles.yaml",
+  "description": "The default model tier per role (spec §12). The selected roster maps the tier to a model; a work order may pick another tier for implement and review.",
+  "type": "object",
+  "properties": {
+    "hermes_main": { "$ref": "policy-defs.schema.json#/$defs/tier" },
+    "hermes_auxiliary": { "$ref": "policy-defs.schema.json#/$defs/tier" },
+    "planner": { "$ref": "policy-defs.schema.json#/$defs/tier" },
+    "implement": { "$ref": "policy-defs.schema.json#/$defs/tier" },
+    "review": { "$ref": "policy-defs.schema.json#/$defs/tier" },
+    "scout": { "$ref": "policy-defs.schema.json#/$defs/tier" },
+    "router": { "$ref": "policy-defs.schema.json#/$defs/tier" },
+    "eval_judge": { "$ref": "policy-defs.schema.json#/$defs/tier" }
+  },
+  "required": ["hermes_main", "hermes_auxiliary", "planner", "implement", "review", "scout", "router", "eval_judge"],
+  "additionalProperties": false
+}

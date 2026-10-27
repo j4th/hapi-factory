@@ -1,0 +1,130 @@
+{
+ "results": [
+  {
+   "workflowName": "archon-attention",
+   "valid": true,
+   "issues": []
+  },
+  {
+   "workflowName": "archon-build-queue",
+   "valid": true,
+   "issues": []
+  },
+  {
+   "workflowName": "archon-deliver",
+   "valid": true,
+   "issues": []
+  },
+  {
+   "workflowName": "archon-deliver-block",
+   "valid": true,
+   "issues": []
+  },
+  {
+   "workflowName": "archon-discoveries",
+   "valid": true,
+   "issues": []
+  },
+  {
+   "workflowName": "archon-implement",
+   "valid": true,
+   "issues": []
+  },
+  {
+   "workflowName": "archon-intake",
+   "valid": true,
+   "issues": []
+  },
+  {
+   "workflowName": "archon-investigate",
+   "valid": true,
+   "issues": []
+  },
+  {
+   "workflowName": "archon-merge-queue",
+   "valid": true,
+   "issues": []
+  },
+  {
+   "workflowName": "archon-plan",
+   "valid": true,
+   "issues": []
+  },
+  {
+   "workflowName": "archon-plan-block",
+   "valid": true,
+   "issues": []
+  },
+  {
+   "workflowName": "archon-pr",
+   "valid": true,
+   "issues": []
+  },
+  {
+   "workflowName": "archon-review",
+   "valid": true,
+   "issues": []
+  },
+  {
+   "workflowName": "archon-review-block",
+   "valid": true,
+   "issues": []
+  },
+  {
+   "workflowName": "archon-review-eval",
+   "valid": true,
+   "issues": []
+  },
+  {
+   "workflowName": "archon-review-eval-judge",
+   "valid": true,
+   "issues": []
+  },
+  {
+   "workflowName": "archon-ship",
+   "valid": true,
+   "issues": []
+  },
+  {
+   "workflowName": "archon-ship-block",
+   "valid": true,
+   "issues": []
+  },
+  {
+   "workflowName": "archon-simplify",
+   "valid": true,
+   "issues": []
+  },
+  {
+   "workflowName": "archon-triage",
+   "valid": true,
+   "issues": []
+  },
+  {
+   "workflowName": "archon-triage-block",
+   "valid": true,
+   "issues": []
+  },
+  {
+   "workflowName": "archon-upkeep",
+   "valid": true,
+   "issues": []
+  },
+  {
+   "workflowName": "archon-validate",
+   "valid": true,
+   "issues": []
+  },
+  {
+   "workflowName": "archon-worktree-cleanup",
+   "valid": true,
+   "issues": []
+  }
+ ],
+ "summary": {
+  "total": 24,
+  "valid": 24,
+  "errors": 0,
+  "warnings": 0
+ }
+}

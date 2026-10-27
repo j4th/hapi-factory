@@ -1,0 +1,227 @@
+# The hapi-factory stack (spec §4.3, §9, §10, §11.3, §11.4). Start and stop it with
+# `mise run up` / `mise run down`, which run as the dedicated `hapi` user on rootless
+# Docker; docs/runbooks/stack.md is the full procedure.
+#
+# Zones. Each zone's containers sit on an internal-only network (no route out, no
+# external DNS). Their one way out is the zone's egress proxy, which also joins
+# `outbound` and allows only what build/egress/<zone>.squid.conf allows (generated
+# from policy/trusted_sources.yaml by `mise run policy:build`):
+#
+#   zone      network       proxy             service
+#   hermes    hermes-net    egress-hermes     hermes  (the coordinator)
+#   archon    archon-net    egress-archon     archon  (the run engine; Pi runs inside it)
+#   research  research-net  egress-research   none yet: the hapi-research container is Plan 04's
+#
+# Secrets. Each zone service's one env_file is its own zone's secrets,
+# $XDG_RUNTIME_DIR/hapi/env/<zone>.env, which `hapi secrets resolve` writes on the
+# user's tmpfs (docs/secrets.md#the-env-files). The host zone's file holds the
+# GitHub App keys and is never given to a container. Everything else a zone
+# service is given, the proxy variables and the generated hardening settings, is
+# in its `environment:`, which Compose puts above env_file, so no secret can
+# override it; src/stack/env.ts is the list, tests/stack/compose.test.ts checks
+# this file against it, and the manifest may not name any of it (docs/secrets.md).
+#
+# Hardening, on every service: no capabilities, no new privileges, a non-root user,
+# pid and memory limits, a read-only root filesystem (writable paths are tmpfs or a
+# named volume), no published ports, a health check. The exceptions are commented
+# where they are. Spike T12 re-checks all of this under rootless Docker; a setting
+# it relaxes is changed here with a comment naming the spike.
+#
+# Pins (spec §11.6): the Squid image is pinned by tag and digest below; Hermes and
+# Archon by the FROM lines of stack/hermes/Dockerfile and stack/archon/Dockerfile.
+# docs/runbooks/stack.md#pinned-images records each digest and when it was read.
+
+name: hapi
+
+x-hardening: &hardening
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  read_only: true
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options: { max-size: 10m, max-file: "3" }
+  labels:
+    org.hapi.stack: hapi-factory
+    # Who started the stack, and whether HAPI_ALLOW_CURRENT_USER bypassed the hapi
+    # user (a dev-only downgrade); set by `hapi stack up`, read by Task 6's audit.
+    # A stack started any other way (a raw `docker compose up`) says `unknown`.
+    org.hapi.started-by: ${HAPI_STARTED_BY:-unknown}
+    org.hapi.dev-override: ${HAPI_DEV_OVERRIDE:-unknown}
+    # A digest of build/, set by `hapi stack up`. Compose recreates a container when its
+    # config changes, but not when only a bind-mounted file does; this label is how a
+    # policy change reaches a running proxy, Hermes and Archon.
+    org.hapi.build-sha256: ${HAPI_BUILD_SHA256:-}
+
+# Squid as the image's own unprivileged user (_daemon_, uid 584792; the Ubuntu rock
+# owns its writable dirs with it), in the foreground (-N), on the generated config.
+# The config sets `pid_filename none`, so a reload is a container restart.
+x-egress: &egress
+  <<: *hardening
+  # ubuntu/squid 7.2-26.04_edge (Squid 7.7 on Ubuntu 26.04 LTS), read 2026-10-26.
+  image: ubuntu/squid:7.2-26.04_edge@sha256:d11db6479501aa4618b3253f95a88b2547229e2d081726b6fb20dc75a98cc61b
+  entrypoint: ["/usr/sbin/squid-gnutls"]
+  command: ["-N", "-f", "/etc/squid/hapi.conf"]
+  user: "584792:584792"
+  pids_limit: 64
+  mem_limit: 256m
+  # No cache dir and logs on stdout, so Squid writes nothing; these keep its own
+  # dirs writable in case a helper does.
+  tmpfs:
+    - /var/spool/squid:size=16m,uid=584792,gid=584792,mode=0700
+    - /var/log/squid:size=16m,uid=584792,gid=584792,mode=0700
+    - /tmp:size=16m,mode=1777
+  healthcheck:
+    # The rock has no shell tools to speak HTTP with, but it has perl: is 3128 accepting?
+    test: ["CMD", "perl", "-MIO::Socket::INET", "-e", "exit(IO::Socket::INET->new(PeerAddr => '127.0.0.1:3128', Timeout => 3) ? 0 : 1)"]
+    interval: 30s
+    timeout: 5s
+    retries: 3
+    start_period: 20s
+    start_interval: 2s
+
+services:
+  egress-hermes:
+    <<: *egress
+    volumes:
+      - ../build/egress/hermes.squid.conf:/etc/squid/hapi.conf:ro
+    networks:
+      hermes-net: {}
+      outbound: {}
+
+  egress-archon:
+    <<: *egress
+    volumes:
+      - ../build/egress/archon.squid.conf:/etc/squid/hapi.conf:ro
+    networks:
+      archon-net: {}
+      outbound: {}
+
+  egress-research:
+    <<: *egress
+    volumes:
+      - ../build/egress/research.squid.conf:/etc/squid/hapi.conf:ro
+    networks:
+      research-net: {}
+      outbound: {}
+
+  # Hermes, the coordinator (spec §9.1): the pinned official image, its generated
+  # config, and the `local` terminal backend running inside this container, which is
+  # itself the boundary. The gateway (Slack, Socket Mode: no inbound port) is the
+  # main program. Its API listens on 127.0.0.1 inside the container only.
+  hermes:
+    <<: *hardening
+    build: { context: ./hermes }
+    image: hapi-factory/hermes:v0.22.5
+    # A local build, never a registry pull of hapi-factory/*, whatever command starts it.
+    pull_policy: build
+    command: ["gateway", "run"]
+    # The image's hermes user. Its s6-overlay init accepts that UID (any other is
+    # refused) and then skips its root-only bootstrap (UID remap, volume chown), so
+    # it warns that two optional steps failed and continues.
+    user: "10000:10000"
+    pids_limit: 1024
+    mem_limit: 4g
+    tmpfs:
+      # Exception: exec, because s6-overlay's init runs its programs from /run.
+      - /run:exec,size=64m,uid=10000,gid=10000,mode=0755
+      - /tmp:size=512m,uid=10000,gid=10000,mode=1777
+    # The hermes zone's secrets only.
+    env_file:
+      - ${XDG_RUNTIME_DIR:?set XDG_RUNTIME_DIR to your own runtime dir, e.g. /run/user/<uid> (docs/runbooks/stack.md)}/hapi/env/hermes.env
+    # Above env_file: serviceEnvironment("hermes") in src/stack/env.ts.
+    environment:
+      # Where Hermes reads its read-only generated config; the image sets it too.
+      HERMES_HOME: /opt/data
+      HTTP_PROXY: http://egress-hermes:3128
+      HTTPS_PROXY: http://egress-hermes:3128
+      http_proxy: http://egress-hermes:3128
+      https_proxy: http://egress-hermes:3128
+      NO_PROXY: localhost,127.0.0.1,::1
+      no_proxy: localhost,127.0.0.1,::1
+    volumes:
+      # HERMES_HOME: sessions, memories and skills (with write approval, spec §9.1).
+      - hermes-data:/opt/data
+      - ../build/hermes/config.yaml:/opt/data/config.yaml:ro
+    networks:
+      hermes-net: {}
+    depends_on:
+      egress-hermes: { condition: service_healthy }
+    healthcheck:
+      # `hermes gateway status` exits 0 whether or not the gateway runs, so read its answer.
+      test: ["CMD-SHELL", "hermes gateway status 2>&1 | grep -q 'Gateway is running'"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 90s
+      start_interval: 5s
+
+  # Archon, the run engine (spec §9.2), with Pi in-process (§9.3): the pinned
+  # official image plus baked toolchains (stack/archon/Dockerfile), so runs need no
+  # GitHub egress. Its server listens on 127.0.0.1:3090 only (HOST below)
+  # and has no auth in SQLite mode, so nothing outside this container reaches it.
+  archon:
+    <<: *hardening
+    build: { context: ./archon }
+    image: hapi-factory/archon:0.12.1
+    pull_policy: build
+    # The image's appuser. Its entrypoint skips the root-only chown and gosu then.
+    user: "1001:1001"
+    pids_limit: 2048
+    mem_limit: 4g
+    tmpfs:
+      - /tmp:size=1g,uid=1001,gid=1001,mode=1777
+    # The archon zone's secrets only.
+    env_file:
+      - ${XDG_RUNTIME_DIR:?set XDG_RUNTIME_DIR to your own runtime dir, e.g. /run/user/<uid> (docs/runbooks/stack.md)}/hapi/env/archon.env
+    # Above env_file: serviceEnvironment("archon") in src/stack/env.ts. The six from HOST
+    # to PI_CODING_AGENT_DIR are build/archon/archon.env's settings (ARCHON_ENV in
+    # src/generate/archon.ts), set here so that no secret can override them.
+    environment:
+      # Archon's home is /.archon (the run DB, workspaces, worktrees), as in its own compose file.
+      ARCHON_DOCKER: "true"
+      HOST: 127.0.0.1
+      ARCHON_TELEMETRY_DISABLED: "1"
+      DO_NOT_TRACK: "1"
+      PI_OFFLINE: "1"
+      PI_TELEMETRY: "0"
+      PI_CODING_AGENT_DIR: /opt/hapi/pi-agent
+      HTTP_PROXY: http://egress-archon:3128
+      HTTPS_PROXY: http://egress-archon:3128
+      http_proxy: http://egress-archon:3128
+      https_proxy: http://egress-archon:3128
+      NO_PROXY: localhost,127.0.0.1,::1
+      no_proxy: localhost,127.0.0.1,::1
+    volumes:
+      - archon-data:/.archon
+      # $HOME: Claude Code and Pi session state, ~/.gitconfig.
+      - archon-home:/home/appuser
+      - ../build/archon/config.yaml:/.archon/config.yaml:ro
+      # PI_CODING_AGENT_DIR (above): Pi's models.json and hapi-guard.json, read-only.
+      # The path is PI_AGENT_DIR in src/generate/archon.ts; tests/stack/compose.test.ts keeps them equal.
+      - ../build/pi:/opt/hapi/pi-agent:ro
+    networks:
+      archon-net: {}
+    depends_on:
+      egress-archon: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--max-time", "5", "-o", "/dev/null", "http://127.0.0.1:3090/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+      start_interval: 5s
+
+networks:
+  hermes-net: { internal: true }
+  archon-net: { internal: true }
+  research-net: { internal: true }
+  # The proxies' only way out. They can't reach each other on it.
+  outbound:
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "false"
+
+volumes:
+  hermes-data: {}
+  archon-data: {}
+  archon-home: {}

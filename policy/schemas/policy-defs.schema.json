@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "policy-defs.schema.json",
+  "title": "Shared definitions",
+  "description": "Definitions shared by the policy, repo-overlay and work-order schemas. Not a schema for any one file.",
+  "$defs": {
+    "mode": {
+      "description": "What an agent may do with a protected path. Tightening order: allow < ask < deny.",
+      "enum": ["allow", "ask", "deny"]
+    },
+    "pathModes": {
+      "description": "The mode per session kind (spec §8.2): interactive = the operator is in the session; unattended = Hermes cron, webhook and API surfaces; workers = Pi or Claude Code inside Archon.",
+      "type": "object",
+      "properties": {
+        "interactive": { "$ref": "#/$defs/mode" },
+        "unattended": { "$ref": "#/$defs/mode" },
+        "workers": { "$ref": "#/$defs/mode" }
+      },
+      "required": ["interactive", "unattended", "workers"],
+      "additionalProperties": false
+    },
+    "risk": {
+      "description": "A work order's risk: drives review depth and thresholds.",
+      "enum": ["low", "medium", "high"]
+    },
+    "tier": {
+      "description": "An abstract model tier. Rosters map tiers to models; work orders and roles name tiers, never model ids.",
+      "enum": ["small", "medium", "large"]
+    },
+    "sourceTier": {
+      "description": "A trusted-source tier (spec §10): T0 pinned local snapshots, T1 first-party domains and package registries, T2 curated aggregators, T3 the open web.",
+      "enum": ["T0", "T1", "T2", "T3"]
+    },
+    "effort": {
+      "description": "Reasoning effort, using Archon's ladder; Archon clamps it to what each provider supports.",
+      "enum": ["minimal", "low", "medium", "high", "xhigh", "max"]
+    },
+    "hostname": {
+      "description": "A plain, lowercase domain name with at least two labels: no scheme, port, path, wildcard or leading dot, and not an IP address. The egress generator allows the domain and its subdomains.",
+      "type": "string",
+      "pattern": "^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+    },
+    "hostList": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/hostname" },
+      "uniqueItems": true
+    },
+    "forgeHost": {
+      "description": "A forge host: one of the forge domains or a subdomain of one. The capture group is the forge domain. This is the one list of forge domains; src/policy/hosts.ts reads it from here.",
+      "type": "string",
+      "pattern": "^(?:.+\\.)?(github\\.com|githubusercontent\\.com|githubassets\\.com|ghcr\\.io|gitlab\\.com|bitbucket\\.org)$"
+    },
+    "nonForgeHost": {
+      "description": "A hostname that is not a forge host. Used wherever a host can reach the archon zone, which has no forge route (spec §4.3).",
+      "allOf": [{ "$ref": "#/$defs/hostname" }],
+      "not": { "$ref": "#/$defs/forgeHost" }
+    },
+    "nonForgeHostList": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/nonForgeHost" },
+      "uniqueItems": true
+    },
+    "repoPath": {
+      "description": "A path or glob relative to the repo root: not absolute, no '..' segment, no backslash or control characters.",
+      "type": "string",
+      "pattern": "^(?!/)(?!(?:.*/)?\\.\\.(?:/|$))[^\\\\\\u0000-\\u001f]+$"
+    },
+    "pathGlob": {
+      "description": "A protected-path glob, anchored at the repo root: segments joined by single slashes; '**' as a whole segment matches zero or more segments, '*' any run of characters within one segment, '?' exactly one; every other character is literal. No '.', '..' or empty segment, no leading or trailing slash, and no '[', ']', '{', '}', '!', backslash or control character, and printable ASCII only. Matching ignores case. A file's mode is the strictest across every glob that matches it (src/policy/paths.ts).",
+      "type": "string",
+      "pattern": "^(?=[\\u0020-\\u007e]*$)(?:\\*\\*|(?!\\.{1,2}(?:/|$))(?:(?!\\*\\*)[^/\\\\\\[\\]{}!\\u0000-\\u001f\\u007f])+)(?:/(?:\\*\\*|(?!\\.{1,2}(?:/|$))(?:(?!\\*\\*)[^/\\\\\\[\\]{}!\\u0000-\\u001f\\u007f])+))*$"
+    },
+    "slug": {
+      "description": "Lowercase words joined by single hyphens, e.g. factory-task.",
+      "type": "string",
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+      "maxLength": 80
+    },
+    "usd": {
+      "description": "An amount in US dollars, greater than zero.",
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "count": {
+      "description": "A whole number, at least 1.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "exactVersion": {
+      "description": "An exact release version, MAJOR.MINOR.PATCH (calendar versions such as 2026.10.24 too). Never a range (^4.3.0, ~4.3), a tag (latest) or a prerelease (4.3.0-canary.1).",
+      "type": "string",
+      "pattern": "^(?:0|[1-9][0-9]{0,8})\\.(?:0|[1-9][0-9]{0,8})\\.(?:0|[1-9][0-9]{0,8})$"
+    },
+    "advisoryId": {
+      "description": "A security advisory id: a CVE (CVE-2026-75130) or a GitHub advisory (GHSA-97r6-3rgm-v39r).",
+      "type": "string",
+      "pattern": "^(?:CVE-[0-9]{4}-[0-9]{4,}|GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4})$"
+    },
+    "npmPin": {
+      "description": "An exact npm package pin: the name, an exact version and that version's registry integrity (dist.integrity at https://registry.npmjs.org/<name>, an SRI sha512). Shared by policy/mcp.yaml and policy/mcp.lock.json.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "An npm package name, optionally scoped: @upstash/context7-mcp.",
+          "type": "string",
+          "pattern": "^(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*$",
+          "maxLength": 214
+        },
+        "version": { "$ref": "#/$defs/exactVersion" },
+        "integrity": {
+          "description": "sha512- and 88 base64 characters, exactly as the registry gives it.",
+          "type": "string",
+          "pattern": "^sha512-[A-Za-z0-9+/]{86}==$"
+        }
+      },
+      "required": ["name", "version", "integrity"],
+      "additionalProperties": false
+    },
+    "imagePin": {
+      "description": "An OCI image pinned by digest: name[:tag]@sha256:<64 hex>. A tag alone is not a pin.",
+      "type": "string",
+      "pattern": "^[a-z0-9]+(?:[._/-][a-z0-9]+)*(?::[A-Za-z0-9_][A-Za-z0-9._-]{0,127})?@sha256:[0-9a-f]{64}$"
+    },
+    "httpsUrl": {
+      "description": "An https:// URL with no user info, whitespace or control characters.",
+      "type": "string",
+      "pattern": "^https://[^\\s\\u0000-\\u001f/?#@]+(?:[/?#][^\\s\\u0000-\\u001f]*)?$",
+      "maxLength": 2048
+    },
+    "mcpUrl": {
+      "description": "An MCP server's endpoint: an httpsUrl with no '$', query or fragment. Hermes expands ${VAR} and ${env:VAR} in a server entry's url, headers, args and env, so a '$' here could put Hermes's provider key, or another server's key, into a request to this host. A headers field, if one is ever added, gets the same ban. A query or fragment ('?', '#') could hold a literal credential (?key=...), which would be written in plaintext into every generated config. Shared by policy/mcp.yaml and policy/mcp.lock.json.",
+      "type": "string",
+      "allOf": [{ "$ref": "#/$defs/httpsUrl" }],
+      "pattern": "^[^$?#]+$"
+    }
+  }
+}
