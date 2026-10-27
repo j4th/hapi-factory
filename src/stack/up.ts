@@ -8,7 +8,8 @@
  *    `sudo -u hapi -H -- sh -c '<fixed script>' hapi-stack <args>`, in hapi's
  *    own checkout (~hapi/hapi-factory), with hapi's XDG_RUNTIME_DIR and mise
  *    (`reexecScript`). There is no login shell, so each forwarded argument
- *    stays an argv entry of its own, and no shell ever parses it.
+ *    stays an argv entry of its own through the re-exec; mise then quotes them
+ *    into its task's command line, so they reach hapi's `up` as typed.
  *    HAPI_ALLOW_CURRENT_USER=1 skips the re-exec, for development and the
  *    stage-a tests only: a downgrade (no dedicated user, no rootless Docker)
  *    that it warns about, labels on every container (org.hapi.dev-override),
@@ -178,8 +179,9 @@ const definedEnv = (env: Env): Record<string, string> => Object.fromEntries(Obje
 /**
  * The script `sh -c` runs as hapi to re-exec `mise run <task>`. It is fixed text: nothing the caller passes is
  * ever in it. The forwarded arguments follow it on sudo's command line as argv entries of their own, and reach
- * mise as "$@", so no shell parses them: a `$`, a `$(...)`, a backtick, a quote or a space in one arrives as it
- * was typed.
+ * mise as "$@", so no shell parses them on the way to mise: a `$`, a `$(...)`, a backtick, a quote or a space in
+ * one arrives as it was typed. mise then quotes them into its task's `run` line for its own `sh -c`; that quoting
+ * is mise's, checked by hand once and in stage b (H-146(e)), not by a unit test.
  *
  * It sets up what hapi's login shell used to give `sudo -iu` (H-148), and nothing else:
  * - XDG_RUNTIME_DIR, defaulting to hapi's /run/user/<uid> when sudo has cleared it (lingering keeps that, H-004);

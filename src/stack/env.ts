@@ -148,6 +148,8 @@ export const CONTROL_ENV_NAMES: readonly string[] = [
  * PI_*, CLAUDE_CODE_*). No entry of the committed stack/secrets.yaml starts
  * with one (a unit test checks). `PYTHON` has no underscore: Python's own
  * variables are PYTHONPATH, PYTHONHOME, PYTHONSTARTUP and the rest.
+ * CLAUDE_CODE_ also keeps CLAUDE_CODE_OAUTH_TOKEN out: the factory bills by
+ * API key and never runs on subscription OAuth (spec §11.5).
  */
 export const CONTROL_ENV_PREFIXES: readonly string[] = [
   "ARCHON_",
@@ -167,10 +169,21 @@ export const CONTROL_ENV_PREFIXES: readonly string[] = [
 ];
 
 /**
+ * Env name suffixes no secret may end with: a client's endpoint override
+ * (ANTHROPIC_BASE_URL, OPENAI_API_BASE, GITHUB_API_URL,
+ * OTEL_EXPORTER_OTLP_ENDPOINT). One would send a client's requests, and the
+ * key that goes with them, somewhere else. An endpoint is policy, committed
+ * and reviewed, not a secret; the egress allowlists are the second check. A
+ * credential that is itself a URL (a webhook) ends in plain _URL, which stays
+ * allowed.
+ */
+export const CONTROL_ENV_SUFFIXES: readonly string[] = ["_API_BASE", "_API_URL", "_BASE_URL", "_ENDPOINT"];
+
+/**
  * Why no secret may have the env name `name`, or undefined when one may: a
  * name hapi sets itself (`RESERVED_ENV_NAMES`), an exact process-control or
- * trust-store name (`CONTROL_ENV_NAMES`), or one that starts with a prefix of
- * `CONTROL_ENV_PREFIXES`. The reason names the rule and the env name (which
+ * trust-store name (`CONTROL_ENV_NAMES`), one that starts with a prefix of
+ * `CONTROL_ENV_PREFIXES`, or an endpoint override (`CONTROL_ENV_SUFFIXES`). The reason names the rule and the env name (which
  * the manifest's errors already show for any key of env-name form), never a
  * value. src/secrets/manifest.ts calls it for every env name of the manifest,
  * in every zone.
@@ -185,6 +198,10 @@ export function reservedEnvRule(name: string): string | undefined {
   const prefix = CONTROL_ENV_PREFIXES.find((p) => name.startsWith(p));
   if (prefix !== undefined) {
     return `${name} is reserved: env names starting ${prefix} configure a runtime, the loader or a tool in the containers (CONTROL_ENV_PREFIXES, src/stack/env.ts), so a secret may not use one`;
+  }
+  const suffix = CONTROL_ENV_SUFFIXES.find((s) => name.endsWith(s));
+  if (suffix !== undefined) {
+    return `${name} is reserved: env names ending ${suffix} set where a client sends its requests and its key (CONTROL_ENV_SUFFIXES, src/stack/env.ts); an endpoint belongs in policy/, not in a secret`;
   }
   return undefined;
 }

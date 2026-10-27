@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { loadPolicy, PolicyError } from "../../src/policy/load";
 import { LOGICAL_NAME, loadManifest, MANIFEST_FILE, manifestEntries, manifestNames, mcpSecretGaps, SECRET_ZONES } from "../../src/secrets/manifest";
 import { resolveSecrets, type SecretProvider } from "../../src/secrets/provider";
-import { CONTROL_ENV_NAMES, CONTROL_ENV_PREFIXES, RESERVED_ENV_NAMES, reservedEnvRule, serviceEnvironment, ZONE_SERVICES } from "../../src/stack/env";
+import { CONTROL_ENV_NAMES, CONTROL_ENV_PREFIXES, CONTROL_ENV_SUFFIXES, RESERVED_ENV_NAMES, reservedEnvRule, serviceEnvironment, ZONE_SERVICES } from "../../src/stack/env";
 
 // Obviously fake: not, and not like, a real credential.
 const FAKE = "fake-secret-value-7f3a";
@@ -218,19 +218,23 @@ describe("loadManifest", () => {
       ...["OPENSSL_CONF", "SSLKEYLOGFILE", "XDG_CONFIG_HOME", "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "BUN_OPTIONS", "MISE_DATA_DIR", "UV_INDEX_URL"],
       ...["NPM_CONFIG_REGISTRY", "HERMES_CONFIG", "ARCHON_HOME"],
     ];
-    for (const name of [...ruling, ...CONTROL_ENV_NAMES, ...CONTROL_ENV_PREFIXES.map((p) => `${p}X`)]) {
+    for (const name of [...ruling, ...CONTROL_ENV_NAMES, ...CONTROL_ENV_PREFIXES.map((p) => `${p}X`), ...CONTROL_ENV_SUFFIXES.map((s) => `X${s}`)]) {
       expect([name, reservedEnvRule(name)?.startsWith(`${name} is reserved: `)]).toEqual([name, true]);
       const e = policyError(() => loadManifest(manifestFile(full(`  ${name}: hapi-x\n`))));
       expect([name, e.issues.map((i) => i.path)]).toEqual([name, [`/host/${name}`]]);
     }
     for (const name of ["HERMES_HOME", "ARCHON_DOCKER", "PI_OFFLINE"]) expect(reservedEnvRule(name)).toContain("hapi sets it in the containers itself");
+    for (const name of ["ANTHROPIC_BASE_URL", "OPENAI_API_BASE", "GITHUB_API_URL", "OTEL_EXPORTER_OTLP_ENDPOINT", "CLAUDE_CODE_OAUTH_TOKEN"]) {
+      expect([name, reservedEnvRule(name)?.startsWith(`${name} is reserved: `)]).toEqual([name, true]);
+    }
+    expect(reservedEnvRule("ANTHROPIC_BASE_URL")).toContain("env names ending _BASE_URL set where a client sends its requests and its key");
   });
 
   test("a lookalike that is neither an exact name nor under a prefix is allowed, as is every name the committed manifest uses", () => {
     for (const name of ["LDAP_PASSWORD", "NODEPING_API_KEY", "BUNNY_API_KEY", "MISER_TOKEN", "UVX_TOKEN", "PIPELINE_KEY", "PINECONE_API_KEY", "GIT_TOKEN", "GITHUB_TOKEN"]) {
       expect([name, reservedEnvRule(name)]).toEqual([name, undefined]);
     }
-    for (const name of ["PATH_TOKEN", "MY_PATH", "SSL_CERT_FILE_ID", "HERMESAPI_KEY", "ARCHONS_KEY", "HOMEPAGE_KEY", "XDG_TOKEN"]) {
+    for (const name of ["PATH_TOKEN", "MY_PATH", "SSL_CERT_FILE_ID", "HERMESAPI_KEY", "ARCHONS_KEY", "HOMEPAGE_KEY", "XDG_TOKEN", "SLACK_WEBHOOK_URL", "BASE_URL_TOKEN", "ENDPOINT_KEY"]) {
       expect([name, reservedEnvRule(name)]).toEqual([name, undefined]);
     }
     expect(Object.keys(loadManifest(manifestFile(full("  LDAP_PASSWORD: hapi-x\n  NODEPING_API_KEY: hapi-y\n"))).host!)).toEqual(["D", "LDAP_PASSWORD", "NODEPING_API_KEY"]);
@@ -253,7 +257,9 @@ describe("loadManifest", () => {
   test("the control lists: sorted, env-name shaped, and no exact name is already under a prefix", () => {
     expect(CONTROL_ENV_NAMES).toEqual([...CONTROL_ENV_NAMES].sort());
     expect(CONTROL_ENV_PREFIXES).toEqual([...CONTROL_ENV_PREFIXES].sort());
-    for (const name of [...CONTROL_ENV_NAMES, ...CONTROL_ENV_PREFIXES]) expect(name).toMatch(/^[A-Z_][A-Z0-9_]*$/);
+    expect(CONTROL_ENV_SUFFIXES).toEqual([...CONTROL_ENV_SUFFIXES].sort());
+    for (const name of [...CONTROL_ENV_NAMES, ...CONTROL_ENV_PREFIXES, ...CONTROL_ENV_SUFFIXES]) expect(name).toMatch(/^[A-Z_][A-Z0-9_]*$/);
+    for (const name of CONTROL_ENV_NAMES) expect([name, CONTROL_ENV_SUFFIXES.filter((s) => name.endsWith(s))]).toEqual([name, []]);
     for (const name of CONTROL_ENV_NAMES) expect([name, CONTROL_ENV_PREFIXES.filter((p) => name.startsWith(p))]).toEqual([name, []]);
     expect(CONTROL_ENV_PREFIXES).toEqual(["ARCHON_", "BUN_", "CLAUDE_CODE_", "DYLD_", "GIT_CONFIG_", "HERMES_", "LD_", "MISE_", "NODE_", "NPM_CONFIG_", "PIP_", "PI_", "PYTHON", "UV_"]);
   });
