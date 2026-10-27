@@ -623,6 +623,164 @@ test("no automatic fallback: a failing configured provider is the error", async 
 
 ---
 
+### Task 4c: Recovery recipient, per-machine keys and secret-store lifecycle
+
+The spec is §11.5. The evidence comes from the ledger's 20:25 research entry and `.superpowers/sdd/…/research-age-key-recovery.json`: three researchers plus three adversarial verifiers, running experiments on sops 3.13.3 / age 1.3.2.
+
+**Why:** Task 4b gives each store exactly one age key, on one machine. If that machine dies, the store is gone.
+
+The standard pattern comes from the sops docs ("multiple master keys", with one key's private half stored offline), age's author and Flux. **It never backs up a key by copying it.** Instead, every store is encrypted to:
+- **one key per machine or user**, generated where it lives and never copied (the operator's laptop, the VM, the `hapi` user);
+- **one recovery (break-glass) recipient**, whose identity is wrapped with a **tool-generated 10-word passphrase** (about 110 bits, behind scrypt) and stored as `recovery.age` beside the store.
+
+That leaves the end user one backup job: **store 10 words somewhere you won't lose them**, with no product named. The wrapped file is useless without the words, so it may sit in `private/` and be backed up with the store. This is the controller's default; the operator may override it.
+
+**Files:**
+- Create:
+  - `src/secrets/recipients.ts`: the recipients file, the PQ/classic check, drift against the store
+  - `src/secrets/recovery.ts`: generate, wrap and unwrap the recovery identity, and the word list
+  - `src/secrets/lifecycle.ts`: `join`, `add-machine`, `recover`, `drill`, `revoke`, `new-recovery`
+  - `src/secrets/cli.ts`: every `hapi secrets …` handler, moved out of `provider.ts` to break its import cycle
+  - `src/secrets/wordlist.ts`: the vendored list, with its source and license header
+  - `policy/schemas/secrets-recipients.schema.json`
+  - tests under `tests/secrets/`
+- Modify:
+  - `src/secrets/init.ts`, `src/secrets/provider.ts`, `src/secrets/providers/sops.ts`, `src/secrets/files.ts`, `src/cli.ts`
+  - `mise.toml` (controller-authorized: the new tasks)
+  - `docs/secrets.md`, `README.md`, `docs/runbooks/*` where they mention the age key
+
+**Interfaces:**
+- **Recipients file** `secrets.recipients.yaml`:
+  - It sits beside the store, at the same dir and basename stem, e.g. `private/secrets.recipients.yaml`.
+  - Public keys only, schema-validated: `{pq: true, recipients: [{name, kind: "machine"|"recovery", recipient: "age1…", added: <ISO date>}]}`.
+  - A `name` matches `^[a-z0-9][a-z0-9-]{0,62}$`.
+  - `check` and every lifecycle command compare it with the store's `sops.age[].recipient` metadata, read without decrypting.
+  - Drift in either direction is an error that names the extra or missing recipient by name or public key. Public keys are not secret.
+- **Post-quantum by default:**
+  - Keys come from `age-keygen -pq`: identity `AGE-SECRET-KEY-PQ-1…`, recipient `age1pq1…`.
+  - sops silently allows a mix of PQ and classic recipients, which drops PQ protection (age itself refuses a mix). So **`check` and every command refuse a mix.**
+  - `pq: false` in the recipients file selects all-classic instead, for P-256 hardware plugins later. It's documented as a trade-off.
+  - init reuses an existing age key only if its kind matches `pq`; otherwise it stops with an explanation.
+- **Tool resolution:**
+  - `age`, `age-keygen` and the bundled `age-plugin-batchpass` must be the **mise-pinned age** (≥ 1.3.2; the distro age 1.1.1 lacks PQ and batchpass).
+  - Resolve the install dir once, with `mise where age`, injectable for tests.
+  - Put it first on the `PATH` of every age and sops child.
+  - Refuse to run if `age --version` reports below the pin.
+- **The recovery identity:**
+  - Generated with `age-keygen -pq` (or classic when `pq: false`). Its recipient is recorded **at creation**, because `age-keygen -y` can't read a wrapped file.
+  - The **passphrase is 10 words** drawn with `crypto.getRandomValues` from a 2048-word list. Use the list age itself uses for `age -p`, if its license allows vendoring (check age's source); otherwise BIP-39 English. Record the source and license in `wordlist.ts`.
+  - It's wrapped non-interactively: `AGE_PASSPHRASE_FD=<fd>` + `age -e -j batchpass`. Verify the exact interface against the pinned age's `age-plugin-batchpass` docs and help.
+  - The plaintext identity and the words exist **only in memory**, never in argv, env or a file.
+- **Words input:**
+  - Read from `/dev/tty` (injectable), with echo off where the terminal allows it.
+  - Spaces, case and extra whitespace are normalised.
+  - Each word is checked against the list, so a typo gets "word 4 is not in the list" instead of a scrypt failure.
+- **sops never sees a wrapped identity.** Wrapped identities make sops prompt through gpg-agent or the TTY, and sops's gpg-agent client ignores `GNUPGHOME`. So the tool unwraps the recovery identity itself and hands sops the plain identity in the child's env as **`SOPS_AGE_KEY`**, only for the recover, drill and new-recovery calls. Every sops child env also sets **`GPG_AGENT_INFO=`**, empty.
+- **Recipient changes go through `sops --config /dev/null rotate -i --add-age … / --rm-age …`.** That re-keys the data key on every change. `updatekeys` doesn't re-key, and `--config /dev/null` stays. The recipients file is updated in the same step: write it atomically after sops succeeds; if sops fails, leave it untouched.
+
+**Commands** (each also a mise task `secrets:<name>`; `--config` as in Task 4b):
+- **`hapi secrets init`** (extends Task 4b):
+  1. Creates the machine key (`--name`, default `<hostname>-<user>`, normalised to the name pattern), unless one already exists.
+  2. Creates the recovery identity and words in memory.
+  3. **Shows the words once**, with the instruction "store these 10 words where you keep things you can't lose (a password manager, paper in a safe, or both). With `recovery.age` they open your secrets if every machine is lost."
+  4. **Asks for 2 of the words**, at random positions. A mismatch re-shows the words, up to 3 tries, then aborts.
+  5. Only then encrypts the template to **both** recipients, and writes the store, `recovery.age` (0600), the recipients file and the config. Every file write is **no-replace**: `link(tmp, path)` and then `unlink(tmp)`, failing with EEXIST.
+
+  Also:
+  - It refuses coinciding paths among config, store, age key, `recovery.age` and the recipients file.
+  - An abort at any step writes nothing.
+  - `--no-confirm` exists only for tests and non-interactive CI fixtures. It is refused when stdin is a TTY, so a human can't skip the check.
+- **`hapi secrets join --store <path to a copy of the store>`:** for a new machine or user.
+  - Creates this machine's key (never overwriting one) and its local config.
+  - Prints its recipient, plus the exact command to run on a machine that already has access: `mise run secrets:add-machine -- --name <n> --recipient <age1…>`.
+  - It doesn't touch the store.
+- **`hapi secrets add-machine --name <n> --recipient <age1…>`:**
+  - Validates the recipient's form and its PQ kind, and refuses a duplicate name or recipient.
+  - Runs `rotate -i --add-age` and updates the recipients file.
+- **`hapi secrets recover`:** for a box that has the store, `recovery.age` and the recipients file, but no key that opens them.
+  1. Joins (creates this machine's key).
+  2. Reads the words and unwraps the recovery identity in memory.
+  3. Runs `rotate -i --add-age <this machine>` with `SOPS_AGE_KEY=<recovery identity>`.
+  4. Updates the recipients file.
+
+  After that the machine works without the words.
+- **`hapi secrets drill`:** proves the backup works.
+  - Reads the words and unwraps the recovery identity.
+  - Decrypts the store in a child with `HOME` and `XDG_CONFIG_HOME` pointed at a fresh temp dir under `$XDG_RUNTIME_DIR/hapi/`, so no machine key can be loaded, and only `SOPS_AGE_KEY` set.
+  - Reports "recovery works: N names readable", never a value. It deletes the temp dir.
+  - It writes nothing else.
+- **`hapi secrets revoke --name <n>`:**
+  - Runs `rotate -i --rm-age <recipient>` and updates the recipients file.
+  - It refuses to remove the last `machine` recipient, or the only `recovery` recipient (use `new-recovery`).
+  - It prints the order sops documents for a compromised key: "if this key may be compromised, also reissue every credential in the store: copies of the store in git history stay readable by the removed key forever".
+- **`hapi secrets new-recovery`:** for when the words are lost or exposed. It needs a working machine key.
+  1. Creates a new recovery identity and words, with the same show-and-confirm flow as init.
+  2. Adds it with `rotate -i --add-age`, then removes the old one with `--rm-age`.
+  3. Replaces `recovery.age` and updates the recipients file. This is the one deliberate replace: back up the old file in memory and restore it if any step fails.
+- **`hapi secrets check`** (extends Task 4b):
+  - It also reports the recipients: names, kinds, PQ.
+  - It **errors** on recipient drift or a PQ/classic mix.
+  - It **warns, and still exits 0,** when the store has no `recovery` recipient or `recovery.age` is missing.
+
+**Folded Task 4b minors:**
+- **Checkout boundary:** `defaultRepoRoot` runs git with every `GIT_*` env var cleared. It treats as "inside the checkout" both the worktree top level and the **main worktree**, the parent of `git rev-parse --path-format=absolute --git-common-dir`. That way `private/` is still covered when hapi runs from a `.worktrees/` worktree.
+- **Stale plaintext files:** `writeSecretFiles` removes, once:
+  - Task 4-era `$XDG_RUNTIME_DIR/hapi/{hermes,archon,research,host}.env` regular files;
+  - generation dirs not referenced by the `env` symlink, i.e. ones orphaned by a crash.
+- **`checkSecrets`** masks unknown names in the API itself (`shownName`), not only in the CLI.
+- **README:** step 5 expects every secret found except the three Slack values until Task 13.
+- **CLI handlers** move to `src/secrets/cli.ts`, which removes the `provider.ts` ↔ `providers/*` cycle.
+
+**Docs:**
+- **`docs/secrets.md`** gets a "Keys and recovery" section, which replaces "back up the age key". It covers:
+  - the pattern and why there's no copying;
+  - what to store (10 words) and where;
+  - each lifecycle command, with a worked example: laptop → VM → `hapi` user;
+  - lost key vs compromised key;
+  - PQ by default, and its costs: about 5 KB per recipient, and no P-256 hardware plugins;
+  - hardware keys, Shamir key groups and cloud KMS as later add-ons, with one line each;
+  - the threat notes:
+    - the words plus `recovery.age` equal a master key;
+    - sops never gets a wrapped key;
+    - the gpg-agent isolation.
+- **`README.md`:** setup step 3 gains the words step and `secrets:drill`.
+- **The runbooks** point to it. `docs/runbooks/stack.md` (Task 5) uses `join` + `add-machine` for the `hapi` user.
+- No personal identifiers.
+
+- [ ] **Step 1: Write the failing tests:**
+
+```ts
+test("init encrypts to a machine key and a recovery recipient, both PQ, and writes the recipients file", async () => {});
+test("init writes nothing if the word confirmation fails or any step aborts", async () => {});
+test("init refuses coinciding paths and never replaces a file created after its checks (no-replace write)", async () => {});
+test("the words and the plaintext recovery identity never reach argv, env, a file or an error", async () => { /* record every runner call and fs write */ });
+test("words are 10 from the 2048-word list via crypto RNG; input normalisation; a non-list word is named by position", () => {});
+test("join creates a key and config without touching the store, and prints the add-machine command", async () => {});
+test("add-machine and revoke go through rotate with --config /dev/null and keep the recipients file in step; revoke refuses the last machine or the only recovery", async () => {});
+test("recover: words → SOPS_AGE_KEY only in the sops child env → rotate --add-age self", async () => {});
+test("drill decrypts with an isolated HOME and only the recovery identity, and prints no value", async () => {});
+test("check errors on recipient drift or a PQ/classic mix and warns without a recovery recipient", async () => {});
+test("every sops child env sets GPG_AGENT_INFO= and SOPS_DISABLE_VERSION_CHECK=1, and PATH starts with the mise age dir", async () => {});
+test("defaultRepoRoot covers the main worktree from a linked worktree and ignores GIT_DIR/GIT_WORK_TREE", async () => {});
+test("writeSecretFiles removes Task 4-era zone files and orphaned generations", async () => {});
+// HAPI_INT=1 only: the full lifecycle with throwaway keys in temp dirs, using the real
+// mise-pinned sops and age: init → drill → join(second HOME) → add-machine → resolve as the
+// second machine → revoke the first → recover on a third HOME with only the store,
+// recovery.age, recipients file and words → new-recovery
+```
+
+- [ ] **Step 2: Run** `bun test tests/secrets`. Expected: FAIL.
+- [ ] **Step 3: Implement.** The Task 4b safety rules apply unchanged:
+  - never touch the real `~/.config/sops`, `~/.config/hapi` or `~/.gnupg`;
+  - point HOME, XDG_CONFIG_HOME and XDG_RUNTIME_DIR at temp dirs for every test;
+  - keep tests away from the real gpg-agent: `GPG_AGENT_INFO=` and no `$XDG_RUNTIME_DIR/gnupg` socket;
+  - write nothing into the repo outside your intended changes.
+- [ ] **Step 4: Run** `mise run lint && mise run test && HAPI_INT=1 bun test tests/secrets`. Expected: PASS, with no test word or identity in the output.
+- [ ] **Step 5: Manual (the operator, at the checkpoint).** `mise run secrets:init -- --file private/secrets.enc.yaml`. Store the words. Then `secrets:drill` and `secrets:edit`. Later, `join` + `add-machine` for the `hapi` user and the VM.
+- [ ] **Step 6: Commit** `git commit -m "feat(secrets): recovery recipient with a 10-word wrapped key, per-machine keys, join/add-machine/recover/drill/revoke"`
+
+---
+
 ### Task 5: Host setup and the stack (rootless Docker, internal networks, Squid egress, Hermes, Archon)
 
 **Files:**
