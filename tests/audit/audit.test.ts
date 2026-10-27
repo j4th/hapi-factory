@@ -54,9 +54,11 @@ test("audit passes a clean fixture", async () => {
   expect(results.map((r) => r.id).sort()).toEqual([...CHECK_IDS].sort());
   for (const r of results) expect([r.id, r.status, r.detail]).toEqual([r.id, r.status === "skip" ? "skip" : "pass", r.detail]);
   // What can be checked without a repo or a secrets store passes.
-  for (const id of ["generated.drift", "runtime.archon-env", "runtime.hermes-no-yolo", "runtime.dev-override", "pins.versions", "tools.archon-validate", "tools.hermes-validate", "mcp.tool-hashes"]) {
+  for (const id of ["generated.drift", "runtime.archon-env", "runtime.hermes-no-yolo", "runtime.dev-override", "pins.versions", "tools.archon-validate", "tools.hermes-validate"]) {
     expect([id, only(results, id).status]).toEqual([id, "pass"]);
   }
+  // The live MCP comparison waits for Plan 04 (H-101), so it is a skip until then (H-026).
+  expect(only(results, "mcp.tool-hashes").status).toBe("skip");
   for (const id of ["github.rulesets", "github.app-perms", "repo.ai-workflows"]) {
     expect([id, only(results, id).status, only(results, id).detail]).toEqual([id, "skip", "no --repo given"]);
   }

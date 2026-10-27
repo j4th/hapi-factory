@@ -12,11 +12,16 @@
  *   write tool didn't slip into the allowlist;
  * - every server the stack runs (the zone services' enabled servers) has a
  *   lock entry for its pin.
- * What it can't yet: compare a running server's live surface with the lock.
- * That needs the live fetch Plan 04 wires (H-101), so a server that runs
- * makes this a skip. Today none runs (the hermes zone enables Phoenix only
- * with o11y; the research container arrives in Plan 04), so there is nothing
- * live to compare, and that is a pass that says so.
+ * Any of these failing is a fail.
+ * What it can't yet: compare the live surfaces of the servers that run with
+ * the lock, which is what the check verifies. That needs the live fetch Plan
+ * 04 wires (H-101), so until then the check can only skip once the offline
+ * checks pass, saying why (H-026), whether or not a server runs: the audit
+ * reads which servers run from policy, not from the running stack (today
+ * none: the hermes zone enables Phoenix only with o11y, archon never loads
+ * one, and the research container arrives in Plan 04). With `--strict` that
+ * skip is a fail, which stage b expects until H-101 closes
+ * (docs/runbooks/stack.md#5-the-audit).
  */
 import { join } from "node:path";
 import { canonicalJson, loadLock, pinOf } from "../../mcp/lock";
@@ -54,20 +59,15 @@ export async function mcpToolHashes(run: AuditRun): Promise<CheckResult[]> {
   const catalog = Object.keys(p.mcp.servers).length;
   const counts = `the lock (${lockFile}) holds ${Object.keys(lock).length} entries for ${catalog} catalog servers, ${pinned.size} pinned at their current pin`;
   if (problems.length > 0) return [result(id, "fail", `${problems.join("; ")}; ${counts}`)];
-  if (runs.length > 0) {
-    return [
-      result(
-        id,
-        "skip",
-        `${runs.join(", ")} run${runs.length === 1 ? "s" : ""} in this stack, but a live tool surface can't be fetched until Plan 04 wires \`hapi mcp verify\` (H-101), so it wasn't compared with the lock; ${counts}`,
-      ),
-    ];
-  }
+  const running =
+    runs.length > 0
+      ? `${runs.join(", ")} run${runs.length === 1 ? "s" : ""} in this stack`
+      : `no MCP server runs in this stack by policy (the hermes zone enables none with o11y ${o11yEnabled(p) ? "on" : "off"}, archon never loads one, and the research container arrives in Plan 04)`;
   return [
     result(
       id,
-      "pass",
-      `no MCP server runs in this stack (the hermes zone enables none with o11y ${o11yEnabled(p) ? "on" : "off"}, archon never loads one, and the research container arrives in Plan 04), so there is no live surface to compare; ${counts}`,
+      "skip",
+      `the live tool surfaces can't be compared with the lock until Plan 04 wires the live fetch (\`hapi mcp verify\`, H-101); ${running}; the offline lock checks pass: ${counts}`,
     ),
   ];
 }

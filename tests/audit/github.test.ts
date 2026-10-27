@@ -8,6 +8,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { aiWorkflowProblems } from "../../src/audit/checks/github";
 import { runAudit } from "../../src/audit/index";
 import { API, APP_IDS, cleanup, cleanWorld, FIXTURES, githubRoutes, goodRulesets, hostEnv, NAME, only, OWNER } from "./helpers";
 
@@ -176,6 +177,32 @@ describe("repo.ai-workflows", () => {
     const r = await run(await withToken({ workflows: { "agent.yaml": text } }));
     expect(r.workflows.status).toBe("fail");
     expect(r.workflows.detail).toContain("agent.yaml");
+  });
+
+  test("a secret written inline in the agent's own `run:` line counts", async () => {
+    const text = 'on: issue_comment\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }} claude -p "$BODY"\n';
+    expect(aiWorkflowProblems(".github/workflows/inline.yml", text)).toEqual([expect.stringContaining("secrets.ANTHROPIC_API_KEY")]);
+    const r = await run(await withToken({ workflows: { "inline.yml": text } }));
+    expect(r.workflows.status).toBe("fail");
+    expect(r.workflows.detail).toContain(".github/workflows/inline.yml (job a) runs claude in a run: step on issue_comment");
+    expect(r.workflows.detail).toContain("secrets.ANTHROPIC_API_KEY");
+    // The run line itself is never echoed: it could hold a literal secret.
+    expect(r.workflows.detail).not.toContain("$BODY");
+  });
+
+  test("a credential anywhere in the agent's job counts: an earlier step's $GITHUB_ENV, a later step's input, a step field", async () => {
+    // The steps of one job share a runner: an exported secret reaches the agent, and an agent can rewrite what a later step runs.
+    const job = (steps: string) => `on: {issues: {types: [opened]}}\njobs:\n  triage:\n    runs-on: ubuntu-latest\n    steps:\n${steps}`;
+    const cases: Record<string, string> = {
+      "GITHUB_ENV": '      - run: echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> "$GITHUB_ENV"\n      - run: codex exec "$TITLE"\n',
+      "later step": '      - run: codex exec "$TITLE"\n      - uses: actions/github-script@v8\n        with:\n          github-token: ${{ secrets.LABEL_TOKEN }}\n',
+      "step field": "      - name: agent ${{ github.token }}\n        run: gemini -p hi\n",
+    };
+    for (const [what, steps] of Object.entries(cases)) {
+      expect([what, aiWorkflowProblems(".github/workflows/t.yml", job(steps)).length]).toEqual([what, 1]);
+    }
+    // The control: the same job with no credential anywhere passes.
+    expect(aiWorkflowProblems(".github/workflows/t.yml", job('      - run: codex exec "$TITLE"\n'))).toEqual([]);
   });
 
   test("no .github/workflows at all passes", async () => {

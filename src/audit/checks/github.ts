@@ -25,9 +25,13 @@
  *   permission beyond the runbook's table, on the App or on its installation
  *   (selected repositories only), and neither is a bypass actor anywhere.
  * - repo.ai-workflows: no workflow runs an AI agent (a known AI action, or an
- *   AI CLI in a `run:`) with a credential (a `secrets.*` or `github.token`
- *   reference, or `id-token: write`) on a comment, issue or review trigger,
- *   or `pull_request_target`: the "Comment and Control" class (spec §7).
+ *   AI CLI in a `run:`) on a comment, issue or review trigger, or
+ *   `pull_request_target`, in a job that holds a credential (a `secrets.*` or
+ *   `github.token` reference anywhere in the job, in any step's inputs, env or
+ *   script, or the workflow's env; or `id-token: write`): the "Comment and
+ *   Control" class (spec §7). The steps of a job share one runner, so a
+ *   secret an earlier step exports reaches the agent, and the agent can
+ *   rewrite what a later step runs with its secret.
  */
 import { lstat, readFile } from "node:fs/promises";
 import YAML from "yaml";
@@ -329,7 +333,7 @@ function triggers(doc: Record<string, unknown>): string[] {
   return Object.keys(asRecord(on) ?? {});
 }
 
-/** The credentials a piece of a workflow references (secret names, github.token, id-token: write). */
+/** The credentials the given parts of a workflow reference, in any field at any depth (secret names, github.token), or grant (`id-token: write` in a permissions block). */
 function credentials(...parts: unknown[]): string[] {
   const found = new Set<string>();
   for (const p of parts) {
@@ -353,15 +357,19 @@ export function aiWorkflowProblems(path: string, text: string): string[] {
   const problems: string[] = [];
   for (const [jobName, job] of Object.entries(asRecord(doc.jobs) ?? {})) {
     const j = asRecord(job) ?? {};
+    // Everything the job holds: every field of every step (`run:` included, where a secret can be written inline,
+    // or exported to $GITHUB_ENV for the steps after it), the job's own env, permissions and other fields, and the
+    // workflow's env and permissions.
+    const creds = credentials(j, j.permissions, doc.env, doc.permissions);
+    if (creds.length === 0) continue;
     for (const step of Array.isArray(j.steps) ? j.steps.map(asRecord) : []) {
       const uses = typeof step?.uses === "string" ? step.uses : undefined;
       const runLine = typeof step?.run === "string" ? step.run : undefined;
-      const ai = (uses !== undefined && AI_ACTIONS.some((re) => re.test(uses))) || (runLine !== undefined && AI_CLI.test(runLine));
-      if (!ai) continue;
-      const creds = credentials(step?.with, step?.env, j.env, doc.env, j.permissions, doc.permissions);
-      if (creds.length === 0) continue;
-      const what = uses ?? `run: ${runLine!.trim().split("\n")[0]!.slice(0, 60)}`;
-      problems.push(`${path} (job ${jobName}) runs ${what} with ${creds.join(", ")} on ${bad.join(", ")}`);
+      const action = uses !== undefined && AI_ACTIONS.some((re) => re.test(uses)) ? uses : undefined;
+      // Only the CLI's name: the rest of a run line is never echoed, since it could hold a literal secret.
+      const cli = runLine === undefined ? undefined : AI_CLI.exec(runLine)?.[0].replace(/^[\s;&|(]+/, "");
+      if (action === undefined && cli === undefined) continue;
+      problems.push(`${path} (job ${jobName}) runs ${action ?? `${cli} in a run: step`} on ${bad.join(", ")}, and the job holds ${creds.join(", ")}`);
     }
   }
   return problems;

@@ -23,7 +23,7 @@ mise run audit -- --strict --repo "$OWNER/hapi-factory"
 | Flag | What it does |
 |---|---|
 | `--repo owner/name` | A repo for the `github.*` and `repo.*` checks. Give it more than once for several repos. Without it, those checks skip. |
-| `--strict` | Every skip becomes a fail, its detail starting `--strict: skipped:`. Use it for stage b and any scheduled audit, where a check that couldn't be made must not look fine. |
+| `--strict` | Every skip becomes a fail, its detail starting `--strict: skipped:`. Use it for stage b and any scheduled audit, where a check that couldn't be made must not look fine. Until Plan 04 wires the live MCP fetch (H-101), `mcp.tool-hashes` is always a skip, so a strict run always has that one fail ([below](#mcptool-hashes); [stage b](runbooks/stack.md#5-the-audit)). |
 | `--dev` | The dev-only downgrades (the dev bypass, the env-file secrets provider) are reported as a skip instead of a fail. For development only. |
 | `--github-token-file path` | The operator's GitHub token, in a file only its owner can read (mode `0600`). It is read once and never printed, logged or put in a command line. Needed for the bypass-actor checks ([below](#github-credentials)). |
 | `--build-dir dir` | Compare another deployed build/ instead of hapi's `~hapi/hapi-factory/build`. |
@@ -33,9 +33,10 @@ It prints one line per check, then a summary:
 
 ```text
 pass  generated.drift         /home/hapi/hapi-factory/build equals a fresh build of /home/hapi/hapi-factory/policy (roster anthropic, 10 files); 5 running containers were started from it (org.hapi.build-sha256)
+skip  mcp.tool-hashes         the live tool surfaces can't be compared with the lock until Plan 04 wires the live fetch (`hapi mcp verify`, H-101); ...
 skip  github.rulesets         no --repo given
 ...
-hapi audit: 10 pass, 0 fail, 3 skip
+hapi audit: 9 pass, 0 fail, 4 skip
 ```
 
 **Exit codes:** `0` when no check fails, `1` when any check fails (after `--strict`), `2` on a usage error (an unknown flag, a missing value, a `--repo` that isn't `owner/name`, a flag given twice). A check that throws is a fail naming the error: the audit fails closed.
@@ -48,13 +49,13 @@ Every detail names files, keys, containers and env var names. None prints a secr
 - **fail:** it found a problem, or it hit an error.
 - **skip:** it couldn't be made, and the detail says why: the stack isn't running, there is no `--repo`, there are no GitHub credentials, Docker isn't available, the image isn't built here. **A skip is never a pass.** `--strict` turns every skip into a fail.
 
-Without the stack and without `--repo`, as on a development machine, most checks skip: run `mise run audit` there to see the pins and the MCP lock checked, and the rest skip with their reasons.
+Without the stack and without `--repo`, as on a development machine, most checks skip: run `mise run audit` there to see the pins checked, the MCP lock's offline checks made (`mcp.tool-hashes` still reports a skip, since the live comparison waits for H-101), and the rest skip with their reasons.
 
 ## The checks
 
 | Check | Verifies | Spec | Needs |
 |---|---|---|---|
-| [`generated.drift`](#generateddrift) | The deployed build/ equals a fresh build of policy/, and every running container was started from it | §8.1, §11.8 | The deployed build/; Docker for the labels |
+| [`generated.drift`](#generateddrift) | The deployed build/ equals a fresh build of policy/, with no other file or directory in it, and every running container was started from it | §8.1, §11.8 | The deployed build/; Docker for the labels |
 | [`runtime.archon-env`](#runtimearchon-env) | The running archon's environment and read-only mounts | §9.2, §9.3 | Docker, the stack up |
 | [`runtime.hermes-no-yolo`](#runtimehermes-no-yolo) | No yolo, and approvals not off, in Hermes's effective config | §9.1 | Docker, the stack up |
 | [`runtime.dev-override`](#runtimedev-override) | The stack was started by `hapi stack up` as hapi, without the dev bypass | §4.3, §11.3 | Docker, the stack up |
@@ -70,13 +71,13 @@ Without the stack and without `--repo`, as on a development machine, most checks
 
 ### generated.drift
 
-**Verifies.** The deployed build/ (the one `hapi stack up` writes and the containers bind-mount: hapi's `~hapi/hapi-factory/build`, found from hapi's passwd entry; this checkout's `build/` when this shell sets `HAPI_ALLOW_CURRENT_USER=1`; or `--build-dir`) is byte for byte a fresh `buildAll` of `--policy`, for one of the three rosters (`up --roster` picks one; the detail names it). The fresh builds go into temp dirs the audit removes; the deployed build/ is never written. Then each running container's `org.hapi.build-sha256` label must be that build's digest (`buildDigest`, `src/stack/up.ts`), the label `up` sets.
+**Verifies.** The deployed build/ (the one `hapi stack up` writes and the containers bind-mount: hapi's `~hapi/hapi-factory/build`, found from hapi's passwd entry; this checkout's `build/` when this shell sets `HAPI_ALLOW_CURRENT_USER=1`; or `--build-dir`) is exactly a fresh `buildAll` of `--policy`, for one of the three rosters (`up --roster` picks one; the detail names it): every generated file byte for byte, as a regular file (a symlink is a fail, and is never followed), and **no other path**, file or directory, anywhere under it. Archon mounts `build/pi` whole, read-only, as Pi's agent dir (`PI_CODING_AGENT_DIR`), so a planted or stale `settings.json`, `auth.json`, `models-store.json` or `extensions/` there would be read by Pi even though every generated file matches. The audit lists the deployed build recursively and names each such path (a directory once, with a trailing `/`), never reading it. The fresh builds go into temp dirs the audit removes; the deployed build/ is never written. Then each running container's `org.hapi.build-sha256` label must be that build's digest (`buildDigest`, `src/stack/up.ts`), the label `up` sets.
 
 **Why.** The generators are deterministic ([docs/generated-configs.md](generated-configs.md)), so a difference is a hand edit, a stale build, or a policy change not yet deployed (spec §8.1; Review Focus 4: `approvals.mode: off` or `HOST=0.0.0.0` in a deployed file). Compose recreates a container whose config changed, not one whose bind-mounted file changed, so a container with another build's label may still run an older config.
 
 **Credential.** None: local files, and `docker inspect` for the labels.
 
-**Fix.** Never edit build/ by hand. Change policy/ in a PR, then `mise run up` rebuilds build/ and restarts what changed. The detail names each differing file and key (YAML, JSON, `archon.env`) or line (`squid.conf`), never the deployed value; "missing" means a generated file is gone.
+**Fix.** Never edit build/ by hand. Change policy/ in a PR, then `mise run up` rebuilds build/ and restarts what changed. The detail names each differing file and key (YAML, JSON, `archon.env`) or line (`squid.conf`), never the deployed value; "missing" means a generated file is gone. "not in a fresh build" is a path nothing generates: a planted file, or one a policy change left behind. `mise run up` never deletes a file (`buildAll` only writes, H-156), so remove each such path by hand, as hapi, then run the audit again. "not a regular file" or "not a directory" is a symlink (or other special file) where a generated file or directory belongs: remove it and `mise run up`.
 
 **Skip.** No hapi user on this host (pass `--build-dir`), no deployed build yet (`mise run up` writes it), or a build/ you can't read (run the audit as hapi). With the stack down it still compares the files and says the labels weren't checked.
 
@@ -168,7 +169,9 @@ The detail also gives the config's `_config_version` stamp: the generated config
 - for each server pinned at its current pin, every allowlisted tool (`tools.include`) is in the locked surface with `readOnlyHint: true` (H-035);
 - every server the stack runs (the zone services' enabled servers) has a lock entry for its pin.
 
-What it can't do yet is compare a running server's live surface with the lock: that needs the live fetch Plan 04 wires (H-101). Today no MCP server runs (the hermes zone enables Phoenix only with o11y on, archon never loads one, and the research container arrives in Plan 04), so there is nothing live to compare, and the check passes saying so.
+Any of these failing is a fail. What it can't do yet is the comparison the check exists for: the live tool surfaces of the servers that run against the lock. That needs the live fetch Plan 04 wires (H-101), so until then, once the offline checks pass, the check is a **skip** that says so (H-026), whether or not a server runs. The audit reads which servers run from policy, not from the running stack; today policy runs none (the hermes zone enables Phoenix only with o11y on, archon never loads one, and the research container arrives in Plan 04), and the detail says that too.
+
+Under `--strict` that skip is a fail, like any other. So until H-101 closes, a strict audit (stage b's last step) always has exactly this one fail, its detail starting `--strict: skipped: the live tool surfaces can't be compared with the lock until Plan 04`: [the stack runbook](runbooks/stack.md#5-the-audit) says how to read it. Any other `mcp.tool-hashes` fail is a real one.
 
 **Why.** Spec §10.1, the rug-pull defense: `hapi audit` (`mcp.tool-hashes`) fails closed on drift.
 
@@ -176,7 +179,7 @@ What it can't do yet is compare a running server's live surface with the lock: t
 
 **Fix.** Remove an orphaned entry in the PR that removed its server; re-pin a server whose surface changed, through a planning PR (`new_skill_or_mcp`); never allowlist a tool that isn't read-only.
 
-**Skip.** A server runs in the stack (o11y on), but its live surface can't be fetched until Plan 04.
+**Skip.** Always, once the offline checks pass, until Plan 04 wires the live fetch (H-101): the live surfaces can't be compared yet. The detail names the servers that run by policy (Phoenix, with o11y on), or says none does.
 
 ### secrets.provider
 
@@ -233,7 +236,7 @@ Rules in a ruleset in `evaluate` or `disabled` mode don't apply to `main`, so th
 
 ### repo.ai-workflows
 
-**Verifies**, per `--repo`: no `.github/workflows/*.yml` or `*.yaml` runs an AI agent with a credential on `issue_comment`, `issues`, `pull_request_review`, `pull_request_review_comment` or `pull_request_target`. An AI agent is a known AI action (`anthropics/claude-code-action`, `anthropics/claude-code-base-action`, `openai/codex-action`, `google-github-actions/run-gemini-cli`, `google-gemini/gemini-cli-action`, `actions/ai-inference`) or an AI CLI in a `run:` step (`claude`, `@anthropic-ai/claude-code`, `codex`, `gemini`, `aider`, `opencode`). A credential is a `secrets.*` or `github.token` reference in the step, its job's or the workflow's `env`, or `id-token: write`. A workflow that doesn't parse fails, since it can't be cleared. The tests use a copy of the mtg repo's comment-triggered `claude.yml` (H-036); no test reads another repo.
+**Verifies**, per `--repo`: no `.github/workflows/*.yml` or `*.yaml` runs an AI agent with a credential on `issue_comment`, `issues`, `pull_request_review`, `pull_request_review_comment` or `pull_request_target`. An AI agent is a known AI action (`anthropics/claude-code-action`, `anthropics/claude-code-base-action`, `openai/codex-action`, `google-github-actions/run-gemini-cli`, `google-gemini/gemini-cli-action`, `actions/ai-inference`) or an AI CLI in a `run:` step (`claude`, `@anthropic-ai/claude-code`, `codex`, `gemini`, `aider`, `opencode`). A credential is a `secrets.*` or `github.token` reference anywhere in the agent's job (any field of any step, so a secret written inline in a `run:` line, such as `run: ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }} claude -p "$BODY"`, counts; the job's `env` and other fields) or in the workflow's `env`, or `id-token: write` on the job or the workflow. The whole job counts, not just the agent's step, because a job's steps share one runner: an earlier step can export a secret to `$GITHUB_ENV` for the agent, and the agent can rewrite what a later step runs with its secret. The detail names the action or the CLI, never the rest of a `run:` line. A workflow that doesn't parse fails, since it can't be cleared. The tests use a copy of the mtg repo's comment-triggered `claude.yml` (H-036); no test reads another repo.
 
 **Why.** Spec §7 and §11.7: the onboarding PR removes or hardens any workflow that runs an AI agent with secrets on PR, issue or comment triggers (the "Comment and Control" class), and `mise run audit` fails until that's done. Anyone who can comment can steer such an agent.
 

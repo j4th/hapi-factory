@@ -1,11 +1,13 @@
 /**
  * generated.drift: the deployed build/ equals a fresh `buildAll` of policy/
- * (any roster), and every running container was started from that build
- * (its org.hapi.build-sha256 label). The fresh build goes into a temp dir;
- * the deployed build/ is never written.
+ * (any roster): every generated file byte for byte, and no other path, file
+ * or directory, anywhere under it (archon mounts build/pi whole as Pi's agent
+ * dir). And every running container was started from that build (its
+ * org.hapi.build-sha256 label). The fresh build goes into a temp dir; the
+ * deployed build/ is never written.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, cpSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { runAudit } from "../../src/audit/index";
 import { buildAll } from "../../src/generate/index";
@@ -82,6 +84,53 @@ describe("generated.drift", () => {
     expect(r.status).toBe("fail");
     expect(r.detail).toContain("mcp/hermes.mcp.json: missing");
     expect(r.detail).toContain("hermes/config.yaml: does not parse");
+  });
+
+  test("a path a fresh build doesn't have fails, naming it: archon reads build/pi wholesale as Pi's agent dir", async () => {
+    const w = await cleanWorld();
+    // Pi inside Archon would read each of these: a planted settings.json or auth.json, an extensions/ dir.
+    writeFileSync(join(w.build, "pi", "settings.json"), '{"secret-planted-value": true}\n');
+    writeFileSync(join(w.build, "pi", "auth.json"), "{}\n");
+    mkdirSync(join(w.build, "pi", "extensions", "deep"), { recursive: true });
+    writeFileSync(join(w.build, "pi", "extensions", "deep", "evil.ts"), "export default {}\n");
+    mkdirSync(join(w.build, "pi", "empty-dir"));
+    // A stale file a policy change left behind (buildAll never deletes), elsewhere in build/.
+    writeFileSync(join(w.build, "mcp", "old.mcp.json"), "{}\n");
+    mkdirSync(join(w.build, "leftover"));
+    const r = await drift(w);
+    expect(r.status).toBe("fail");
+    for (const p of ["pi/settings.json", "pi/auth.json", "pi/extensions/", "pi/empty-dir/", "mcp/old.mcp.json", "leftover/"]) expect(r.detail).toContain(`${p}: not in a fresh build`);
+    // A directory is named once, not every file under it; and nothing is read from an unexpected path.
+    expect(r.detail).not.toContain("evil.ts");
+    expect(r.detail).not.toContain("secret-planted-value");
+    // `mise run up` never deletes a file, so the fix says to remove them.
+    expect(r.detail).toContain("remove");
+  });
+
+  test("an extra file alone fails even when every generated file matches and every label is right", async () => {
+    const w = await cleanWorld();
+    writeFileSync(join(w.build, "pi", "models-store.json"), "{}\n");
+    const r = await drift(w);
+    expect(r.status).toBe("fail");
+    expect(r.detail).toContain("pi/models-store.json: not in a fresh build");
+    expect(r.detail).not.toContain("was started from another build");
+  });
+
+  test("a symlink where a generated file or directory belongs fails, even with the same bytes, and is never followed", async () => {
+    const w = await cleanWorld();
+    const elsewhere = tempDir("hapi-audit-elsewhere-");
+    const models = join(w.build, "pi", "models.json");
+    copyFileSync(models, join(elsewhere, "models.json"));
+    rmSync(models);
+    symlinkSync(join(elsewhere, "models.json"), models);
+    cpSync(join(w.build, "egress"), join(elsewhere, "egress"), { recursive: true });
+    rmSync(join(w.build, "egress"), { recursive: true });
+    symlinkSync(join(elsewhere, "egress"), join(w.build, "egress"));
+    const r = await drift(w);
+    expect(r.status).toBe("fail");
+    expect(r.detail).toContain("pi/models.json: not a regular file (a symlink)");
+    expect(r.detail).toContain("egress: not a directory (a symlink)");
+    expect(r.detail).toContain("egress/archon.squid.conf: missing");
   });
 
   test("a container started from another build fails, naming it; one with no build label too", async () => {

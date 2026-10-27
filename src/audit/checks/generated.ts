@@ -8,19 +8,26 @@
  *   `~hapi/hapi-factory/build` (or, under the dev bypass, this checkout's
  *   build/). It is only ever read.
  * - The fresh build is `buildAll` into a temp dir, once per roster (`up
- *   --roster` picks one), and the deployed build must equal one of them byte
- *   for byte. The emitters are deterministic, so any difference is a hand
+ *   --roster` picks one), and the deployed build must equal one of them
+ *   exactly: every generated file byte for byte, as a regular file (never a
+ *   symlink), and no other path, file or directory, anywhere under it. Archon
+ *   mounts build/pi whole as Pi's agent dir, so a planted or stale
+ *   settings.json, auth.json or extensions/ there would be read; and
+ *   `buildAll` never deletes, so a file policy stopped generating stays
+ *   behind. The emitters are deterministic, so any difference is a hand
  *   edit, a stale build or a policy change not yet deployed. A difference is
  *   named by file and key (YAML, JSON, env) or line (squid.conf), never by
- *   the deployed value.
+ *   the deployed value; a path a fresh build doesn't have is named and never
+ *   read.
  * - Each running container's `org.hapi.build-sha256` label must be that
  *   build's digest (`buildDigest`, src/stack/up.ts; H-147): Compose recreates
  *   a container whose config changed, not one whose bind-mounted file did, so
  *   a container with an older label may still run an older config.
  */
+import type { Dirent } from "node:fs";
 import { mkdtemp, readdir, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import YAML from "yaml";
 import { buildAll, ROSTERS } from "../../generate/index";
 import { loadPolicy } from "../../policy/load";
@@ -137,22 +144,71 @@ function describe(name: string, deployed: string, fresh: string): { text: string
   return { text: `${name}: ${lines.length === 1 ? "line" : "lines"} ${listed(lines.map(String), 4)} ${lines.length === 1 ? "differs" : "differ"}`, size: lines.length };
 }
 
-/** Every difference between the deployed build and `fresh`, one per file, with how many keys or lines each is. */
-async function compare(dir: string, fresh: FreshBuild): Promise<{ text: string; size: number }[]> {
-  const problems: { text: string; size: number }[] = [];
-  for (const file of fresh.files) {
-    const name = relative("build", file);
-    const want = await readFile(join(fresh.root, file), "utf8");
-    let got: string;
+interface Problem {
+  text: string;
+  /** How many keys or lines it is (1000 for a whole file), to choose the closest roster. */
+  size: number;
+  /** A path a fresh build doesn't have: `mise run up` never deletes, so it must be removed by hand. */
+  extra?: true;
+}
+
+/** What a directory entry is, for a detail: never followed or read. */
+function kind(e: Dirent): string {
+  if (e.isSymbolicLink()) return "a symlink";
+  if (e.isFIFO()) return "a FIFO";
+  if (e.isSocket()) return "a socket";
+  if (e.isBlockDevice() || e.isCharacterDevice()) return "a device";
+  return e.isDirectory() ? "a directory" : e.isFile() ? "a regular file" : "not a file or directory";
+}
+
+/**
+ * Every difference between the deployed build and `fresh`, sorted by path: each path under the deployed build
+ * that a fresh build doesn't have (a file, or a directory named once, its contents never listed), each generated
+ * file missing or not a regular file, and each one that differs.
+ */
+async function compare(dir: string, fresh: FreshBuild): Promise<Problem[]> {
+  const want = new Set(fresh.files.map((f) => relative("build", f)));
+  const wantDirs = new Set<string>();
+  for (const f of want) for (let d = dirname(f); d !== "."; d = dirname(d)) wantDirs.add(d);
+  const problems: Problem[] = [];
+  const seen = new Set<string>();
+  const walk = async (rel: string): Promise<void> => {
+    let entries: Dirent[];
     try {
-      got = await readFile(join(dir, name), "utf8");
+      entries = await readdir(join(dir, rel), { withFileTypes: true });
     } catch (e) {
-      problems.push({ text: `${name}: ${(e as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : `cannot be read (${(e as NodeJS.ErrnoException).code})`}`, size: 1000 });
-      continue;
+      problems.push({ text: `${rel === "" ? "." : rel}/: cannot be read (${(e as NodeJS.ErrnoException).code ?? "error"})`, size: 1000 });
+      return;
     }
-    if (got !== want) problems.push(describe(name, got, want));
-  }
-  return problems;
+    for (const e of entries.sort((a, b) => (a.name < b.name ? -1 : 1))) {
+      const name = rel === "" ? e.name : `${rel}/${e.name}`;
+      if (wantDirs.has(name)) {
+        // readdir's entries are lstat's: a symlink to a directory is a symlink, never followed.
+        if (e.isDirectory()) await walk(name);
+        else problems.push({ text: `${name}: not a directory (${kind(e)})`, size: 1000 });
+      } else if (!want.has(name)) {
+        problems.push({ text: `${name}${e.isDirectory() ? "/" : ""}: not in a fresh build`, size: 1000, extra: true });
+      } else {
+        seen.add(name);
+        if (!e.isFile()) {
+          problems.push({ text: `${name}: not a regular file (${kind(e)})`, size: 1000 });
+          continue;
+        }
+        let got: string;
+        try {
+          got = await readFile(join(dir, name), "utf8");
+        } catch (err) {
+          problems.push({ text: `${name}: cannot be read (${(err as NodeJS.ErrnoException).code ?? "error"})`, size: 1000 });
+          continue;
+        }
+        const wanted = await readFile(join(fresh.root, "build", name), "utf8");
+        if (got !== wanted) problems.push(describe(name, got, wanted));
+      }
+    }
+  };
+  await walk("");
+  for (const name of want) if (!seen.has(name)) problems.push({ text: `${name}: missing`, size: 1000 });
+  return problems.sort((a, b) => (a.text < b.text ? -1 : 1));
 }
 
 /** generated.drift */
@@ -184,11 +240,14 @@ export async function generatedDrift(run: AuditRun): Promise<CheckResult[]> {
 
   if (best.problems.length > 0 || labelProblems.length > 0) {
     const files = best.problems.length > 0 ? `${deployed.dir} differs from a fresh build of ${run.ctx.policyDir} (closest: roster ${best.build.roster}): ${best.problems.map((p) => p.text).join("; ")}` : "";
+    const extra = best.problems.some((p) => p.extra)
+      ? `; \`mise run up\` never deletes, so remove each path marked "not in a fresh build" from ${deployed.dir} (as ${HAPI_USER})`
+      : "";
     return [
       result(
         id,
         "fail",
-        `${[files, ...labelProblems].filter((s) => s !== "").join("; ")}. build/ is generated: never edit it by hand. Change policy/ in a PR, then \`mise run up\` rebuilds it and restarts what changed`,
+        `${[files, ...labelProblems].filter((s) => s !== "").join("; ")}. build/ is generated: never edit it by hand. Change policy/ in a PR, then \`mise run up\` rebuilds it and restarts what changed${extra}`,
       ),
     ];
   }

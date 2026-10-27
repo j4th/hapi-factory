@@ -349,7 +349,7 @@ Task 5 wrote the stack and proved its egress boundary on the build host's own Do
    - Check that `docker compose -p hapi ps` shows all five services healthy.
 
    Make the Slack app first (step 3 of the section above): until its three values are in your store, and copied to hapi, `up` stops at the secrets step.
-5. **The audit, last:** as `hapi`, in its checkout, with the stack up, `mise run audit -- --strict --repo "$OWNER/hapi-factory" --github-token-file <file>` (your own GitHub token in a `0600` file, which the bypass-actor checks need). Expected: exit 0, `0 fail` ([docs/audit.md](docs/audit.md), [the stack runbook](docs/runbooks/stack.md#5-the-audit)).
+5. **The audit, last:** as `hapi`, in its checkout, with the stack up, `mise run audit -- --strict --repo "$OWNER/hapi-factory" --github-token-file <file>` (your own GitHub token in a `0600` file, which the bypass-actor checks need). Expected, until Plan 04 wires the live MCP fetch (H-101): every check `pass` except one fail, `mcp.tool-hashes`, whose detail starts `--strict: skipped:` (it can't compare a running server's tool surface yet), so `12 pass, 1 fail, 0 skip` and exit 1; any other fail is real. After H-101: exit 0, `0 fail` ([docs/audit.md](docs/audit.md), [the stack runbook](docs/runbooks/stack.md#5-the-audit)).
 
 ## Documentation map
 

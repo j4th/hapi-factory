@@ -2,8 +2,9 @@
  * mcp.tool-hashes (spec §10.1, handoffs H-026, H-035): the lock as a whole
  * (its hashes, no orphaned entry), each pinned server's allowlisted tools
  * annotated read-only in the locked surface, and the live surfaces of the
- * servers the stack runs. Until Plan 04 wires the live fetch (H-101), a
- * server that runs can only be a skip; today none runs.
+ * servers the stack runs. Until Plan 04 wires the live fetch (H-101), the
+ * check can only skip once the offline checks pass, saying why (H-026), and
+ * fail when they don't.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { cpSync, readFileSync, writeFileSync } from "node:fs";
@@ -32,10 +33,21 @@ function lockEntry(policyDir: string, server: string, tools: { name: string; ann
 }
 
 describe("mcp.tool-hashes", () => {
-  test("no MCP server runs in this stack today (no o11y, no research container), so there is nothing live to verify: pass, saying so", async () => {
+  test("until Plan 04 wires the live fetch it is a skip, saying why, even with no MCP server running today (H-026)", async () => {
     const r = await tool(join(REPO, "policy"));
-    expect(r.status).toBe("pass");
-    expect(r.detail).toContain("no MCP server runs");
+    expect(r.status).toBe("skip");
+    expect(r.detail).toContain("H-101");
+    expect(r.detail).toContain("no MCP server runs in this stack");
+    expect(r.detail).toContain("the offline lock checks pass");
+  });
+
+  test("with --strict its skip is a fail, as stage b expects until H-101 (docs/runbooks/stack.md#5-the-audit)", async () => {
+    const w = await cleanWorld();
+    w.ctx.strict = true;
+    const r = only(await runAudit(w.ctx), "mcp.tool-hashes");
+    expect(r.status).toBe("fail");
+    expect(r.detail).toStartWith("--strict: skipped: ");
+    expect(r.detail).toContain("H-101");
   });
 
   test("a server that runs (Phoenix, with o11y on) fails with no lock entry, and is a skip with one until Plan 04 wires the live fetch (H-101)", async () => {
@@ -91,6 +103,6 @@ describe("mcp.tool-hashes", () => {
       join(dir, "mcp.lock.json"),
       lockJson({ context7: lockEntry(dir, "context7", [{ name: "resolve-library-id", annotations: { readOnlyHint: true } }, { name: "query-docs", annotations: { readOnlyHint: true } }]) }),
     );
-    expect((await tool(dir)).status).toBe("pass");
+    expect((await tool(dir)).status).toBe("skip");
   });
 });
