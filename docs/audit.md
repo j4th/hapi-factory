@@ -70,6 +70,7 @@ Without the stack and without `--repo`, as on a development machine, most checks
 | [`github.rulesets`](#githubrulesets) | The two `main` rulesets, per `--repo` | §5.1, §11.5 | `--repo`; a token ([below](#github-credentials)) |
 | [`github.app-perms`](#githubapp-perms) | Neither App has administration, workflows or a bypass, per `--repo` | §11.5 | `--repo`; the App keys |
 | [`repo.ai-workflows`](#repoai-workflows) | No workflow runs an AI agent with secrets on comment, issue or review triggers, per `--repo` | §7, §11.7 | `--repo`; a token |
+| [`repo.private-untracked`](#repoprivate-untracked) | The checkout tracks nothing under `private/`, and its root `.gitignore` ignores `private/` | §11.5 (H-058) | The checkout (git) |
 
 ### generated.drift
 
@@ -253,6 +254,22 @@ The whole job counts, not just the agent's step, because a job's steps share one
 **Fix.** Remove the workflow, or move the agent to a trigger that gets no secrets (`pull_request`, where a fork's PR runs without them). If it must stay on its trigger, give its job nothing: no secret, `permissions:` with read scopes only (or `{}`), and `persist-credentials: false` on any checkout.
 
 **Skip.** No `--repo` or no credentials.
+
+### repo.private-untracked
+
+**Verifies** the checkout the audit runs in, not a `--repo`:
+- nothing under `private/` is tracked, in any case (`git ls-files -- ':(icase)private'`), so a `Private/` counts too, and so does a nested repo added as a gitlink;
+- the checkout's own root `.gitignore` ignores `private/` (`git check-ignore --no-index -v`). A `.git/info/exclude` or a global excludes file doesn't count, since a clone doesn't get it.
+
+git runs on the audit's root with `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` and `GIT_COMMON_DIR` unset, so your shell can't point it at another repo, and with fsmonitor off. The root must be the checkout's top level (`mise run audit` runs there).
+
+**Why.** `private/` is your own repo: the research, the secrets store and personal notes ([README, Publishing](../README.md#publishing-after-task-7b-the-remotes-the-rulesets-and-the-apps)). hapi-factory is public, so one `git add -A` that picked it up would publish it (H-058). The store is encrypted; the research and notes aren't.
+
+**Credential.** None: local git only.
+
+**Fix.** `git rm -r --cached private` and commit. If that commit was pushed, removing the files isn't enough: they stay in the history until it is rewritten (the method of Task 7b Step 7). Add a `private/` line to the root `.gitignore` if it is missing.
+
+**Skip.** Never. No checkout, or git failing, is a fail.
 
 ## GitHub credentials
 

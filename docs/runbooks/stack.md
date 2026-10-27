@@ -188,7 +188,7 @@ It checks that the deployed `build/` is what policy builds and that the containe
 mise run audit -- --strict --repo <owner>/<name> --github-token-file <file> | grep -v '^pass'
 ```
 
-For one `--repo` it must print exactly two lines: the `mcp.tool-hashes` fail, its detail starting `--strict: skipped: the live tool surfaces can't be compared with the lock until Plan 04`, and the summary `hapi audit: 12 pass, 1 fail, 0 skip`. Any other line is a real failure: fix it and run the audit again. So is an `mcp.tool-hashes` fail whose detail doesn't start `--strict: skipped:` (a lock problem). When H-101 closes, the exception goes: stage b, and any scheduled strict audit, then expect exit 0 and `0 fail`.
+For one `--repo` it must print exactly two lines: the `mcp.tool-hashes` fail, its detail starting `--strict: skipped: the live tool surfaces can't be compared with the lock until Plan 04`, and the summary `hapi audit: 13 pass, 1 fail, 0 skip`. Any other line is a real failure: fix it and run the audit again. So is an `mcp.tool-hashes` fail whose detail doesn't start `--strict: skipped:` (a lock problem). When H-101 closes, the exception goes: stage b, and any scheduled strict audit, then expect exit 0 and `0 fail`.
 
 ## Kill switches
 

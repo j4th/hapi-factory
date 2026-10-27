@@ -26,6 +26,7 @@ import { generatedDrift } from "./checks/generated";
 import { githubAppPerms, githubRulesets, repoAiWorkflows } from "./checks/github";
 import { mcpToolHashes } from "./checks/mcp";
 import { pinsVersions } from "./checks/pins";
+import { repoPrivateUntracked } from "./checks/repo";
 import { archonEnv, devOverride, hermesNoYolo } from "./checks/runtime";
 import { secretsCheck, secretsProvider } from "./checks/secrets";
 import { archonValidate, hermesValidate } from "./checks/tools";
@@ -46,6 +47,7 @@ const CHECKS: readonly (readonly [id: string, check: Check])[] = [
   ["github.rulesets", githubRulesets],
   ["github.app-perms", githubAppPerms],
   ["repo.ai-workflows", repoAiWorkflows],
+  ["repo.private-untracked", repoPrivateUntracked],
 ];
 
 export const CHECK_IDS: readonly string[] = CHECKS.map(([id]) => id);
