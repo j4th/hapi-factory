@@ -241,8 +241,8 @@ hapi secrets resolve [--config file] [--dry-run]
 |---|---|
 | 1. `XDG_RUNTIME_DIR` must be set to an absolute path | a plain `Error` |
 | 2. load the manifest (`stack/secrets.yaml`) and check it against its schema | a `PolicyError`, naming the file and JSON Pointer |
-| 3. check it maps every MCP reference (`mcpSecretGaps`) | a `SecretError` |
-| 4. load the config; a missing file, then the schema | a `SecretError` ("no secrets config at ..."), then a `PolicyError` |
+| 3. load the config; a missing file, then the schema | a `SecretError` ("no secrets config at ..."), then a `PolicyError` |
+| 4. check the manifest maps every MCP reference (`mcpSecretGaps`) | a `SecretError` |
 | 5. check `XDG_RUNTIME_DIR` is a real directory, yours, mode `0700` as systemd makes it, and make `hapi/` in it (`0700`) | a plain `Error` |
 | 6. fetch every logical name once, from the configured provider only (for sops: the key checks, the file's shape, then `sops decrypt`) | a `SecretError` naming the file, the exit code or the names |
 | 7. check every value: present, not empty or blank, no single quote, no NUL | a `SecretError` naming `zone/ENV (name)` |
