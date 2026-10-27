@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# hapi-factory's pre-commit hook (Task 7b Step 5, H-057). Install it once per
+# clone: `git config core.hooksPath .githooks` (README, Quick start).
+#
+# Before each commit:
+# 1. gitleaks, at the version mise.toml pins, scans the staged changes. A
+#    finding stops the commit; its output is redacted, so the secret itself is
+#    never printed.
+# 2. No staged line or path holds one of the operator's personal strings
+#    (private/personal-strings.txt, .githooks/lib.sh). It names the file and
+#    line, never the string. In a clone without private/, as anyone but the
+#    operator has, this step is skipped with a notice.
+#
+# Don't skip it with --no-verify: CI scans for secrets too, but nothing else
+# checks personal strings before a push.
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
+# shellcheck source=.githooks/lib.sh
+. "$root/.githooks/lib.sh"
+
+# 1. Secrets. gitleaks exits 1 on a finding and something else when it fails. It is
+# quiet unless it finds something; then -v names the file, line and rule, redacted.
+status=0
+mise exec -- gitleaks git --pre-commit --staged --redact --no-banner --no-color --log-level warn -v . || status=$?
+if [[ "$status" -eq 1 ]]; then
+  echo "pre-commit: gitleaks found a possible secret in the staged changes (above, redacted). Unstage it and keep it out of the repo." >&2
+  exit 1
+elif [[ "$status" -ne 0 ]]; then
+  echo "pre-commit: gitleaks could not run (exit $status), so the commit is stopped. Run \`mise install\` in this checkout." >&2
+  exit 1
+fi
+
+# 2. Personal strings.
+patterns="$(personal_patterns)"
+if [[ -z "$patterns" ]]; then
+  skip_notice
+  exit 0
+fi
+trap 'rm -f "$patterns"' EXIT
+
+# Every added line as "path<TAB>line number<TAB>text", from a zero-context diff.
+# The prefixes are explicit, so a diff.noprefix or diff.mnemonicPrefix setting can't change "+++ b/<path>".
+# "+++ " is a file header only between "diff --git" and the first "@@": an added line
+# that starts with "++ " is "+++ ..." in the diff too, and must still be checked.
+added="$(git -c core.quotePath=false diff --cached -U0 --no-color --no-ext-diff --src-prefix=a/ --dst-prefix=b/ --diff-filter=ACMR |
+  awk '/^diff --git / { header = 1; next }
+       header && /^\+\+\+ / { file = substr($0, 7); next }
+       /^@@ / { header = 0; match($0, /\+[0-9]+/); line = substr($0, RSTART + 1, RLENGTH - 1) + 0; next }
+       !header && /^\+/ { print file "\t" line "\t" substr($0, 2); line++ }')"
+lines="$(printf '%s\n' "$added" | grep -F -i -f "$patterns" | cut -f1,2 | tr '\t' ':' || true)"
+paths="$(git -c core.quotePath=false diff --cached --name-only --diff-filter=ACMR | grep -F -i -f "$patterns" || true)"
+
+if [[ -n "$lines" || -n "$paths" ]]; then
+  echo "pre-commit: the staged changes hold a personal string from $PERSONAL_STRINGS:" >&2
+  [[ -z "$paths" ]] || printf '%s\n' "$paths" | sed 's/^/  in the path /' >&2
+  [[ -z "$lines" ]] || printf '%s\n' "$lines" | sed 's/^/  at /' >&2
+  echo "Replace it (\"the operator\", \$OWNER or <owner>), then stage and commit again." >&2
+  exit 1
+fi

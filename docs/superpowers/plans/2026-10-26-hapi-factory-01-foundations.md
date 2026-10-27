@@ -938,7 +938,7 @@ The repo stays private until this task is done. Its requirements are this text p
 
 - [ ] **Step 7: History rewrite (H-056) [operator].** Right before the first push, after Steps 1–6 are committed:
   1. Back up first: `git branch backup/pre-filter-repo` and `git bundle create private/pre-filter-repo.bundle --all`.
-  2. With the operator's go-ahead, run `git filter-repo --invert-paths --path research_notes --path reports --replace-text private/replacements.txt` (run from a pinned version, e.g. `uvx git-filter-repo==<version>`; adding it to mise.toml is **[operator]**).
+  2. With the operator's go-ahead, run `git filter-repo --invert-paths --path research_notes --path reports --replace-text private/replacements.txt --replace-message private/replacements.txt` (add `--mailmap private/mailmap` if the operator wants the author and committer email changed, e.g. to their GitHub noreply address) (run from a pinned version, e.g. `uvx git-filter-repo==<version>`; adding it to mise.toml is **[operator]**).
   3. Verify:
      - `gitleaks git --redact` over the whole rewritten history finds nothing;
      - `git log -p --all | grep -nF -f private/personal-strings.txt` finds nothing;

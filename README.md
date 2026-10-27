@@ -33,6 +33,7 @@ git clone https://github.com/j4th/hapi-factory.git   # the public remote is a ma
 cd hapi-factory
 mise trust                   # first time only: let mise load this repo's mise.toml
 mise install                 # install the exact tool versions pinned in mise.toml
+git config core.hooksPath .githooks   # the commit hooks: gitleaks on staged changes, and no personal strings
 mise run lint                # install JS deps from bun.lock, then type-check
 mise run test                # run the unit tests
 mise run hapi -- --version   # run the CLI (prints 0.1.0)
@@ -61,6 +62,7 @@ What exists now:
 | `mise.toml` | Tool pins and the [mise tasks](#mise-tasks). This is a protected path (spec §8.2): an interactive agent session must ask the operator before editing it, and unattended sessions and workers may not edit it at all. |
 | `package.json`, `bun.lock` | JS project metadata and dependencies, pinned to exact versions: `ajv` (JSON Schema validation) and `yaml` at runtime, `typescript` and `@types/bun` for development. The lockfile is committed. |
 | `.factory/config.yaml` | hapi-factory's own repo overlay (spec §7): when the factory works on this repo, it also protects `policy/**` and `stack/**`. An overlay can only tighten the central policy, and `.factory/**` is itself a protected path. Enforced once Plan 03's run engine loads overlays (H-172). |
+| `.githooks/` | The commit hooks, installed with `git config core.hooksPath .githooks`. `pre-commit` runs gitleaks, at the version `mise.toml` pins, on the staged changes, then stops the commit if a staged line or path holds one of the operator's personal strings (`private/personal-strings.txt`). `commit-msg` checks the message the same way. In a clone without `private/`, the personal-strings check is skipped with a notice. Don't bypass them with `--no-verify`. |
 | `.coderabbit.yaml` | CodeRabbit's review-only config (spec §9.6): every way it can write to the repo is off, and its tools stay on as a second opinion beside CI. A protected path, since CodeRabbit reviews a PR with that branch's own copy. |
 | `bunfig.toml` | Bun install settings: exact versions and a 3-day release-age cooldown (see [Toolchain and pinning](#toolchain-and-pinning)). |
 | `tsconfig.json` | Strict TypeScript settings, used only for type-checking. Bun runs the `.ts` files directly. |
