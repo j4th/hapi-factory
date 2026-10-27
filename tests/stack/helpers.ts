@@ -5,11 +5,20 @@
  * around) each zone's egress proxy.
  *
  * Everything a test creates carries the project's name: Compose's own
- * containers, networks and volumes, plus the label `org.hapi.int=<project>`
- * on every container started here with `docker run`. `Project.down` removes
- * exactly those, so other Docker workloads on the host are never touched.
+ * containers, networks and volumes, the images it builds, plus the label
+ * `org.hapi.int=<project>` on every container started here with `docker run`.
+ * `Project.down` removes exactly those, so other Docker workloads on the host
+ * are never touched.
+ *
+ * Nothing a running stack uses is touched either. The project runs a
+ * byte-for-byte copy of stack/ in its own temp dir, so the compose file's
+ * `../build/...` mounts resolve to the project's own build dir (`Project.build`,
+ * which the test fills with `buildAll`), never the checkout's build/, which the
+ * real `hapi` project bind-mounts. And the services Compose builds get
+ * project-named image tags, never the real stack's `hapi-factory/*` tags.
  */
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { parse, stringify } from "yaml";
@@ -63,6 +72,23 @@ export async function online(): Promise<boolean> {
   }
 }
 
+/**
+ * Every file under `dir` (none if it doesn't exist), each as its inode, size,
+ * mtime and SHA-256: equal snapshots mean nothing was written there, not even
+ * the same bytes in place.
+ */
+export function treeSnapshot(dir: string): Record<string, string> {
+  if (!existsSync(dir)) return {};
+  const out: Record<string, string> = {};
+  for (const rel of readdirSync(dir, { recursive: true, encoding: "utf8" }).sort()) {
+    const path = join(dir, rel);
+    const st = lstatSync(path);
+    if (!st.isFile()) continue;
+    out[rel] = `${st.ino}:${st.size}:${st.mtimeMs}:${createHash("sha256").update(readFileSync(path)).digest("hex")}`;
+  }
+  return out;
+}
+
 /** The stack's compose file, parsed (anchors merged). */
 export function composeFile(): { name?: string; services: Record<string, Record<string, unknown>>; networks: Record<string, Record<string, unknown> | null>; volumes?: Record<string, unknown> } {
   return parse(readFileSync(COMPOSE_FILE, "utf8"), { merge: true });
@@ -77,26 +103,42 @@ export interface CurlResult {
   stderr: string;
 }
 
-/** A throwaway Compose project of stack/compose.yaml, with its own XDG_RUNTIME_DIR. */
+/**
+ * A throwaway Compose project of stack/compose.yaml, with its own copy of
+ * stack/, its own build dir and its own XDG_RUNTIME_DIR, all under `root`.
+ */
 export class Project {
   readonly name = `hapi-int-${crypto.randomUUID().slice(0, 8)}`;
   readonly root = mkdtempSync(join(tmpdir(), "hapi-stack-int-"));
   readonly xdg = join(this.root, "run");
+  /** The project's copy of stack/; its compose file's `../build` is `build` below. */
+  readonly stack = join(this.root, "stack");
+  /** The generated configs this project mounts (the test writes them with `buildAll`). */
+  readonly build = join(this.root, "build");
+  readonly composeFile = join(this.stack, "compose.yaml");
   readonly overrideFile = join(this.root, "compose.override.yaml");
   private clients = new Map<string, string>();
 
-  constructor(override: Record<string, unknown>) {
+  /** `override` is the test's second compose file; each built service gets an `image` tag `<project>-<service>:int` in it. */
+  constructor(override: { services: Record<string, Record<string, unknown>> }) {
     mkdirSync(this.xdg, { mode: 0o700 });
-    writeFileSync(this.overrideFile, stringify(override));
+    cpSync(join(REPO, "stack"), this.stack, { recursive: true });
+    mkdirSync(this.build);
+    const services = { ...override.services };
+    for (const [service, def] of Object.entries(parse(readFileSync(this.composeFile, "utf8"), { merge: true }).services as Record<string, Record<string, unknown>>)) {
+      if (def.build === undefined) continue;
+      services[service] = { ...services[service], image: `${this.name}-${service}:int` };
+    }
+    writeFileSync(this.overrideFile, stringify({ ...override, services }));
   }
 
   get env(): Record<string, string | undefined> {
     return { ...process.env, XDG_RUNTIME_DIR: this.xdg };
   }
 
-  /** `docker compose` on this project: stack/compose.yaml plus the test's override. */
+  /** `docker compose` on this project: its copy of stack/compose.yaml plus the test's override. */
   compose(args: string[], timeoutMs = 300_000): Promise<Result> {
-    return run(["docker", "compose", "-p", this.name, "-f", COMPOSE_FILE, "-f", this.overrideFile, ...args], { env: this.env, timeoutMs });
+    return run(["docker", "compose", "-p", this.name, "-f", this.composeFile, "-f", this.overrideFile, ...args], { env: this.env, timeoutMs });
   }
 
   async mustCompose(args: string[], timeoutMs = 300_000): Promise<string> {
@@ -159,20 +201,45 @@ export class Project {
     return this.compose(["exec", "-T", service, ...cmd], 60_000);
   }
 
-  /** Remove everything this project made: Compose's containers, networks and volumes, and the labelled containers. */
+  /**
+   * The mounts a service's processes see (`/proc/self/mountinfo`): each mount
+   * point, with the per-mount options of the mount on top there (`ro` or `rw`
+   * first). These flags are what the kernel enforces, whoever writes.
+   */
+  async mounts(service: string): Promise<Map<string, string[]>> {
+    const r = await this.exec(service, ["cat", "/proc/self/mountinfo"]);
+    if (r.code !== 0) throw new Error(`${service}: cat /proc/self/mountinfo exited ${r.code}: ${r.stderr.trim()}`);
+    const found = new Map<string, string[]>();
+    for (const line of r.stdout.split("\n").filter(Boolean)) {
+      // id, parent, major:minor, root, mount point, mount options, ... (proc(5)); octal escapes for space and friends.
+      const f = line.split(" ");
+      found.set(f[4]!.replace(/\\([0-7]{3})/g, (_, o: string) => String.fromCharCode(parseInt(o, 8))), f[5]!.split(","));
+    }
+    return found;
+  }
+
+  /** Remove everything this project made: Compose's containers, networks and volumes, the labelled containers and the images it built. */
   async down(): Promise<void> {
     // The labelled containers first: Compose can't remove a network they are still attached to.
     const ids = (await run(["docker", "ps", "-aq", "--filter", `label=org.hapi.int=${this.name}`])).stdout.split("\n").filter(Boolean);
     if (ids.length > 0) await run(["docker", "rm", "-f", "-v", ...ids]);
     const r = await this.compose(["down", "-v", "--remove-orphans", "-t", "5"], 180_000);
+    // The images this project built (none if the zone services were skipped); never the real stack's.
+    const built = (await run(["docker", "image", "ls", "--filter", `reference=${this.name}-*`, "--format", "{{.Repository}}:{{.Tag}}"])).stdout.split("\n").filter(Boolean);
+    if (built.length > 0) await run(["docker", "image", "rm", ...built]);
     rmSync(this.root, { recursive: true, force: true });
     if (r.code !== 0) throw new Error(`docker compose -p ${this.name} down failed (exit ${r.code}): ${r.stderr.trim()}`);
   }
 
-  /** What is left of this project in Docker: containers, networks and volumes named after it. */
+  /** What is left of this project in Docker: containers, networks, volumes and images named after it. */
   async leftovers(): Promise<string[]> {
-    const list = async (kind: string[], field: string) =>
-      (await run(["docker", ...kind, "--filter", `name=${this.name}`, "--format", `{{.${field}}}`])).stdout.split("\n").filter(Boolean);
-    return [...(await list(["ps", "-a"], "Names")), ...(await list(["network", "ls"], "Name")), ...(await list(["volume", "ls"], "Name"))];
+    const list = async (kind: string[], filter: string, field: string) =>
+      (await run(["docker", ...kind, "--filter", filter, "--format", field])).stdout.split("\n").filter(Boolean);
+    return [
+      ...(await list(["ps", "-a"], `name=${this.name}`, "{{.Names}}")),
+      ...(await list(["network", "ls"], `name=${this.name}`, "{{.Name}}")),
+      ...(await list(["volume", "ls"], `name=${this.name}`, "{{.Name}}")),
+      ...(await list(["image", "ls"], `reference=${this.name}-*`, "{{.Repository}}:{{.Tag}}")),
+    ];
   }
 }

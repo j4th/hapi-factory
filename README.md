@@ -340,7 +340,12 @@ Task 5 wrote the stack and proved its egress boundary on the build host's own Do
 1. **Host setup, once:** `sudo scripts/host-setup.sh "$PWD"` from your checkout (or with no argument once the GitHub remote exists). It creates the `hapi` user, rootless Docker with lingering, a pinned mise and hapi's checkout, then prints the next steps. Check: `sudo -iu hapi docker info --format '{{.SecurityOptions}}'` contains `rootless`.
 2. **hapi's toolchain:** as `hapi`, `export XDG_RUNTIME_DIR=/run/user/$(id -u)`, then `cd ~/hapi-factory && mise trust && mise install && mise run setup`.
 3. **hapi's secrets:** copy your store, its recipients file and `recovery.age` into `/home/hapi/.config/hapi/` with `sudo install -o hapi -g hapi -m 0600`; as `hapi`, `mise run secrets:join -- --store ~/.config/hapi/secrets.enc.yaml --name hapi`; run the `add-machine` command it prints in your checkout; copy the three files again; as `hapi`, `mise run secrets:check`.
-4. **Start and test:** `mise run up`, then as `hapi`, `mise run test:int`, and `docker compose -p hapi ps` shows all five services healthy. Until the Slack values exist (Task 13), `up` stops at the secrets step ([the open item](docs/runbooks/stack.md#open-items)).
+4. **Start and test:**
+   - Run `mise run up`.
+   - As `hapi`, run `mise run test:int`. It runs its own throwaway copy of the stack, with its own generated configs, so it leaves the running stack and the checkout's `build/` alone.
+   - Check that `docker compose -p hapi ps` shows all five services healthy.
+
+   Until the Slack values exist (Task 13), `up` stops at the secrets step ([the open item](docs/runbooks/stack.md#open-items)).
 
 ## Documentation map
 

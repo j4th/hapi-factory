@@ -9,7 +9,13 @@
  * XDG_RUNTIME_DIR, and the test's override (a second compose file) adds only
  * `extra_hosts` on the proxies, which plant names that resolve to private,
  * NAT64 and other special addresses, so the DNS-rebinding checks need no DNS
- * server, and blanks Hermes's Slack tokens so the gateway calls nobody.
+ * server, blanks Hermes's Slack tokens so the gateway calls nobody, and gives
+ * the built images project-named tags.
+ *
+ * Nothing a running stack uses is touched, so this may run beside `mise run
+ * up`'s `hapi` project: the configs are generated into the project's own
+ * build dir, which its own copy of stack/ mounts (tests/stack/helpers.ts), and
+ * afterAll checks that the checkout's build/ was not written to.
  *
  * External network: the tests whose names say "(internet)" need this host to
  * reach api.anthropic.com, github.com, example.com and 1.1.1.1, and the zone
@@ -29,7 +35,7 @@ import { loadManifest, type Manifest } from "../../src/secrets/manifest";
 import { resolveSecrets, type SecretProvider } from "../../src/secrets/provider";
 import { cidrContains } from "../../src/stack/cidr";
 import { CLIENT_RANGES } from "../../src/generate/egress";
-import { composeFile, must, online, Project, REPO } from "./helpers";
+import { composeFile, must, online, Project, REPO, treeSnapshot } from "./helpers";
 
 const INT = Boolean(process.env.HAPI_INT);
 const ONLINE = INT ? await online() : false;
@@ -64,8 +70,11 @@ describe.skipIf(!INT)("the stack's egress boundary (throwaway compose project)",
   const blank = { SLACK_BOT_TOKEN: "", SLACK_APP_TOKEN: "", SLACK_ALLOWED_USERS: "" };
   // Made in beforeAll, so a skipped run (the unit suite) creates nothing.
   let p: Project;
+  // The checkout's own build/, which a running stack bind-mounts: the test must never write there.
+  let liveBuild: Record<string, string>;
 
   beforeAll(async () => {
+    liveBuild = treeSnapshot(join(REPO, "build"));
     p = new Project({
       services: {
         "egress-hermes": { extra_hosts: PLANTED.allowlisted },
@@ -74,19 +83,36 @@ describe.skipIf(!INT)("the stack's egress boundary (throwaway compose project)",
         hermes: { environment: blank },
       },
     });
-    // As `mise run up` does: the generated configs, then the zone env files, then the stack.
-    await buildAll(loadPolicy(join(REPO, "policy")), join(REPO, "build"));
+    // As `mise run up` does: the generated configs (into the project's own build dir), then the zone env files, then the stack.
+    await buildAll(loadPolicy(join(REPO, "policy")), p.build);
     const manifest: Manifest = loadManifest(join(REPO, "stack", "secrets.yaml"));
     manifest.archon = { ...manifest.archon, HAPI_INT_PROBE: "hapi-int-probe" };
     await resolveSecrets(manifest, fakeProvider, { outDir: join(p.xdg, "hapi") });
     await p.mustCompose(["up", "-d", "--wait", "--wait-timeout", "120", "egress-hermes", "egress-archon", "egress-research"]);
   }, 600_000);
 
+  /**
+   * Each `ro` mount point of `service` is mounted read-only and each `rw` one read-write (the control: the flags
+   * are read, not assumed), from the kernel's own mount table. Then the behaviour: a write to `probe` (by default
+   * a new file in /) fails with EROFS. A write as the service's non-root user fails with EACCES anyway on a
+   * root-owned or foreign file, so only "Read-only file system" proves the read-only mount (H-146(c)).
+   */
+  const expectMounts = async (service: string, want: { ro: string[]; rw: string[] }, probe = "/hapi-ro-probe") => {
+    const mounts = await p.mounts(service);
+    const flag = (point: string) => mounts.get(point)?.[0] ?? "not mounted";
+    for (const point of want.ro) expect([service, point, flag(point)]).toEqual([service, point, "ro"]);
+    for (const point of want.rw) expect([service, point, flag(point)]).toEqual([service, point, "rw"]);
+    const w = await p.exec(service, ["sh", "-c", 'echo x > "$1"', "sh", probe]);
+    expect([service, probe, w.code === 0, /Read-only file system/.test(w.stderr)]).toEqual([service, probe, false, true]);
+  };
+
   afterAll(async () => {
     if (p === undefined) return;
     await p.down();
-    // Nothing of the throwaway project is left behind.
+    // Nothing of the throwaway project is left behind...
     expect(await p.leftovers()).toEqual([]);
+    // ...and nothing outside it was touched: the checkout's build/ is as it was, inode for inode.
+    expect(treeSnapshot(join(REPO, "build"))).toEqual(liveBuild);
   }, 300_000);
 
   describe("the networks", () => {
@@ -106,14 +132,14 @@ describe.skipIf(!INT)("the stack's egress boundary (throwaway compose project)",
       expect(names.sort()).toEqual(["egress-archon", "egress-hermes", "egress-research"]);
     });
 
-    test("each proxy runs non-root, with no capabilities and a read-only root filesystem", async () => {
+    test("each proxy runs non-root, with no capabilities and a read-only root filesystem and config", async () => {
       for (const zone of ["hermes", "archon", "research"]) {
         const service = `egress-${zone}`;
         const status = (await p.exec(service, ["cat", "/proc/1/status"])).stdout;
         expect([service, /^Uid:\s+(\d+)/m.exec(status)?.[1]]).not.toEqual([service, "0"]);
         expect([service, /^CapEff:\s+(\w+)/m.exec(status)?.[1]]).toEqual([service, "0000000000000000"]);
         expect([service, /^NoNewPrivs:\s+(\d)/m.exec(status)?.[1]]).toEqual([service, "1"]);
-        expect([service, (await p.exec(service, ["sh", "-c", "echo x > /hapi-ro-probe"])).code]).not.toEqual([service, 0]);
+        await expectMounts(service, { ro: ["/", "/etc/squid/hapi.conf"], rw: ["/tmp", "/var/spool/squid", "/var/log/squid"] });
       }
     });
   });
@@ -163,7 +189,7 @@ describe.skipIf(!INT)("the stack's egress boundary (throwaway compose project)",
     // Two throwaway proxies on archon-net, each with 203.0.113.7 <-> api.anthropic.com in /etc/hosts, which Squid
     // uses for reverse lookups too: the real archon config, and the control with both defences removed.
     const squidImage = String(composeFile().services["egress-archon"]!.image);
-    const real = readFileSync(join(REPO, "build", "egress", "archon.squid.conf"), "utf8");
+    const real = readFileSync(join(p.build, "egress", "archon.squid.conf"), "utf8");
     const weak = real.replaceAll("dstdomain -n ", "dstdomain ").replace("http_access deny ip_literal\n", "");
     expect(weak).not.toBe(real);
     const proxies: Record<string, string> = {};
@@ -291,8 +317,9 @@ describe.skipIf(!INT)("the stack's egress boundary (throwaway compose project)",
         expect([service, /^Uid:\s+(\d+)/m.exec(status)?.[1]]).toEqual([service, uid]);
         expect([service, /^CapEff:\s+(\w+)/m.exec(status)?.[1]]).toEqual([service, "0000000000000000"]);
         expect([service, /^NoNewPrivs:\s+(\d)/m.exec(status)?.[1]]).toEqual([service, "1"]);
-        expect([service, (await p.exec(service, ["sh", "-c", "echo x > /hapi-ro-probe"])).code]).not.toEqual([service, 0]);
       }
+      await expectMounts("archon", { ro: ["/", "/.archon/config.yaml"], rw: ["/tmp", "/.archon", "/home/appuser"] });
+      await expectMounts("hermes", { ro: ["/", "/opt/data/config.yaml"], rw: ["/tmp", "/run", "/opt/data"] });
     });
 
     test("each sees only its own zone's secrets, never host.env, and its own proxy", async () => {
@@ -314,9 +341,9 @@ describe.skipIf(!INT)("the stack's egress boundary (throwaway compose project)",
       for (const line of ["HOST=127.0.0.1", "ARCHON_TELEMETRY_DISABLED=1", "DO_NOT_TRACK=1", "PI_OFFLINE=1", "PI_TELEMETRY=0", "PI_CODING_AGENT_DIR=/opt/hapi/pi-agent"]) {
         expect(env.split("\n")).toContain(line);
       }
-      expect((await p.exec("archon", ["cat", "/opt/hapi/pi-agent/models.json"])).stdout).toBe(readFileSync(join(REPO, "build", "pi", "models.json"), "utf8"));
-      expect((await p.exec("archon", ["sh", "-c", "echo x > /opt/hapi/pi-agent/models.json"])).code).not.toBe(0);
-      expect((await p.exec("archon", ["cat", "/.archon/config.yaml"])).stdout).toBe(readFileSync(join(REPO, "build", "archon", "config.yaml"), "utf8"));
+      expect((await p.exec("archon", ["cat", "/opt/hapi/pi-agent/models.json"])).stdout).toBe(readFileSync(join(p.build, "pi", "models.json"), "utf8"));
+      await expectMounts("archon", { ro: ["/opt/hapi/pi-agent"], rw: [] }, "/opt/hapi/pi-agent/models.json");
+      expect((await p.exec("archon", ["cat", "/.archon/config.yaml"])).stdout).toBe(readFileSync(join(p.build, "archon", "config.yaml"), "utf8"));
     });
 
     test("a single-quoted env_file value reaches the container byte for byte (newline, $, #, spaces, backslash, quote)", async () => {

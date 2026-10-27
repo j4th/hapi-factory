@@ -15,7 +15,7 @@ This runbook covers running the hapi-factory stack (spec §4.3, §9, §10, §11.
 It runs in two stages:
 
 - **Stage a (done in Plan 01 Task 5):** the files below were written, and the integration tests ran on the build host's rootful Docker as an ordinary user. That run covered the egress proxies and networks, plus Hermes and Archon started with fake secrets. No real secret was used, and `scripts/host-setup.sh` was not run.
-- **Stage b (the operator, later):** sections 1–4 on the real host, as the `hapi` user on rootless Docker, then `mise run test:int` there.
+- **Stage b (the operator, later):** sections 1–4 on the real host, as the `hapi` user on rootless Docker, then `mise run test:int` there. It may run while the stack is up, because it never touches the running stack or the checkout's `build/` ([what the tests prove](#what-the-tests-prove)).
 
 Every command marked *as hapi* runs in a shell of the `hapi` user (`sudo -iu hapi`). The other commands run as the operator, from the operator's own checkout.
 
@@ -273,11 +273,19 @@ Spike T12 re-checks these settings under rootless Docker. If it relaxes one, it 
 | `tests/scripts/host-setup.test.ts` | It never runs the script. `bash -n` parses it, and shellcheck lints it when on PATH. It is in strict mode, and every step runs after the root check. Each step checks before it acts. The subordinate ID range covers uid 584792. Docker is rootless and lingering is on. mise is pinned to `min_version`, checked by SHA-256, and never piped to a shell. The checkout goes where `up` re-execs. The next steps are printed. |
 | `tests/generate/egress.test.ts` | The proxies' new `to_localnet` ranges (`::/96`, `2002::/16`, `2001::/32`, `100::/64`, `fec0::/10`). No range covers another, so `squid -k parse` stays clean. `pinger_enable off` is set, and the NAT64 trade-off is noted. |
 
-`mise run test:int` (`HAPI_INT=1`) runs every `*.int.test.ts`. It needs Docker, and the internet for the tests marked so; offline, those are skipped with a warning. Each run builds its own Compose project, `hapi-int-<random>`, from the same `stack/compose.yaml`. It uses fake secrets written by hapi's own resolver, plus a test override that only plants `/etc/hosts` names on the proxies and blanks Hermes's Slack tokens. Afterwards it removes every container, network and volume it made, and checks that none is left.
+`mise run test:int` (`HAPI_INT=1`) runs every `*.int.test.ts`. It needs Docker, and the internet for the tests marked so; offline, those are skipped with a warning. Each run builds its own Compose project, `hapi-int-<random>`, from a byte-for-byte copy of `stack/` in a temp dir. It uses fake secrets written by hapi's own resolver, plus a test override that only plants `/etc/hosts` names on the proxies, blanks Hermes's Slack tokens and gives the images it builds project-named tags. Afterwards it removes every container, network, volume and image it made, and checks that none is left.
+
+It never touches a running stack, so you can run it while the `hapi` project is up:
+
+- It generates the configs into its own temp build dir, and its copy of `stack/compose.yaml` mounts that dir (the compose file's `../build/...` paths resolve next to the copy).
+- The checkout's `build/`, which the running stack bind-mounts, is never written. The test checks this at the end: every file there must keep its inode, size, mtime and hash.
+- It never builds or retags the real stack's `hapi-factory/hermes` and `hapi-factory/archon` images.
+
+It does start a second Hermes and Archon, with fake keys, so allow for their memory (up to 4 GB each).
 
 | Test (`tests/stack/egress.int.test.ts`) | What it proves |
 |---|---|
-| the networks | The zone networks Docker makes are internal and inside `zone_clients`, and only the three proxies are on `outbound`. Each proxy runs non-root, with no capabilities and a read-only root. |
+| the networks | The zone networks Docker makes are internal and inside `zone_clients`, and only the three proxies are on `outbound`. Each proxy runs non-root, with no capabilities. Its root and its config are read-only, and so are its mounts; see [how the read-only checks work](#how-the-read-only-checks-work). |
 | `egress: allowed host via proxy succeeds` (archon and hermes; internet) | `api.anthropic.com` tunnels through its zone's proxy, `API.Anthropic.COM` too. |
 | `egress: disallowed host via proxy is denied` | A host off the allowlist gets `403`: `github.com` for archon, `example.com` for hermes. |
 | every IP-literal destination is refused | `203.0.113.7`, `1.2.3.4`, `[2001:db8::1]`, `[::ffff:1.2.3.4]`, `[::ffff:203.0.113.7]`, `[::]`, `[::1]`, `[64:ff9b::1.2.3.4]` and `2130706433` all get `403` in both allowlisted zones. They are sent raw, so curl normalises nothing. |
@@ -294,9 +302,9 @@ Spike T12 re-checks these settings under rootless Docker. If it relaxes one, it 
 | `egress: direct connection is blocked even when proxy is stopped` | With `egress-archon` stopped, the proxy route fails, and so do direct connections over IPv4 and IPv6. They fail closed, never bypass. |
 | `archon listens on loopback only` (internet: the image build) | `127.0.0.1:3090/api/health` answers inside the container. From archon-net, `archon:3090` and `:3000` refuse the connection. |
 | hermes listens on loopback only | Every listening socket in the Hermes container is on a loopback address. |
-| the zone services' hardening | Archon runs as 1001 and Hermes as 10000, with no capabilities, `NoNewPrivs` and a read-only root. |
+| the zone services' hardening | Archon runs as 1001 and Hermes as 10000, with no capabilities and `NoNewPrivs`. The root and the config files (`/.archon/config.yaml`, `/opt/data/config.yaml`) are mounted read-only, and a write to `/` fails with `Read-only file system`. The controls: the tmpfs and volume paths are mounted read-write. |
 | zone separation | Each container sees its own zone's values and its own proxy. Neither sees the other zone's values, the research values or any `host.env` value (the App keys). |
-| archon's generated config | `archon.env`'s settings are in its environment. `build/pi` is at `PI_CODING_AGENT_DIR`, the same bytes, and read-only. `build/archon/config.yaml` is Archon's config. |
+| archon's generated config | `archon.env`'s settings are in its environment. The test's `build/pi` is at `PI_CODING_AGENT_DIR`, the same bytes. That mount is read-only, and a write to `models.json` fails with `Read-only file system`. The test's `build/archon/config.yaml` is Archon's config. |
 | the env_file round trip (H-019) | A value holding a newline, `$`, `${...}`, `#`, spaces, a backslash, a double quote and a tab reaches the container byte for byte, through hapi's writer and Compose's `env_file`. |
 | the pins at run time | Hermes reports v0.22.5. Archon reports 0.12.1, with Pi 1.3.0, Node 24.22.1, uv 0.13.5 and Python 3.14.9. |
 | from inside archon (internet) | Its proxy variables reach `api.anthropic.com` and get `403` for `github.com`. |
@@ -305,5 +313,14 @@ Spike T12 re-checks these settings under rootless Docker. If it relaxes one, it 
 |---|---|
 | `tests/secrets/sops.int.test.ts` | The whole key lifecycle on the real sops and age, and now also these: <br>- the store stays mode `0600` after each real `sops rotate` (add-machine, revoke, recover); <br>- decoy gpg-agent sockets in each machine's `HOME` and `XDG_RUNTIME_DIR` are never dialled; <br>- sops 3.13.3 reads its default key file as well as `SOPS_AGE_KEY_FILE` (the control: it fails without it), which is why `checkSopsKeys` checks that file; <br>- sops leaves `""` unencrypted, which `sopsFileProblem` allows. |
 | `tests/generate/policy-build.int.test.ts` | `mise run policy:build -- --roster budget --out <dir>` passes its flags through mise: it writes the ten files with the budget roster. An unknown roster exits non-zero and writes nothing. |
+
+#### How the read-only checks work
+
+Each read-only check reads two things, so dropping `read_only: true` or a `:ro` makes it fail:
+
+- **The mount flag.** The test reads the kernel's mount table as the container sees it (`/proc/self/mountinfo`). Each read-only path must be mounted `ro`, and each writable path `rw`.
+- **The error.** A write must fail with `Read-only file system` (EROFS).
+
+Neither "the write failed" nor its exit code proves anything. Each service writes as its non-root user. A file it doesn't own, or a root-owned `/`, refuses that write with `Permission denied` whether or not the mount is read-only. Stage a checked this by removing `read_only: true` and the `:ro` on `build/pi`: the old checks still passed, and the new ones failed.
 
 Stage a ran all of these on the build host's rootful Docker, as an ordinary user. Stage b runs them again as hapi on rootless Docker.
