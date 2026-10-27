@@ -85,13 +85,25 @@ function anthropicModel(p: Policy, role: Role): { id: string; effort: Effort } {
  * "docs/*.md" becomes "*.md". Our globs ignore case, and fnmatch on Linux
  * doesn't, so each letter becomes a bracket class: "AGENTS.md" is emitted as
  * "[aA][gG][eE][nN][tT][sS].[mM][dD]" (fnmatch reads brackets; our glob syntax
- * forbids them, so no other meaning can sneak in). Globs ending in "**" match
+ * forbids them, so no other meaning can sneak in). The class holds every code
+ * point that `globMatches` folds to that letter, so "s" is "[sSſ]" and "k" is
+ * "[kK\u212A]" (the Kelvin sign); globs are ASCII-only, so no other letter needs one. Globs ending in "**" match
  * whole directories, which a basename can't say; they are returned separately
  * for the comment.
  */
-/** An fnmatch pattern that matches `s` in any case: each ASCII letter becomes `[xX]`. */
+/**
+ * The non-ASCII code points that Unicode simple case folding (`globMatches`'s "iu"
+ * flags) maps to an ASCII letter: the long s and the Kelvin sign, and no others
+ * (tests/policy/paths.test.ts checks every code point).
+ */
+export const NON_ASCII_FOLDS: Readonly<Record<string, string>> = Object.freeze({ k: "\u212A", s: "\u017F" });
+
+/** An fnmatch pattern that matches `s` in any case, as `globMatches` does: each ASCII letter becomes a class of every code point that folds to it. */
 function foldCase(s: string): string {
-  return s.replace(/[a-z]/gi, (c) => `[${c.toLowerCase()}${c.toUpperCase()}]`);
+  return s.replace(/[a-z]/gi, (c) => {
+    const l = c.toLowerCase();
+    return `[${l}${l.toUpperCase()}${NON_ASCII_FOLDS[l] ?? ""}]`;
+  });
 }
 
 function instructionPatterns(p: Policy): { patterns: string[]; directories: string[] } {

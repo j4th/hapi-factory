@@ -75,7 +75,7 @@ The schema (`pathGlob` in `policy-defs.schema.json`) accepts only this dialect, 
 | `a/**/b` | `a/b`, `a/x/b`, `a/x/y/b` |
 | `*.md`, `docs/?.md` | `*` matches any run of characters within one segment and `?` exactly one. Neither crosses a `/`. Dotfiles aren't special. |
 
-Every other character is literal. A glob may not have a `.`, `..` or empty segment, or a leading or trailing `/`. It may not contain `[`, `]`, `{`, `}`, `!`, a backslash or a control character. `**` must be a whole segment. These rules make each path have one spelling, and they stop another glob dialect from reading a different meaning into a key, such as `!` as negation.
+Every other character is literal. A glob may not have a `.`, `..` or empty segment, or a leading or trailing `/`. It may not contain `[`, `]`, `{`, `}`, `!`, a backslash, a control character or anything outside printable ASCII, so every guard folds its case the same way. `**` must be a whole segment. These rules make each path have one spelling, and they stop another glob dialect from reading a different meaning into a key, such as `!` as negation.
 
 ### `commands.yaml`
 

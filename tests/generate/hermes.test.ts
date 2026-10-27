@@ -95,7 +95,7 @@ describe("protected instruction files", () => {
     const c = config();
     expect(c.security.protected_instruction_files).toBe(true);
     expect(c.security.protected_instruction_extra_patterns).toEqual(
-      [".[cC][oO][dD][eE][rR][aA][bB][bB][iI][tT].[cC][oO][nN][fF][iI][gG].[tT][sS]", ".[cC][oO][dD][eE][rR][aA][bB][bB][iI][tT].[yY][aA][mM][lL]", ".[cC][oO][dD][eE][rR][aA][bB][bB][iI][tT].[yY][mM][lL]", ".[cC][uU][rR][sS][oO][rR][rR][uU][lL][eE][sS]", ".[hH][eE][rR][mM][eE][sS].[mM][dD]", ".[wW][iI][nN][dD][sS][uU][rR][fF][rR][uU][lL][eE][sS]", "[aA][gG][eE][nN][tT].[mM][dD]", "[aA][gG][eE][nN][tT][sS].[mM][dD]", "[aA][gG][eE][nN][tT][sS].[oO][vV][eE][rR][rR][iI][dD][eE].[mM][dD]", "[cC][lL][aA][uU][dD][eE].[lL][oO][cC][aA][lL].[mM][dD]", "[cC][lL][aA][uU][dD][eE].[mM][dD]", "[gG][eE][mM][iI][nN][iI].[mM][dD]", "[hH][eE][rR][mM][eE][sS].[mM][dD]", "[mM][iI][sS][eE].[tT][oO][mM][lL]", "[rR][eE][vV][iI][eE][wW].[mM][dD]", "[sS][oO][uU][lL].[mM][dD]"],
+      [".[cC][oO][dD][eE][rR][aA][bB][bB][iI][tT].[cC][oO][nN][fF][iI][gG].[tT][sS\u017F]", ".[cC][oO][dD][eE][rR][aA][bB][bB][iI][tT].[yY][aA][mM][lL]", ".[cC][oO][dD][eE][rR][aA][bB][bB][iI][tT].[yY][mM][lL]", ".[cC][uU][rR][sS\u017F][oO][rR][rR][uU][lL][eE][sS\u017F]", ".[hH][eE][rR][mM][eE][sS\u017F].[mM][dD]", ".[wW][iI][nN][dD][sS\u017F][uU][rR][fF][rR][uU][lL][eE][sS\u017F]", "[aA][gG][eE][nN][tT].[mM][dD]", "[aA][gG][eE][nN][tT][sS\u017F].[mM][dD]", "[aA][gG][eE][nN][tT][sS\u017F].[oO][vV][eE][rR][rR][iI][dD][eE].[mM][dD]", "[cC][lL][aA][uU][dD][eE].[lL][oO][cC][aA][lL].[mM][dD]", "[cC][lL][aA][uU][dD][eE].[mM][dD]", "[gG][eE][mM][iI][nN][iI].[mM][dD]", "[hH][eE][rR][mM][eE][sS\u017F].[mM][dD]", "[mM][iI][sS\u017F][eE].[tT][oO][mM][lL]", "[rR][eE][vV][iI][eE][wW].[mM][dD]", "[sS\u017F][oO][uU][lL].[mM][dD]"],
     );
   });
 
@@ -118,7 +118,7 @@ describe("protected instruction files", () => {
         "keys/**": DENY,
       }),
     );
-    expect(c.security.protected_instruction_extra_patterns).toEqual(["*.[pP][eE][mM]", "[sS][eE][cC][rR][eE][tT].[mM][dD]"]);
+    expect(c.security.protected_instruction_extra_patterns).toEqual(["*.[pP][eE][mM]", "[sS\u017F][eE][cC][rR][eE][tT].[mM][dD]"]);
   });
 
   test("the patterns are a superset: every file a Hermes-relevant glob matches, some pattern matches", () => {
@@ -128,7 +128,7 @@ describe("protected instruction files", () => {
     // (the only brackets: the glob syntax forbids them, so they come from case folding).
     const fnmatch = (pat: string, name: string) =>
       new RegExp(`^${pat.replace(/[.+^${}()|\\]/g, "\\$&").replaceAll("*", ".*").replaceAll("?", ".")}$`).test(name);
-    const files = ["AGENTS.md", "agents.MD", "docs/README.md", "Docs/a.MD", "a/key1.txt", "a/b/c/KEYZ.txt", "x/y/z.cfg", "X/Y/Z.CFG"];
+    const files = ["AGENTS.md", "agents.MD", "docs/README.md", "Docs/a.MD", "a/key1.txt", "a/b/c/KEYZ.txt", "a/\u212Aey2.txt", "x/y/z.cfg", "X/Y/Z.CFG"];
     for (const [glob] of Object.entries(paths)) {
       for (const file of files.filter((f) => globMatches(glob, f))) {
         expect(patterns.some((pat) => fnmatch(pat, basename(file)))).toBe(true);
@@ -140,7 +140,7 @@ describe("protected instruction files", () => {
     const a = emitHermes(withPaths({ "**/SECRET.md": ASK, "docs/SECRET.md": DENY, ".github/**": ASK, ".github/workflows/**": DENY }));
     const b = emitHermes(withPaths({ ".github/workflows/**": DENY, ".github/**": ASK, "docs/SECRET.md": DENY, "**/SECRET.md": ASK }));
     expect(a).toEqual(b);
-    expect(YAML.parse(a["config.yaml"]!).security.protected_instruction_extra_patterns).toEqual(["[sS][eE][cC][rR][eE][tT].[mM][dD]"]);
+    expect(YAML.parse(a["config.yaml"]!).security.protected_instruction_extra_patterns).toEqual(["[sS\u017F][eE][cC][rR][eE][tT].[mM][dD]"]);
   });
 });
 

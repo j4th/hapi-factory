@@ -1,3 +1,4 @@
+import { NON_ASCII_FOLDS } from "../../src/generate/hermes";
 import { describe, expect, test } from "bun:test";
 import { loadPolicy } from "../../src/policy/load";
 import { effectiveModes, globMatches } from "../../src/policy/paths";
@@ -23,6 +24,7 @@ describe("globMatches", () => {
     [".github/**", ".GitHub/workflows/ci.yml", true],
     // Case folding is Unicode's: the long s (U+017F) folds to "s", so it matches too.
     ["**/SOUL.md", "\u017FOUL.md", true],
+    ["keys/**", "\u212Aeys/a.pem", true], // the Kelvin sign folds to "k"
     // Every other character is literal: "." is not a regex wildcard.
     ["mise.toml", "misextoml", false],
     // "dir/**" covers the directory itself and everything under it, dotfiles included.
@@ -128,6 +130,17 @@ describe("effectiveModes", () => {
   });
 });
 
+test("only the long s and the Kelvin sign fold to an ASCII letter (src/generate/hermes.ts's NON_ASCII_FOLDS)", () => {
+  const letter = /^[a-z]$/iu;
+  const found: Record<string, string> = {};
+  for (let cp = 0x80; cp <= 0x10ffff; cp++) {
+    if (cp >= 0xd800 && cp <= 0xdfff) continue; // lone surrogates aren't code points of a string
+    const ch = String.fromCodePoint(cp);
+    if (letter.test(ch)) for (const a of "abcdefghijklmnopqrstuvwxyz") if (new RegExp(`^${a}$`, "iu").test(ch)) found[a] = ch;
+  }
+  expect(found).toEqual({ ...NON_ASCII_FOLDS });
+});
+
 describe("protected-path glob syntax (schema)", () => {
   const modes = { interactive: "ask", unattended: "deny", workers: "deny" };
   const keyIssue = (glob: string) =>
@@ -154,6 +167,9 @@ describe("protected-path glob syntax (schema)", () => {
       "a**", // "**" not a whole segment
       "**a/b",
       "a/***",
+      "**/\u00C4GENTS.md", // non-ASCII: its case folding could differ between guards
+      "\u017FOUL.md", // the long s, which folds to "s"
+      "a\u00A0b", // a no-break space
       "",
     ]) {
       expect(keyIssue(glob)).toEqual(["invalid key"]);
