@@ -154,7 +154,7 @@ git add -A
 git commit -m "chore: hapi-factory skeleton, toolchain, CI; add design, recon report and research notes"
 ```
 
-- [ ] **Step 6: Manual (the operator; outward-facing).** Rename the local repo to `hapi-factory`. Create the **public** GitHub repo `j4th/hapi-factory`, push `main`, and add a ruleset on `main`: 1 approving review, required check `ci`. Task 5 clones from this remote.
+- [ ] **Step 6: Manual (the operator; outward-facing).** Superseded: the repos were created private and empty, and nothing is pushed until Task 7b is done. The publish sequence (push, make hapi-factory public, the two `main` rulesets) is the register's H-074 and H-075, and README's "Publishing, after Task 7b".
 
 ---
 

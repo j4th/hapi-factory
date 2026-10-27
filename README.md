@@ -240,21 +240,56 @@ Plan 05 builds the template and `mise run new-repo`. This section will become th
 
 These steps are outward-facing or privileged, so agents never do them; the operator does them by hand. Later tasks add their own steps here.
 
-### Plan 01 Task 1: the GitHub remote and the `main` rulesets
+**The order.** Each step needs the ones before it:
+1. Your secrets store, the provider keys and the MCP keys ([Tasks 4, 4b and 4c](#plan-01-tasks-4-4b-and-4c-your-secrets-store-provider-keys-and-slack), [Task 3b](#plan-01-task-3b-mcp-server-keys)).
+2. The Slack app (step 3 of Tasks 4, 4b and 4c).
+3. Task 7b, the pre-publish cleanup. Agents do most of it; you approve its gated steps: the edits to protected files, the license and the history rewrite.
+4. Publishing, the GitHub Apps and CodeRabbit ([Publishing](#publishing-after-task-7b-the-remotes-the-rulesets-and-the-apps)). The rulesets need a public repo, and the Apps need the rulesets.
+5. The host and the stack, stage b ([Task 5](#plan-01-task-5-the-host-and-the-stack-stage-b)). `mise run up` refuses an empty secret, so the Slack and App values must be in your store first.
 
-1. **Rename the local repo to `hapi-factory`.** This is already done: the working directory is `hapi-factory`.
+### Plan 01 Task 3b: MCP server keys
 
-2. **Create the public repo and push `main`.**
+`policy/mcp.yaml` names each MCP server's secret by its logical name (`secret:hapi-mcp-<name>`). Add each to your secrets store under exactly this name (`mise run secrets:edit`, [docs/secrets.md](docs/secrets.md#adding-a-secret)):
+
+| Logical name | Manifest entry | What it is | Needed when |
+|---|---|---|---|
+| `hapi-mcp-context7-api-key` | `research` / `HAPI_MCP_CONTEXT7_API_KEY` (already in `stack/secrets.yaml`) | A Context7 API key, on a spend-capped, search-only account (spec §10.1). Task 4's [provider-keys runbook](docs/runbooks/provider-keys.md#search-keys-brave-exa-context7) covers it. | Now: `hapi secrets resolve` needs every name in the manifest |
+| `hapi-mcp-phoenix-viewer-key` | `hermes` / `HAPI_MCP_PHOENIX_VIEWER_KEY` (add it to the manifest then) | A Phoenix API key minted by a **VIEWER**-role user, never an admin or member | Before you turn on the observability profile (`flags.otel.enabled: true`); until it's in the manifest and your store, `hapi secrets resolve` fails |
+
+Each key belongs to one server only. The generated configs reference it as `${HAPI_MCP_<NAME>}` (for example `${HAPI_MCP_CONTEXT7_API_KEY}`), never by value. See [docs/mcp.md](docs/mcp.md) and [docs/secrets.md](docs/secrets.md#mcp-secrets).
+
+### Plan 01 Tasks 4, 4b and 4c: your secrets store, provider keys and Slack
+
+Do these in order. Each runbook gives the logical name each secret goes under in your store.
+
+1. **Your secrets store (sops + age, the default):** `mise run secrets:init -- --file private/secrets.enc.yaml`, in a terminal (the store, its recipients file and `recovery.age` in `private/`, so they are backed up with your private repo; this machine's key stays in `~/.config/sops/age/` and is never copied). It shows **10 recovery words** once: store them where you keep things you can't lose (a password manager, paper in a safe, or both), and type back the two it asks for. Then `mise run secrets:drill` to prove the words open the store ([docs/secrets.md](docs/secrets.md#getting-started-with-sops--age)). Later, the `hapi` user and the VM each get their own key with `secrets:join` and `secrets:add-machine` ([keys and recovery](docs/secrets.md#keys-and-recovery)). Bitwarden is an optional alternative ([docs/secrets.md](docs/secrets.md#optional-bitwarden-secrets-manager-bws)).
+2. **Provider keys:** the Anthropic Console workspaces `hapi-hermes` ($60), `hapi-factory` ($100) and `hapi-evals` ($40), OpenCode Go, the OpenRouter key `hapi-jev` ($2/month, set as a $0.06 limit that resets daily, with ZDR enforced unless the documented Jev exception applies), and the Brave, Exa and Context7 search keys ([provider keys](docs/runbooks/provider-keys.md)). Add each to your store with `mise run secrets:edit`.
+3. **Slack:** a dedicated workspace, `#hapi-intake` and `#hapi-alerts`, and the app's tokens ([Slack](docs/runbooks/slack.md)). The app is created from a manifest that a one-off `docker run` of the pinned Hermes image prints, with no network and no stack, so do this before the stack's stage b: `mise run up` refuses an empty secret.
+4. **Check:** `mise run secrets:check`. Expected: every line says `found` and it exits 0, with the recipients listed (this machine and `recovery`) and no value printed. Until you have made the Slack app (step 3) and the GitHub Apps ([Publishing](#publishing-after-task-7b-the-remotes-the-rulesets-and-the-apps), step 6), their values show as `empty` and it exits 1 naming just those: the three Slack values (`hapi-hermes-slack-bot-token`, `hapi-hermes-slack-app-token`, `hapi-hermes-slack-allowed-users`) and the four App values (`hapi-host-planner-app-id`, `hapi-host-planner-app-private-key`, `hapi-host-factory-app-id`, `hapi-host-factory-app-private-key`).
+
+### Publishing, after Task 7b: the remotes, the rulesets and the Apps
+
+Set `OWNER` to your GitHub login first (`export OWNER=<your-login>`); the commands below use it.
+
+1. **Both repos already exist, private and empty:** `$OWNER/hapi-factory` and `$OWNER/hapi-factory-private`. **Push nothing until Task 7b is done.** Until its history rewrite, the history still holds the research and the personal details that Task 7b removes (H-056), and a push can't be taken back.
+
+2. **Push the cleaned history,** once Task 7b's checks pass. Confirm each first push yourself:
 
    ```bash
-   gh repo create j4th/hapi-factory --public \
-     --description "Hermes + Archon + Pi: a reference stack for an end-to-end agentic software factory" \
-     --source . --remote origin
+   git remote add origin "https://github.com/$OWNER/hapi-factory.git"
    git push -u origin main
    git push -u origin plan-01-foundations   # then open a PR from it into main
+   git -C private remote add origin "https://github.com/$OWNER/hapi-factory-private.git"
+   git -C private push -u origin main
    ```
 
-3. **Add two rulesets on `main`.** Together they make the operator the only one who can merge into `main` (always through a PR), require a passing `ci` check for every merge, the operator's included, and block force-pushes and deletion. They are two rulesets, not one, because a ruleset's bypass list covers *every* rule in that ruleset. If the approval bypass and the `ci` check sat in one ruleset, the bypass would also let a merge through with `ci` red or missing. GitHub applies every ruleset that targets a branch, and a bypass in one ruleset doesn't carry over to another.
+3. **Make hapi-factory public;** hapi-factory-private stays private. Free-plan rulesets need a public repo.
+
+   ```bash
+   gh repo edit "$OWNER/hapi-factory" --visibility public --accept-visibility-change-consequences
+   ```
+
+4. **Add two rulesets on `main`.** Together they make the operator the only one who can merge into `main` (always through a PR), require a passing `ci` check for every merge, the operator's included, and block force-pushes and deletion. They are two rulesets, not one, because a ruleset's bypass list covers *every* rule in that ruleset. If the approval bypass and the `ci` check sat in one ruleset, the bypass would also let a merge through with `ci` red or missing. GitHub applies every ruleset that targets a branch, and a bypass in one ruleset doesn't carry over to another.
 
    - **`main-protect`** holds the required `ci` check and the force-push and deletion blocks. It has **no bypass actors**. Nobody, the operator included, can merge with `ci` failing or not yet run, force-push `main` or delete it. This is how every lane, `lane:direct` included, gets the same CI gates (spec §5.1).
    - **`main-review`** holds the pull-request rule (1 approving review, from a code owner) and **Restrict updates**. Its only bypass actor is the repository Admin role, in PR-only mode. Without that bypass, the operator couldn't merge his own `lane:direct` PRs, because GitHub doesn't let a PR's author approve it (spec §18). The bypass covers these two rules and nothing else; **`ci` can never be bypassed**. Because the bypass is PR-only, it applies only when merging a PR. the operator still can't push straight to `main`.
@@ -263,7 +298,7 @@ These steps are outward-facing or privileged, so agents never do them; the opera
    The GitHub Apps get no bypass in either ruleset. `integration_id` 15368 is GitHub Actions, so only Actions can satisfy the `ci` check. In `bypass_actors`, `actor_id` 5 is the repository Admin role.
 
    ```bash
-   gh api -X POST repos/j4th/hapi-factory/rulesets --input - <<'EOF'
+   gh api -X POST repos/$OWNER/hapi-factory/rulesets --input - <<'EOF'
    {
      "name": "main-protect",
      "target": "branch",
@@ -280,7 +315,7 @@ These steps are outward-facing or privileged, so agents never do them; the opera
    }
    EOF
 
-   gh api -X POST repos/j4th/hapi-factory/rulesets --input - <<'EOF'
+   gh api -X POST repos/$OWNER/hapi-factory/rulesets --input - <<'EOF'
    {
      "name": "main-review",
      "target": "branch",
@@ -302,7 +337,7 @@ These steps are outward-facing or privileged, so agents never do them; the opera
    EOF
    ```
 
-   **Check the result.** Run `gh api repos/j4th/hapi-factory/rulesets`, or open **Settings → Rules → Rulesets**. You should see both rulesets, and `main-protect` should list no bypass actors. To see the combined rules that apply to `main`, run `gh api repos/j4th/hapi-factory/rules/branches/main`.
+   **Check the result.** Run `gh api repos/$OWNER/hapi-factory/rulesets`, or open **Settings → Rules → Rulesets**. You should see both rulesets, and `main-protect` should list no bypass actors. To see the combined rules that apply to `main`, run `gh api repos/$OWNER/hapi-factory/rules/branches/main`.
 
    Then open a test PR and confirm three things:
    - The `ci` check runs and is required.
@@ -313,34 +348,19 @@ These steps are outward-facing or privileged, so agents never do them; the opera
 
    These commands follow GitHub's REST docs, but nobody has run them yet. If GitHub rejects a field, set up the same two rulesets in the UI. Keep the rules split the same way: never put the `ci` check in a ruleset that has a bypass actor, and never put Restrict updates in one that has none. `tests/docs/rulesets.test.ts` holds this JSON to those rules.
 
-4. **Task 5's host setup clones from this remote** once it exists: `scripts/host-setup.sh` defaults to your checkout's `origin`. Until then, give it your checkout's path ([Plan 01 Task 5](#plan-01-task-5-the-host-and-the-stack-stage-b)).
+5. **CODEOWNERS:** your own PR adds `.github/CODEOWNERS` with `* @<your-login>`, before either App is installed. `main-review` requires a code owner's review, and with you as the only code owner, no App's approval counts ([GitHub Apps runbook](docs/runbooks/github-apps.md#code-owners-a-second-layer)).
 
-### Plan 01 Task 3b: MCP server keys
+6. **The GitHub Apps:** `hapi-planner` and `hapi-factory`, with exactly their permissions, installed on selected repos only, their keys in your store under the `host` zone, then the `agent-branch-scope` and `tags-admin-only` rulesets ([GitHub Apps](docs/runbooks/github-apps.md)). Then check that an App's merge call is refused, even with your approval and `ci` green ([Check it](docs/runbooks/github-apps.md#check-it)).
 
-`policy/mcp.yaml` names each MCP server's secret by its logical name (`secret:hapi-mcp-<name>`). Add each to your secrets store under exactly this name (`mise run secrets:edit`, [docs/secrets.md](docs/secrets.md#adding-a-secret)):
+7. **CodeRabbit (optional),** once CODEOWNERS is merged: install it on hapi-factory only, never on hapi-factory-private. Never tick its "Commit the changes to this branch" checkbox or run `@coderabbitai autopilot` on a factory or planning PR: either commits under your own GitHub sign-in, past the factory's checks. The register's H-164 has the checks to run after installing.
 
-| Logical name | Manifest entry | What it is | Needed when |
-|---|---|---|---|
-| `hapi-mcp-context7-api-key` | `research` / `HAPI_MCP_CONTEXT7_API_KEY` (already in `stack/secrets.yaml`) | A Context7 API key, on a spend-capped, search-only account (spec §10.1). Task 4's [provider-keys runbook](docs/runbooks/provider-keys.md#search-keys-brave-exa-context7) covers it. | Now: `hapi secrets resolve` needs every name in the manifest |
-| `hapi-mcp-phoenix-viewer-key` | `hermes` / `HAPI_MCP_PHOENIX_VIEWER_KEY` (add it to the manifest then) | A Phoenix API key minted by a **VIEWER**-role user, never an admin or member | Before you turn on the observability profile (`flags.otel.enabled: true`); until it's in the manifest and your store, `hapi secrets resolve` fails |
-
-Each key belongs to one server only. The generated configs reference it as `${HAPI_MCP_<NAME>}` (for example `${HAPI_MCP_CONTEXT7_API_KEY}`), never by value. See [docs/mcp.md](docs/mcp.md) and [docs/secrets.md](docs/secrets.md#mcp-secrets).
-
-### Plan 01 Tasks 4, 4b and 4c: your secrets store, provider keys, Slack and the GitHub Apps
-
-Do these in order. Each runbook gives the logical name each secret goes under in your store.
-
-1. **Your secrets store (sops + age, the default):** `mise run secrets:init -- --file private/secrets.enc.yaml`, in a terminal (the store, its recipients file and `recovery.age` in `private/`, so they are backed up with your private repo; this machine's key stays in `~/.config/sops/age/` and is never copied). It shows **10 recovery words** once: store them where you keep things you can't lose (a password manager, paper in a safe, or both), and type back the two it asks for. Then `mise run secrets:drill` to prove the words open the store ([docs/secrets.md](docs/secrets.md#getting-started-with-sops--age)). Later, the `hapi` user and the VM each get their own key with `secrets:join` and `secrets:add-machine` ([keys and recovery](docs/secrets.md#keys-and-recovery)). Bitwarden is an optional alternative ([docs/secrets.md](docs/secrets.md#optional-bitwarden-secrets-manager-bws)).
-2. **Provider keys:** the Anthropic Console workspaces `hapi-hermes` ($60), `hapi-factory` ($100) and `hapi-evals` ($40), OpenCode Go, the OpenRouter key `hapi-jev` ($2/month, set as a $0.06 limit that resets daily, with ZDR enforced unless the documented Jev exception applies), and the Brave, Exa and Context7 search keys ([provider keys](docs/runbooks/provider-keys.md)). Add each to your store with `mise run secrets:edit`.
-3. **Slack:** a dedicated workspace, `#hapi-intake` and `#hapi-alerts`, and the app's tokens ([Slack](docs/runbooks/slack.md)). The app is created from a manifest that a one-off `docker run` of the pinned Hermes image prints, with no network and no stack, so do this before the stack's stage b: `mise run up` refuses an empty secret.
-4. **GitHub Apps and rulesets:** `hapi-planner` and `hapi-factory` with exactly their permissions, their keys in your store, and the rulesets: Restrict updates on `main-review`, so that no App can merge, and code-owner review ([GitHub Apps](docs/runbooks/github-apps.md)). The rulesets need the repo to be public. Then check that an App's merge call is refused. Do this before the stack's stage b too: `mise run up` refuses an empty secret, the App keys included.
-5. **Check:** `mise run secrets:check`. Expected: every line says `found` and it exits 0, with the recipients listed (this machine and `recovery`) and no value printed. Until you have made the Slack app (step 3) and the GitHub Apps (step 4), their values show as `empty` and it exits 1 naming just those: the three Slack values (`hapi-hermes-slack-bot-token`, `hapi-hermes-slack-app-token`, `hapi-hermes-slack-allowed-users`) and the four App values (`hapi-host-planner-app-id`, `hapi-host-planner-app-private-key`, `hapi-host-factory-app-id`, `hapi-host-factory-app-private-key`).
+8. **Task 5's host setup clones from this remote** once it's pushed: `scripts/host-setup.sh` defaults to your checkout's `origin`. Until then, give it your checkout's path ([Plan 01 Task 5](#plan-01-task-5-the-host-and-the-stack-stage-b)).
 
 ### Plan 01 Task 5: the host and the stack (stage b)
 
 Task 5 wrote the stack and proved its egress boundary on the build host's own Docker, with fake secrets (stage a). What remains is the real host, as the operator, following [docs/runbooks/stack.md](docs/runbooks/stack.md):
 
-0. **The Slack app first,** with its three values in your store (step 3 of the section above): `mise run up` refuses an empty secret.
+0. **The Slack app and the GitHub Apps first,** with their values in your store ([Tasks 4, 4b and 4c](#plan-01-tasks-4-4b-and-4c-your-secrets-store-provider-keys-and-slack), step 3; [Publishing](#publishing-after-task-7b-the-remotes-the-rulesets-and-the-apps), step 6): `mise run up` refuses an empty secret.
 1. **Host setup, once:** `sudo scripts/host-setup.sh "$PWD"` from your checkout (or with no argument once the GitHub remote exists; with an SSH `origin`, pass its HTTPS URL, since hapi clones it with its own credentials). It creates the `hapi` user, rootless Docker with lingering, a pinned mise and hapi's checkout, then prints the next steps. Check: `sudo -iu hapi docker info --format '{{.SecurityOptions}}'` contains `rootless`.
 2. **hapi's toolchain:** as `hapi`, `export XDG_RUNTIME_DIR=/run/user/$(id -u)`, then `cd ~/hapi-factory && mise trust && mise install && mise run setup`.
 3. **hapi's secrets:** as yourself, from your checkout, `scripts/copy-secrets-to-hapi.sh` (it hands your store, its recipients file and `recovery.age` to a `tar` running as hapi, which writes them into hapi's `~/.config/hapi/`: root never writes into hapi's home); as `hapi`, `mise run secrets:join -- --store ~/.config/hapi/secrets.enc.yaml --name hapi`; run the `add-machine` command it prints in your checkout; run `scripts/copy-secrets-to-hapi.sh` again; as `hapi`, `mise run secrets:check`.
@@ -349,7 +369,7 @@ Task 5 wrote the stack and proved its egress boundary on the build host's own Do
    - As `hapi`, run `mise run test:int`. It runs its own throwaway copy of the stack, with its own generated configs, so it leaves the running stack and the checkout's `build/` alone.
    - Check that `docker compose -p hapi ps` shows all five services healthy.
 
-   Make the Slack app first (step 3 of the section above): until its three values are in your store, and copied to hapi, `up` stops at the secrets step.
+   Until the Slack and App values are in your store, and copied to hapi, `up` stops at the secrets step.
 5. **The audit, last:** as `hapi`, in its checkout, with the stack up, `mise run audit -- --strict --repo "$OWNER/hapi-factory" --github-token-file <file>` (your own GitHub token in a `0600` file, which the bypass-actor checks need). Expected, until Plan 04 wires the live MCP fetch (H-101): every check `pass` except one fail, `mcp.tool-hashes`, whose detail starts `--strict: skipped:` (it can't compare a running server's tool surface yet), so `12 pass, 1 fail, 0 skip` and exit 1; any other fail is real. After H-101: exit 0, `0 fail` ([docs/audit.md](docs/audit.md), [the stack runbook](docs/runbooks/stack.md#5-the-audit)).
 
 ## Documentation map

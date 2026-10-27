@@ -74,7 +74,7 @@ Rulesets are where the "no merge" rule lives. Neither App is a bypass actor in a
 
 ### The two rulesets on `main` (Plan 01 Task 1)
 
-The exact commands are in the README, under [Manual setup steps, Plan 01 Task 1](../../README.md#plan-01-task-1-the-github-remote-and-the-main-rulesets). In short:
+The exact commands are in the README, under [Publishing, after Task 7b](../../README.md#publishing-after-task-7b-the-remotes-the-rulesets-and-the-apps). In short:
 
 | Ruleset | Rules | Bypass actors |
 |---|---|---|
