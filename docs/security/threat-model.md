@@ -432,7 +432,7 @@ Both Apps are limited to `plan/**` ∪ `factory/**` (`agent-branch-scope`). Hold
 The control is `main-review`'s Restrict updates (the `update` rule), with code-owner review as a second layer (AC-7). Its live proof is H-078's App-merge-refusal check. The public repo, the rulesets, CODEOWNERS and both Apps it needs are in place since 2026-10-27 (H-074–H-077); its App token needs `hapi secrets resolve`, so it waits on the Slack app's values. **Result: pending (H-078).**
 
 - **Owner control:** AC-7, with `tests/docs/rulesets.test.ts` holding the documented JSON to it, and the audit's `github.rulesets` and `github.app-perms` checking the live repo in stage b (H-080).
-- **Next level:** when H-078 runs, record its result here. If GitHub refuses the merge, AC-7 becomes verified live. If the merge goes through: revert it, suspend both installations ([kill switch 2](../runbooks/kill-switches.md#2-suspend-the-github-app-installations)), record "an App can merge once the operator has approved and `ci` is green" as a residual here, and remove the "no merge rights" claims from the README and the GitHub Apps runbook.
+- **Next level:** when H-078 runs, record its result here. If GitHub refuses the merge, AC-7 stays documented, not verified live until stage b's strict audit (H-080) also passes `github.rulesets` and `github.app-perms`, which check AC-7's other parts: the bypass actors and the Apps' permissions. Then it is verified live. If the merge goes through: revert it, suspend both installations ([kill switch 2](../runbooks/kill-switches.md#2-suspend-the-github-app-installations)), record "an App can merge once the operator has approved and `ci` is green" as a residual here, and remove the "no merge rights" claims from the README and the GitHub Apps runbook.
 - **Catalog:** ASI03; AML.T0091.000. **Status:** documented, not verified live (H-078).
 
 <a id="h-040"></a>
@@ -580,7 +580,7 @@ Stage a ran everything on the build host's rootful Docker as an ordinary user, w
 - **H-080 (stage b):** `scripts/host-setup.sh`, rootless Docker, the store handed to hapi, `mise run up` and `mise run test:int` as hapi, then the strict audit (AC-1, AC-12, MO-2).
 - **H-146:** (a) the Squid image under hapi's subordinate range; (b) kill switch 4 under rootless networking; (c) the integration tests as hapi, DNS on internal networks included (DS-3); (d) the hapi-side steps of both scripts through the real sudo (AC-2); (e) `up`'s re-exec through the real sudo and mise (AC-4).
 - **H-160:** the kill-switch runbook's other marks: the providers' UI paths, whether a token minted before a suspension is refused, and switch 3's fallback and hard stop (MO-5).
-- **H-078 and H-079:** the public repo, the rulesets, CODEOWNERS and both Apps are in place since 2026-10-27 (H-074–H-077); what's left is the live checks with App tokens: the refused approval, merge and pushes (AC-7, AC-8, GR-8), and the token API's version and scope.
+- **H-078 and H-079:** the public repo, the rulesets, CODEOWNERS and both Apps are in place since 2026-10-27 (H-074–H-077); what's left is the live checks with App tokens: that an App's approval doesn't satisfy the code-owner rule (GR-8), that its merge and its pushes outside `plan/**` and `factory/**` are refused (AC-7, AC-8), and the token API's version and scope.
 
 **Owner control:** the controls stay documented, not enforced, until each check passes, and stage b ends with the strict audit. **Next level:** run them, then mark each control here. **Status:** documented, not verified live.
 

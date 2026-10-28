@@ -88,7 +88,9 @@ hapi-host-planner-app-private-key: |
 
 ## The rulesets
 
-Rulesets are where the "no merge" rule lives. Neither App is a bypass actor in any of them. `hapi audit --repo $OWNER/hapi-factory` checks the live rulesets and both Apps against this page (`github.rulesets`, `github.app-perms`, [docs/audit.md](../audit.md#githubrulesets)), and `tests/docs/rulesets.test.ts` holds the JSON on this page and in the README to the same rules. GitHub shows a ruleset's bypass actors only to a token with write access to it, so the audit's bypass checks use your own token (`--github-token-file`), never an App's: the Apps never get Administration.
+Rulesets are where the "no merge" rule lives. Neither App is a bypass actor in any of them. `hapi audit --repo $OWNER/hapi-factory` checks the rules on `main` and both Apps against this page (`github.rulesets`, `github.app-perms`, [docs/audit.md](../audit.md#githubrulesets)), and that no ruleset has an App as a bypass actor. It doesn't yet check the [branch and tag scope](#branch-and-tag-scope) rulesets (register H-174); [Check it](#check-it) steps 1, 2 and 5 do, by hand. `tests/docs/rulesets.test.ts` holds the JSON on this page and in the README to the same rules. GitHub shows a ruleset's bypass actors only to a token with write access to it, so the audit's bypass checks use your own token (`--github-token-file`), never an App's: the Apps never get Administration.
+
+**The Admin role is you, on a repo your personal account owns.** Three of the rulesets let the repository Admin role (`actor_id` 5) bypass them. A personal account's repo has one Admin, its owner: collaborators get write access at most. On an organization's repo, every repository Admin and every organization owner has the same bypasses, so give no one else the Admin role there.
 
 ### The two rulesets on `main` (Plan 01 Task 1)
 
@@ -178,16 +180,23 @@ EOF
 
 Run these with `$OWNER` set ([before you start](#before-you-start)). Steps 1 and 2 need only `gh`. Steps 3–5 need an App token, so `hapi secrets resolve` must have run, and it writes nothing while any secret in the manifest is empty: they wait until the Slack app's values are in your store too ([the Slack runbook](slack.md)).
 
-1. **Rulesets:** GitHub's list of rulesets leaves out their rules and bypass actors, so read each one:
+1. **Rulesets:** GitHub's list of rulesets leaves out their conditions, rules and bypass actors, so read each one:
 
    ```bash
    for id in $(gh api "repos/$OWNER/hapi-factory/rulesets" --jq '.[].id'); do
-     gh api "repos/$OWNER/hapi-factory/rulesets/$id" \
-       --jq '{name, bypass: [.bypass_actors[] | "\(.actor_type):\(.actor_id):\(.bypass_mode)"], rules: [.rules[].type]}'
+     gh api "repos/$OWNER/hapi-factory/rulesets/$id" --jq '{name, target, enforcement, refs: .conditions.ref_name,
+       bypass: [.bypass_actors[] | "\(.actor_type):\(.actor_id):\(.bypass_mode)"],
+       rules: [.rules[] | .type + (if .type == "required_status_checks" then "(" + ([.parameters.required_status_checks[] | "\(.context)@\(.integration_id)"] | join(",")) + ")"
+                                   elif .type == "pull_request" then "(approvals=\(.parameters.required_approving_review_count),codeowner=\(.parameters.require_code_owner_review))" else "" end)]}'
    done
    ```
 
-   It prints the four rulesets. `main-protect`'s `bypass` is empty, `main-review`'s is `RepositoryRole:5:pull_request`, and the other two have `RepositoryRole:5:always`. None lists an `Integration`.
+   It prints the four rulesets. Compare each with its JSON on this page and in the README:
+   - every one is `"enforcement": "active"`, with the `target` and `refs` its JSON gives;
+   - `main-protect`: `bypass` empty, and its rules include `required_status_checks(ci@15368)`;
+   - `main-review`: `bypass` is `RepositoryRole:5:pull_request`, and its rules are `pull_request(approvals=1,codeowner=true)` and `update`;
+   - `agent-branch-scope` and `tags-admin-only`: `bypass` is `RepositoryRole:5:always`, and their rules are `creation`, `update` and `deletion`;
+   - none lists an `Integration`.
 2. **Branch rules:** `gh api "repos/$OWNER/hapi-factory/rules/branches/main"` shows `update` (from `main-review`) as well as the `ci` check. `gh api "repos/$OWNER/hapi-factory/rules/branches/some-feature"` shows `creation`, `update` and `deletion`. `gh api "repos/$OWNER/hapi-factory/rules/branches/plan%2Fexample"` shows none of them.
 3. **A token** ([docs/secrets.md](../secrets.md#hapi-token-mint)), once `hapi secrets resolve` has run:
 
