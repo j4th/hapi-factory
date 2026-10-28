@@ -214,10 +214,15 @@ export function appOf(c: FetchCall): "planner" | "factory" {
 export const MINTED_TOKEN = "fake-installation-token-audit";
 
 /** The routes of a GitHub repo set up as the runbook says, read with a token file or with an App. */
-export function githubRoutes(o: { rulesets?: Record<string, any>[]; workflows?: Record<string, string>; appPermissions?: Record<string, Record<string, string>> } = {}): Record<string, Reply | ((c: FetchCall) => Reply)> {
+export function githubRoutes(
+  o: { rulesets?: Record<string, any>[]; workflows?: Record<string, string>; appPermissions?: Record<string, Record<string, string>>; defaultBranch?: string | null } = {},
+): Record<string, Reply | ((c: FetchCall) => Reply)> {
   const rulesets = o.rulesets ?? goodRulesets();
   const repo = `${API}/repos/${OWNER}/${NAME}`;
+  const defaultBranch = o.defaultBranch === undefined ? "main" : o.defaultBranch;
   const routes: Record<string, Reply | ((c: FetchCall) => Reply)> = {
+    // null: GitHub's answer without default_branch.
+    [`GET ${repo}`]: { status: 200, body: { full_name: `${OWNER}/${NAME}`, ...(defaultBranch === null ? {} : { default_branch: defaultBranch }) } },
     [`GET ${repo}/rules/branches/main?per_page=100&page=1`]: { status: 200, body: branchRules(rulesets) },
     [`GET ${repo}/rulesets?per_page=100&page=1`]: { status: 200, body: rulesets.map(({ rules, conditions, bypass_actors, ...summary }) => summary) },
     [`GET ${repo}/contents/.github/workflows`]: {

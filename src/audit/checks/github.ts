@@ -24,7 +24,8 @@
  *   /repos/{owner}/{repo}/installation), which needs no permission.
  * With neither, each check is a skip saying what is missing.
  *
- * - github.rulesets: the effective rules on main (GET .../rules/branches/main)
+ * - github.rulesets: that main is the default branch (GET /repos/{owner}/{repo}),
+ *   the effective rules on main (GET .../rules/branches/main)
  *   and every ruleset (GET .../rulesets, then each by id), held to
  *   docs/runbooks/github-apps.md as tests/docs/rulesets.test.ts holds the
  *   README's JSON: main-protect and main-review, never one ruleset.
@@ -205,6 +206,8 @@ interface Ruleset {
 }
 interface RepoData {
   via: string;
+  /** The repo's default branch, or undefined if GitHub didn't say. */
+  defaultBranch: string | undefined;
   /** The effective rules on main. */
   rules: Rule[];
   rulesets: Ruleset[];
@@ -217,11 +220,13 @@ function repoData(run: AuditRun, repo: RepoRef): Promise<RepoData | { none: stri
   return run.once(`gh-data:${repoName(repo)}`, async () => {
     const cred = await credential(run, repo);
     if ("none" in cred) return cred;
+    const { default_branch } = (await getOk(run, repoPath(repo), cred.token)) as { default_branch?: unknown };
     const rules = (await getAll(run, `${repoPath(repo)}/rules/branches/main`, cred.token)) as Rule[];
     const list = (await getAll(run, `${repoPath(repo)}/rulesets`, cred.token)) as Ruleset[];
     const rulesets: Ruleset[] = [];
     for (const r of list) rulesets.push((await getOk(run, `${repoPath(repo)}/rulesets/${Number(r.id)}`, cred.token)) as Ruleset);
-    return { via: cred.via, rules, rulesets, bypassVisible: rulesets.every((r) => Array.isArray(r.bypass_actors)) };
+    const defaultBranch = typeof default_branch === "string" ? default_branch : undefined;
+    return { via: cred.via, defaultBranch, rules, rulesets, bypassVisible: rulesets.every((r) => Array.isArray(r.bypass_actors)) };
   });
 }
 
@@ -233,11 +238,12 @@ const ACTIONS = 15368;
 
 /**
  * The branch and tag scope rulesets (AC-8), as docs/runbooks/github-apps.md sets them. `mayExclude` is what the
- * runbook lets the operator add: Dependabot's branches, once its version updates are on. Any other exclusion widens
- * what the Apps may push.
+ * runbook lets the operator add: Dependabot's branches, once its version updates are on. They are
+ * dependabot/<ecosystem>/<name>, and GitHub matches a trailing ** within one segment, so the pattern is ** then *.
+ * Any other exclusion widens what the Apps may push.
  */
 const SCOPE_RULESETS = [
-  { name: "agent-branch-scope", target: "branch", exclude: ["~DEFAULT_BRANCH", "refs/heads/plan/**", "refs/heads/factory/**"], mayExclude: ["refs/heads/dependabot/**"] },
+  { name: "agent-branch-scope", target: "branch", exclude: ["~DEFAULT_BRANCH", "refs/heads/plan/**", "refs/heads/factory/**"], mayExclude: ["refs/heads/dependabot/**/*"] },
   { name: "tags-admin-only", target: "tag", exclude: [], mayExclude: [] },
 ] as const;
 
@@ -278,6 +284,12 @@ export async function githubRulesets(run: AuditRun): Promise<CheckResult[]> {
       continue;
     }
     const problems: string[] = [];
+    // The main-* rulesets follow ~DEFAULT_BRANCH and agent-branch-scope exempts it, so main's rules below say what
+    // guards the default branch only while main is the default.
+    if (data.defaultBranch !== "main") {
+      const is = data.defaultBranch === undefined ? "unknown (GitHub returned no default_branch)" : data.defaultBranch;
+      problems.push(`the default branch is ${is}, not main: this check reads main's rules, and agent-branch-scope exempts the default branch, so make main the default again`);
+    }
     const rules = data.rules;
     const of = (type: string) => rules.filter((r) => r.type === type);
     if (!of("pull_request").some((r) => Number(r.parameters?.required_approving_review_count) >= 1)) {

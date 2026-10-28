@@ -103,8 +103,23 @@ describe("github.rulesets", () => {
   test("the pass names the branch and tag scope rulesets, and allows the Dependabot exclusion the runbook offers", async () => {
     let r = await run(await withToken());
     expect(r.rulesets.detail).toContain("agent-branch-scope and tags-admin-only");
-    r = await run(await withToken({ rulesets: mutate((x) => named(x, "agent-branch-scope").conditions.ref_name.exclude.push("refs/heads/dependabot/**")) }));
+    // Dependabot's branches are dependabot/<ecosystem>/<name>, and GitHub's trailing ** matches one segment only.
+    r = await run(await withToken({ rulesets: mutate((x) => named(x, "agent-branch-scope").conditions.ref_name.exclude.push("refs/heads/dependabot/**/*")) }));
     expect([r.rulesets.status, r.rulesets.detail]).toEqual(["pass", expect.stringContaining("agent-branch-scope and tags-admin-only") as unknown as string]);
+  });
+
+  // main's rules stand for the default branch's only while main is the default: the main-* rulesets follow
+  // ~DEFAULT_BRANCH, and agent-branch-scope exempts it.
+  test("fails when main isn't the default branch", async () => {
+    const r = await run(await withToken({ defaultBranch: "release" }));
+    expect(r.rulesets.status).toBe("fail");
+    expect(r.rulesets.detail).toContain("the default branch is release, not main");
+  });
+
+  test("fails closed when GitHub doesn't say which branch is the default", async () => {
+    const r = await run(await withToken({ defaultBranch: null }));
+    expect(r.rulesets.status).toBe("fail");
+    expect(r.rulesets.detail).toContain("GitHub returned no default_branch");
   });
 
   test("a ruleset in evaluate mode doesn't count: GitHub doesn't apply it to main", async () => {
