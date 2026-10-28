@@ -39,8 +39,8 @@ It prints each path it wrote, one per line, and exits 0. A usage error (an unkno
 | `build/hermes/config.yaml` | Hermes's `config.yaml` (Hermes v0.22.5 keys) | `budgets.yaml`, `flags.yaml`, `mcp.yaml`, `protected_paths.yaml`, `roles.yaml`, `rosters/anthropic.yaml` | Mounted read-only at `/opt/data/config.yaml` (`$HERMES_HOME`) in the `hermes` container |
 | `build/archon/config.yaml` | Archon's global config, `~/.archon/config.yaml` (Archon v0.12.1): model tiers and aliases | `roles.yaml`, `rosters/<roster>.yaml` | Mounted read-only at `/.archon/config.yaml` (Archon's home in its container) in `archon` |
 | `build/archon/archon.env` | The Archon container's environment | Spec §9.2 and §9.3 (no policy file) | The record of the six settings the `archon` service's `environment:` sets, and what the audit's `runtime.archon-env` holds the running container to. Compose doesn't read the file ([below](#buildarchonarchonenv)) |
-| `build/pi/models.json` | Pi 1.3.0's model registry: `maxTokens` caps | `rosters/<roster>.yaml` | Mounted read-only at `PI_CODING_AGENT_DIR` |
-| `build/pi/hapi-guard.json` | Settings for Plan 02's hapi-guard Pi extension | `protected_paths.yaml`, `budgets.yaml` | Mounted read-only at `PI_CODING_AGENT_DIR` |
+| `build/pi/models.json` | Pi 1.3.0's model registry: `maxTokens` caps | `rosters/<roster>.yaml` | Mounted read-only at `PI_CODING_AGENT_DIR` (Plan 02 binds it into a tmpfs there instead, H-181) |
+| `build/pi/hapi-guard.json` | Settings for Plan 02's hapi-guard Pi extension | `protected_paths.yaml`, `budgets.yaml` | Mounted read-only at `PI_CODING_AGENT_DIR` (Plan 02 binds it into a tmpfs there instead, H-181) |
 | `build/egress/hermes.squid.conf` | Squid config for the `hermes` zone's egress proxy | `trusted_sources.yaml` | The `egress-hermes` container, read-only |
 | `build/egress/archon.squid.conf` | Squid config for the `archon` zone's egress proxy | `trusted_sources.yaml` | The `egress-archon` container, read-only |
 | `build/egress/research.squid.conf` | Squid config for the `research` zone's egress proxy | `trusted_sources.yaml` | The `egress-research` container, read-only (the research zone's own service arrives in Plan 04) |
@@ -150,7 +150,7 @@ aliases:          # one per Archon role, at its roles.yaml tier
 | `DO_NOT_TRACK` | `1` | The cross-tool telemetry opt-out, which Archon also honours (spec §9.2). |
 | `PI_OFFLINE` | `1` | Pi makes no network calls of its own. **Critical:** without it, Pi installs the packages a repo's `.pi/settings.json` lists, even with extensions off (spec §9.3). It also stops catalog refreshes and update checks. |
 | `PI_TELEMETRY` | `0` | No Pi install telemetry (spec §9.3). |
-| `PI_CODING_AGENT_DIR` | `/opt/hapi/pi-agent` | Pi's agent directory. Task 5 mounts `build/pi` there **read-only**, so Pi reads this `models.json` and nothing in the container can change it (spec §9.3). The path is `PI_AGENT_DIR` in `src/generate/archon.ts`. |
+| `PI_CODING_AGENT_DIR` | `/opt/hapi/pi-agent` | Pi's agent directory. Task 5 mounts `build/pi` there **read-only**, so Pi reads this `models.json` and nothing in the container can change it (spec §9.3). The path is `PI_AGENT_DIR` in `src/generate/archon.ts`. Spike T8 found Pi must also write there (`models-store.json` on every credential sync, `auth.json`, `sessions/`), so the read-only mount fails every Pi node; Plan 02 makes the directory a tmpfs with hapi's files bound read-only into it ([docs/spikes/01-pi-under-archon.md](spikes/01-pi-under-archon.md), H-181). |
 
 These are the Global Constraints' Archon and Pi values; the audit's `runtime.archon-env` checks the running container's environment against them ([docs/audit.md](audit.md#runtimearchon-env)).
 

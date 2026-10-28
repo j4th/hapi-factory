@@ -30,7 +30,7 @@ Every command marked *as hapi* runs in a shell of the `hapi` user (`sudo -iu hap
 | `egress-archon` | archon | `archon-net`, `outbound` | itself | Squid, on `build/egress/archon.squid.conf`: HTTPS to the archon allowlist only, with no forge route |
 | `egress-research` | research | `research-net`, `outbound` | itself | Squid, on `build/egress/research.squid.conf`: the open web, minus private ranges |
 | `hermes` | hermes | `hermes-net` | `egress-hermes` | Hermes v0.22.5, the coordinator, running `gateway run` with `build/hermes/config.yaml` |
-| `archon` | archon | `archon-net` | `egress-archon` | Archon 0.12.1, with Pi 1.3.0 in-process, `build/archon/*` and `build/pi` (read-only) |
+| `archon` | archon | `archon-net` | `egress-archon` | Archon 0.12.1, with Pi 1.3.0 in-process, `build/archon/*` and `build/pi` (read-only; spike T8 found Pi must write beside it, so Plan 02 binds it into a tmpfs, H-181) |
 
 The research zone's own container, hapi-research, arrives in Plan 04. Task 5 ships its network, its proxy and its tests.
 
