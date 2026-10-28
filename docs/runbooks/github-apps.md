@@ -198,10 +198,11 @@ Run these with `$OWNER` set ([before you start](#before-you-start)). Steps 1 and
    - `agent-branch-scope` and `tags-admin-only`: `bypass` is `RepositoryRole:5:always`, and their rules are `creation`, `update` and `deletion`;
    - none lists an `Integration`.
 2. **Branch rules:** `gh api "repos/$OWNER/hapi-factory/rules/branches/main"` shows `update` (from `main-review`) as well as the `ci` check. `gh api "repos/$OWNER/hapi-factory/rules/branches/some-feature"` shows `creation`, `update` and `deletion`. `gh api "repos/$OWNER/hapi-factory/rules/branches/plan%2Fexample"` shows none of them.
-3. **A token** ([docs/secrets.md](../secrets.md#hapi-token-mint)), once `hapi secrets resolve` has run:
+3. **A token** ([docs/secrets.md](../secrets.md#hapi-token-mint)). Run these from your checkout, in one shell you keep open for steps 4 and 5; the token lasts an hour, so mint another if it runs out:
 
    ```bash
-   hapi token mint --app planner --repo "$OWNER/hapi-factory"      # prints the token file's path
+   mise run hapi -- secrets resolve                                       # writes the env files to your tmpfs
+   mise run hapi -- token mint --app planner --repo "$OWNER/hapi-factory" # prints the token file's path
    tok="$XDG_RUNTIME_DIR/hapi/tokens/planner.$OWNER.hapi-factory.token"
    GH_TOKEN="$(cat "$tok")" gh api /installation/repositories --jq '.repositories[].full_name'
    ```
@@ -222,7 +223,7 @@ Run these with `$OWNER` set ([before you start](#before-you-start)). Steps 1 and
    **Before you approve it, check that an App's approval doesn't count** ([code owners](#code-owners-a-second-layer)). Approve it as `hapi-factory`, which isn't a code owner, with its own token:
 
    ```bash
-   hapi token mint --app factory --repo "$OWNER/hapi-factory"
+   mise run hapi -- token mint --app factory --repo "$OWNER/hapi-factory"
    ftok="$XDG_RUNTIME_DIR/hapi/tokens/factory.$OWNER.hapi-factory.token"
    GH_TOKEN="$(cat "$ftok")" gh api "repos/$OWNER/hapi-factory/pulls/$pr/reviews" -f event=APPROVE -f body="Delete me."
    gh pr view "$pr" --repo "$OWNER/hapi-factory" --json reviewDecision --jq .reviewDecision
@@ -264,7 +265,7 @@ Kill switch 2 (spec §11.8; the full steps are in [kill switches](kill-switches.
 
 1. On the App's settings page, **Generate a private key**. The old key still works until you delete it.
 2. Replace the PEM under `hapi-host-<app>-app-private-key` in your secrets store (`mise run secrets:edit`). Then shred the downloaded file.
-3. Run `hapi secrets resolve`, then mint a test token as in [check it](#check-it).
+3. Run `mise run hapi -- secrets resolve`, then mint a test token as in [check it](#check-it).
 4. **Delete the old key** on the App's settings page.
 
 If a key may have leaked, suspend the installation first, then rotate.
