@@ -45,7 +45,7 @@ The research zone's own container, hapi-research, arrives in Plan 04. Task 5 shi
 - **State** lives in three named volumes:
   - `hermes-data`: Hermes's home (sessions, memories, skills);
   - `archon-data`: `/.archon` (the run DB, workspaces, worktrees);
-  - `archon-home`: `/home/appuser` (Claude Code and Pi session state).
+  - `archon-home`: `/home/appuser` (Claude Code's state and `~/.gitconfig`). Pi keeps its sessions in `PI_CODING_AGENT_DIR`, not here, and Plan 02 makes that a tmpfs, so they don't survive a restart (spike T8, H-181). H-182 plans a per-run `$HOME` too.
 
   `mise run down` keeps them.
 
