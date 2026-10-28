@@ -4,9 +4,11 @@
  *
  * - `--github-token-file <path>`: the operator's own token (a file only its
  *   owner can read; never printed, logged or put in argv), for every read.
- *   GitHub returns a ruleset's `bypass_actors` only to a token with write
- *   access to that ruleset (repository Administration), and the Apps never
- *   get Administration, so this is the only way the bypass checks run.
+ *   GitHub returns a ruleset's `bypass_actors` only when "the user making the
+ *   API request has write access to the ruleset" (a fine-grained token with
+ *   Administration read-only, from the repo's admin, got them in stage b,
+ *   H-150), and the Apps never get Administration, so this is the only way the
+ *   bypass checks run.
  * - else an installation token of one of the Apps, from the App keys in
  *   host.env as `hapi token mint` reads them, minted for this one repo with
  *   `contents: read` and `metadata: read` only (the one POST), and revoked
@@ -211,7 +213,7 @@ interface RepoData {
   /** The effective rules on main. */
   rules: Rule[];
   rulesets: Ruleset[];
-  /** Whether GitHub returned bypass_actors for every ruleset (only to a token with write access to them). */
+  /** Whether GitHub returned bypass_actors for every ruleset (never to an App's token: no Administration). */
   bypassVisible: boolean;
 }
 
@@ -340,7 +342,7 @@ export async function githubRulesets(run: AuditRun): Promise<CheckResult[]> {
         result(
           id,
           "skip",
-          `${name}: the rules on main and the branch and tag scope rulesets pass, but GitHub returned no bypass_actors (it shows them only to a token with write access to the ruleset, i.e. repository Administration, which the Apps never get), so no bypass check was made: pass --github-token-file with the operator's token`,
+          `${name}: the rules on main and the branch and tag scope rulesets pass, but GitHub returned no bypass_actors (read with ${data.via}; it shows them only to a user with write access to the ruleset, never to the Apps, which have no Administration permission), so no bypass check was made: pass --github-token-file with the operator's token, a fine-grained one with Administration read-only (docs/audit.md#github-credentials)`,
         ),
       );
     } else {
@@ -413,7 +415,7 @@ export async function githubAppPerms(run: AuditRun): Promise<CheckResult[]> {
     // No credential to read the rulesets is a gap (a skip); a read that fails is a fail, as in github.rulesets.
     const data = await repoData(run, repo).catch((e: Error) => ({ error: e.message }));
     if ("error" in data) problems.push(`reading the rulesets failed, so whether an App is a bypass actor can't be checked: ${data.error}`);
-    else if ("none" in data || !data.bypassVisible) gaps.push(`no ruleset's bypass_actors could be read (${"none" in data ? data.none : "GitHub shows them only to a token with Administration write: pass --github-token-file"})`);
+    else if ("none" in data || !data.bypassVisible) gaps.push(`no ruleset's bypass_actors could be read (${"none" in data ? data.none : "GitHub shows them only to a user with write access to the ruleset, never to the Apps: pass --github-token-file with the operator's token, a fine-grained one with Administration read-only"})`);
     else {
       for (const r of data.rulesets) {
         for (const a of r.bypass_actors ?? []) {
