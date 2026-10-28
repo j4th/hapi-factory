@@ -47,7 +47,7 @@ This is hapi-factory's threat model, the `docs/security/threat-model.md` that sp
 - **The stack**, `stack/compose.yaml`: `hermes` (Hermes v0.22.5, the coordinator), `archon` (Archon 0.12.1, with Pi 1.3.0 in-process as the worker), and one Squid egress proxy per zone (`egress-hermes`, `egress-archon`, `egress-research`), on internal-only networks.
 - **Policy**, `policy/`, compiled into every tool's config by `src/generate/` (the gitignored `build/`).
 - **Secrets:** the manifest `stack/secrets.yaml`, sops + age by default, and the zone env files on hapi's tmpfs (`src/secrets/`).
-- **GitHub:** two Apps and four rulesets, documented ([GitHub Apps runbook](../runbooks/github-apps.md)), to be applied by hand (H-074–H-077), and App token minting (`src/forge/github/app-token.ts`).
+- **GitHub:** two Apps and four rulesets, applied by hand on 2026-10-27 from the [GitHub Apps runbook](../runbooks/github-apps.md) (H-074–H-077), and App token minting (`src/forge/github/app-token.ts`).
 - **`hapi audit`** (`src/audit/`) and the [kill switches](../runbooks/kill-switches.md).
 
 **Planned for Phase 1** (spec §4.2, §15): hapi-guard and Jev (Plan 02); the `factory-task` workflow, poller, mirror and harvester (Plan 03); Hermes's plugins and skills and the research container (Plan 04); the repo contract and CI gates (Plan 05); evals and metrics (Plan 06).
@@ -133,7 +133,7 @@ Spec §11.2, in substance: no stage should hold all three of untrusted input, se
 | hapi-research | Yes (T3 web) | None | None (returns a brief) | Quarantine and schema | Planned (Plan 04, H-099). It holds spend-capped search keys, so its sensitive access is minimal, not none (H-042, H-083) |
 | Archon implement | Repo contents, work order | Capped model keys | Worktree only | Container, egress allowlist, hapi-guard, scope checks, no forge creds | Container DS-6, egress DS-2 and no forge route AC-9 enforced in config and on rootful Docker (stage a); as hapi on rootless, not verified live (H-146(c)); hapi-guard DS-16 planned (Plan 02, H-087); scope checks planned (Plan 03, H-161) |
 | Review | The diff | Read-only | None | Separate session and model | Planned (Plan 03, H-161) |
-| Harvester and merge | Indirect | Forge write | Yes | Deterministic code; the operator's approval; required checks | The harvester is planned (Plan 03, H-161); the approval and `ci` gate AC-7 documented, not verified live (H-075, H-078) |
+| Harvester and merge | Indirect | Forge write | Yes | Deterministic code; the operator's approval; required checks | The harvester is planned (Plan 03, H-161); the approval and `ci` gate AC-7 documented, not verified live (H-078) |
 
 ## 4. Threats by MAESTRO layer
 
@@ -246,8 +246,8 @@ The six domains, as SANS's post on its Critical AI Security Guidelines (the v1.1
 | AC-4 | The same re-exec through the host's real sudo (`env_reset`, `secure_path`, `use_pty`), and mise quoting the arguments into its task's command line so they reach hapi's `up` as typed | §4.3 | as AC-3 | documented, not verified live (H-146(e)) |
 | AC-5 | Each zone container gets only its own zone's env file; `host.env`, which holds the App keys, goes to no container; no zone but `host` holds an App key | §4.3, §11.5 | `stack/compose.yaml`, `stack/secrets.yaml`, `src/secrets/manifest.ts`; `tests/stack/compose.test.ts`, `tests/secrets/manifest.test.ts`, and "zone separation" in `tests/stack/egress.int.test.ts` | enforced in the generated config and on rootful Docker (stage a); as hapi on rootless Docker: documented, not verified live (H-146(c)) |
 | AC-6 | App tokens: one repo, exactly the App's permissions, one hour, minted on the host; a token that comes back broader, or for other repos, is refused and revoked at once | §4.4, §11.5 | `src/forge/github/app-token.ts`; `tests/forge/app-token.test.ts` (`mintInstallationToken rejects broader permissions`) | enforced (the first live mint, H-079, checks GitHub's response shape) |
-| AC-7 | No App can merge, and only the operator merges: `main-review` restricts updates (only the Admin role, PR-only, may update `main`) and needs a code owner's approval; `main-protect` requires `ci` with no bypass; neither App has Administration or Workflows, or is ever a bypass actor | §5.1, §11.5, §11.9 | README and `docs/runbooks/github-apps.md`; `tests/docs/rulesets.test.ts` holds their JSON to it; the audit's `github.rulesets` and `github.app-perms` check the live repo | documented, not verified live (H-075, H-076, H-077, H-078) |
-| AC-8 | The Apps push only `plan/**` and `factory/**` (`agent-branch-scope`), and only the Admin role touches tags (`tags-admin-only`) | §11.5 | `docs/runbooks/github-apps.md`; `tests/docs/rulesets.test.ts` | documented, not verified live (H-077) |
+| AC-7 | No App can merge, and only the operator merges: `main-review` restricts updates (only the Admin role, PR-only, may update `main`) and needs a code owner's approval; `main-protect` requires `ci` with no bypass; neither App has Administration or Workflows, or is ever a bypass actor | §5.1, §11.5, §11.9 | README and `docs/runbooks/github-apps.md`; `tests/docs/rulesets.test.ts` holds their JSON to it; the audit's `github.rulesets` and `github.app-perms` check the live repo | documented, not verified live (H-078) |
+| AC-8 | The Apps push only `plan/**` and `factory/**` (`agent-branch-scope`), and only the Admin role touches tags (`tags-admin-only`) | §11.5 | `docs/runbooks/github-apps.md`; `tests/docs/rulesets.test.ts` | documented, not verified live (H-078) |
 | AC-9 | The archon zone has no forge credential and no forge route: its allowlist holds no forge host, and the generator refuses one, in any case or as a subdomain | §4.3, §9.4 | `policy/trusted_sources.yaml`, `src/policy/hosts.ts` (`forgeDomain`), `src/generate/egress.ts`; `tests/generate/egress.test.ts` ("the archon zone has no forge route"), `tests/policy/load.test.ts`, `tests/secrets/manifest.test.ts`, and the forge tests in `tests/stack/egress.int.test.ts` | enforced in the generated config and on rootful Docker (stage a); as hapi on rootless Docker: documented, not verified live (H-146(c)) |
 | AC-10 | Hermes gets a 1-hour `hapi-planner` token per session from a host-side minter, never an App key | §9.1 #7, §11.5 | — | planned (Plan 04, H-098) |
 | AC-11 | No subscription OAuth: API keys only; the manifest refuses every `CLAUDE_CODE_` name, `CLAUDE_CODE_OAUTH_TOKEN` included | §3, §11.5 | `src/stack/env.ts` (`CONTROL_ENV_PREFIXES`); `tests/secrets/manifest.test.ts` | enforced |
@@ -334,7 +334,7 @@ The six domains, as SANS's post on its Critical AI Security Guidelines (the v1.1
 | GR-5 | The work-order schema and validator: `egress_extra` refuses forge hosts (`nonForgeHostList`); at run time, the order is validated before any of its hosts reaches a proxy | §6 | `policy/schemas/work-order.schema.json`, `src/workorder/validate.ts`; `tests/workorder/validate.test.ts` | enforced (the run-time path: planned, Plan 02, H-088) |
 | GR-6 | CI gates: gitleaks, Semgrep or Opengrep, OSV-Scanner, zizmor; Actions pinned to SHAs; no AI agent with secrets on PR or issue triggers; the work-order schema; trailers and lane labels on `lane:factory`; the protected-path diff; the MCP scanners | §11.7 | `.github/workflows/ci.yml` (this repo's own CI today) | planned (Plan 05, H-111, H-112, H-113, H-163) |
 | GR-7 | Hard spend caps at the providers: `hapi-hermes` $60, `hapi-factory` $100, `hapi-evals` $40, the default workspace unused; OpenRouter limits that reset daily | §3, §11.5, §12 | `policy/budgets.yaml`, `docs/runbooks/provider-keys.md` | documented, not verified live (H-071; the audit doesn't read them yet, H-151) |
-| GR-8 | CODEOWNERS: the operator is the only code owner, so no App's approval counts | §7, §11.9 | `docs/runbooks/github-apps.md` | documented, not verified live (H-076) |
+| GR-8 | CODEOWNERS: the operator is the only code owner, so no App's approval counts | §7, §11.9 | `docs/runbooks/github-apps.md` | documented, not verified live (H-078) |
 | GR-9 | CodeRabbit is review-only: `.coderabbit.yaml` turns off every way it writes (approvals, finishing touches, labels, auto-replies, issue features) and keeps chat learnings local and delayed 30 days; the file is a protected path, as are agent instruction files at any depth, since it reviews a PR with that PR's own config and reads them as guidelines | §8.2, §9.6 | `.coderabbit.yaml`, `policy/protected_paths.yaml`; `tests/policy/load.test.ts`, `tests/policy/paths.test.ts` | enforced in config; CodeRabbit's own behaviour: documented, not verified live (H-164) |
 
 ## 7. Spec §11.9 residual risks
@@ -391,7 +391,7 @@ Spec §11.9 #3 and §11.5: each container's model keys are in its environment, w
 
 Spec §11.9 #4: Hermes's protected-file gate has holes: shell writes, and `always` carry-over. A write made through the terminal misses it (spec §9.1 #1 cites upstream #143266, marked [verify] there), an `always` approval carries over, the gate only asks, and its extra patterns match basenames, so a directory glob (`.agents/**`, `.github/**`) can't be expressed.
 
-- **Owner control:** hapi-path-guard (IS-3: planned, Plan 04, H-093, H-094), the command allowlist hook (IS-4: planned, Plan 04, H-095) and the PR backstop: CODEOWNERS and the rulesets, so a protected file can't reach `main` without the operator (AC-7, GR-8: documented, not verified live, H-075, H-076). Today: the generated filename rules (IS-2) and manual approvals with unattended deny (IS-1), both enforced. Spike T9 tests the gate's mechanics (H-064, H-093).
+- **Owner control:** hapi-path-guard (IS-3: planned, Plan 04, H-093, H-094), the command allowlist hook (IS-4: planned, Plan 04, H-095) and the PR backstop: CODEOWNERS and the rulesets, so a protected file can't reach `main` without the operator (AC-7, GR-8: documented, not verified live, H-078). Today: the generated filename rules (IS-2) and manual approvals with unattended deny (IS-1), both enforced. Spike T9 tests the gate's mechanics (H-064, H-093).
 - **Next level:** make the protected paths read-only at the filesystem in Hermes's working copies (a read-only bind mount, or the vetted bubblewrap plugin, spec §9.1), so no write path, shell or tool, reaches them. Unscheduled.
 - **Catalog:** ASI02, ASI05; LLM06:2025; AML.T0053, AML.T0081. **Status:** accepted residual.
 
@@ -400,7 +400,7 @@ Spec §11.9 #4: Hermes's protected-file gate has holes: shell writes, and `alway
 
 Spec §11.9 #5: text in a target repo (`AGENTS.md`, `.pi/`, `.agents/`, code, comments, docs) is context that Hermes and Pi read, and can carry instructions.
 
-- **Owner control:** the spec's four: strip `.pi/` and `.agents/` before Pi runs (DS-15: planned, Plan 03, H-161); CODEOWNERS on `AGENTS.md` (GR-8: documented, not verified live, H-076); workers have no web (IS-5: enforced, the archon zone has T0–T1 only and no MCP server); and the reviewer is advisory (IS-10: planned, Plan 03, H-161), with only the operator merging (AC-7). Also enforced today: `PI_OFFLINE=1`, so a repo's `.pi/` settings can't install packages (DS-11), and `AGENTS.md`, `.pi/**` and `.agents/**` are `deny` for workers in policy (GR-3; Pi's guard is H-087).
+- **Owner control:** the spec's four: strip `.pi/` and `.agents/` before Pi runs (DS-15: planned, Plan 03, H-161); CODEOWNERS on `AGENTS.md` (GR-8: documented, not verified live, H-078); workers have no web (IS-5: enforced, the archon zone has T0–T1 only and no MCP server); and the reviewer is advisory (IS-10: planned, Plan 03, H-161), with only the operator merging (AC-7). Also enforced today: `PI_OFFLINE=1`, so a repo's `.pi/` settings can't install packages (DS-11), and `AGENTS.md`, `.pi/**` and `.agents/**` are `deny` for workers in policy (GR-3; Pi's guard is H-087).
 - **Next level:** the injection screen over untrusted text (IS-7: planned, Plan 04, H-162; a signal, never a boundary), and Archon honouring Pi's own project trust upstream, so `.pi/` needn't be stripped (spec §9.3). Unscheduled beyond Plan 04.
 - **Catalog:** ASI01, ASI06; LLM01:2025; AML.T0051.001. **Status:** accepted residual.
 
@@ -409,7 +409,7 @@ Spec §11.9 #5: text in a target repo (`AGENTS.md`, `.pi/`, `.agents/`, code, co
 
 Spec §11.9 #6: the in-run review (and CodeRabbit, later) reads a diff that the worker wrote and that repo content may have steered, so the review can be manipulated.
 
-- **Owner control:** the review is advisory; the operator merges (AC-7: documented, not verified live, H-075, H-078), with `ci` required and no bypass (`main-protect`). The review runs in a separate session, with a different model, read-only (IS-10: planned, Plan 03, H-161). CodeRabbit is never a merge authority or a required check (spec §9.6; AC-17, which the audit checks).
+- **Owner control:** the review is advisory; the operator merges (AC-7: documented, not verified live, H-078), with `ci` required and no bypass (`main-protect`). The review runs in a separate session, with a different model, read-only (IS-10: planned, Plan 03, H-161). CodeRabbit is never a merge authority or a required check (spec §9.6; AC-17, which the audit checks).
 - **Next level:** evals that measure what the review catches against seeded defects (Plan 06's evals and calibration records, H-168), and a second vendor's review (CodeRabbit on hapi-factory since 2026-10-27, H-164; its place in the run loop is H-166), still advisory.
 - **Catalog:** ASI09; LLM01:2025; AML.T0051.001, AML.T0067. **Status:** accepted residual.
 
@@ -422,17 +422,17 @@ The items the handoffs register sent to Plan 01 Task 7 (H-038–H-052, H-137), t
 
 Both Apps are limited to `plan/**` ∪ `factory/**` (`agent-branch-scope`). Holding an App to its own prefix would make it a bypass actor, which is forbidden, so a `hapi-planner` token in Hermes can push a `factory/**` branch. (The plan's "branches restricted by ruleset to `plan/*`" is stale: H-081.)
 
-- **Owner control:** only the operator merges, with `ci` green (AC-7: documented, not verified live, H-075, H-078); only the harvester's deterministic code holds `hapi-factory` tokens; the branch-scope rulesets (AC-8, H-077).
+- **Owner control:** only the operator merges, with `ci` green (AC-7: documented, not verified live, H-078); only the harvester's deterministic code holds `hapi-factory` tokens; the branch-scope rulesets (AC-8: documented, not verified live, H-078).
 - **Next level:** CI checks lane labels and commit trailers, so a `factory/**` push made with a planner token is caught before merge (GR-6: planned, Plan 05, H-113).
 - **Catalog:** ASI03; AML.T0091.000. **Status:** accepted residual.
 
 <a id="h-039"></a>
 ### H-039: "no App can merge" rests on a check not yet run
 
-The control is `main-review`'s Restrict updates (the `update` rule), with code-owner review as a second layer (AC-7). Its live proof is H-078's App-merge-refusal check, which needs the public repo, the rulesets, CODEOWNERS and both Apps (H-074–H-077). **Result: pending (H-078).**
+The control is `main-review`'s Restrict updates (the `update` rule), with code-owner review as a second layer (AC-7). Its live proof is H-078's App-merge-refusal check. The public repo, the rulesets, CODEOWNERS and both Apps it needs are in place since 2026-10-27 (H-074–H-077); its App token needs `hapi secrets resolve`, so it waits on the Slack app's values. **Result: pending (H-078).**
 
 - **Owner control:** AC-7, with `tests/docs/rulesets.test.ts` holding the documented JSON to it, and the audit's `github.rulesets` and `github.app-perms` checking the live repo in stage b (H-080).
-- **Next level:** when H-078 runs, record its result here. If GitHub refuses the merge, AC-7 becomes verified live. If the merge goes through: revert it, suspend both installations ([kill switch 2](../runbooks/kill-switches.md#2-suspend-the-github-app-installations)), record "an App can merge once the operator has approved and `ci` is green" as a residual here, and remove the "no merge rights" claims from the README and the GitHub Apps runbook.
+- **Next level:** when H-078 runs, record its result here. If GitHub refuses the merge, AC-7 stays documented, not verified live until stage b's strict audit (H-080) also passes `github.rulesets` and `github.app-perms`, which check AC-7's other parts: the bypass actors and the Apps' permissions. Then it is verified live. If the merge goes through: revert it, suspend both installations ([kill switch 2](../runbooks/kill-switches.md#2-suspend-the-github-app-installations)), record "an App can merge once the operator has approved and `ci` is green" as a residual here, and remove the "no merge rights" claims from the README and the GitHub Apps runbook.
 - **Catalog:** ASI03; AML.T0091.000. **Status:** documented, not verified live (H-078).
 
 <a id="h-040"></a>
@@ -580,7 +580,7 @@ Stage a ran everything on the build host's rootful Docker as an ordinary user, w
 - **H-080 (stage b):** `scripts/host-setup.sh`, rootless Docker, the store handed to hapi, `mise run up` and `mise run test:int` as hapi, then the strict audit (AC-1, AC-12, MO-2).
 - **H-146:** (a) the Squid image under hapi's subordinate range; (b) kill switch 4 under rootless networking; (c) the integration tests as hapi, DNS on internal networks included (DS-3); (d) the hapi-side steps of both scripts through the real sudo (AC-2); (e) `up`'s re-exec through the real sudo and mise (AC-4).
 - **H-160:** the kill-switch runbook's other marks: the providers' UI paths, whether a token minted before a suspension is refused, and switch 3's fallback and hard stop (MO-5).
-- **H-074 to H-079:** the public repo, rulesets, CODEOWNERS, the Apps and the App-merge-refusal check (AC-7, AC-8, GR-8).
+- **H-078 and H-079:** the public repo, the rulesets, CODEOWNERS and both Apps are in place since 2026-10-27 (H-074–H-077); what's left is the live checks with App tokens: that an App's approval doesn't satisfy the code-owner rule (GR-8), that its merge and its pushes outside `plan/**` and `factory/**` are refused (AC-7, AC-8), and the token API's version and scope.
 
 **Owner control:** the controls stay documented, not enforced, until each check passes, and stage b ends with the strict audit. **Next level:** run them, then mark each control here. **Status:** documented, not verified live.
 
