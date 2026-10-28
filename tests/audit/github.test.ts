@@ -79,6 +79,19 @@ describe("github.rulesets", () => {
     ["an App as a bypass actor", mutate((r) => named(r, "agent-branch-scope").bypass_actors.push({ actor_id: APP_IDS.planner, actor_type: "Integration", bypass_mode: "always" })), "Integration"],
     ["no main-review", mutate((r) => r.splice(1, 1)), "main-review"],
     ["no force-push block", mutate((r) => (named(r, "main-protect").rules = named(r, "main-protect").rules.filter((x: any) => x.type !== "non_fast_forward"))), "non_fast_forward"],
+    // The branch and tag scope rulesets (AC-8, H-174): they don't apply to main, so main's effective rules never show them.
+    ["no agent-branch-scope", mutate((r) => r.splice(r.indexOf(named(r, "agent-branch-scope")), 1)), "no ruleset named agent-branch-scope"],
+    ["no tags-admin-only", mutate((r) => r.splice(r.indexOf(named(r, "tags-admin-only")), 1)), "no ruleset named tags-admin-only"],
+    ["tags-admin-only in evaluate mode", mutate((r) => (named(r, "tags-admin-only").enforcement = "evaluate")), "tags-admin-only is evaluate, not active"],
+    ["agent-branch-scope disabled", mutate((r) => (named(r, "agent-branch-scope").enforcement = "disabled")), "agent-branch-scope is disabled, not active"],
+    ["agent-branch-scope on tags", mutate((r) => (named(r, "agent-branch-scope").target = "tag")), "agent-branch-scope targets tag, not branch"],
+    ["agent-branch-scope narrowed to some branches", mutate((r) => (named(r, "agent-branch-scope").conditions.ref_name.include = ["refs/heads/feature/**"])), "agent-branch-scope includes refs/heads/feature/**, not only ~ALL"],
+    ["agent-branch-scope excluding more branches", mutate((r) => named(r, "agent-branch-scope").conditions.ref_name.exclude.push("refs/heads/release/**")), "agent-branch-scope also excludes refs/heads/release/**"],
+    ["agent-branch-scope without the plan/** exclusion", mutate((r) => (named(r, "agent-branch-scope").conditions.ref_name.exclude = ["~DEFAULT_BRANCH", "refs/heads/factory/**"])), "agent-branch-scope doesn't exclude refs/heads/plan/**"],
+    ["tags-admin-only excluding a tag", mutate((r) => named(r, "tags-admin-only").conditions.ref_name.exclude.push("refs/tags/v*")), "tags-admin-only also excludes refs/tags/v*"],
+    ["tags-admin-only without the deletion rule", mutate((r) => (named(r, "tags-admin-only").rules = [{ type: "creation" }, { type: "update" }])), "tags-admin-only has no deletion rule"],
+    ["agent-branch-scope's bypass PR-only, not always", mutate((r) => (named(r, "agent-branch-scope").bypass_actors[0].bypass_mode = "pull_request")), "agent-branch-scope's bypass actors"],
+    ["a second bypass actor on tags-admin-only", mutate((r) => named(r, "tags-admin-only").bypass_actors.push({ actor_id: 4, actor_type: "RepositoryRole", bypass_mode: "always" })), "tags-admin-only's bypass actors"],
   ] as const) {
     test(`fails on ${what}`, async () => {
       const r = await run(await withToken({ rulesets: rulesets as Record<string, any>[] }));
@@ -86,6 +99,28 @@ describe("github.rulesets", () => {
       expect(r.rulesets.detail).toContain(says);
     });
   }
+
+  test("the pass names the branch and tag scope rulesets, and allows the Dependabot exclusion the runbook offers", async () => {
+    let r = await run(await withToken());
+    expect(r.rulesets.detail).toContain("agent-branch-scope and tags-admin-only");
+    // Dependabot's branches are dependabot/<ecosystem>/<name>, and GitHub's trailing ** matches one segment only.
+    r = await run(await withToken({ rulesets: mutate((x) => named(x, "agent-branch-scope").conditions.ref_name.exclude.push("refs/heads/dependabot/**/*")) }));
+    expect([r.rulesets.status, r.rulesets.detail]).toEqual(["pass", expect.stringContaining("agent-branch-scope and tags-admin-only") as unknown as string]);
+  });
+
+  // main's rules stand for the default branch's only while main is the default: the main-* rulesets follow
+  // ~DEFAULT_BRANCH, and agent-branch-scope exempts it.
+  test("fails when main isn't the default branch", async () => {
+    const r = await run(await withToken({ defaultBranch: "release" }));
+    expect(r.rulesets.status).toBe("fail");
+    expect(r.rulesets.detail).toContain("the default branch is release, not main");
+  });
+
+  test("fails closed when GitHub doesn't say which branch is the default", async () => {
+    const r = await run(await withToken({ defaultBranch: null }));
+    expect(r.rulesets.status).toBe("fail");
+    expect(r.rulesets.detail).toContain("GitHub returned no default_branch");
+  });
 
   test("a ruleset in evaluate mode doesn't count: GitHub doesn't apply it to main", async () => {
     const r = await run(await withToken({ rulesets: mutate((x) => (named(x, "main-protect").enforcement = "evaluate")) }));

@@ -24,7 +24,8 @@
  *   /repos/{owner}/{repo}/installation), which needs no permission.
  * With neither, each check is a skip saying what is missing.
  *
- * - github.rulesets: the effective rules on main (GET .../rules/branches/main)
+ * - github.rulesets: that main is the default branch (GET /repos/{owner}/{repo}),
+ *   the effective rules on main (GET .../rules/branches/main)
  *   and every ruleset (GET .../rulesets, then each by id), held to
  *   docs/runbooks/github-apps.md as tests/docs/rulesets.test.ts holds the
  *   README's JSON: main-protect and main-review, never one ruleset.
@@ -199,11 +200,14 @@ interface Ruleset {
   name: string;
   target?: string;
   enforcement?: string;
+  conditions?: { ref_name?: { include?: unknown; exclude?: unknown } };
   bypass_actors?: { actor_id: number | null; actor_type: string; bypass_mode?: string }[];
   rules?: Rule[];
 }
 interface RepoData {
   via: string;
+  /** The repo's default branch, or undefined if GitHub didn't say. */
+  defaultBranch: string | undefined;
   /** The effective rules on main. */
   rules: Rule[];
   rulesets: Ruleset[];
@@ -216,18 +220,52 @@ function repoData(run: AuditRun, repo: RepoRef): Promise<RepoData | { none: stri
   return run.once(`gh-data:${repoName(repo)}`, async () => {
     const cred = await credential(run, repo);
     if ("none" in cred) return cred;
+    const { default_branch } = (await getOk(run, repoPath(repo), cred.token)) as { default_branch?: unknown };
     const rules = (await getAll(run, `${repoPath(repo)}/rules/branches/main`, cred.token)) as Rule[];
     const list = (await getAll(run, `${repoPath(repo)}/rulesets`, cred.token)) as Ruleset[];
     const rulesets: Ruleset[] = [];
     for (const r of list) rulesets.push((await getOk(run, `${repoPath(repo)}/rulesets/${Number(r.id)}`, cred.token)) as Ruleset);
-    return { via: cred.via, rules, rulesets, bypassVisible: rulesets.every((r) => Array.isArray(r.bypass_actors)) };
+    const defaultBranch = typeof default_branch === "string" ? default_branch : undefined;
+    return { via: cred.via, defaultBranch, rules, rulesets, bypassVisible: rulesets.every((r) => Array.isArray(r.bypass_actors)) };
   });
 }
 
 const NO_REPO = "no --repo given";
 const ADMIN_PR_ONLY = [{ actor_id: 5, actor_type: "RepositoryRole", bypass_mode: "pull_request" }];
+const ADMIN_ALWAYS = [{ actor_id: 5, actor_type: "RepositoryRole", bypass_mode: "always" }];
 /** GitHub Actions' integration id: only Actions can satisfy the ci check. */
 const ACTIONS = 15368;
+
+/**
+ * The branch and tag scope rulesets (AC-8), as docs/runbooks/github-apps.md sets them. `mayExclude` is what the
+ * runbook lets the operator add: Dependabot's branches, once its version updates are on. They are
+ * dependabot/<ecosystem>/<name>, and GitHub matches a trailing ** within one segment, so the pattern is ** then *.
+ * Any other exclusion widens what the Apps may push.
+ */
+const SCOPE_RULESETS = [
+  { name: "agent-branch-scope", target: "branch", exclude: ["~DEFAULT_BRANCH", "refs/heads/plan/**", "refs/heads/factory/**"], mayExclude: ["refs/heads/dependabot/**/*"] },
+  { name: "tags-admin-only", target: "tag", exclude: [], mayExclude: [] },
+] as const;
+
+/** What's wrong with one scope ruleset, held to its runbook JSON (bypass actors only when GitHub showed them). */
+function scopeProblems(r: Ruleset, want: (typeof SCOPE_RULESETS)[number], bypassVisible: boolean): string[] {
+  const problems: string[] = [];
+  const list = (v: unknown) => (Array.isArray(v) ? v.map(String) : []);
+  if (r.enforcement !== "active") problems.push(`${r.name} is ${r.enforcement ?? "of no enforcement"}, not active`);
+  if (r.target !== want.target) problems.push(`${r.name} targets ${r.target ?? "nothing"}, not ${want.target}`);
+  const include = list(r.conditions?.ref_name?.include);
+  if (include.length !== 1 || include[0] !== "~ALL") problems.push(`${r.name} includes ${include.join(", ") || "nothing"}, not only ~ALL`);
+  const exclude = list(r.conditions?.ref_name?.exclude);
+  const allowed: readonly string[] = [...want.exclude, ...want.mayExclude];
+  const extra = exclude.filter((x) => !allowed.includes(x));
+  if (extra.length > 0) problems.push(`${r.name} also excludes ${extra.join(", ")}, so the Apps could touch those refs`);
+  for (const x of want.exclude) if (!exclude.includes(x)) problems.push(`${r.name} doesn't exclude ${x}`);
+  for (const t of ["creation", "update", "deletion"]) if (!(r.rules ?? []).some((x) => x.type === t)) problems.push(`${r.name} has no ${t} rule`);
+  if (bypassVisible && JSON.stringify((r.bypass_actors ?? []).map(({ actor_id, actor_type, bypass_mode }) => ({ actor_id, actor_type, bypass_mode }))) !== JSON.stringify(ADMIN_ALWAYS)) {
+    problems.push(`${r.name}'s bypass actors are not exactly the Admin role (actor_id 5), always`);
+  }
+  return problems;
+}
 
 /** github.rulesets */
 export async function githubRulesets(run: AuditRun): Promise<CheckResult[]> {
@@ -246,6 +284,12 @@ export async function githubRulesets(run: AuditRun): Promise<CheckResult[]> {
       continue;
     }
     const problems: string[] = [];
+    // The main-* rulesets follow ~DEFAULT_BRANCH and agent-branch-scope exempts it, so main's rules below say what
+    // guards the default branch only while main is the default.
+    if (data.defaultBranch !== "main") {
+      const is = data.defaultBranch === undefined ? "unknown (GitHub returned no default_branch)" : data.defaultBranch;
+      problems.push(`the default branch is ${is}, not main: this check reads main's rules, and agent-branch-scope exempts the default branch, so make main the default again`);
+    }
     const rules = data.rules;
     const of = (type: string) => rules.filter((r) => r.type === type);
     if (!of("pull_request").some((r) => Number(r.parameters?.required_approving_review_count) >= 1)) {
@@ -274,6 +318,12 @@ export async function githubRulesets(run: AuditRun): Promise<CheckResult[]> {
         problems.push("main-review's bypass actors are not exactly the Admin role (actor_id 5), PR-only");
       }
     }
+    // Not on main, so main's effective rules never show them: read by name.
+    for (const want of SCOPE_RULESETS) {
+      const scope = data.rulesets.find((r) => r.name === want.name);
+      if (scope === undefined) problems.push(`no ruleset named ${want.name}`);
+      else problems.push(...scopeProblems(scope, want, data.bypassVisible));
+    }
     if (data.bypassVisible) {
       for (const r of data.rulesets) {
         const bypass = r.bypass_actors ?? [];
@@ -290,7 +340,7 @@ export async function githubRulesets(run: AuditRun): Promise<CheckResult[]> {
         result(
           id,
           "skip",
-          `${name}: the rules on main pass, but GitHub returned no bypass_actors (it shows them only to a token with write access to the ruleset, i.e. repository Administration, which the Apps never get), so no bypass check was made: pass --github-token-file with the operator's token`,
+          `${name}: the rules on main and the branch and tag scope rulesets pass, but GitHub returned no bypass_actors (it shows them only to a token with write access to the ruleset, i.e. repository Administration, which the Apps never get), so no bypass check was made: pass --github-token-file with the operator's token`,
         ),
       );
     } else {
@@ -298,7 +348,7 @@ export async function githubRulesets(run: AuditRun): Promise<CheckResult[]> {
         result(
           id,
           "pass",
-          `${name}: main requires only the ci check, from GitHub Actions, with no bypass, blocks force-pushes and deletion, and main-review requires 1 code-owner approval with Restrict updates and only the Admin PR-only bypass; no ruleset without bypass actors restricts updates, and no App is a bypass actor (read with ${data.via})`,
+          `${name}: main requires only the ci check, from GitHub Actions, with no bypass, blocks force-pushes and deletion, and main-review requires 1 code-owner approval with Restrict updates and only the Admin PR-only bypass; agent-branch-scope and tags-admin-only are active, scoped as the runbook sets them, with only the Admin role's bypass; no ruleset without bypass actors restricts updates, and no App is a bypass actor (read with ${data.via})`,
         ),
       );
     }

@@ -67,7 +67,7 @@ Without the stack and without `--repo`, as on a development machine, most checks
 | [`mcp.tool-hashes`](#mcptool-hashes) | The MCP lock, its read-only tools, and the servers the stack runs | §10.1 | policy/ |
 | [`secrets.provider`](#secretsprovider) | The secrets provider (not the env-file downgrade), and for sops the recipients file and `recovery.age` | §11.5 | The secrets config |
 | [`secrets.check`](#secretscheck) | Every secret `resolve` needs is found, none empty or invalid | §11.5 | The secrets config and store |
-| [`github.rulesets`](#githubrulesets) | The two `main` rulesets, per `--repo` | §5.1, §11.5 | `--repo`; a token ([below](#github-credentials)) |
+| [`github.rulesets`](#githubrulesets) | The four rulesets, per `--repo` | §5.1, §11.5 | `--repo`; a token ([below](#github-credentials)) |
 | [`github.app-perms`](#githubapp-perms) | Neither App has administration, workflows or a bypass, per `--repo` | §11.5 | `--repo`; the App keys |
 | [`repo.ai-workflows`](#repoai-workflows) | No workflow runs an AI agent with secrets on comment, issue or review triggers, per `--repo` | §7, §11.7 | `--repo`; a token |
 | [`repo.private-untracked`](#repoprivate-untracked) | The checkout tracks nothing under `private/`, and its root `.gitignore` ignores `private/` | §11.5 (H-058) | The checkout (git) |
@@ -211,14 +211,16 @@ Under `--strict` that skip is a fail, like any other. So until H-101 closes, a s
 
 ### github.rulesets
 
-**Verifies**, per `--repo`, from the effective rules on `main` (`GET /repos/{owner}/{repo}/rules/branches/main`) and every ruleset (`GET .../rulesets`, then each by id), held to [docs/runbooks/github-apps.md](runbooks/github-apps.md) as `tests/docs/rulesets.test.ts` holds the README's JSON (H-023):
+**Verifies**, per `--repo`, from the repo (`GET /repos/{owner}/{repo}`), the effective rules on `main` (`GET .../rules/branches/main`) and every ruleset (`GET .../rulesets`, then each by id), held to [docs/runbooks/github-apps.md](runbooks/github-apps.md) as `tests/docs/rulesets.test.ts` holds the README's JSON (H-023):
+- `main` is the default branch. `main-protect` and `main-review` follow the default branch (`~DEFAULT_BRANCH`) and `agent-branch-scope` exempts it, so `main`'s rules say what guards the default branch only while `main` is the default. A repo whose answer has no `default_branch` fails;
 - `main` has a `pull_request` rule with `required_approving_review_count` ≥ 1, a `required_status_checks` rule with `ci` from GitHub Actions (`integration_id` 15368) and no other required check, and `deletion` and `non_fast_forward` rules. A third-party reviewer's check, such as CodeRabbit's, is never required (spec §9.6): it would let an advisory reviewer block a merge, or stand in for a gate once green;
 - `main-review` applies to `main`, with the `update` rule (Restrict updates), `require_code_owner_review: true`, and exactly the Admin role's PR-only bypass (`actor_id` 5, `bypass_mode: pull_request`);
+- `agent-branch-scope` and `tags-admin-only` exist and are `active`, with the runbook's target (`branch`, `tag`), refs and rules: `include` only `~ALL`; `agent-branch-scope` excludes `~DEFAULT_BRANCH`, `refs/heads/plan/**` and `refs/heads/factory/**`, plus `refs/heads/dependabot/**/*` if you added it for Dependabot, and nothing else, while `tags-admin-only` excludes nothing; the `creation`, `update` and `deletion` rules; and exactly the Admin role's bypass, always (`actor_id` 5, `bypass_mode: always`). Neither applies to `main`, so they are read by name (H-174);
 - no ruleset holding `required_status_checks` has a bypass actor; no ruleset without bypass actors has `update`; no ruleset has an `Integration` (GitHub App) bypass actor, ours or a third party's such as CodeRabbit.
 
 Rules in a ruleset in `evaluate` or `disabled` mode don't apply to `main`, so they don't count.
 
-**Why.** Spec §5.1 and §11.5: every lane gets the same CI gates, and no App can merge or bypass. `main` is guarded by two rulesets, because one ruleset's owner bypass would also bypass `ci`.
+**Why.** Spec §5.1 and §11.5: every lane gets the same CI gates, and no App can merge or bypass. `main` is guarded by two rulesets, because one ruleset's owner bypass would also bypass `ci`. The other two keep the Apps to `plan/**` and `factory/**` and off tags (AC-8): an exclusion added to either would widen what the Apps may push.
 
 **Credential.** The operator's token (`--github-token-file`), or else a read-only App installation token ([below](#github-credentials)). GitHub returns `bypass_actors` only to a token with write access to the ruleset, so with an App token the bypass checks can't be made.
 

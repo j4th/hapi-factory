@@ -88,7 +88,7 @@ hapi-host-planner-app-private-key: |
 
 ## The rulesets
 
-Rulesets are where the "no merge" rule lives. Neither App is a bypass actor in any of them. `hapi audit --repo $OWNER/hapi-factory` checks the rules on `main` and both Apps against this page (`github.rulesets`, `github.app-perms`, [docs/audit.md](../audit.md#githubrulesets)), and that no ruleset has an App as a bypass actor. It doesn't yet check the [branch and tag scope](#branch-and-tag-scope) rulesets (register H-174); [Check it](#check-it) steps 1, 2 and 5 do, by hand. `tests/docs/rulesets.test.ts` holds the JSON on this page and in the README to the same rules. GitHub shows a ruleset's bypass actors only to a token with write access to it, so the audit's bypass checks use your own token (`--github-token-file`), never an App's: the Apps never get Administration.
+Rulesets are where the "no merge" rule lives. Neither App is a bypass actor in any of them. `hapi audit --repo $OWNER/hapi-factory` checks the four rulesets and both Apps against this page (`github.rulesets`, `github.app-perms`, [docs/audit.md](../audit.md#githubrulesets)), and that no ruleset has an App as a bypass actor. `tests/docs/rulesets.test.ts` holds the JSON on this page and in the README to the same rules. GitHub shows a ruleset's bypass actors only to a token with write access to it, so the audit's bypass checks use your own token (`--github-token-file`), never an App's: the Apps never get Administration. Keep `main` the default branch: `main-protect` and `main-review` follow the default branch (`~DEFAULT_BRANCH`) and `agent-branch-scope` exempts it, but the audit reads `main`'s rules, so it fails if `main` isn't the default.
 
 **The Admin role is you, on a repo your personal account owns.** Three of the rulesets let the repository Admin role (`actor_id` 5) bypass them. A personal account's repo has one Admin, its owner: collaborators get write access at most. On an organization's repo, every repository Admin and every organization owner has the same bypasses, so give no one else the Admin role there.
 
@@ -170,7 +170,7 @@ gh api -X POST "repos/$OWNER/hapi-factory/rulesets" --input - <<'EOF'
 EOF
 ```
 
-`actor_id` 5 is the repository Admin role, which bypasses both rulesets always, so your own pushes to other branches still go through. These commands were first run on 2026-10-27, and GitHub accepted every field; read back, each ruleset holds exactly these fields. If GitHub ever rejects a field, set up the same rulesets in the UI. If you turn on Dependabot version updates, add `refs/heads/dependabot/**` to `agent-branch-scope`'s `exclude`, or Dependabot can't push its branches.
+`actor_id` 5 is the repository Admin role, which bypasses both rulesets always, so your own pushes to other branches still go through. These commands were first run on 2026-10-27, and GitHub accepted every field; read back, each ruleset holds exactly these fields. If GitHub ever rejects a field, set up the same rulesets in the UI. **A trailing `**` matches one segment of a branch name** (GitHub matches with `File::FNM_PATHNAME`): the Apps can push `plan/x` and `factory/x`, never `plan/x/y`. GitHub's rules for a branch (`gh api "repos/$OWNER/hapi-factory/rules/branches/plan%2Fx%2Fy"`) showed `creation`, `update` and `deletion` on 2026-10-27. hapi's branches are one segment (`plan/<slug>`, `factory/<id>`). Dependabot's aren't (`dependabot/<ecosystem>/<name>`), so if you turn on Dependabot version updates, add `refs/heads/dependabot/**/*` to `agent-branch-scope`'s `exclude`, or Dependabot can't push its branches.
 
 **What rulesets can't do: keep each App to its own prefix.** GitHub rulesets can only say "nobody but the bypass actors". "Only `hapi-planner` may push `plan/**`" would need `hapi-planner` as a bypass actor on a `plan/**` ruleset, and no App is ever a bypass actor. So either App can push either prefix. In practice:
 - only the harvester's deterministic code holds `hapi-factory` tokens, and it pushes `factory/<id>` only;
@@ -198,10 +198,11 @@ Run these with `$OWNER` set ([before you start](#before-you-start)). Steps 1 and
    - `agent-branch-scope` and `tags-admin-only`: `bypass` is `RepositoryRole:5:always`, and their rules are `creation`, `update` and `deletion`;
    - none lists an `Integration`.
 2. **Branch rules:** `gh api "repos/$OWNER/hapi-factory/rules/branches/main"` shows `update` (from `main-review`) as well as the `ci` check. `gh api "repos/$OWNER/hapi-factory/rules/branches/some-feature"` shows `creation`, `update` and `deletion`. `gh api "repos/$OWNER/hapi-factory/rules/branches/plan%2Fexample"` shows none of them.
-3. **A token** ([docs/secrets.md](../secrets.md#hapi-token-mint)), once `hapi secrets resolve` has run:
+3. **A token** ([docs/secrets.md](../secrets.md#hapi-token-mint)). Run these from your checkout, in one shell you keep open for steps 4 and 5; the token lasts an hour, so mint another if it runs out:
 
    ```bash
-   hapi token mint --app planner --repo "$OWNER/hapi-factory"      # prints the token file's path
+   mise run hapi -- secrets resolve                                       # writes the env files to your tmpfs
+   mise run hapi -- token mint --app planner --repo "$OWNER/hapi-factory" # prints the token file's path
    tok="$XDG_RUNTIME_DIR/hapi/tokens/planner.$OWNER.hapi-factory.token"
    GH_TOKEN="$(cat "$tok")" gh api /installation/repositories --jq '.repositories[].full_name'
    ```
@@ -222,7 +223,7 @@ Run these with `$OWNER` set ([before you start](#before-you-start)). Steps 1 and
    **Before you approve it, check that an App's approval doesn't count** ([code owners](#code-owners-a-second-layer)). Approve it as `hapi-factory`, which isn't a code owner, with its own token:
 
    ```bash
-   hapi token mint --app factory --repo "$OWNER/hapi-factory"
+   mise run hapi -- token mint --app factory --repo "$OWNER/hapi-factory"
    ftok="$XDG_RUNTIME_DIR/hapi/tokens/factory.$OWNER.hapi-factory.token"
    GH_TOKEN="$(cat "$ftok")" gh api "repos/$OWNER/hapi-factory/pulls/$pr/reviews" -f event=APPROVE -f body="Delete me."
    gh pr view "$pr" --repo "$OWNER/hapi-factory" --json reviewDecision --jq .reviewDecision
@@ -249,7 +250,16 @@ Run these with `$OWNER` set ([before you start](#before-you-start)). Steps 1 and
    GH_TOKEN="$(cat "$tok")" gh api "repos/$OWNER/hapi-factory/git/refs" -f ref=refs/tags/ruleset-check -f sha="$main"
    ```
 
-   **Expected: GitHub refuses both** with a repository rule violation. If either goes through, delete it as yourself (`gh api -X DELETE "repos/$OWNER/hapi-factory/git/refs/heads/ruleset-check"`, or `.../git/refs/tags/ruleset-check`), then check that ruleset's conditions, and that no App is a bypass actor in it (step 1). Then revoke the test token:
+   **Expected: GitHub refuses both.** The refs API says only `Reference update failed` (HTTP 422), not which rule, so check as yourself. GitHub's rule insights list each evaluation, newest first:
+
+   ```bash
+   for id in $(gh api "repos/$OWNER/hapi-factory/rulesets/rule-suites?time_period=hour" --jq '.[:3][].id'); do
+     gh api "repos/$OWNER/hapi-factory/rulesets/rule-suites/$id" --jq '"\(.ref) \(.actor_name) \(.result): " +
+       ([.rule_evaluations[] | select(.result == "fail") | "\(.rule_source.name)/\(.rule_type)"] | join(", "))'
+   done
+   ```
+
+   It prints `refs/tags/ruleset-check hapi-planner[bot] fail: tags-admin-only/creation`, `refs/heads/ruleset-check hapi-planner[bot] fail: agent-branch-scope/creation` and, from step 4, `refs/heads/main hapi-planner[bot] fail: main-review/update`. If either ref goes through, delete it as yourself (`gh api -X DELETE "repos/$OWNER/hapi-factory/git/refs/heads/ruleset-check"`, or `.../git/refs/tags/ruleset-check`), then check that ruleset's conditions, and that no App is a bypass actor in it (step 1). Then revoke the test token:
 
    ```bash
    GH_TOKEN="$(cat "$tok")" gh api -X DELETE /installation/token
@@ -264,7 +274,7 @@ Kill switch 2 (spec §11.8; the full steps are in [kill switches](kill-switches.
 
 1. On the App's settings page, **Generate a private key**. The old key still works until you delete it.
 2. Replace the PEM under `hapi-host-<app>-app-private-key` in your secrets store (`mise run secrets:edit`). Then shred the downloaded file.
-3. Run `hapi secrets resolve`, then mint a test token as in [check it](#check-it).
+3. Run `mise run hapi -- secrets resolve`, then mint a test token as in [check it](#check-it).
 4. **Delete the old key** on the App's settings page.
 
 If a key may have leaked, suspend the installation first, then rotate.
