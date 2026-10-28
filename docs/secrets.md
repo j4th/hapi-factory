@@ -154,13 +154,15 @@ Run `mise run secrets:edit` and add, or fill in, one line per secret, under its 
 
 ```yaml
 hapi-hermes-anthropic-api-key: sk-ant-...
+hapi-host-planner-app-id: "1234567"
 hapi-host-planner-app-private-key: |
   -----BEGIN RSA PRIVATE KEY-----
   ...
   -----END RSA PRIVATE KEY-----
 ```
 
-- Every value is a top-level string. A multi-line value, such as a PEM, is a YAML block scalar (`|`).
+- Every value is a top-level string. A multi-line value, such as a PEM, is a YAML block scalar (`|`), its lines indented with spaces ([the GitHub Apps runbook](runbooks/github-apps.md#adding-the-id-and-key) has the Vim commands).
+- **Quote a value YAML would read as something else,** such as a number (a GitHub App ID) or `true`. Unquoted, it isn't a string, and `check` and `resolve` stop with `<name> is not a string`.
 - A value can't hold a single quote (`'`) or NUL: an env file can't carry them literally ([the env files](#the-env-files)). `check` reports such a value as `invalid`.
 - **Don't use `sops set` or put a value on any command line:** it ends up in your shell history and in the process list.
 - Then `mise run secrets:check`.
@@ -397,7 +399,7 @@ mise run secrets:edit
 
 For the sops provider only. Holding the store's [lock](#the-commands), it first runs the store checks every lifecycle command runs: the file's shape, age recipients and nothing else (no [other master key](#the-recipients-file), no metadata field hapi doesn't know), and the recipients file in step with the store, with no post-quantum/classic mix. So new values never go into a store that a key outside the recipients file could open. Then it checks the age key, and runs `sops edit` on the configured file in your terminal, with your `$EDITOR`. sops decrypts the file into a temp file for the editor and encrypts it again when you quit.
 
-- **The temp file is on your tmpfs.** hapi sets `TMPDIR` to `$XDG_RUNTIME_DIR/hapi`, so it needs `XDG_RUNTIME_DIR` ([below](#hapi-secrets-resolve)). Make sure your editor doesn't copy the buffer anywhere else: Neovim, for one, keeps swap files under `~/.local/state/nvim/` by default (run it with `-n` for no swap file).
+- **The temp file is on your tmpfs.** hapi sets `TMPDIR` to `$XDG_RUNTIME_DIR/hapi`, so it needs `XDG_RUNTIME_DIR` ([below](#hapi-secrets-resolve)). Make sure your editor doesn't copy the buffer anywhere else. Neovim keeps swap files under `~/.local/state/nvim/` and history in its ShaDa file, Vim keeps registers in `~/.viminfo`, and either keeps an undo file if your config turns one on. So run `EDITOR='nvim --clean -n' mise run secrets:edit`, or `EDITOR='vim --clean -n' mise run secrets:edit`: `--clean` skips your config and the history file, and `-n` the swap file. nano, by default, keeps nothing outside the temp file.
 - **Your shell's `SOPS_*` variables are dropped**, so they can't add a recipient or a key; hapi sets `SOPS_AGE_KEY_FILE`, `SOPS_DISABLE_VERSION_CHECK=1` and `GPG_AGENT_INFO=`, and puts the pinned age first on `PATH`. sops runs with `--config /dev/null`.
 - If you quit without a change, sops exits 200, which hapi treats as success.
 - **Ctrl-C in the editor is the editor's.** It reaches hapi too (they share the terminal), so while `sops edit` runs, hapi ignores it, as `system(3)` does; a `SIGTERM` or `SIGHUP` waits until sops ends, then hapi releases the lock and exits.

@@ -13,7 +13,7 @@ This page covers:
 - [before you start](#before-you-start);
 - [the two Apps](#the-two-apps) and [creating them](#creating-each-app);
 - [the rulesets](#the-rulesets): the two on `main`, [code owners](#code-owners-a-second-layer), and [branch and tag scope](#branch-and-tag-scope);
-- [checking it all](#check-it), including that an App's merge call is refused;
+- [checking it all](#check-it), including that an App's merge call is refused, and so are its pushes to any other branch or a tag;
 - [the kill switch](#kill-switch-suspend-an-installation) and [rotating a private key](#rotating-a-private-key).
 
 ## Before you start
@@ -53,20 +53,38 @@ Both private keys live only in your secrets store and in the `host` zone's env f
 
 ## Creating each App
 
-Do this twice: once for `hapi-planner`, once for `hapi-factory`.
+Do steps 1–11 twice: once for `hapi-planner`, once for `hapi-factory`. Then apply the [branch and tag scope](#branch-and-tag-scope) rulesets, and only then install each App (step 12). An App installed before those rulesets could create, push or delete any branch but `main`, and any tag.
 
 1. Open **GitHub → Settings → Developer settings → GitHub Apps → New GitHub App**.
 2. **GitHub App name:** `hapi-planner` (or `hapi-factory`). App names are global on GitHub. If the name is taken, add a suffix; hapi finds the App by its App ID, not its name.
 3. **Homepage URL:** `https://github.com/<your-github-login>/hapi-factory`.
-4. **Identifying and authorizing users:** leave the callback URL empty. Leave **Request user authorization (OAuth) during installation** and **Enable Device Flow** off. The Apps act only as themselves.
+4. **Identifying and authorizing users:** leave the callback URL empty. Leave **Request user authorization (OAuth) during installation** and **Enable Device Flow** off, and **Expire user authorization tokens** as it is. The Apps act only as themselves, so they never have user tokens. Under **Post installation**, leave the setup URL empty and **Redirect on update** off.
 5. **Webhook:** untick **Active**. hapi has no inbound endpoint; the poller polls (spec §9.4).
-6. **Permissions:** exactly as [the table above](#the-two-apps). Subscribe to no events.
+6. **Permissions:** exactly as [the table above](#the-two-apps). Metadata turns Read-only by itself once you pick another permission. Subscribe to no events.
 7. **Where can this GitHub App be installed?** **Only on this account.**
-8. **Create GitHub App.** Note the **App ID** on the App's General page.
+8. **Create GitHub App.** Note the **App ID** on the App's General page: the number, not the Client ID, which starts with `Iv`. Don't generate a client secret; nothing uses one.
 9. **Private keys → Generate a private key.** Your browser downloads a `.pem` file.
-10. **Add both to your secrets store** with `mise run secrets:edit` ([docs/secrets.md](../secrets.md#adding-a-secret)): the PEM file's whole contents as `hapi-host-planner-app-private-key` (or `hapi-host-factory-...`), as a YAML block scalar (`hapi-host-planner-app-private-key: |`, then the PEM's lines indented), and the App ID as `hapi-host-planner-app-id`. `stack/secrets.yaml` already puts both in the `host` zone.
-11. **Delete the downloaded key file:** `shred -u ~/Downloads/<app-name>.*.private-key.pem`. Never commit a key, and never paste one into a chat.
-12. **Install App → your account → Only select repositories.** Pick only the hapi-managed repos (`$OWNER/hapi-factory` now; `odoo-mcp` later). Never **All repositories**.
+10. **Add both to your secrets store** with `mise run secrets:edit`, as [below](#adding-the-id-and-key): the App ID as `hapi-host-planner-app-id` (or `hapi-host-factory-...`), quoted, and the PEM file's whole contents as `hapi-host-planner-app-private-key`. `secrets:init` made both names, empty, and `stack/secrets.yaml` already puts them in the `host` zone.
+11. **Delete the downloaded key file,** once `mise run secrets:check` says `found` for both: `shred -u ~/Downloads/<app-name>.*.private-key.pem`. Never commit a key, and never paste one into a chat.
+12. **Install it,** once both Apps exist and the [branch and tag scope](#branch-and-tag-scope) rulesets are applied. First check the App's **Permissions & events** page against [the table](#the-two-apps), by eye: `gh api apps/<app-name>` returns 404 for a private App with `gh`'s login, so `gh` can't read it back for you. (`hapi audit`'s `github.app-perms` checks it with the App's own key, once `hapi secrets resolve` runs.) Then **Install App → your account → Only select repositories.** Pick only the hapi-managed repos (`$OWNER/hapi-factory` now; `odoo-mcp` later). Never **All repositories**.
+
+### Adding the ID and key
+
+Start the editor with its swap and history files off, so no copy of the key lands on disk outside the tmpfs ([docs/secrets.md](../secrets.md#hapi-secrets-edit)): `EDITOR='nvim --clean -n' mise run secrets:edit` for Neovim, or `EDITOR='vim --clean -n' mise run secrets:edit` for Vim. nano needs no flags. Fill in each App's two lines:
+
+```yaml
+hapi-host-planner-app-id: "1234567"
+hapi-host-planner-app-private-key: |
+  -----BEGIN RSA PRIVATE KEY-----
+  ...
+  -----END RSA PRIVATE KEY-----
+```
+
+- **Quote the App ID.** The store holds only strings. Unquoted, the ID is a YAML number, and `secrets:check` and `resolve` stop with `hapi-host-planner-app-id is not a string`.
+- **The key is a YAML block scalar:** its line ends in `|`, with the empty `""` gone, and every PEM line below it is indented two spaces, never a tab.
+- **To read the key in without the clipboard** (Vim or Neovim): put the cursor on the `|` line and run `:r ~/Downloads/<app-name>.<date>.private-key.pem`, then `:'[,']s/^/  /`. `:r` puts the file's lines below the cursor and marks them `'[` to `']`; the substitute puts two spaces in front of each.
+- **If you pasted it instead,** those marks may not cover exactly the key. Put the cursor on its `-----BEGIN` line and run `:.,/-----END/s/^/  /`, which indents from there to the next `-----END` line. The key went through your clipboard, so copy something harmless over it, and clear your clipboard manager's history if you use one.
+- `:set list` shows a tab as `^I`. Then save and quit. sops won't save a file whose YAML is broken: it says so and offers to reopen the editor.
 
 ## The rulesets
 
@@ -118,6 +136,8 @@ Two more rulesets keep the Apps on their own branches and off tags:
 - **`agent-branch-scope`** covers every branch except `main`, `plan/**` and `factory/**`. Only the Admin role (you) may create, push or delete those branches. The Apps aren't bypass actors, so they can push only `plan/**` and `factory/**`.
 - **`tags-admin-only`**: only the Admin role may create, move or delete tags. Contents write would otherwise let an App create a tag or a release, which can trigger release workflows.
 
+Apply both **before you install either App** ([creating each App](#creating-each-app)).
+
 ```bash
 gh api -X POST "repos/$OWNER/hapi-factory/rulesets" --input - <<'EOF'
 {
@@ -148,7 +168,7 @@ gh api -X POST "repos/$OWNER/hapi-factory/rulesets" --input - <<'EOF'
 EOF
 ```
 
-`actor_id` 5 is the repository Admin role. These commands follow GitHub's REST docs, but nobody has run them yet. If GitHub rejects a field, set up the same rulesets in the UI. If you turn on Dependabot version updates, add `refs/heads/dependabot/**` to `agent-branch-scope`'s `exclude`, or Dependabot can't push its branches.
+`actor_id` 5 is the repository Admin role, which bypasses both rulesets always, so your own pushes to other branches still go through. These commands were first run on 2026-10-27, and GitHub accepted every field; read back, each ruleset holds exactly these fields. If GitHub ever rejects a field, set up the same rulesets in the UI. If you turn on Dependabot version updates, add `refs/heads/dependabot/**` to `agent-branch-scope`'s `exclude`, or Dependabot can't push its branches.
 
 **What rulesets can't do: keep each App to its own prefix.** GitHub rulesets can only say "nobody but the bypass actors". "Only `hapi-planner` may push `plan/**`" would need `hapi-planner` as a bypass actor on a `plan/**` ruleset, and no App is ever a bypass actor. So either App can push either prefix. In practice:
 - only the harvester's deterministic code holds `hapi-factory` tokens, and it pushes `factory/<id>` only;
@@ -156,9 +176,18 @@ EOF
 
 ## Check it
 
-Run these with `$OWNER` set ([before you start](#before-you-start)).
+Run these with `$OWNER` set ([before you start](#before-you-start)). Steps 1 and 2 need only `gh`. Steps 3–5 need an App token, so `hapi secrets resolve` must have run, and it writes nothing while any secret in the manifest is empty: they wait until the Slack app's values are in your store too ([the Slack runbook](slack.md)).
 
-1. **Rulesets:** `gh api "repos/$OWNER/hapi-factory/rulesets"` lists the four rulesets. No `bypass_actors` entry has `"actor_type": "Integration"`, and `main-protect` has none at all.
+1. **Rulesets:** GitHub's list of rulesets leaves out their rules and bypass actors, so read each one:
+
+   ```bash
+   for id in $(gh api "repos/$OWNER/hapi-factory/rulesets" --jq '.[].id'); do
+     gh api "repos/$OWNER/hapi-factory/rulesets/$id" \
+       --jq '{name, bypass: [.bypass_actors[] | "\(.actor_type):\(.actor_id):\(.bypass_mode)"], rules: [.rules[].type]}'
+   done
+   ```
+
+   It prints the four rulesets. `main-protect`'s `bypass` is empty, `main-review`'s is `RepositoryRole:5:pull_request`, and the other two have `RepositoryRole:5:always`. None lists an `Integration`.
 2. **Branch rules:** `gh api "repos/$OWNER/hapi-factory/rules/branches/main"` shows `update` (from `main-review`) as well as the `ci` check. `gh api "repos/$OWNER/hapi-factory/rules/branches/some-feature"` shows `creation`, `update` and `deletion`. `gh api "repos/$OWNER/hapi-factory/rules/branches/plan%2Fexample"` shows none of them.
 3. **A token** ([docs/secrets.md](../secrets.md#hapi-token-mint)), once `hapi secrets resolve` has run:
 
@@ -181,20 +210,42 @@ Run these with `$OWNER` set ([before you start](#before-you-start)).
      -f title="test: ruleset check" -f head=plan/ruleset-check -f base=main -f body="Delete me." --jq .number)
    ```
 
+   **Before you approve it, check that an App's approval doesn't count** ([code owners](#code-owners-a-second-layer)). Approve it as `hapi-factory`, which isn't a code owner, with its own token:
+
+   ```bash
+   hapi token mint --app factory --repo "$OWNER/hapi-factory"
+   ftok="$XDG_RUNTIME_DIR/hapi/tokens/factory.$OWNER.hapi-factory.token"
+   GH_TOKEN="$(cat "$ftok")" gh api "repos/$OWNER/hapi-factory/pulls/$pr/reviews" -f event=APPROVE -f body="Delete me."
+   gh pr view "$pr" --repo "$OWNER/hapi-factory" --json reviewDecision --jq .reviewDecision
+   GH_TOKEN="$(cat "$ftok")" gh api -X DELETE /installation/token
+   rm "$ftok"
+   ```
+
+   **Expected: `REVIEW_REQUIRED`,** and the PR page's merge box still asks for a code owner's review. If they disagree, the merge box decides. If the App's approval counts, Restrict updates still stops the App merging, but the second layer is gone: check that `.github/CODEOWNERS` on `main` names only you and that `main-review` has `require_code_owner_review: true`, and record it against GR-8 in the threat model.
+
    Wait for `ci` to go green on it, and **approve it yourself** in the web UI. Then try to merge it as the App:
 
    ```bash
    GH_TOKEN="$(cat "$tok")" gh api -X PUT "repos/$OWNER/hapi-factory/pulls/$pr/merge"
    ```
 
-   **Expected: GitHub refuses it** with a repository rule violation, and the PR stays open. Then close the PR without merging, delete the `plan/ruleset-check` branch, and revoke the test token:
+   **Expected: GitHub refuses it** with a repository rule violation, and the PR stays open. Then close the PR without merging and delete the `plan/ruleset-check` branch. Keep the token and `$main` for step 5.
+
+   **If the merge goes through, the "Neither can merge" rule doesn't hold.** Stop. Revert the merge in a PR of your own, and suspend both installations ([kill switch](#kill-switch-suspend-an-installation)). Check that `main-review` lists `update` and that the App isn't a bypass actor. Don't unsuspend until the merge call is refused. If no ruleset setting refuses it, record "an App can merge once you have approved and `ci` is green" as a residual risk in the threat model (`docs/security/threat-model.md`, Plan 01 Task 7, spec §11.9), and remove the "no merge rights" claims from this page and the README.
+
+5. **An App can't push outside `plan/**` and `factory/**`, or touch a tag** (`agent-branch-scope`, `tags-admin-only`). With the same token, try to create a branch and a tag:
+
+   ```bash
+   GH_TOKEN="$(cat "$tok")" gh api "repos/$OWNER/hapi-factory/git/refs" -f ref=refs/heads/ruleset-check -f sha="$main"
+   GH_TOKEN="$(cat "$tok")" gh api "repos/$OWNER/hapi-factory/git/refs" -f ref=refs/tags/ruleset-check -f sha="$main"
+   ```
+
+   **Expected: GitHub refuses both** with a repository rule violation. If either goes through, delete it as yourself (`gh api -X DELETE "repos/$OWNER/hapi-factory/git/refs/heads/ruleset-check"`, or `.../git/refs/tags/ruleset-check`), then check that ruleset's conditions, and that no App is a bypass actor in it (step 1). Then revoke the test token:
 
    ```bash
    GH_TOKEN="$(cat "$tok")" gh api -X DELETE /installation/token
    rm "$tok"
    ```
-
-   **If the merge goes through, the "Neither can merge" rule doesn't hold.** Stop. Revert the merge in a PR of your own, and suspend both installations ([kill switch](#kill-switch-suspend-an-installation)). Check that `main-review` lists `update` and that the App isn't a bypass actor. Don't unsuspend until the merge call is refused. If no ruleset setting refuses it, record "an App can merge once you have approved and `ci` is green" as a residual risk in the threat model (`docs/security/threat-model.md`, Plan 01 Task 7, spec §11.9), and remove the "no merge rights" claims from this page and the README.
 
 ## Kill switch: suspend an installation
 
