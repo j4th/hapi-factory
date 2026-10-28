@@ -422,7 +422,7 @@ protected_paths:
 - Archon's `archon-cli` skill, vendored and pinned, for status only (§9.2)
 
 **Build** [call]:
-1. **`hapi-path-guard`**, a Python plugin. Prompts on glob matches in interactive sessions and blocks in unattended ones (via `ctx.current_cron_execution()` and `ctx.session_surface()`); blocks under yolo. It must also cover shell writes, since the core gate misses them (#143266) [verify].
+1. **`hapi-path-guard`**, a Python plugin. Prompts on glob matches in interactive sessions and blocks in unattended ones (via `ctx.current_cron_execution()` and `ctx.session_surface()`); blocks under yolo. It must also cover shell writes, since the core gate misses them (#143266; seen in spike T9, docs/spikes/02-hermes-path-guard.md). Spike T9 also found that returning `approve` already gets the interactive/unattended split from Hermes's approval modes.
 2. **`hapi-cmd-allow`**, a default-deny `pre_tool_call` shell hook with `fail_closed: true`.
 3. **`hapi-planning` skill**: brainstorm → research brief → design and threat model → work orders → planning PR. It uses `new-work-order` (deterministic id and `traceparent`, schema validation).
 4. **`hapi-research` profile**, quarantined in **its own container**: web tools only, no terminal, no repo write, no secrets except spend-capped, search-only keys (§10.1). It returns a schema-validated brief, and the **`hapi-research-note` skill** writes `docs/research/<topic>.md` with retrieval dates, source hashes and a `recheck_by` date.
