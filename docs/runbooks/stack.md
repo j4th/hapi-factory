@@ -16,7 +16,7 @@ This runbook covers running the hapi-factory stack (spec §4.3, §9, §10, §11.
 It runs in two stages:
 
 - **Stage a (done in Plan 01 Task 5):** the files below were written, and the integration tests ran on the build host's rootful Docker as an ordinary user. That run covered the egress proxies and networks, plus Hermes and Archon started with fake secrets. No real secret was used, and `scripts/host-setup.sh` was not run.
-- **Stage b (the operator, later):** first the Slack app ([docs/runbooks/slack.md](slack.md)), with its three values in your store, and the GitHub Apps ([docs/runbooks/github-apps.md](github-apps.md)), with their four: `mise run up` refuses an empty secret. The Slack app's manifest needs no stack (a one-off `docker run` of the pinned Hermes image with no network); the Apps need the repo public with its rulesets. Then sections 1–4 on the real host, as the `hapi` user on rootless Docker, then `mise run test:int` there. It may run while the stack is up, because it never touches the running stack or the checkout's `build/` ([what the tests prove](#what-the-tests-prove)). Stage b ends with [the audit](#5-the-audit), as hapi, with the stack up: `mise run audit -- --strict --repo <owner>/<name> --github-token-file <file>` (until Plan 04, its one expected fail is `mcp.tool-hashes`: [how to read it](#5-the-audit)).
+- **Stage b (the operator; run on 2026-10-28, and again on any new host):** first the Slack app ([docs/runbooks/slack.md](slack.md)), with its three values in your store, and the GitHub Apps ([docs/runbooks/github-apps.md](github-apps.md)), with their four: `mise run up` refuses an empty secret. The Slack app's manifest needs no stack (a one-off `docker run` of the pinned Hermes image with no network); the Apps need the repo public with its rulesets. Then sections 1–4 on the real host, as the `hapi` user on rootless Docker, then `mise run test:int` there. It may run while the stack is up, because it never touches the running stack or the checkout's `build/` ([what the tests prove](#what-the-tests-prove)). Stage b ends with [the audit](#5-the-audit), as hapi, with the stack up: `mise run audit -- --strict --repo <owner>/<name> --github-token-file <file>` (until Plan 04, its one expected fail is `mcp.tool-hashes`: [how to read it](#5-the-audit)).
 
 Every command marked *as hapi* runs in a shell of the `hapi` user (`sudo -iu hapi`). The other commands run as the operator, from the operator's own checkout.
 
@@ -144,7 +144,7 @@ mise run down
    sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; export XDG_RUNTIME_DIR; export PATH="$HOME/.local/bin:$PATH"; cd "$HOME/hapi-factory" && exec "$HOME/.local/bin/mise" run up -- "$@"' hapi-stack <your flags>
    ```
 
-   The script is fixed text, and your flags follow it as arguments of their own (`"$@"`), so no shell parses them on the way to mise: a `$`, a backtick, a quote or a space in a `--config` path arrives as you typed it. mise then quotes them into its task's command line for its own shell; stage b checks that end to end (H-146(e)). It is not `sudo -i`, whose login shell re-parses the command's words and expands a `$` (sudo(8)). The script sets what that shell used to give: `XDG_RUNTIME_DIR` when sudo has cleared it, hapi's `~/.local/bin` first on `PATH` (the secrets step runs `mise where age`), the checkout as the working directory, and mise by the path `scripts/host-setup.sh` installs it at.
+   The script is fixed text, and your flags follow it as arguments of their own (`"$@"`), so no shell parses them on the way to mise: a `$`, a backtick, a quote or a space in a `--config` path arrives as you typed it. mise then quotes them into its task's command line for its own shell; stage b checked that end to end (H-146(e), 2026-10-28). It is not `sudo -i`, whose login shell re-parses the command's words and expands a `$` (sudo(8)). The script sets what that shell used to give: `XDG_RUNTIME_DIR` when sudo has cleared it, hapi's `~/.local/bin` first on `PATH` (the secrets step runs `mise where age`), the checkout as the working directory, and mise by the path `scripts/host-setup.sh` installs it at.
 
    So it builds hapi's checkout's policy, not yours: pull there first (`git -C ~/hapi-factory pull`, as hapi). The user is the one the process runs as; `$USER` is not trusted.
 2. **Policy build:** `buildAll` writes `build/` ([docs/generated-configs.md](../generated-configs.md)). A digest of `build/` becomes a label on every container (`org.hapi.build-sha256`). Compose recreates a container whose config changed, but not one whose bind-mounted file changed. With the label, a policy change still reaches the running proxies, Hermes and Archon.
@@ -180,7 +180,7 @@ The last step of stage b, and whenever you want to know the stack still matches 
 mise run audit -- --strict --repo <owner>/<name> --github-token-file <file>
 ```
 
-It checks that the deployed `build/` is what policy builds and that the containers were started from it, Archon's environment and Hermes's approval settings in the running containers, that the stack was started by `hapi stack up` without the dev bypass, the pins, Archon's and Hermes's own reading of the deployed configs (offline, in the stack's own images), the MCP lock, the secrets setup, and the repo's rulesets, App permissions and AI workflows. `--strict` makes every check that couldn't be made fail. `--github-token-file <file>` is the operator's token, mode `0600`, and a strict run needs it: GitHub shows a ruleset's bypass actors only to a token that can write the ruleset, which the Apps never can, so without it the bypass parts of `github.rulesets` and `github.app-perms` skip, and `--strict` fails them. Every check, its credential, its fix and its skip: [docs/audit.md](../audit.md).
+It checks that the deployed `build/` is what policy builds and that the containers were started from it, Archon's environment and Hermes's approval settings in the running containers, that the stack was started by `hapi stack up` without the dev bypass, the pins, Archon's and Hermes's own reading of the deployed configs (offline, in the stack's own images), the MCP lock, the secrets setup, and the repo's rulesets, App permissions and AI workflows. `--strict` makes every check that couldn't be made fail. `--github-token-file <file>` is the operator's token, mode `0600`, and a strict run needs it: GitHub shows a ruleset's bypass actors to your token, but never to the Apps', which have no Administration permission, so without it the bypass parts of `github.rulesets` and `github.app-perms` skip, and `--strict` fails them. A fine-grained token for the one repo with Administration and Contents read-only is enough (stage b, H-150): put it in the file without echoing it, and delete the token and the file when you are done ([docs/audit.md](../audit.md#github-credentials)). Every check, its credential, its fix and its skip: [docs/audit.md](../audit.md).
 
 **What stage b expects, until Plan 04.** `mcp.tool-hashes` checks the MCP lock offline, but comparing a running server's tool surface with the lock needs the live fetch Plan 04 wires (H-101). Until then it can only skip (H-026), so a strict run always has that one fail and exits 1. Stage b passes when that is the only fail and every other check passed. Show only what didn't pass:
 
@@ -252,10 +252,10 @@ Three more rules hold for the whole stack:
 **Exceptions:**
 
 - **Hermes's `/run` tmpfs allows exec.** s6-overlay, the image's init, runs its programs from `/run`. Every other tmpfs is `noexec`, Docker's default.
-- **Hermes starts as its own user, not as root.** Its s6-overlay accepts that UID and skips its root-only bootstrap (the UID remap and the volume chown). It logs two warnings and continues: `docker_config_migrate.py failed` and `dependency refresh failed`. Both steps are optional.
+- **Hermes starts as its own user, not as root.** Its s6-overlay accepts that UID and skips its root-only bootstrap (the UID remap and the volume chown). Two later boot steps, the config-schema migration and the dependency refresh, run through `s6-setuidgid`, which can't set groups without `CAP_SETGID`: each logs `s6-applyuidgid: fatal: unable to set supplementary group list`, then `docker_config_migrate.py failed` or `dependency refresh failed`, and Hermes continues. Neither step is needed, and the migration must never run on the generated config; H-179(g) skips it on purpose ([spike 05](../spikes/05-rootless-images.md)).
 - **Archon logs a warning that gh is not authenticated.** That is by design: the archon zone has no forge credential (spec §4.3).
 
-Spike T12 re-checks these settings under rootless Docker. If it relaxes one, it changes `stack/compose.yaml` with a comment naming the spike.
+Spike T12 re-checked these settings under rootless Docker on 2026-10-28 and relaxed none ([spike 05](../spikes/05-rootless-images.md)).
 
 ## Troubleshooting
 
@@ -279,7 +279,8 @@ Spike T12 re-checks these settings under rootless Docker. If it relaxes one, it 
 
 ### Open items
 
-- **Not yet run on the real host:** host setup, rootless Docker, the subordinate ID range, lingering, the kill switches' stage-b marks ([the runbook](kill-switches.md)), `up`'s re-exec through the host's real sudo, the whole stack under hapi, and the audit against it and the real GitHub repo. That is stage b, and spike T12 runs alongside it.
+- **Run on the real host in stage b (2026-10-28):** host setup and a re-run of it, rootless Docker 29.9.2, the subordinate ID range, lingering, the store handed to hapi, `up`'s re-exec through the host's real sudo, the whole stack under hapi, `mise run test:int` as hapi, kill switch 4, and the strict audit against the real GitHub repo. Spike T12 ran alongside it ([spike 05](../spikes/05-rootless-images.md)).
+- **Not yet run there:** the kill switches' other stage-b marks (H-160, [the runbook](kill-switches.md)), and host setup for a `hapi` user that existed before it, whose added subordinate range rootlesskit may not map (H-188).
 
 ## What the tests prove
 
@@ -350,4 +351,4 @@ Each read-only check reads two things, so dropping `read_only: true` or a `:ro` 
 
 Neither "the write failed" nor its exit code proves anything. Each service writes as its non-root user. A file it doesn't own, or a root-owned `/`, refuses that write with `Permission denied` whether or not the mount is read-only. Stage a checked this by removing `read_only: true` and the `:ro` on `build/pi`: the old checks still passed, and the new ones failed.
 
-Stage a ran all of these on the build host's rootful Docker, as an ordinary user. Stage b runs them again as hapi on rootless Docker.
+Stage a ran all of these on the build host's rootful Docker, as an ordinary user. Stage b ran them again as hapi on rootless Docker on 2026-10-28: 38 of 38 passed.

@@ -366,7 +366,7 @@ Set `OWNER` to your GitHub login first (`export OWNER=<your-login>`); the comman
 
 ### Plan 01 Task 5: the host and the stack (stage b)
 
-Task 5 wrote the stack and proved its egress boundary on the build host's own Docker, with fake secrets (stage a). What remains is the real host, as the operator, following [docs/runbooks/stack.md](docs/runbooks/stack.md):
+Task 5 wrote the stack and proved its egress boundary on the build host's own Docker, with fake secrets (stage a). Stage b is the real host, as the operator, following [docs/runbooks/stack.md](docs/runbooks/stack.md). It ran on 2026-10-28, with spike T12 ([spike 05](docs/spikes/05-rootless-images.md)); on a new host, these are the steps:
 
 0. **The Slack app and the GitHub Apps first,** with their values in your store ([Tasks 4, 4b and 4c](#plan-01-tasks-4-4b-and-4c-your-secrets-store-provider-keys-and-slack), step 3; [Publishing](#publishing-after-task-7b-the-remotes-the-rulesets-and-the-apps), step 6): `mise run up` refuses an empty secret.
 1. **Host setup, once:** `sudo scripts/host-setup.sh "$PWD"` from your checkout (or with no argument once the GitHub remote exists; with an SSH `origin`, pass its HTTPS URL, since hapi clones it with its own credentials). It creates the `hapi` user, rootless Docker with lingering, a pinned mise and hapi's checkout, then prints the next steps. Check: `sudo -iu hapi docker info --format '{{.SecurityOptions}}'` contains `rootless`.
@@ -378,7 +378,7 @@ Task 5 wrote the stack and proved its egress boundary on the build host's own Do
    - Check that `docker compose -p hapi ps` shows all five services healthy.
 
    Until the Slack and App values are in your store, and copied to hapi, `up` stops at the secrets step.
-5. **The audit, last:** as `hapi`, in its checkout, with the stack up, `mise run audit -- --strict --repo "$OWNER/hapi-factory" --github-token-file <file>` (your own GitHub token in a `0600` file, which the bypass-actor checks need). Expected, until Plan 04 wires the live MCP fetch (H-101): every check `pass` except one fail, `mcp.tool-hashes`, whose detail starts `--strict: skipped:` (it can't compare a running server's tool surface yet), so `13 pass, 1 fail, 0 skip` and exit 1; any other fail is real. After H-101: exit 0, `0 fail` ([docs/audit.md](docs/audit.md), [the stack runbook](docs/runbooks/stack.md#5-the-audit)).
+5. **The audit, last:** as `hapi`, in its checkout, with the stack up, `mise run audit -- --strict --repo "$OWNER/hapi-factory" --github-token-file <file>` (your own GitHub token in a `0600` file, which the bypass-actor checks need: a fine-grained token for the one repo with Administration and Contents read-only is enough, [docs/audit.md](docs/audit.md#github-credentials)). Expected, until Plan 04 wires the live MCP fetch (H-101): every check `pass` except one fail, `mcp.tool-hashes`, whose detail starts `--strict: skipped:` (it can't compare a running server's tool surface yet), so `13 pass, 1 fail, 0 skip` and exit 1; any other fail is real. After H-101: exit 0, `0 fail` ([docs/audit.md](docs/audit.md), [the stack runbook](docs/runbooks/stack.md#5-the-audit)).
 
 ## Documentation map
 
