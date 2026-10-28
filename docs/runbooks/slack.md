@@ -11,6 +11,7 @@ Hermes talks to you through Slack, in Socket Mode, so there is no inbound endpoi
   - **`#hapi-intake`**: where you talk to Hermes. One thread per feature.
   - **`#hapi-alerts`**: posts from the bot only: the poller, the harvester and flag notices.
   - **A DM with the bot**, for ad-hoc chat.
+- **Make `#hapi-intake` and `#hapi-alerts` private, with only you and the bot in them.** Anyone else in the workspace is off the allowlist, so Hermes rejects their own messages. Whether its context for a thread it answers includes their messages is untested (H-179), and if it does, that is a way around the allowlist.
 - Slack is a third party. Messages carry links and summaries, never code or secrets (spec §9.1). The record of truth stays on GitHub.
 
 ## The app
@@ -54,13 +55,19 @@ Plan 04 compiles these into Hermes's generated config. For the Task 13 spike, se
 | Setting | Value | Why |
 |---|---|---|
 | `slack.unauthorized_dm_behavior` | `ignore` | The default, `pair`, answers a stranger's DM with a pairing prompt. `ignore` drops it silently. |
-| Home channel | `#hapi-alerts` | Where scheduled and cron messages go. Hermes takes it as the channel's ID (`SLACK_HOME_CHANNEL`). |
+| Home channel | `#hapi-alerts` | Where scheduled and cron messages go. Hermes takes it as the channel's ID (`SLACK_HOME_CHANNEL`), which belongs in your store (H-179). Until Plan 04 maps it, Hermes's first reply asks you to run `/hermes sethome`: ignore it, since that would make your DM the home channel. |
 
 ## Check it (Plan 01 Task 13)
 
+Run on 2026-10-28, and passed: [spike 06](../spikes/06-hermes-slack-socket-mode.md).
+
 - Your DMs to the bot get an answer.
-- A second test user's DMs are ignored, with no reply at all.
-- No inbound port opens: `ss -ltn` inside the Hermes container shows no new listener.
+- A second test user's DMs are ignored, with no reply at all. Hermes logs `Early reject of unauthorized user`.
+- No inbound port opens. The image has no `ss`, so list the container's listeners from `/proc` (addresses in hex, little-endian: `0100007F:21C2` is `127.0.0.1:8642`). Each must be on `127.0.0.1`, or `127.0.0.11`, Docker's DNS:
+
+  ```bash
+  docker exec hapi-hermes-1 cat /proc/net/tcp /proc/net/tcp6 | awk '$4 == "0A" {print $2}'
+  ```
 
 ## Kill switch
 
