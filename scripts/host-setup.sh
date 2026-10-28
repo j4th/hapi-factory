@@ -154,7 +154,9 @@ ensure_rootless_docker() {
     as_hapi dockerd-rootless-setuptool.sh install
     as_hapi systemctl --user enable --now docker
   fi
-  if as_hapi docker context inspect rootless >/dev/null 2>&1; then
+  # `docker context use` prints "Current context is now ..." on stderr, so it runs only
+  # when the context isn't rootless yet: a re-run then prints nothing for this step.
+  if ! as_hapi docker context show 2>/dev/null | grep -qx rootless && as_hapi docker context inspect rootless >/dev/null 2>&1; then
     as_hapi docker context use rootless >/dev/null
   fi
   as_hapi docker info --format '{{.SecurityOptions}}' | grep -q rootless ||
