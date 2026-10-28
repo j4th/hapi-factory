@@ -250,7 +250,16 @@ Run these with `$OWNER` set ([before you start](#before-you-start)). Steps 1 and
    GH_TOKEN="$(cat "$tok")" gh api "repos/$OWNER/hapi-factory/git/refs" -f ref=refs/tags/ruleset-check -f sha="$main"
    ```
 
-   **Expected: GitHub refuses both** with a repository rule violation. If either goes through, delete it as yourself (`gh api -X DELETE "repos/$OWNER/hapi-factory/git/refs/heads/ruleset-check"`, or `.../git/refs/tags/ruleset-check`), then check that ruleset's conditions, and that no App is a bypass actor in it (step 1). Then revoke the test token:
+   **Expected: GitHub refuses both.** The refs API says only `Reference update failed` (HTTP 422), not which rule, so check as yourself. GitHub's rule insights list each evaluation, newest first:
+
+   ```bash
+   for id in $(gh api "repos/$OWNER/hapi-factory/rulesets/rule-suites?time_period=hour" --jq '.[:3][].id'); do
+     gh api "repos/$OWNER/hapi-factory/rulesets/rule-suites/$id" --jq '"\(.ref) \(.actor_name) \(.result): " +
+       ([.rule_evaluations[] | select(.result == "fail") | "\(.rule_source.name)/\(.rule_type)"] | join(", "))'
+   done
+   ```
+
+   It prints `refs/tags/ruleset-check hapi-planner[bot] fail: tags-admin-only/creation`, `refs/heads/ruleset-check hapi-planner[bot] fail: agent-branch-scope/creation` and, from step 4, `refs/heads/main hapi-planner[bot] fail: main-review/update`. If either ref goes through, delete it as yourself (`gh api -X DELETE "repos/$OWNER/hapi-factory/git/refs/heads/ruleset-check"`, or `.../git/refs/tags/ruleset-check`), then check that ruleset's conditions, and that no App is a bypass actor in it (step 1). Then revoke the test token:
 
    ```bash
    GH_TOKEN="$(cat "$tok")" gh api -X DELETE /installation/token
