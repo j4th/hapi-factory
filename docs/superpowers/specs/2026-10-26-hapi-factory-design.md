@@ -472,7 +472,7 @@ protected_paths:
 - **Worker environment:**
   - `PI_OFFLINE=1`. Blocks the repo-settings package auto-install, which otherwise runs even with extensions off. **Critical.**
   - `PI_TELEMETRY=0`
-  - A read-only `PI_CODING_AGENT_DIR` holding `models.json`, with `maxTokens` around 64K.
+  - A `PI_CODING_AGENT_DIR` whose `models.json` (with `maxTokens` around 64K) nothing in the container can change. Spike T8 found Pi must write its own cache and sessions there, so the directory is a tmpfs with hapi's files bound read-only into it (docs/spikes/01-pi-under-archon.md).
   - `hapi-guard` as the only user-level extension.
 - **Repo `.pi/` can't be excluded under Archon today.** Pi trusts every project under the SDK, and Archon only toggles extensions all-on or all-off. So `prepare` strips `.pi/` and `.agents/`, and hapi-guard blocks writes to them.
   - Longer term: upstream an Archon PR to honor Pi's native project trust [call; good showcase contribution].

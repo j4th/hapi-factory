@@ -30,7 +30,7 @@ Every command marked *as hapi* runs in a shell of the `hapi` user (`sudo -iu hap
 | `egress-archon` | archon | `archon-net`, `outbound` | itself | Squid, on `build/egress/archon.squid.conf`: HTTPS to the archon allowlist only, with no forge route |
 | `egress-research` | research | `research-net`, `outbound` | itself | Squid, on `build/egress/research.squid.conf`: the open web, minus private ranges |
 | `hermes` | hermes | `hermes-net` | `egress-hermes` | Hermes v0.22.5, the coordinator, running `gateway run` with `build/hermes/config.yaml` |
-| `archon` | archon | `archon-net` | `egress-archon` | Archon 0.12.1, with Pi 1.3.0 in-process, `build/archon/*` and `build/pi` (read-only) |
+| `archon` | archon | `archon-net` | `egress-archon` | Archon 0.12.1, with Pi 1.3.0 in-process, `build/archon/*` and `build/pi` (read-only; spike T8 found Pi must write beside it, so Plan 02 binds it into a tmpfs, H-181) |
 
 The research zone's own container, hapi-research, arrives in Plan 04. Task 5 ships its network, its proxy and its tests.
 
@@ -45,7 +45,7 @@ The research zone's own container, hapi-research, arrives in Plan 04. Task 5 shi
 - **State** lives in three named volumes:
   - `hermes-data`: Hermes's home (sessions, memories, skills);
   - `archon-data`: `/.archon` (the run DB, workspaces, worktrees);
-  - `archon-home`: `/home/appuser` (Claude Code and Pi session state).
+  - `archon-home`: `/home/appuser` (Claude Code's state and `~/.gitconfig`). Pi keeps its sessions in `PI_CODING_AGENT_DIR`, not here, and Plan 02 makes that a tmpfs, so they don't survive a restart (spike T8, H-181). H-182 plans a per-run `$HOME` too.
 
   `mise run down` keeps them.
 
