@@ -69,4 +69,5 @@ Pi stays in-process with Archon (spec §9.3). The worker posture becomes:
 - **Plan 02 (H-181):** the Pi directory's layout, in `stack/compose.yaml` and its tests; `assistants.pi.enableExtensions` in the generated config; Bun's auto-install; and hapi-guard's backstop check for `.pi/` and `.agents/`. H-087 gets the guard's inputs (findings 5 and 6).
 - **Plan 03 (H-161):** the strip node before every Pi node; codebases registered with a remote, never fetched from; and a restarted run starting over from a fresh worktree, since sessions are on tmpfs.
 - **The threat model:** DS-11's read-only directory is replaced by the layout in finding 1. DS-15's strip is the only prevention (finding 2).
+- **State that outlives a run (H-182, DS-17, threat L4.10).** The operator's point after the spike: a poisoned run could plant state and get itself killed, for a later run to pick up. Beyond the worktree and Pi's sessions, the Archon container keeps `$HOME` and `/.archon` on persistent volumes. So nothing a worker writes may outlive its run but the commit the harvester takes.
 - **Closed:** H-061, H-062 and H-063.

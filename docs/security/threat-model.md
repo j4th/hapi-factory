@@ -186,6 +186,7 @@ Each row: the threat, its catalog IDs, the controls that answer it ([section 6](
 | L4.7 | The deployed stack drifts from policy: a hand edit, a stale file, a key a tool ignores, a stack started outside `up` | ASI10; AML.T0081 | GR-1, DS-9, DS-10, MO-1 | [the audit's gaps](#audit-gaps) |
 | L4.8 | A compromised image, tool or package release | ASI04; LLM03:2025; AML.T0010.004, AML.T0010.001, AML.T0011.001 | DS-7, DS-8 | [H-051](#h-051) |
 | L4.9 | A kill switch doesn't stop what it should, when it's needed | ASI08, ASI10 | MO-5 | [not yet verified live](#not-yet-verified-live) |
+| L4.10 | A run plants state that outlives it, and a later run or Archon itself executes it: a `.pi/` extension in a reused worktree, `core.fsmonitor` or `core.hooksPath` in `~/.gitconfig` (run by Archon's own git commands), a hook in `~/.claude/settings.json` (later Claude-provider nodes), a modified package in a cache, or another registry in `~/.npmrc`. A poisoned run can plant it and then get itself killed | ASI05, ASI06; LLM03:2025; AML.T0081, AML.T0080.000 | DS-17, DS-15, DS-6 | — |
 
 ### L5 Evaluation and Observability
 
@@ -295,6 +296,7 @@ The six domains, as SANS's post on its Critical AI Security Guidelines (the v1.1
 | DS-14 | A running server's live tool surface is compared with the lock: `hapi mcp verify`, at stack start, and in the audit | §10.1 | `src/mcp/lock.ts`, `src/audit/checks/mcp.ts` | planned (Plan 04, H-101) |
 | DS-15 | Per-run isolation: ephemeral worktrees; `prepare` strips `.pi/` and `.agents/` before Pi runs; non-persistent containers for externally fed sessions | §9.2, §11.3 | — | planned (Plan 03, H-161). Spike T8 showed the strip is the only prevention: Archon trusts a repo's `.pi/`, and an unstripped repo extension ran in the Pi worker ([spike 01](../spikes/01-pi-under-archon.md)) |
 | DS-16 | hapi-guard, Pi's only user extension: protected paths denied, budgets, `max_tokens` clamped | §9.3 | `build/pi/hapi-guard.json` from `src/generate/pi.ts` | planned (Plan 02, H-087) |
+| DS-17 | Nothing a worker writes outlives its run but the commit the harvester takes: the strip before every Pi node; a restarted run starts over from a fresh worktree; a per-run `$HOME`, with git and Claude Code config generated fresh and read-only, not the persistent `archon-home` volume; caches, config and workflows read-only or per-run; later, a fresh container per run | §9.2, §11.3 | — | planned (Plan 02 and Plan 03, H-182; the strip and fresh worktrees, H-161) |
 
 ### 6.4 Inference Security
 
