@@ -63,10 +63,13 @@ Run on 2026-10-28, and passed: [spike 06](../spikes/06-hermes-slack-socket-mode.
 
 - Your DMs to the bot get an answer.
 - A second test user's DMs are ignored, with no reply at all. Hermes logs `Early reject of unauthorized user`.
-- No inbound port opens. The image has no `ss`, so list the container's listeners from `/proc` (addresses in hex, little-endian: `0100007F:21C2` is `127.0.0.1:8642`). Each must be on `127.0.0.1`, or `127.0.0.11`, Docker's DNS:
+- No inbound port opens:
+  - `docker port hapi-hermes-1` prints nothing, so no port is published;
+  - every TCP listener and every UDP socket inside the container is on `127.0.0.1`, or `127.0.0.11`, Docker's DNS. The image has no `ss`, so read them from `/proc` (addresses in hex, little-endian: `0100007F:21C2` is `127.0.0.1:8642`):
 
   ```bash
-  docker exec hapi-hermes-1 cat /proc/net/tcp /proc/net/tcp6 | awk '$4 == "0A" {print $2}'
+  docker exec hapi-hermes-1 cat /proc/net/tcp /proc/net/tcp6 | awk '$4 == "0A" {print "tcp", $2}'
+  docker exec hapi-hermes-1 cat /proc/net/udp /proc/net/udp6 | awk 'NR > 1 && $2 ~ /:/ {print "udp", $2}'
   ```
 
 ## Kill switch

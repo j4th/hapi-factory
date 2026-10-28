@@ -1028,5 +1028,5 @@ Spike 2 of spec §19 (Pi config skew) is **resolved by design**: Archon's Pi use
 - `mise run test` and `mise run test:int` pass.
 - `mise run audit` exits 0.
 - `docs/security/threat-model.md` exists.
-- All seven spike notes are committed, each with a decision and its consequence for the next plans.
+- The spike notes of Tasks 8–13 are committed, each with a decision and its consequence for the next plans. Task 14 is on hold (H-177): Plan 03's planning retargets it, and its note comes with Plan 03.
 - [handoffs.md](handoffs.md) is current: diffed against the SDD ledger before the plan's workspace is deleted, with every open item assigned to a later task, plan or the operator.
