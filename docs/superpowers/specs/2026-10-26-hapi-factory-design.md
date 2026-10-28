@@ -782,8 +782,10 @@ Cost rules:
 - **Escalate effort before changing model.**
 - **Hard caps live at the provider** (workspaces and keys). Archon budgets and hapi-guard are the in-run caps.
 - **Handle Anthropic's 429 `enforced_spend_limit_reached`** as terminal. Don't retry it.
-- **[verify early]:** Anthropic rejects edited conversation history for accounts created on or after 2026-08-31. Make sure Hermes compression and Pi compaction don't break on that.
-- **[verify]:** a one-dollar test of whether Claude-provider (Agent SDK) review draws on the API credit. The credits doc says the Agent SDK is covered.
+- **[verify early]:** Anthropic rejects edited conversation history for accounts created on or after 2026-08-31. Make sure Hermes compression and Pi compaction don't break on that. Settled by spike T11 (docs/spikes/04-anthropic-history-and-billing.md):
+  - the operator's account isn't enforced, on Haiku 5.5, Sonnet 5.5 or Opus 5.5;
+  - opted in as an enforced account would be, neither harness fails. Pi sends `drop_block` for models its catalog flags, so compaction drops the kept turn's reasoning, but an unflagged model would fail its node (H-184). Hermes gets one 400 per compression, then strips the stale blocks and resends (H-185).
+- **[verify]:** a one-dollar test of whether Claude-provider (Agent SDK) review draws on the API credit. The credits doc says the Agent SDK is covered. Spike T11 ran one such node, on Sonnet 5.5 with the archon zone's key as its only credential. The Console confirmation is open (H-187), because the Console's usage was hours behind.
 - **Provider subscriptions: decided after v1, from measured numbers** [call].
   - **The question** [user]: is the factory better funded by one larger Claude plan's API credit, or by a smaller Claude plan for interactive work plus a cheaper coding plan for the factory?
   - **How it was evaluated** (2026-10-26, the private provider-subscriptions research, [docs/research](../../research/README.md)): each plan against what an unattended factory needs. Terms that allow unattended, third-party-harness use; data retention and training; the models it serves; and its price against the API credit it would replace.
