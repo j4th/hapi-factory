@@ -491,7 +491,7 @@ protected_paths:
 Small scripts run by `hapi` (systemd user timers, installed by `mise run up`):
 
 - **Poller:** reads the forge via a read-only token or the public API. No inbound endpoint. It fires `archon trigger fire` for:
-  - merged work orders on `main` with no run (`--delivery-id <merge-sha>`);
+  - merged work orders on `main` with no run, one fire per work order (`--delivery-id <merge-sha>:<work-order-id>`: spike T10 found that a shared key starts only the first);
   - delivery PRs newly labeled `hapi:rework` by a maintainer, passing maintainer review comments as data (§5.2).
 
   It also queues maintainer comments on planning PRs for Hermes and posts alerts to `#hapi-alerts`.
@@ -986,7 +986,7 @@ Because v1 keeps Archon off the forge (§9.4), hapi-factory may need little or n
 - Which search backend, within §10's constraints.
 - Fan-out thresholds, within §5.4.
 - Whether to upstream the Archon Pi-trust fix during phase 1 or later.
-- Deduplicating the trigger key when one merge carries several work orders.
+- Deduplicating the trigger key when one merge carries several work orders: settled by spike T10, one delivery ID per work order (§9.4; docs/spikes/03-archon-budget-trigger-env.md).
 - The toolchain mise installs inside the Archon container.
 - How the ruleset lets the operator merge PRs they authored themselves (`lane:direct`). Rulesets don't let an author approve their own PR. Use an owner-only bypass that the Apps and agents can never use.
 
