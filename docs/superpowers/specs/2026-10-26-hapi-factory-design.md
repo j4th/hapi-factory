@@ -29,9 +29,9 @@ hapi-factory is a **public, best-practices reference stack** for an end-to-end a
 
 ### Success
 
-- **v1** is a **net-new, minimal Odoo MCP server** (CRM and finance), taken from a Hermes conversation through research, architecture, threat model and work orders to merged PRs through the full stack.
+- **v1** is a **net-new, minimal MCP server**, taken from a Hermes conversation through research, architecture, threat model and work orders to merged PRs through the full stack. **Its subject is uncommitted:** picking it with Hermes is the conversation's first step, so it is part of what v1 tests (§15; H-177) [user].
   - The operator chose net-new over their existing mtg repo [user]. That repo already carries so much context and old-kit instructions that "drop this into other repos" would become a rabbit hole before the core loop works.
-  - The designer chose Odoo as the net-new project and set its v1 scope [call].
+  - The designer first chose Odoo (CRM and finance) and set a v1 scope for it [call]. On 2026-10-27 the operator reopened the subject: a dead-simple energy and weather data server is the other candidate so far, and the brainstorm decides [user].
   - Section 15 gives the definition of done.
 - **Phase 2** is the existing mtg MCP server [user]. Retire the old kit, have Hermes triage its open issues, then do one full run-through as a bundled PR (or a single PR if one issue merits it).
 - **Longer term**, other people can stand the stack up with mise, point it at their own repos, and learn from how it's composed [user].
@@ -63,7 +63,7 @@ hapi-factory is a **public, best-practices reference stack** for an end-to-end a
 - **GitLab support.** GitHub comes first, but the design stays forge-agnostic and documents the GitLab lift (§16) [user].
 - **The Claude Code worker lane and the direct Hermes → Pi lane.** The work-order contract is designed for both. They're built in phase 4 [user, for "later"].
 - **Onboarding existing repos.** Existing-repo onboarding and a general `onboard` tool come later [user]. v1 creates the new repo from the contract template. mtg is onboarded by hand in phase 2, and only then is a general tool extracted.
-- **Odoo beyond the minimal v1 scope**, such as write tools or finance mutations. Those come later.
+- **The showcase beyond the minimal v1 scope**, such as write tools (for Odoo, finance mutations). Those come later.
 - **Team or multi-user operation**, hosted SaaS, or Windows/macOS support.
 - **Archon's bundled SDLC pack and its merge queue.** We write a few small workflows of our own and let GitHub's branch rules do the merging (§9.2).
 - **Parallel runs across one repo.** Runs queue per repo.
@@ -168,7 +168,7 @@ So **nothing inside the Archon container is a human-approval boundary**. The bou
   - each repo has its own run queue (resource `github:<owner>/<repo>:factory`).
 - **A new trust domain** gets its own Hermes profile, Archon container and zone, model workspace and spend cap, and Slack channel. Examples: the downstream abliteration.ai security work, or any client or private code. This stops memory and skill bleed between domains: a poisoned memory in one domain can't steer another.
 - **No run ever spans two repos.** A cross-repo feature is one work order per repo, coordinated by Hermes.
-- **v1 has one domain** ("oss": hapi-factory, odoo-mcp, later mtg).
+- **v1 has one domain** ("oss": hapi-factory, the v1 showcase repo, later mtg).
 
 ---
 
@@ -908,32 +908,32 @@ A flagged run gets `hapi:flagged` on its PR and an alert in `#hapi-alerts`.
 | Phase | Scope | Done when |
 |---|---|---|
 | 0. Foundations | Repo skeleton, `mise.toml`, `policy/` + generator (minimum: protected paths, commands, budgets, rosters, flags), containers for Hermes and Archon, egress proxy, `hapi` user, GitHub Apps, Console workspaces and keys, defaults flipped, `mise run audit`, threat model v0 | `mise run up` on this machine brings the stack up; `mise run audit` passes |
-| **1. v1: net-new Odoo MCP (minimal)** | Repo template and `mise run new-repo`. `hapi-planning`, `hapi-research`/`hapi-research-note` and `new-work-order`. Poller (merge + rework label), mirror, harvester, `factory-task`, hapi-guard, CI reusable workflow, metrics and trailers, Slack gateway and alerts. Local Odoo dev sidecar (official Odoo + Postgres images) for smoke. Eval case 1 and planning eval 1. | See below |
+| **1. v1: a net-new MCP server (minimal), its subject picked with Hermes** | Repo template and `mise run new-repo`. `hapi-planning`, `hapi-research`/`hapi-research-note` and `new-work-order`. Poller (merge + rework label), mirror, harvester, `factory-task`, hapi-guard, CI reusable workflow, metrics and trailers, Slack gateway and alerts. A local sidecar on the private network for smoke: a subject-agnostic one until the brainstorm, then the one its design names (H-177). Eval case 1 and planning eval 1. | See below |
 | 2. Brownfield: mtg MCP | Retire the old kit in mtg by hand through a Hermes planning PR: trim `AGENTS.md`; remove `CLAUDE.md`, `HERMES.md`, `.pi/`, `.claude/`, `.agents/skills/`; harden or remove the comment-triggered Claude workflows [user]. Hermes triages open issues, then one full run-through as a bundled PR (or a single PR if an issue merits it) [user]. Then extract a general `onboard` tool. | mtg run-through merged; old kit gone; audit passes on mtg |
-| 3. Showcase depth and VM | Odoo beyond minimal (more tools, a real fan-out case), the optional o11y profile, more eval cases, published write-up. Same mise path on a fresh VM, with remote access via tunnel or proxy. Optional **`hapi-heads-up`** Hermes plugin: a tool-less, cheap-model pass over recent context after each turn that posts a note to Slack only when something is worth flagging. The main agent never sees it unless the operator forwards it. Modeled on Claude Code's "You should know" side agent [call]. | Fresh VM → `mise run up` → eval suite passes |
+| 3. Showcase depth and VM | The showcase beyond minimal (more tools, a real fan-out case), the optional o11y profile, more eval cases, published write-up. Same mise path on a fresh VM, with remote access via tunnel or proxy. Optional **`hapi-heads-up`** Hermes plugin: a tool-less, cheap-model pass over recent context after each turn that posts a note to Slack only when something is worth flagging. The main agent never sees it unless the operator forwards it. Modeled on Claude Code's "You should know" side agent [call]. | Fresh VM → `mise run up` → eval suite passes |
 | 4. More lanes | Claude Code worker lane; Hermes → Pi direct lane (review the open Hermes PR #106739 pi-agent skill as a starting point) | Same eval cases pass with the Claude Code worker |
 | 5. GitLab | GitLab forge adapter (§16) | Pilot eval passes on GitLab |
 
-**v1 scope: Odoo MCP, minimal** [call]:
-- A read-only MCP server against Odoo's external API.
-- At most **two or three work orders**, bundled where related. For example:
+**v1 scope: one MCP server, minimal** [call; the subject reopened by the operator, 2026-10-27]:
+- A read-only MCP server over one data source. **The subject is uncommitted, and picking it is part of the v1 test:** the operator brainstorms it with Hermes in `#hapi-intake` (step 2 below), and nothing built before then assumes it (H-177) [user]. The candidates so far are Odoo's external API (the first pick) and public energy and weather data.
+- At most **two or three work orders**, bundled where related. For example, for Odoo:
   - (1) the server skeleton with config, auth handling and a health tool;
   - (2) one read-only CRM tool, such as `search_partners`;
   - optionally (3) one read-only finance tool, such as `list_invoices`.
 - No write tools, no hosting, local stdio transport.
-- Smoke tests run against a **local Odoo sidecar** on the private network. The worker needs no external egress beyond model APIs, which is a strong security property for the pilot.
+- Smoke tests run against a **local sidecar** on the private network: for Odoo, the official Odoo and Postgres images; for a public data API, a stub serving recorded responses. The worker needs no external egress beyond model APIs, which is a strong security property for the pilot. Until the brainstorm, Plans 03 and 05 smoke-test against a subject-agnostic sidecar.
 - Hermes decides the exact cut during planning, and the operator approves it at the planning PR.
 
 **v1 definition of done** [user scope; call specifics]:
-1. The operator runs `mise run new-repo -- odoo-mcp`. The repo exists with the contract, ruleset and both Apps installed.
-2. In Slack (`#hapi-intake`), the operator brainstorms the Odoo MCP server with Hermes.
-   - `hapi-research` produces dated, first-party-sourced notes on Odoo's external API and the MCP spec.
-   - Hermes drafts `docs/design/odoo-mcp.md`, `docs/security/threat-model.md` (MAESTRO, scoped to this server) and the work orders on `plan/odoo-mcp`.
+1. The operator runs `mise run new-repo -- <name>`. The repo exists with the contract, ruleset and both Apps installed.
+2. In Slack (`#hapi-intake`), the operator brainstorms the showcase with Hermes, starting with its subject.
+   - `hapi-research` produces dated, first-party-sourced notes on the chosen data source's API and the MCP spec.
+   - Hermes drafts `docs/design/<name>.md`, `docs/security/threat-model.md` (MAESTRO, scoped to this server) and the work orders on `plan/<name>`.
    - Hermes opens a `lane:planning` PR.
 3. The operator merges it. Exactly **one** Archon run per work order starts within the poll interval, without the operator touching Archon.
 4. Each run:
    - Pi builds inside the container, with `.pi/` stripped and hapi-guard active.
-   - `mise run check` and `mise run smoke` pass against the Odoo sidecar.
+   - `mise run check` and `mise run smoke` pass against its sidecar.
    - The scope check passes.
    - The independent review returns `ready`.
 5. The harvester opens one `lane:factory` PR per work order, with trailers and the run summary.
@@ -999,4 +999,4 @@ Because v1 keeps Archon off the forge (§9.4), hapi-factory may need little or n
 5. Anthropic: does the history-edit rejection hit Hermes or Pi compaction? A one-dollar Agent SDK billing test.
 6. Hermes install via mise; Hermes Docker backend on rootless Podman.
 7. Hermes's Slack gateway runs in Socket Mode, with no inbound endpoint, and supports a user-ID allowlist.
-8. The official Odoo and Postgres images run as a private sidecar the Archon container can reach, and `mise run smoke` can seed minimal CRM and invoice data.
+8. A private smoke sidecar runs where the Archon container can reach it, and `mise run smoke` can seed or replay its data. As first written: the official Odoo and Postgres images, with minimal CRM and invoice data. Until the brainstorm picks the subject: a subject-agnostic one (H-177).

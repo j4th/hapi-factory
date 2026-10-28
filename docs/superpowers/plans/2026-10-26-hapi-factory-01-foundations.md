@@ -41,7 +41,7 @@ This is Plan 01 of 07. Each later plan is written after the plans before it fini
 | 04 Coordinator | Hermes plugins `hapi-path-guard` and `hapi-cmd-allow`; skills `hapi-planning`, `new-work-order` and `hapi-research-note` (with citation check); the `hapi-research` profile and **its own container** (native Brave and Exa web backends, Context7 MCP from the Task 3b catalog); freshness job; the `hapi-status` tool; Slack gateway; PR-comment queue plus the injection screen; the three skill tiers and `hapi skill fork\|diff\|promote\|drop` (handoffs H-104–H-109) | Planning PRs from a Slack conversation |
 | 05 Repo contract | `templates/repo-contract/`, `mise run new-repo`, the reusable CI workflow (gates, schema, trailers, protected-path diff), `.coderabbit.yaml`, ruleset application | New repos born compliant |
 | 06 Evals & metrics | Eval case format and runner, planning eval, `metrics.jsonl`, flags and thresholds, Jev/CodeRabbit calibration records | `mise run eval` |
-| 07 v1 acceptance | The Odoo MCP run-through against the spec's v1 definition of done (§15), plus the budget, portable and jev-off runs | v1 done |
+| 07 v1 acceptance | The v1 run-through against the spec's v1 definition of done (§15), starting with the brainstorm that picks the showcase's subject (H-177), plus the budget, portable and jev-off runs | v1 done |
 
 Phases 2–5 (mtg brownfield; showcase depth plus VM; more lanes; GitLab) get their own plans after v1.
 
@@ -1013,6 +1013,8 @@ Spike 2 of spec §19 (Pi config skew) is **resolved by design**: Archon's Pi use
 - [ ] **Step 3:** Record the result in `docs/spikes/06-hermes-slack-socket-mode.md` and commit.
 
 ### Task 14: Spike: Odoo sidecar for smoke tests (for Plans 03/05/07)
+
+**On hold (H-177).** The showcase's subject is uncommitted and picked in the v1 brainstorm, so Plan 03's planning retargets this spike to a subject-agnostic smoke sidecar. The steps below are the Odoo version, as first written.
 
 - [ ] **Step 1:** Run the official `odoo` + `postgres` images, digest-pinned, on `archon-net` as `odoo.internal`. Write `spikes/scratch/odoo/seed.py`, which creates 3 partners and 2 posted customer invoices via Odoo's external JSON-RPC API.
 - [ ] **Step 2:** From the Archon container, call `res.partner` `search_read` through the external API. Expected: 3 partners. Record startup time and RAM.
