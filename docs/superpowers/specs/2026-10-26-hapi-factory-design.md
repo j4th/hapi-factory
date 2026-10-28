@@ -880,7 +880,7 @@ A flagged run gets `hapi:flagged` on its PR and an alert in `#hapi-alerts`.
   - Archon has no OpenTelemetry. A small bridge reads its run events over REST/SSE and emits OTLP.
 - **Attribute mapping:** the Collector maps Claude Code's token attributes to `gen_ai.usage.*`.
 - **[verify]:**
-  - trace context survives `archon trigger fire` and detached runs;
+  - trace context survives `archon trigger fire` and detached runs: settled by spike T10 for a `TRACEPARENT` exported into `fire`'s environment, which every node of the detached run inherits, Pi's shell included. The `traceparent` input reaches bash nodes only, as `$INPUTS_TRACEPARENT`, and a queued request run by a later drain is untested (docs/spikes/03-archon-budget-trigger-env.md);
   - spans flush before process exit.
 
 ---

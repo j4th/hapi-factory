@@ -310,7 +310,7 @@ The six domains, as SANS's post on its Critical AI Security Guidelines (the v1.1
 | IS-6 | The research quarantine: its own container, web tools only, no terminal, no repo write, a schema-validated brief | §9.1 #4, §10 | — | planned (Plan 04, H-099) |
 | IS-7 | Untrusted text (queued PR comments, rework comments, CodeRabbit's comments, briefs) is screened and wrapped as quoted data with a warning banner; a signal, never a boundary | §9.5 | — | planned (Plan 04, H-162) |
 | IS-8 | MCP servers run `trust: untrusted`, with include-only tool lists, prompts and resources off, elicitation and sampling off | §10.1 | `src/generate/mcp.ts`, `policy/mcp.yaml`; `tests/generate/hermes.test.ts`, `tests/generate/mcp.test.ts` | enforced |
-| IS-9 | In-run caps: Archon's per-run budget and hapi-guard's, beside Hermes's `max_turns` (IS-1) and Pi's `maxTokens` (DS-11) | §9.2, §9.3 | `policy/budgets.yaml` | planned (Plan 02, H-087; Plan 03, H-161) |
+| IS-9 | In-run caps: Archon's per-run budget and hapi-guard's, beside Hermes's `max_turns` (IS-1) and Pi's `maxTokens` (DS-11) | §9.2, §9.3 | `policy/budgets.yaml` | planned (Plan 02, H-087; Plan 03, H-161, H-183). Spike T10 (2026-10-28): Archon's `max_spend_usd` loads and stops a run, but admits each AI attempt while spend is below it, so a run overshoots by up to one node's cost; it bounds nodes, not dollars ([spike 03](../spikes/03-archon-budget-trigger-env.md)) |
 | IS-10 | The independent review: a separate session, a different model, read-only, advisory | §9.2 | — | planned (Plan 03, H-161) |
 | IS-11 | Skills in three tiers: the factory's own mounted read-only, repo skills changed only by planning PRs, learned skills under write approval and committed by the host | §9.1, §11.6 | — | planned (Plan 04, H-104, H-105, H-106) |
 
@@ -364,7 +364,7 @@ Impact if exploited, likelihood in v0, and the decision. "Low" likelihood means 
 <a id="residual-1"></a>
 ### Residual 1: Pi runs in-process with Archon
 
-Spec §11.9 #1: Pi runs in-process with Archon. It can read Archon state, answer Archon approvals and alter local run records. (Spec §4.3: any local process can answer Archon's approvals, a Pi step through `ARCHON_CLI_COMMAND` included.)
+Spec §11.9 #1: Pi runs in-process with Archon. It can read Archon state, answer Archon approvals and alter local run records. (Spec §4.3: any local process can answer Archon's approvals, a Pi step through `ARCHON_CLI_COMMAND` included. Spike T10 saw `ARCHON_CLI_COMMAND`, the `bun … cli.ts` command, in a Pi node's shell, [spike 03](../spikes/03-archon-budget-trigger-env.md).)
 
 - **Owner control:** the human boundary is on GitHub, and the archon zone holds no forge credentials. Only the operator merges (AC-7: documented, not verified live, H-080; the App's merge refused live, H-078), and the archon zone has no forge credential or route (AC-9: enforced in config and on rootful Docker (stage a); as hapi on rootless, not verified live (H-146(c))). So a Pi step that approves its own Archon gate, or rewrites a run record, still can't get anything onto `main`. No Archon approval node is a security control (spec §9.2).
 - **Next level:** ship run events off-box, to a store the archon zone can't write (MO-6: the o11y collector under its own Unix user, Phase 3, H-122), so a rewritten local record no longer matches the copy.
