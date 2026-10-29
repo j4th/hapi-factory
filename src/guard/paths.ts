@@ -24,6 +24,12 @@
  * - under /tmp: allowed;
  * - anywhere else: blocked.
  *
+ * The name as given is judged as well, before the real path: the strictest of
+ * the two wins. Pi's lexical path, inside the worktree, is checked against the
+ * table too, so a repo symlink `CLAUDE.md -> notes.md` can't be written or
+ * edited as CLAUDE.md, which is what every agent reads, while `notes.md`
+ * itself stays writable.
+ *
  * An existing file with more than one hard link is blocked too: it may be a
  * protected file under another name. Reads are not checked.
  */
@@ -113,6 +119,8 @@ export function protectedTable(globs: Record<string, "deny">): { protectedPaths:
 }
 
 export interface Roots {
+  /** The worktree as Pi and the shell name it: `ctx.cwd`, normalized lexically. */
+  named: string;
   /** The worktree, real. */
   work: string;
   /** /tmp, real. */
@@ -137,9 +145,25 @@ export function isProtected(table: Roots["table"], rel: string): boolean {
 /** The repo-relative form of a real path inside the worktree. */
 export const relTo = (work: string, real: string): string => (real === work ? "" : real.slice(work.length + 1));
 
+/**
+ * `abs`'s name relative to the worktree, lexically: against the worktree as
+ * Pi names it, else against its real path (for an absolute name given that
+ * way). Undefined when the name is outside both.
+ */
+export function namedRel(r: Roots, abs: string): string | undefined {
+  const lexical = resolve(abs);
+  for (const root of [r.named, r.work]) if (within(lexical, root)) return relTo(root, lexical);
+  return undefined;
+}
+
 /** Rule 1 for one write or edit path, as given to the tool. */
 export function checkWrite(r: Roots, input: string, cwd: string, home: string): Verdict {
   const abs = piResolve(input, cwd, home);
+  // The name as given first: a protected name stays protected wherever its link points.
+  const named = namedRel(r, abs);
+  if (named !== undefined && isProtected(r.table, named)) {
+    return { block: true, rule: "protected-path", reason: `${named || "."} is a protected path; workers may not change it`, path: named || "." };
+  }
   let real: string;
   try {
     real = realPath(abs);

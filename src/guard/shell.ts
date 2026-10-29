@@ -13,8 +13,11 @@
  * the command, `~`, symlinks and a shell glob's expansion) to a protected path
  * of the worktree, or into Pi's agent dir, the guard's ledger or the decision
  * log's dir (`paths.out`), and the command has a write indicator. A word is
- * resolved as the kernel resolves it, never lexically (paths.ts, realPath): with
- * `obj -> .git/objects`, `obj/../hooks/x` is `.git/hooks/x`. A word with a ".."
+ * judged twice, and the strictest wins: by its name, normalized lexically as
+ * the command gives it (so `rm CLAUDE.md` blocks when CLAUDE.md is a link to an
+ * unprotected file), and where it lands, resolved as the kernel resolves it
+ * (paths.ts, realPath): with `obj -> .git/objects`, `obj/../hooks/x` is
+ * `.git/hooks/x`. A word with a ".."
  * after a component that doesn't exist blocks too, since where it lands can't
  * be known (`ln -s ... a && echo > a/../x` makes `a` in the same command). The
  * decision-log refusal is a signal as well: the shell can still write there
@@ -39,7 +42,7 @@
  */
 import { lstatSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
-import { isProtected, realPath, relTo, type Roots, Unresolvable, within } from "./paths";
+import { isProtected, namedRel, realPath, relTo, type Roots, Unresolvable, within } from "./paths";
 
 /** One simple command: its words, and the targets of its output redirections. */
 export interface Segment {
@@ -324,6 +327,12 @@ export interface ShellBlock {
 
 /** What one candidate word, resolved, writes to that rule 7 refuses. */
 function refused(abs: string, word: string, tree: boolean, c: ShellContext): ShellBlock | undefined {
+  // The name as the command gives it, lexically, then where it really lands: the strictest wins, so `rm CLAUDE.md`
+  // blocks even when CLAUDE.md is a link to an unprotected file. The worktree root itself is no file to protect.
+  const named = namedRel(c.roots, abs);
+  if (named !== undefined && named !== "" && isProtected(c.roots.table, named)) {
+    return { rule: "shell-write", reason: `this command writes to the protected path ${named}`, path: named };
+  }
   let real: string;
   try {
     real = realPath(abs);

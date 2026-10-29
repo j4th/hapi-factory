@@ -13,7 +13,8 @@ afterEach(cleanupAll);
 /**
  * [command, blocked]. The worktree holds AGENTS.md, .github/workflows/ci.yml, .git/{objects,hooks}, src/a.ts,
  * notes.md, app.log, pkg/CLAUDE.md, node_modules/bun-types/CLAUDE.md (bun-types ships one), and the links
- * link.md -> AGENTS.md, obj -> .git/objects, wf -> .github/workflows and hook -> obj/../hooks/pre-push (dangling).
+ * link.md -> AGENTS.md, obj -> .git/objects, wf -> .github/workflows and hook -> obj/../hooks/pre-push (dangling),
+ * x.md, and CLAUDE.md -> notes.md (a protected name over an unprotected file).
  */
 const VECTORS: [string, boolean][] = [
   // Redirection: >, >>, and the fd and &> forms, attached or not.
@@ -30,6 +31,12 @@ const VECTORS: [string, boolean][] = [
   ["echo x > wf/../workflows/evil.yml", true],
   ["echo x > hook", true],
   ["cp notes.md ./obj/../config", true],
+  // A protected name counts as given, not only where it points: replacing or removing CLAUDE.md changes what agents read.
+  ["rm CLAUDE.md", true],
+  ["ln -sf x.md CLAUDE.md", true],
+  ["mv x.md CLAUDE.md", true],
+  ["echo x > CLAUDE.md", true],
+  ["rm -f ./CLAUDE.md", true],
   ["cat > AGENTS.md <<'EOF'\nhello\nEOF", true],
   // tee
   ["echo x | tee AGENTS.md", true],
@@ -79,6 +86,7 @@ const VECTORS: [string, boolean][] = [
   ["cat AGENTS.md | grep -n agents", false],
   ["grep -rn AGENTS.md src", false],
   ["echo x > notes.md", false],
+  ["echo x >> x.md && cp x.md notes.md", false],
   ["echo 'x > AGENTS.md'", false],
   ["echo \"rm AGENTS.md\"", false],
   ["echo x 2>&1 | tee notes.md", false],
@@ -125,6 +133,8 @@ test("the vector table: each command blocks or allows as listed", async () => {
   symlinkSync(".git/objects", join(h.work, "obj"));
   symlinkSync(".github/workflows", join(h.work, "wf"));
   symlinkSync("obj/../hooks/pre-push", join(h.work, "hook"));
+  writeFileSync(join(h.work, "x.md"), "x\n");
+  symlinkSync("notes.md", join(h.work, "CLAUDE.md"));
   await h.start();
   const got: [string, boolean][] = [];
   for (const [command] of VECTORS) got.push([command, (await h.tool("bash", { command }))?.block === true]);

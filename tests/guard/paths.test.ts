@@ -129,6 +129,22 @@ describe("writes outside the worktree", () => {
     expect(existsSync(join(h.work, "hooks"))).toBe(false);
   });
 
+  test("a protected name is judged as given too, not only where its link points: CLAUDE.md -> notes.md", async () => {
+    const h = await started();
+    writeFileSync(join(h.work, "notes.md"), "notes\n");
+    symlinkSync("notes.md", join(h.work, "CLAUDE.md")); // every agent reads notes.md as CLAUDE.md
+    mkdirSync(join(h.work, "pkg"));
+    symlinkSync("../notes.md", join(h.work, "pkg", "AGENTS.md"));
+    expect(await h.tool("write", { path: "CLAUDE.md", content: "x" })).toEqual({
+      block: true,
+      reason: "hapi-guard: CLAUDE.md is a protected path; workers may not change it (rule protected-path)",
+    });
+    expect((await h.tool("edit", { path: "CLAUDE.md", edits: [{ oldText: "notes", newText: "x" }] }))?.block).toBe(true);
+    expect((await h.tool("write", { path: `${h.work}/pkg/AGENTS.md`, content: "x" }))?.block).toBe(true);
+    expect(await h.tool("write", { path: "notes.md", content: "x" })).toBeUndefined();
+    expect(await h.tool("edit", { path: "notes.md", edits: [{ oldText: "notes", newText: "x" }] })).toBeUndefined();
+  });
+
   test("a .. after a component that doesn't exist is blocked: the kernel can't resolve it either", async () => {
     const h = await started();
     symlinkSync("missing/../AGENTS.md", join(h.work, "n"));

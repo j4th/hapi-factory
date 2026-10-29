@@ -35,7 +35,7 @@
  */
 import { lstatSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { RunFile } from "../generate/archon";
 import { Ledger, sessionSpendUsd, usageUsd, usd } from "./budget";
 import { type GuardSettings, type Identity, loadIdentity, loadRunFile, loadSettings, Problem } from "./config";
@@ -149,7 +149,13 @@ function register(pi: ExtensionAPI, r: Ready, deps: GuardDeps): void {
     if (!ledger) throw new Error("hapi-guard: session_start has not run; the node fails");
     return ledger;
   };
-  const roots = (ctx: ExtensionContext): Roots => ({ work: realDir(ctx.cwd), tmp: realDir(tmpRoot), ledger: realDir(s.paths.ledgerDir), table });
+  const roots = (ctx: ExtensionContext): Roots => ({
+    named: resolve(ctx.cwd),
+    work: realDir(ctx.cwd),
+    tmp: realDir(tmpRoot),
+    ledger: realDir(s.paths.ledgerDir),
+    table,
+  });
 
   /** The run's spend: the other attempts' ledgers, this session's entries plus `pending`, this process's classifier calls. */
   const spend = (ctx: ExtensionContext, pending = 0): { session: number; total: number } => {
