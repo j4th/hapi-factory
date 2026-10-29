@@ -131,6 +131,7 @@ describe("tools.hermes-validate", () => {
     const r = await check(await cleanWorld(), "tools.hermes-validate");
     expect(r.status).toBe("pass");
     expect(r.detail).toContain("agent.reasoning_effort");
+    expect(r.detail).toContain("model.default and model.provider");
     expect(r.detail).toContain("no _config_version");
   });
 
@@ -151,6 +152,37 @@ describe("tools.hermes-validate", () => {
     const r = await check(w, "tools.hermes-validate");
     expect(r.status).toBe("fail");
     expect(r.detail).toContain("security.allow_lazy_install");
+  });
+
+  test("a key under model fails unless it is one of the reviewed keys: DEFAULT_CONFIG's model is a string, so it can't say", async () => {
+    const w = await cleanWorld();
+    const file = join(w.build, "hermes", "config.yaml");
+    const cfg = YAML.parse(readFileSync(file, "utf8"));
+    for (const [rename, says] of [
+      [(m: Record<string, unknown>) => ((m.defualt = m.default), delete m.default), "model.defualt is not a key Hermes knows"],
+      [(m: Record<string, unknown>) => (m.base_url = "https://example.invalid"), "model.base_url is not a key Hermes knows"],
+    ] as const) {
+      const c = structuredClone(cfg);
+      rename(c.model);
+      writeFileSync(file, YAML.stringify(c));
+      w.hermes.effective = hermesMerge(w.hermes.defaults, c);
+      const r = await check(w, "tools.hermes-validate");
+      expect([says, r.status]).toEqual([says, "fail"]);
+      expect(r.detail).toContain(says);
+    }
+  });
+
+  test("a generated mapping whose Hermes default is not a non-empty mapping, with no reviewed key list, fails closed", async () => {
+    const w = await cleanWorld();
+    const file = join(w.build, "hermes", "config.yaml");
+    const cfg = YAML.parse(readFileSync(file, "utf8"));
+    // DEFAULT_CONFIG.providers is {}: nothing there says which keys Hermes reads under it.
+    cfg.providers = { anthropic: { base_url: "https://example.invalid" } };
+    writeFileSync(file, YAML.stringify(cfg));
+    w.hermes.effective = hermesMerge(w.hermes.defaults, cfg);
+    const r = await check(w, "tools.hermes-validate");
+    expect(r.status).toBe("fail");
+    expect(r.detail).toContain("providers.anthropic is not a key Hermes knows");
   });
 
   test("a value Hermes reads differently fails, naming the key", async () => {

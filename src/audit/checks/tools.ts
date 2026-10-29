@@ -16,7 +16,8 @@
  *   that exits non-zero fails, named, whatever it printed.
  * - tools.hermes-validate: Hermes's own config code, in its image: every key
  *   of the deployed config must be one Hermes knows (its DEFAULT_CONFIG, or a
- *   reviewed key it reads outside it), every value must read back as the
+ *   reviewed key it reads outside it or under a key whose default is no
+ *   mapping, such as `model`), every value must read back as the
  *   deployed file says through its `load_config` (YAML 1.1, and it deep-merges partial blocks,
  *   such as an `auxiliary` slot, with its defaults), and its
  *   `validate_config_structure` must report nothing (H-029). Hermes itself
@@ -219,6 +220,17 @@ export const HERMES_MCP_SERVER_KEYS: Readonly<Record<string, readonly string[] |
   sampling: ["enabled"],
 };
 
+/**
+ * The keys hapi deploys under a generated mapping whose Hermes default isn't a non-empty mapping, so DEFAULT_CONFIG
+ * can't say which keys Hermes reads there; each was read in the pinned image's source (2026-10-28). Any other key
+ * under one of these fails, and so does every key under a generated mapping that has neither a non-empty default
+ * mapping nor a list here.
+ */
+export const HERMES_REVIEWED_BLOCKS: Readonly<Record<string, { keys: readonly string[]; why: string }>> = {
+  // DEFAULT_CONFIG.model is "" (a bare model name).
+  model: { keys: ["default", "provider"], why: 'read as model_cfg.get("default") and .get("provider") across hermes_cli/ and agent/' },
+};
+
 /** Runs in the Hermes image with its own Python: its defaults, the effective config, its structure check and the version stamp. Fixed text. */
 const HERMES_SCRIPT = [
   "import json",
@@ -242,8 +254,15 @@ function unknownHermesKeys(ours: Record<string, unknown>, defaults: unknown): st
         if (!Object.hasOwn(HERMES_KEYS_OUTSIDE_DEFAULTS, dotted)) unknown.push(dotted);
         continue;
       }
+      const ourBlock = asRecord(v);
+      if (ourBlock === undefined) continue;
       const child = asRecord(dk[k]);
-      if (asRecord(v) !== undefined && child !== undefined && Object.keys(child).length > 0) walk(v as Record<string, unknown>, child, p);
+      if (child !== undefined && Object.keys(child).length > 0) walk(ourBlock, child, p);
+      else {
+        // Hermes's default can't say which keys it reads here: only a reviewed list can, and without one every key fails.
+        const reviewed = Object.hasOwn(HERMES_REVIEWED_BLOCKS, dotted) ? HERMES_REVIEWED_BLOCKS[dotted]!.keys : [];
+        for (const n of Object.keys(ourBlock)) if (!reviewed.includes(n)) unknown.push(`${dotted}.${n}`);
+      }
     }
   };
   walk(ours, defaults, []);
@@ -313,11 +332,12 @@ export async function hermesValidate(run: AuditRun): Promise<CheckResult[]> {
     ? `_config_version ${String(ours._config_version)} (latest ${String(out.latest_config_version)})`
     : `no _config_version (Hermes reads it as ${String(out.config_version)}, latest ${String(out.latest_config_version)}: a never-stamped current-schema file, which only \`hermes update\` or \`doctor --fix\` would migrate)`;
   const reviewed = Object.entries(HERMES_KEYS_OUTSIDE_DEFAULTS).map(([k, why]) => `${k}, ${why}`).join("; ");
+  const blocks = Object.entries(HERMES_REVIEWED_BLOCKS).map(([block, { keys, why }]) => `${keys.map((n) => `${block}.${n}`).join(" and ")}, ${why}`).join("; ");
   return [
     result(
       id,
       "pass",
-      `Hermes (${img.image}) knows every deployed key (reviewed outside its DEFAULT_CONFIG: ${reviewed}), reads each as the file says, and validate_config_structure reports nothing; the config has ${stamp}`,
+      `Hermes (${img.image}) knows every deployed key (reviewed outside its DEFAULT_CONFIG: ${reviewed}; reviewed under a key whose default is no mapping: ${blocks}), reads each as the file says, and validate_config_structure reports nothing; the config has ${stamp}`,
     ),
   ];
 }
