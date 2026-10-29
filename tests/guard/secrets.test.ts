@@ -46,6 +46,25 @@ describe("writes (rule 6)", () => {
     expect(await h.tool("edit", { path: "notes.md", edits: [{ oldText: FAKE_ENV.CLAUDE_API_KEY, newText: "redacted" }] })).toBeUndefined();
   });
 
+  test("a write or edit whose path holds a secret value or a key-shaped string blocks: a secret never becomes a file name", async () => {
+    const h = setup({ settings: gatesOff });
+    await h.start();
+    expect(await h.tool("write", { path: `notes-${SAMPLES["github-token"]}.md`, content: "x" })).toEqual({
+      block: true,
+      reason: "hapi-guard: the path holds a key shaped like github-token (rule secret, secret: github-token)",
+    });
+    const e = await h.tool("edit", { path: `src/${FAKE_ENV.CLAUDE_API_KEY}/a.ts`, edits: [{ oldText: "a", newText: "b" }] });
+    expect(e?.reason).toBe("hapi-guard: the path holds the value of CLAUDE_API_KEY (rule secret, secret: CLAUDE_API_KEY)");
+    // The path is checked before rule 1, so even a path outside the worktree is reported as a secret, and never logged as one.
+    expect((await h.tool("write", { path: `/etc/${FAKE_ENV.OPENCODE_API_KEY}`, content: "x" }))?.reason).toContain("secret: OPENCODE_API_KEY");
+    const blocks = h.log().filter((r) => r.rule === "secret");
+    expect(blocks.map((r) => [r.tool, r.secret, "path" in r])).toEqual([
+      ["write", "github-token", false],
+      ["edit", "CLAUDE_API_KEY", false],
+      ["write", "OPENCODE_API_KEY", false],
+    ]);
+  });
+
   test("each KEY_PATTERNS sample blocks with secret: <pattern name>", async () => {
     expect(Object.keys(SAMPLES)).toEqual(KEY_PATTERNS.map((k) => k.name));
     const h = setup({ settings: gatesOff });
@@ -75,10 +94,12 @@ test("no record or reason holds a value", async () => {
       await h.tool("write", { path: `/etc/${value}`, content: "x" }),
       await h.tool("bash", { command: `echo ${value}` }),
       await h.tool("edit", { path: "AGENTS.md", edits: [{ oldText: "a", newText: value }] }),
+      // A name the guard logs as given (the tool field and the unknown-tool reason), so the log's scrub is what keeps it out.
+      await h.tool(`tool-${value}`, {}),
     ]) if (r?.reason) reasons.push(r.reason);
     await h.result("bash", [{ type: "text", text: `out ${value} out` }]);
   }
-  expect(reasons.length).toBe(16);
+  expect(reasons.length).toBe(20);
   const log = readFileSync(join(h.out, "decisions.jsonl"), "utf8");
   for (const value of Object.values(FAKE_ENV)) {
     expect(log.includes(value)).toBe(false);

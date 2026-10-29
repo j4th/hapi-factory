@@ -254,6 +254,9 @@ function register(pi: ExtensionAPI, r: Ready, deps: GuardDeps): void {
       if (texts.length === 0 || texts.some((t) => typeof t !== "string")) {
         return block({ rule: "bad-input", reason: tool === "write" ? "write's content is not a string" : "edit's edits[].newText is not a string" });
       }
+      // The path first: a secret must not reach the repo as a file name either.
+      const named = secretBlock(input.path, "the path");
+      if (named) return named;
       const v = checkWrite(roots(ctx), input.path, ctx.cwd, home);
       if (v.block) return block({ rule: v.rule, reason: v.reason, path: v.path });
       for (const text of texts as string[]) {
@@ -268,7 +271,7 @@ function register(pi: ExtensionAPI, r: Ready, deps: GuardDeps): void {
       const command = input.command;
       const b = secretBlock(command, "the command");
       if (b) return b;
-      const sh = checkShell(command, { cwd: ctx.cwd, home, roots: roots(ctx), piDir: realDir(r.agentDir) });
+      const sh = checkShell(command, { cwd: ctx.cwd, home, roots: roots(ctx), piDir: realDir(r.agentDir), out: realDir(s.paths.out) });
       if (sh) return block({ ...sh, note: "; a best-effort check, not a boundary" });
       if (s.gates.bash_gate.enabled && !skipsGate(command, s.gates.bash_gate.skip_commands)) {
         const res = await ask(bashGate, scrubText(command), options);

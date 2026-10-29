@@ -11,8 +11,15 @@
  * newlines and parentheses) with shell quoting, `#` comments and heredoc bodies
  * handled. A simple command blocks when a word resolves (after `cd`s earlier in
  * the command, `~`, symlinks and a shell glob's expansion) to a protected path
- * of the worktree, or into Pi's agent dir or the guard's ledger, and the
- * command has a write indicator:
+ * of the worktree, or into Pi's agent dir, the guard's ledger or the decision
+ * log's dir (`paths.out`), and the command has a write indicator. A word is
+ * resolved as the kernel resolves it, never lexically (paths.ts, realPath): with
+ * `obj -> .git/objects`, `obj/../hooks/x` is `.git/hooks/x`. A word with a ".."
+ * after a component that doesn't exist blocks too, since where it lands can't
+ * be known (`ln -s ... a && echo > a/../x` makes `a` in the same command). The
+ * decision-log refusal is a signal as well: the shell can still write there
+ * with an interpreter, which the threat model keeps as a residual. The write
+ * indicators:
  *
  * - an output redirection (`>`, `>>`, `>|`, `&>`, `N>`): only its target counts;
  * - a file command anywhere in it (`tee`, `rm`, `mv`, `cp`, `ln`, `chmod`,
@@ -25,11 +32,14 @@
  *
  * `rm`, `rmdir`, `mv`, `git rm` and `git mv` on a directory also count every
  * file under it (breadth first, up to WALK_LIMIT entries, after which the rest
- * is unchecked), so `rm -rf .` blocks on the root's AGENTS.md or .git.
+ * is unchecked), so `rm -rf .` blocks on the root's AGENTS.md or .git. The walk
+ * never enters a dependency dir (DEPENDENCY_DIRS): installed packages ship
+ * their own instruction files (bun-types has a CLAUDE.md), which no agent reads
+ * as this repo's, so `rm -rf node_modules` stays allowed.
  */
 import { lstatSync, readdirSync } from "node:fs";
-import { join, resolve } from "node:path";
-import { isProtected, realPath, relTo, type Roots, within } from "./paths";
+import { resolve } from "node:path";
+import { isProtected, realPath, relTo, type Roots, Unresolvable, within } from "./paths";
 
 /** One simple command: its words, and the targets of its output redirections. */
 export interface Segment {
@@ -235,6 +245,9 @@ function segmentGlob(part: string): RegExp | undefined {
   }
 }
 
+/** `p` and one more segment, unnormalized: ".." stays for the kernel (and realPath) to apply. */
+const step = (p: string, part: string): string => (p.endsWith("/") ? `${p}${part}` : `${p}/${part}`);
+
 /** The paths a shell glob names, expanded segment by segment against the filesystem. */
 function expand(abs: string): string[] {
   let paths = ["/"];
@@ -242,7 +255,7 @@ function expand(abs: string): string[] {
     const re = /[*?[]/.test(part) ? segmentGlob(part) : undefined;
     const next: string[] = [];
     for (const p of paths) {
-      if (re === undefined) next.push(join(p, part));
+      if (re === undefined) next.push(step(p, part));
       else {
         let names: string[] = [];
         try {
@@ -250,7 +263,7 @@ function expand(abs: string): string[] {
         } catch {
           // not a directory
         }
-        for (const n of names) if (re.test(n)) next.push(join(p, n));
+        for (const n of names) if (re.test(n)) next.push(step(p, n));
       }
     }
     paths = next.slice(0, WALK_LIMIT);
@@ -258,8 +271,16 @@ function expand(abs: string): string[] {
   return paths;
 }
 
+/**
+ * Package-manager install dirs the walk never enters: node_modules (npm, Bun,
+ * pnpm, Yarn), bower_components, and Python's virtualenvs. A path named
+ * directly still counts: `rm node_modules/x/CLAUDE.md` blocks.
+ */
+const DEPENDENCY_DIRS = new Set(["node_modules", "bower_components", ".venv", "venv"]);
+
 /** The first protected path under a worktree directory, breadth first, or undefined. */
 function protectedUnder(dir: string, r: Roots): string | undefined {
+  if (relTo(r.work, dir).split("/").some((seg) => DEPENDENCY_DIRS.has(seg))) return undefined;
   const queue = [dir];
   let seen = 0;
   while (queue.length > 0) {
@@ -272,11 +293,11 @@ function protectedUnder(dir: string, r: Roots): string | undefined {
     }
     for (const name of entries) {
       if (++seen > WALK_LIMIT) return undefined;
-      const p = join(d, name);
+      const p = step(d, name);
       const rel = relTo(r.work, p);
       if (isProtected(r.table, rel)) return rel;
       try {
-        if (lstatSync(p).isDirectory()) queue.push(p);
+        if (!DEPENDENCY_DIRS.has(name) && lstatSync(p).isDirectory()) queue.push(p);
       } catch {
         // gone
       }
@@ -291,6 +312,8 @@ export interface ShellContext {
   roots: Roots;
   /** Pi's agent dir, real. */
   piDir: string;
+  /** The decision log's dir (`paths.out`), real. */
+  out: string;
 }
 
 export interface ShellBlock {
@@ -300,12 +323,17 @@ export interface ShellBlock {
 }
 
 /** What one candidate word, resolved, writes to that rule 7 refuses. */
-function refused(abs: string, tree: boolean, c: ShellContext): ShellBlock | undefined {
+function refused(abs: string, word: string, tree: boolean, c: ShellContext): ShellBlock | undefined {
   let real: string;
   try {
     real = realPath(abs);
-  } catch {
-    return undefined;
+  } catch (e) {
+    if (!(e instanceof Unresolvable)) return undefined;
+    return {
+      rule: "shell-write",
+      reason: `this command names ${word}, which goes through ${e.missing}, which doesn't exist, and then "..", so where it lands can't be known`,
+      path: abs,
+    };
   }
   const r = c.roots;
   if (within(real, r.work)) {
@@ -323,8 +351,9 @@ function refused(abs: string, tree: boolean, c: ShellContext): ShellBlock | unde
     }
     return undefined;
   }
-  if (within(real, c.piDir)) return { rule: "shell-write", reason: `this command writes into Pi's agent dir (${real})`, path: real };
-  if (within(real, r.ledger)) return { rule: "shell-write", reason: `this command writes into hapi-guard's own budget ledger (${real})`, path: real };
+  if (within(real, c.piDir)) return { rule: "shell-write", reason: `this command writes into Pi's agent dir (${c.piDir})`, path: real };
+  if (within(real, r.ledger)) return { rule: "shell-write", reason: `this command writes into hapi-guard's own budget ledger (${r.ledger})`, path: real };
+  if (within(real, c.out)) return { rule: "shell-write", reason: `this command writes into hapi-guard's decision log dir (${c.out})`, path: real };
   return undefined;
 }
 
@@ -333,11 +362,17 @@ const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
 /** Rule 7 for one bash command: the first write it plainly makes to a protected path, or undefined. */
 export function checkShell(command: string, c: ShellContext): ShellBlock | undefined {
   let dir = c.cwd;
-  const tilde = (w: string) => (w === "~" ? c.home : w.startsWith("~/") ? join(c.home, w.slice(2)) : w);
+  const tilde = (w: string) => (w === "~" ? c.home : w.startsWith("~/") ? step(c.home, w.slice(2)) : w);
+  /** A word as the kernel gets it: `~` expanded, relative to `base`, unnormalized. */
+  const under = (base: string, w: string) => {
+    const t = tilde(w);
+    return t.startsWith("/") ? t : step(base, t);
+  };
   for (const { words, redirects } of parseShell(command)) {
     const head = words.filter((w) => !ENV_ASSIGNMENT.test(w));
     if (head[0] === "cd" || head[0] === "pushd") {
       const to = head[1];
+      // bash's cd is logical (-L): it collapses ".." in the name before it changes dir.
       if (to !== "-") dir = resolve(dir, tilde(to ?? c.home));
       continue;
     }
@@ -349,13 +384,13 @@ export function checkShell(command: string, c: ShellContext): ShellBlock | undef
         const eq = w.indexOf("=");
         if (eq > 0 && eq < w.length - 1) candidates.push([w.slice(eq + 1), ind.tree, dir]);
       }
-      const base = ind.base === undefined ? dir : resolve(dir, tilde(ind.base));
+      const base = ind.base === undefined ? dir : under(dir, ind.base);
       for (const p of ind.implicit) candidates.push([p, false, base]);
     }
     for (const [word, tree, base] of candidates) {
-      const abs = resolve(base, tilde(word));
+      const abs = under(base, word);
       for (const path of /[*?[]/.test(word) ? expand(abs) : [abs]) {
-        const hit = refused(path, tree, c);
+        const hit = refused(path, word, tree, c);
         if (hit) return hit;
       }
     }

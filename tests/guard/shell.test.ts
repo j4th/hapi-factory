@@ -10,7 +10,11 @@ import { cleanupAll, gatesOff, setup } from "./harness";
 
 afterEach(cleanupAll);
 
-/** [command, blocked]. The worktree holds AGENTS.md, .github/workflows/ci.yml, src/a.ts, notes.md, app.log and link.md -> AGENTS.md. */
+/**
+ * [command, blocked]. The worktree holds AGENTS.md, .github/workflows/ci.yml, .git/{objects,hooks}, src/a.ts,
+ * notes.md, app.log, pkg/CLAUDE.md, node_modules/bun-types/CLAUDE.md (bun-types ships one), and the links
+ * link.md -> AGENTS.md, obj -> .git/objects, wf -> .github/workflows and hook -> obj/../hooks/pre-push (dangling).
+ */
 const VECTORS: [string, boolean][] = [
   // Redirection: >, >>, and the fd and &> forms, attached or not.
   ["echo x > AGENTS.md", true],
@@ -21,6 +25,11 @@ const VECTORS: [string, boolean][] = [
   ["echo x >| .github/workflows/ci.yml", true],
   ["echo x > agents.MD", true],
   ["echo x > link.md", true],
+  // A link's ".." applies after the link is followed, as the kernel does: obj/.. is .git, wf/.. is .github.
+  ["echo x > obj/../hooks/pre-commit", true],
+  ["echo x > wf/../workflows/evil.yml", true],
+  ["echo x > hook", true],
+  ["cp notes.md ./obj/../config", true],
   ["cat > AGENTS.md <<'EOF'\nhello\nEOF", true],
   // tee
   ["echo x | tee AGENTS.md", true],
@@ -30,6 +39,7 @@ const VECTORS: [string, boolean][] = [
   ["rm -rf .github", true],
   ["rm -rf .", true],
   ["rm -rf *", true],
+  ["rm -rf pkg", true],
   ["X=1 /bin/rm -f AGENTS.md", true],
   ["sudo rm AGENTS.md", true],
   ["mv notes.md AGENTS.md", true],
@@ -84,6 +94,11 @@ const VECTORS: [string, boolean][] = [
   ["git log -- AGENTS.md", false],
   ["git checkout -b plan/x", false],
   ["rm -f *.log", false],
+  // Dependency dirs aren't walked: packages ship their own instruction files (bun-types has a CLAUDE.md).
+  ["rm -rf node_modules", false],
+  ["rm -rf node_modules && bun install", false],
+  ["rm -rf node_modules/*", false],
+  ["mv node_modules /tmp/old-modules", false],
   ["rm -rf src/tmp", false],
   ["mkdir -p src/new && touch src/new/a.ts", false],
   ["cp src/a.ts /tmp/a.ts", false],
@@ -100,7 +115,16 @@ test("the vector table: each command blocks or allows as listed", async () => {
   writeFileSync(join(h.work, "src", "a.ts"), "export {};\n");
   writeFileSync(join(h.work, "notes.md"), "notes\n");
   writeFileSync(join(h.work, "app.log"), "log\n");
+  mkdirSync(join(h.work, "pkg"));
+  writeFileSync(join(h.work, "pkg", "CLAUDE.md"), "# pkg\n");
+  mkdirSync(join(h.work, "node_modules", "bun-types"), { recursive: true });
+  writeFileSync(join(h.work, "node_modules", "bun-types", "CLAUDE.md"), "# bun-types\n");
+  mkdirSync(join(h.work, ".git", "objects"), { recursive: true });
+  mkdirSync(join(h.work, ".git", "hooks"));
   symlinkSync("AGENTS.md", join(h.work, "link.md"));
+  symlinkSync(".git/objects", join(h.work, "obj"));
+  symlinkSync(".github/workflows", join(h.work, "wf"));
+  symlinkSync("obj/../hooks/pre-push", join(h.work, "hook"));
   await h.start();
   const got: [string, boolean][] = [];
   for (const [command] of VECTORS) got.push([command, (await h.tool("bash", { command }))?.block === true]);
@@ -118,11 +142,16 @@ test("a block names the path and the rule; the log records it", async () => {
   expect([r.event, r.decision, r.rule, r.tool, r.path]).toEqual(["tool_call", "block", "shell-write", "bash", "AGENTS.md"]);
 });
 
-test("a shell write into Pi's agent dir or the guard's ledger blocks too", async () => {
+test("a shell write into Pi's agent dir, the guard's ledger or the decision log's dir blocks too", async () => {
   const h = setup({ settings: gatesOff });
   await h.start();
   expect((await h.tool("bash", { command: `echo x > ${join(h.agentDir, "AGENTS.md")}` }))?.block).toBe(true);
   expect((await h.tool("bash", { command: `rm -rf ${h.ledgerDir}` }))?.block).toBe(true);
+  expect(await h.tool("bash", { command: `echo '{}' >> ${join(h.out, "decisions.jsonl")}` })).toEqual({
+    block: true,
+    reason: `hapi-guard: this command writes into hapi-guard's decision log dir (${h.out}) (rule shell-write; a best-effort check, not a boundary)`,
+  });
+  expect((await h.tool("bash", { command: `truncate -s 0 ${h.out}/decisions.jsonl` }))?.block).toBe(true);
   expect((await h.tool("bash", { command: `echo x > ${join(h.tmp, "scratch.txt")}` }))?.block).toBeUndefined();
 });
 

@@ -1,8 +1,8 @@
 /** Rule 1, H-087 and H-089: hapi-guard's protected paths for write and edit, with Pi's own path resolution. */
 import { afterEach, describe, expect, test } from "bun:test";
-import { linkSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { piResolve } from "../../src/guard/paths";
+import { piResolve, realPath } from "../../src/guard/paths";
 import { loadPolicy } from "../../src/policy/load";
 import { effectiveModes } from "../../src/policy/paths";
 import { cleanupAll, gatesOff, setup } from "./harness";
@@ -107,6 +107,35 @@ describe("writes outside the worktree", () => {
     // A link out of the worktree is outside it.
     symlinkSync("/etc", join(h.work, "etc"));
     expect((await h.tool("write", { path: "etc/passwd", content: "x" }))?.block).toBe(true);
+  });
+
+  test("a link target's .. applies after the link is followed, as the kernel does, never lexically (.git/hooks, .github/workflows)", async () => {
+    const h = await started();
+    mkdirSync(join(h.work, ".git", "objects"), { recursive: true });
+    mkdirSync(join(h.work, ".git", "hooks"));
+    mkdirSync(join(h.work, ".github", "workflows"), { recursive: true });
+    symlinkSync(".git/objects", join(h.work, "a")); // a/.. is .git, not the worktree root
+    symlinkSync("a/../hooks/pre-commit", join(h.work, "l")); // dangling: write would create .git/hooks/pre-commit
+    symlinkSync(".github/workflows", join(h.work, "b"));
+    symlinkSync("b/../workflows/evil.yml", join(h.work, "m"));
+    symlinkSync(`${h.work}/a/../hooks/post-commit`, join(h.work, "q")); // an absolute target, unnormalized
+    expect(realPath(join(h.work, "l"))).toBe(join(h.work, ".git", "hooks", "pre-commit"));
+    expect(realPath(join(h.work, "m"))).toBe(join(h.work, ".github", "workflows", "evil.yml"));
+    for (const path of ["l", "m", "q"]) expect([path, (await h.tool("write", { path, content: "x" }))?.block]).toEqual([path, true]);
+    expect((await h.tool("edit", { path: "l", edits: [{ oldText: "a", newText: "b" }] }))?.block).toBe(true);
+    // The kernel agrees: a write through l lands where realPath said.
+    writeFileSync(join(h.work, "l"), "#!/bin/sh\n");
+    expect(existsSync(join(h.work, ".git", "hooks", "pre-commit"))).toBe(true);
+    expect(existsSync(join(h.work, "hooks"))).toBe(false);
+  });
+
+  test("a .. after a component that doesn't exist is blocked: the kernel can't resolve it either", async () => {
+    const h = await started();
+    symlinkSync("missing/../AGENTS.md", join(h.work, "n"));
+    expect(await h.tool("write", { path: "n", content: "x" })).toEqual({
+      block: true,
+      reason: `hapi-guard: n resolves through ${join(h.work, "missing")}, which doesn't exist, and then "..", so where it lands can't be known (rule invalid-path)`,
+    });
   });
 
   test("a hard link to another file is refused: it may be a protected file under another name", async () => {

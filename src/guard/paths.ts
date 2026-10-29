@@ -2,9 +2,16 @@
  * Rule 1 (design §3.3; H-087, H-089): where a worker's `write` or `edit` may go.
  *
  * A tool path is resolved exactly as Pi 1.3.0's file tools resolve it
- * (`resolveToCwd`, core/tools/path-utils.js:42-44 → utils/paths.js:59-87), then
- * its symlinks are followed the way `fs.writeFile` would follow them, a dangling
- * link included (write.js:44-47 creates the target). The real path is then:
+ * (`resolveToCwd`, core/tools/path-utils.js:42-44 → utils/paths.js:59-87),
+ * which is lexical, as Pi's is. Then its symlinks are followed component by
+ * component, as the kernel follows them for `fs.writeFile`, a dangling link
+ * included (write.js:44-47 creates the target). A link's target is spliced in
+ * unnormalized, so a `..` in it applies to the directory the link before it
+ * points at, never lexically: with `a -> .git/objects`, `a/../hooks` is
+ * `.git/hooks`. (`realpathSync`, Bun's as well as Node's, collapses `x/..`
+ * before following `x`, so it isn't used for this.) A `..` after a component
+ * that doesn't exist can't be resolved by the kernel either, and is blocked.
+ * The real path is then:
  *
  * - inside the worktree (`ctx.cwd`, itself resolved): relativized and checked
  *   with `effectiveModes` from src/policy/paths.ts, bundled in, so the guard and
@@ -21,7 +28,7 @@
  * protected file under another name. Reads are not checked.
  */
 import { lstatSync, readlinkSync, realpathSync, statSync } from "node:fs";
-import { isAbsolute, join, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { effectiveModes } from "../policy/paths";
 import type { PathModes } from "../policy/types";
@@ -46,37 +53,53 @@ export function piResolve(input: string, cwd: string, home: string): string {
 /** Linux's SYMLOOP_MAX. */
 const MAX_LINKS = 40;
 
+/** A path the kernel can't resolve: a ".." after `missing`, a component that doesn't exist. */
+export class Unresolvable extends Error {
+  override name = "Unresolvable";
+  constructor(readonly missing: string) {
+    super(`${missing} doesn't exist, and a ".." follows it`);
+  }
+}
+
 /**
- * The path a write to `abs` (absolute, normalized) would land on: the real
- * path of its longest existing prefix, then each next component that is a
- * symlink followed, dangling or not, until the rest doesn't exist.
+ * The path a write to `abs` (absolute; "." and ".." allowed) would land on, by
+ * the kernel's rules: each component in turn, a symlink's target spliced in
+ * unnormalized (from "/" when absolute) and walked the same way, ".." the
+ * parent of the real path so far. From the first component that doesn't
+ * exist, the rest is literal: the write, or `mkdir -p`, creates it. Throws
+ * Unresolvable for a ".." after that point, and an Error after MAX_LINKS links.
  */
 export function realPath(abs: string): string {
-  let path = abs;
-  for (let hops = 0; hops <= MAX_LINKS; hops++) {
-    const parts = path.split("/").filter(Boolean);
-    let i = parts.length;
-    let real = "/";
-    for (; i >= 0; i--) {
+  const todo = abs.split("/");
+  let cur = "/";
+  let missing: string | undefined;
+  let links = 0;
+  while (todo.length > 0) {
+    const c = todo.shift()!;
+    if (c === "" || c === ".") continue;
+    if (c === "..") {
+      if (missing !== undefined) throw new Unresolvable(missing);
+      cur = dirname(cur);
+      continue;
+    }
+    const next = cur === "/" ? `/${c}` : `${cur}/${c}`;
+    if (missing === undefined) {
+      let link: string | undefined;
       try {
-        real = realpathSync(`/${parts.slice(0, i).join("/")}`);
-        break;
+        if (lstatSync(next).isSymbolicLink()) link = readlinkSync(next);
       } catch {
-        // a shorter prefix, then
+        missing = next;
+      }
+      if (link !== undefined) {
+        if (++links > MAX_LINKS) throw new Error(`${abs}: too many levels of symbolic links`);
+        if (link.startsWith("/")) cur = "/";
+        todo.unshift(...link.split("/"));
+        continue;
       }
     }
-    if (i === parts.length) return real;
-    const next = join(real, parts[i]!);
-    let link: string | undefined;
-    try {
-      if (lstatSync(next).isSymbolicLink()) link = readlinkSync(next);
-    } catch {
-      // doesn't exist: the rest is literal
-    }
-    if (link === undefined) return join(real, ...parts.slice(i));
-    path = resolve(real, link, ...parts.slice(i + 1));
+    cur = next;
   }
-  throw new Error(`${abs}: too many levels of symbolic links`);
+  return cur;
 }
 
 /** Whether `p` is `root` or under it. Both are real, absolute paths. */
@@ -117,7 +140,16 @@ export const relTo = (work: string, real: string): string => (real === work ? ""
 /** Rule 1 for one write or edit path, as given to the tool. */
 export function checkWrite(r: Roots, input: string, cwd: string, home: string): Verdict {
   const abs = piResolve(input, cwd, home);
-  const real = realPath(abs);
+  let real: string;
+  try {
+    real = realPath(abs);
+  } catch (e) {
+    const why =
+      e instanceof Unresolvable
+        ? `resolves through ${e.missing}, which doesn't exist, and then "..", so where it lands can't be known`
+        : "goes through too many levels of symbolic links";
+    return { block: true, rule: "invalid-path", reason: `${input} ${why}`, path: abs };
+  }
   if (within(real, r.work)) {
     const rel = relTo(r.work, real);
     if (isProtected(r.table, rel)) {
@@ -138,7 +170,11 @@ export function checkWrite(r: Roots, input: string, cwd: string, home: string): 
   return { block: true, rule: "outside-worktree", reason: `${real} is outside the worktree; workers write only there and under /tmp`, path: real };
 }
 
-/** The real path of an existing dir, or the path itself when it doesn't exist (so nothing can be inside it). */
+/**
+ * The real path of an existing dir, or the path itself when it doesn't exist (so nothing can be inside it).
+ * Only for the guard's roots (the worktree, /tmp, Pi's dir, the ledger, /out), which hold no "..", so
+ * realpathSync's lexical first step can't misplace them.
+ */
 export function realDir(p: string): string {
   try {
     return realpathSync(p);

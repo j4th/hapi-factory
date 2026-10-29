@@ -5,13 +5,16 @@
  * exact version. Read from a copy of the checkout's files, so a test can
  * break one.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { runAudit } from "../../src/audit/index";
 import { cleanup, cleanWorld, only, rootCopy } from "./helpers";
 
 afterEach(cleanup);
+// Most tests here run a full audit per case, and every audit builds each roster with both bundles
+// (hapi-guard and hapi-decide carry the Anthropic SDK), so a test of 20 cases can pass bun's 5 s.
+setDefaultTimeout(30_000);
 
 async function pins(edit?: (root: string) => void) {
   const w = await cleanWorld();
@@ -200,8 +203,7 @@ describe("pins.versions", () => {
       expect([line, r.status]).toEqual([line, status]);
       if (says !== undefined) expect([line, r.detail]).toEqual([line, expect.stringContaining(says)]);
     }
-    // Eighteen full audits, each building every roster with both bundles: past bun's default 5 s.
-  }, 30_000);
+  });
 
   test("a comment line inside a continued RUN is dropped first, as Docker drops it: never read as packages, never ending the RUN", async () => {
     let r = await pins((root) => append(root, "stack/archon/Dockerfile", "RUN apt-get install -y \\\n    # the pinned tools\n    curl=8.5.0-2ubuntu10.6 \\\n  # and one more\n    jq=1.7.1-3build1\n"));
