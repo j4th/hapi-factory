@@ -9,7 +9,8 @@
 #
 #   zone      network       proxy             service
 #   hermes    hermes-net    egress-hermes     hermes  (the coordinator)
-#   archon    archon-net    egress-archon     archon  (the run engine; Pi runs inside it)
+#   archon    archon-net    egress-archon     archon  (the run template: one container per run, none long-lived;
+#                                                       the launcher joins each run to the proxy on a network of its own)
 #   research  research-net  egress-research   none yet: the hapi-research container is Plan 04's
 #
 # Secrets. Each zone service's one env_file is its own zone's secrets,
@@ -23,7 +24,8 @@
 #
 # Hardening, on every service: no capabilities, no new privileges, a non-root user,
 # pid and memory limits, a read-only root filesystem (writable paths are tmpfs or a
-# named volume), no published ports, a health check. The exceptions are commented
+# named volume), no published ports, a health check (the run service has none: it
+# never runs as a service). The exceptions are commented
 # where they are. Spike T12 re-checks all of this under rootless Docker; a setting
 # it relaxes is changed here with a comment naming the spike.
 #
@@ -158,13 +160,19 @@ services:
 
   # Archon, the run engine (spec §9.2), with Pi in-process (§9.3): the pinned
   # official image plus baked toolchains (stack/archon/Dockerfile), so runs need no
-  # GitHub egress. Its server listens on 127.0.0.1:3090 only (HOST below)
-  # and has no auth in SQLite mode, so nothing outside this container reaches it.
+  # GitHub egress. It is not a running service but the template of one: a run is
+  # a fresh container, started by `hapi run` (Plan 02), whose argv, mounts,
+  # tmpfs, network and volumes the launcher builds from this definition, then
+  # removes. `profiles: ["run"]` keeps `up` from starting it, so `hapi stack up`
+  # builds it by name; `restart: "no"` because a run that ends has ended. Nothing
+  # here listens or is health-checked, and it joins no network of this file.
   archon:
     <<: *hardening
     build: { context: ./archon }
     image: hapi-factory/archon:0.12.1
     pull_policy: build
+    profiles: ["run"]
+    restart: "no"
     # The image's appuser. Its entrypoint skips the root-only chown and gosu then.
     user: "1001:1001"
     pids_limit: 2048
@@ -174,43 +182,66 @@ services:
     # The archon zone's secrets only.
     env_file:
       - ${XDG_RUNTIME_DIR:?set XDG_RUNTIME_DIR to your own runtime dir, e.g. /run/user/<uid> (docs/runbooks/stack.md)}/hapi/env/archon.env
-    # Above env_file: serviceEnvironment("archon") in src/stack/env.ts. The six from HOST
-    # to PI_CODING_AGENT_DIR are build/archon/archon.env's settings (ARCHON_ENV in
-    # src/generate/archon.ts), set here so that no secret can override them.
+    # Above env_file: serviceEnvironment("archon") in src/stack/env.ts, the whole set. The
+    # non-proxy part is build/archon/archon.env's (ARCHON_ENV in src/generate/archon.ts), set here
+    # so that no secret can override it.
     environment:
-      # Archon's home is /.archon (the run DB, workspaces, worktrees), as in its own compose file.
-      ARCHON_DOCKER: "true"
-      HOST: 127.0.0.1
+      # Telemetry off, and Pi: offline, its agent dir (the tmpfs the launcher binds build/pi's files into).
       ARCHON_TELEMETRY_DISABLED: "1"
       DO_NOT_TRACK: "1"
       PI_OFFLINE: "1"
       PI_TELEMETRY: "0"
-      PI_CODING_AGENT_DIR: /opt/hapi/pi-agent
+      PI_CODING_AGENT_DIR: "/opt/hapi/pi-agent"
+      # Bun installs nothing at run time (design §6a item 5).
+      BUN_OPTIONS: "--no-install"
+      # Git: one read-only global file, no system file, and 13 config pairs that beat a repo's own .git/config for the
+      # single-valued program-running keys. Name-indexed drivers and remote.*.uploadpack are the residual (design §6a item 13).
+      GIT_CONFIG_NOSYSTEM: "1"
+      GIT_CONFIG_GLOBAL: "/home/appuser/.gitconfig"
+      GIT_CONFIG_COUNT: "13"
+      GIT_CONFIG_KEY_0: "core.hooksPath"
+      GIT_CONFIG_VALUE_0: "/dev/null"
+      GIT_CONFIG_KEY_1: "core.fsmonitor"
+      GIT_CONFIG_VALUE_1: "false"
+      GIT_CONFIG_KEY_2: "credential.helper"
+      GIT_CONFIG_VALUE_2: ""
+      GIT_CONFIG_KEY_3: "commit.gpgSign"
+      GIT_CONFIG_VALUE_3: "false"
+      GIT_CONFIG_KEY_4: "tag.gpgSign"
+      GIT_CONFIG_VALUE_4: "false"
+      GIT_CONFIG_KEY_5: "push.gpgSign"
+      GIT_CONFIG_VALUE_5: "false"
+      GIT_CONFIG_KEY_6: "log.showSignature"
+      GIT_CONFIG_VALUE_6: "false"
+      GIT_CONFIG_KEY_7: "core.askPass"
+      GIT_CONFIG_VALUE_7: ""
+      GIT_CONFIG_KEY_8: "protocol.ext.allow"
+      GIT_CONFIG_VALUE_8: "never"
+      GIT_CONFIG_KEY_9: "gc.auto"
+      GIT_CONFIG_VALUE_9: "0"
+      GIT_CONFIG_KEY_10: "maintenance.auto"
+      GIT_CONFIG_VALUE_10: "false"
+      GIT_CONFIG_KEY_11: "submodule.recurse"
+      GIT_CONFIG_VALUE_11: "false"
+      GIT_CONFIG_KEY_12: "core.attributesFile"
+      GIT_CONFIG_VALUE_12: "/dev/null"
+      # Git: the file transport only, and no program run on its behalf.
+      GIT_ALLOW_PROTOCOL: "file"
+      GIT_PROTOCOL_FROM_USER: "0"
+      GIT_TERMINAL_PROMPT: "0"
+      GIT_ASKPASS: ""
+      GIT_PAGER: "cat"
+      GIT_EDITOR: "false"
+      # Claude Agent SDK's binary.
+      CLAUDE_BIN_PATH: "/app/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude"
+      # Archon's home is /.archon (the run DB, workspaces, worktrees), as in its own compose file.
+      ARCHON_DOCKER: "true"
       HTTP_PROXY: http://egress-archon:3128
       HTTPS_PROXY: http://egress-archon:3128
       http_proxy: http://egress-archon:3128
       https_proxy: http://egress-archon:3128
       NO_PROXY: localhost,127.0.0.1,::1
       no_proxy: localhost,127.0.0.1,::1
-    volumes:
-      - archon-data:/.archon
-      # $HOME: Claude Code and Pi session state, ~/.gitconfig.
-      - archon-home:/home/appuser
-      - ../build/archon/config.yaml:/.archon/config.yaml:ro
-      # PI_CODING_AGENT_DIR (above): Pi's models.json and hapi-guard.json, read-only.
-      # The path is PI_AGENT_DIR in src/generate/archon.ts; tests/stack/compose.test.ts keeps them equal.
-      - ../build/pi:/opt/hapi/pi-agent:ro
-    networks:
-      archon-net: {}
-    depends_on:
-      egress-archon: { condition: service_healthy }
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "--max-time", "5", "-o", "/dev/null", "http://127.0.0.1:3090/api/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 90s
-      start_interval: 5s
 
 networks:
   hermes-net: { internal: true }
@@ -223,5 +254,3 @@ networks:
 
 volumes:
   hermes-data: {}
-  archon-data: {}
-  archon-home: {}

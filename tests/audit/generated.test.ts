@@ -58,13 +58,13 @@ describe("generated.drift", () => {
     expect(r.detail).not.toContain("128000");
   });
 
-  test("HOST=0.0.0.0 in archon.env fails, naming HOST (Review Focus 4)", async () => {
+  test("PI_OFFLINE=0 in archon.env fails, naming PI_OFFLINE (Review Focus 4)", async () => {
     const w = await cleanWorld();
-    edit(join(w.build, "archon", "archon.env"), "HOST=127.0.0.1", "HOST=0.0.0.0");
+    edit(join(w.build, "archon", "archon.env"), "PI_OFFLINE=1", "PI_OFFLINE=0");
     const r = await drift(w);
     expect(r.status).toBe("fail");
-    expect(r.detail).toContain("archon/archon.env: HOST");
-    expect(r.detail).not.toContain("0.0.0.0");
+    expect(r.detail).toContain("archon/archon.env: PI_OFFLINE");
+    expect(r.detail).not.toContain("PI_OFFLINE=0");
   });
 
   test("an edited squid.conf fails, naming the file and the line", async () => {

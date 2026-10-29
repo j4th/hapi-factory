@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import YAML from "yaml";
-import { emitArchon, PI_AGENT_DIR, RUN_PATHS, type RunFile } from "../../src/generate/archon";
+import { ARCHON_ENV, emitArchon, PI_AGENT_DIR, RUN_PATHS, type RunFile } from "../../src/generate/archon";
 import { loadPolicy } from "../../src/policy/load";
 import { ROLES, type Tier } from "../../src/policy/types";
 
@@ -65,13 +65,58 @@ test("empty.env holds only # lines", () => {
   expect(lines.join("\n")).toContain("Do not edit it by hand");
 });
 
-test("archon env is loopback with telemetry off", () => {
-  const env = emitArchon(p)["archon.env"]!;
-  expect(env).toMatch(/^HOST=127\.0\.0\.1$/m);
-  expect(env).toMatch(/^ARCHON_TELEMETRY_DISABLED=1$/m);
-  expect(env).toMatch(/^DO_NOT_TRACK=1$/m);
-  expect(env).toMatch(/^PI_OFFLINE=1$/m);
-  expect(env).toMatch(/^PI_TELEMETRY=0$/m);
+const GIT_CONFIG_PAIRS = [
+  ["core.hooksPath", "/dev/null"],
+  ["core.fsmonitor", "false"],
+  ["credential.helper", ""],
+  ["commit.gpgSign", "false"],
+  ["tag.gpgSign", "false"],
+  ["push.gpgSign", "false"],
+  ["log.showSignature", "false"],
+  ["core.askPass", ""],
+  ["protocol.ext.allow", "never"],
+  ["gc.auto", "0"],
+  ["maintenance.auto", "false"],
+  ["submodule.recurse", "false"],
+  ["core.attributesFile", "/dev/null"],
+] as const;
+
+/** The run container's whole non-proxy environment, name and value, in order (Plan 02 Task 6). */
+const EXPECTED_ENV: [string, string][] = [
+  ["ARCHON_TELEMETRY_DISABLED", "1"],
+  ["DO_NOT_TRACK", "1"],
+  ["PI_OFFLINE", "1"],
+  ["PI_TELEMETRY", "0"],
+  ["PI_CODING_AGENT_DIR", PI_AGENT_DIR],
+  ["BUN_OPTIONS", "--no-install"],
+  ["GIT_CONFIG_NOSYSTEM", "1"],
+  ["GIT_CONFIG_GLOBAL", "/home/appuser/.gitconfig"],
+  ["GIT_CONFIG_COUNT", "13"],
+  ...GIT_CONFIG_PAIRS.flatMap(([k, v], i): [string, string][] => [
+    [`GIT_CONFIG_KEY_${i}`, k],
+    [`GIT_CONFIG_VALUE_${i}`, v],
+  ]),
+  ["GIT_ALLOW_PROTOCOL", "file"],
+  ["GIT_PROTOCOL_FROM_USER", "0"],
+  ["GIT_TERMINAL_PROMPT", "0"],
+  ["GIT_ASKPASS", ""],
+  ["GIT_PAGER", "cat"],
+  ["GIT_EDITOR", "false"],
+  ["CLAUDE_BIN_PATH", "/app/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude"],
+  ["ARCHON_DOCKER", "true"],
+];
+
+test("ARCHON_ENV is exactly the run container's environment, in order, and has no server settings (no HOST)", () => {
+  expect(ARCHON_ENV.map(([name, value]) => [name, value])).toEqual(EXPECTED_ENV);
+  expect(ARCHON_ENV.map(([name]) => name)).not.toContain("HOST");
+  // Every entry says why.
+  for (const [name, , why] of ARCHON_ENV) expect([name, why.length > 10]).toEqual([name, true]);
+});
+
+test("archon env holds each ARCHON_ENV line once, in order, with its why line above it", () => {
+  const text = emitArchon(p)["archon.env"]!;
+  const settings = text.split("\n").filter((l) => l !== "" && !l.startsWith("#"));
+  expect(settings).toEqual(EXPECTED_ENV.map(([k, v]) => `${k}=${v}`));
 });
 
 test("archon env points Pi at the read-only agent dir that holds build/pi", () => {
@@ -82,7 +127,7 @@ test("archon env points Pi at the read-only agent dir that holds build/pi", () =
 test("archon env is plain KEY=value lines, comments and blank lines, each key once", () => {
   const lines = emitArchon(p)["archon.env"]!.trimEnd().split("\n");
   const settings = lines.filter((l) => l !== "" && !l.startsWith("#"));
-  for (const l of settings) expect(l).toMatch(/^[A-Z][A-Z0-9_]*=[^\s"']+$/);
+  for (const l of settings) expect(l).toMatch(/^[A-Z][A-Z0-9_]*=[^\s"']*$/);
   const keys = settings.map((l) => l.split("=")[0]);
   expect(new Set(keys).size).toBe(keys.length);
 });

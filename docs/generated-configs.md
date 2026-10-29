@@ -38,7 +38,7 @@ It prints each path it wrote, one per line, and exits 0. A usage error (an unkno
 |---|---|---|---|
 | `build/hermes/config.yaml` | Hermes's `config.yaml` (Hermes v0.22.5 keys) | `budgets.yaml`, `flags.yaml`, `mcp.yaml`, `protected_paths.yaml`, `roles.yaml`, `rosters/anthropic.yaml` | Mounted read-only at `/opt/data/config.yaml` (`$HERMES_HOME`) in the `hermes` container |
 | `build/archon/config.yaml` | Archon's global config, `~/.archon/config.yaml` (Archon v0.12.1): model tiers and aliases | `roles.yaml`, `rosters/<roster>.yaml` | Mounted read-only at `/.archon/config.yaml` (Archon's home in its container) in `archon` |
-| `build/archon/archon.env` | The Archon container's environment | Spec §9.2 and §9.3 (no policy file) | The record of the six settings the `archon` service's `environment:` sets, and what the audit's `runtime.archon-env` holds the running container to. Compose doesn't read the file ([below](#buildarchonarchonenv)) |
+| `build/archon/archon.env` | The run container's environment | Spec §9.2, §9.3 and design §6a (no policy file) | The record of the settings the `archon` (run) service's `environment:` sets (`ARCHON_ENV`), and what the audit holds a run container to. Compose doesn't read the file ([below](#buildarchonarchonenv)) |
 | `build/archon/run-config.yaml` | Archon's per-run `--config` layer: the same tiers and aliases, `assistants.pi.enableExtensions: true`, `workflows.autoResumeOnQuotaReset: false` | `roles.yaml`, `rosters/<roster>.yaml` | Bound read-only at `/opt/hapi/run-config.yaml` in the run container (Plan 02 Task 7) |
 | `build/archon/gitconfig` | The run container's `~/.gitconfig`: `[safe]` directories and the worker's `[user]` | The container's paths (`RUN_PATHS`; no policy file) | Bound read-only at `/home/appuser/.gitconfig` in the run container |
 | `build/archon/empty.env` | An env file of only comments | No policy file | Bound read-only over `/.archon/.env` in the run container |
@@ -165,18 +165,25 @@ The per-run container binds these three read-only (spike 07; Plan 02 Task 7).
 
 ## `build/archon/archon.env`
 
+The run container's whole non-proxy environment, in this order (`ARCHON_ENV`, `src/generate/archon.ts`). The `archon` service is a run template, so there is no server and no `HOST`.
+
 | Variable | Value | Why |
 |---|---|---|
-| `HOST` | `127.0.0.1` | Archon's server binds `0.0.0.0` by default and has no auth in SQLite mode, so it listens on loopback only (spec §9.2). |
 | `ARCHON_TELEMETRY_DISABLED` | `1` | No Archon telemetry (spec §9.2). |
 | `DO_NOT_TRACK` | `1` | The cross-tool telemetry opt-out, which Archon also honours (spec §9.2). |
 | `PI_OFFLINE` | `1` | Pi makes no network calls of its own. **Critical:** without it, Pi installs the packages a repo's `.pi/settings.json` lists, even with extensions off (spec §9.3). It also stops catalog refreshes and update checks. |
 | `PI_TELEMETRY` | `0` | No Pi install telemetry (spec §9.3). |
-| `PI_CODING_AGENT_DIR` | `/opt/hapi/pi-agent` | Pi's agent directory. Task 5 mounts `build/pi` there **read-only**, so Pi reads this `models.json` and nothing in the container can change it (spec §9.3). The path is `PI_AGENT_DIR` in `src/generate/archon.ts`. Spike T8 found Pi must also write there (`models-store.json` on every credential sync, `auth.json`, `sessions/`), so the read-only mount fails every Pi node; Plan 02 makes the directory a tmpfs with hapi's files bound read-only into it ([docs/spikes/01-pi-under-archon.md](spikes/01-pi-under-archon.md), H-181). |
+| `PI_CODING_AGENT_DIR` | `/opt/hapi/pi-agent` | Pi's agent directory. In a run it is a tmpfs (Pi writes `models-store.json`, `auth.json` and `sessions/` there) with hapi's generated files bound read-only into it, so nothing in the container can rewrite `models.json` (spec §9.3; [docs/spikes/01-pi-under-archon.md](spikes/01-pi-under-archon.md), H-181). The path is `PI_AGENT_DIR` in `src/generate/archon.ts`. |
+| `BUN_OPTIONS` | `--no-install` | Bun never installs a package at run time, so a script a worker runs can't pull one from a registry. It stops installs, not a repo's `bunfig.toml` preload for a `bun` the worker starts in its clone (a residual: design §6a item 5; spike 07, findings 9 and 11). |
+| `GIT_CONFIG_NOSYSTEM`, `GIT_CONFIG_GLOBAL` | `1`, `/home/appuser/.gitconfig` | Git reads no `/etc/gitconfig`, and its one global file is the generated, read-only `gitconfig`. |
+| `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_0..12`, `GIT_CONFIG_VALUE_0..12` | `13` pairs | Env config outranks a repo's own `.git/config` for a single-valued key: `core.hooksPath=/dev/null`, `core.fsmonitor=false`, `credential.helper=`, `commit.gpgSign=false`, `tag.gpgSign=false`, `push.gpgSign=false`, `log.showSignature=false`, `core.askPass=`, `protocol.ext.allow=never`, `gc.auto=0`, `maintenance.auto=false`, `submodule.recurse=false`, `core.attributesFile=/dev/null`. They close the program-running keys that are single-valued. The residual is name-indexed drivers (`filter.<name>.*`, `diff.<name>.*`, `merge.<name>.driver`, via a planted `.gitattributes`) and `remote.<name>.uploadpack` (design §6a item 13; spike 07, finding 10). hapi-guard deletes only exact secret names, never these. |
+| `GIT_ALLOW_PROTOCOL`, `GIT_PROTOCOL_FROM_USER` | `file`, `0` | Git speaks the file transport only (the clone is from a local path), and treats a requested transport as untrusted. |
+| `GIT_TERMINAL_PROMPT`, `GIT_ASKPASS` | `0`, empty | No prompt and no askpass program. |
+| `GIT_PAGER`, `GIT_EDITOR` | `cat`, `false` | Git runs no pager or editor a config names. |
+| `CLAUDE_BIN_PATH` | `/app/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude` | The Claude Agent SDK's own binary, so Archon's claude nodes need no lookup. |
+| `ARCHON_DOCKER` | `true` | Archon's home is `/.archon` (the run DB, workspaces, worktrees), as in its own compose file. |
 
-These are the Global Constraints' Archon and Pi values; the audit's `runtime.archon-env` checks the running container's environment against them ([docs/audit.md](audit.md#runtimearchon-env)).
-
-**They reach the container through `stack/compose.yaml`'s `environment:`, not this file.** Compose puts `environment:` above `env_file`, and the archon service's only `env_file` is the archon zone's secrets, so a secret named `HOST` or `PI_OFFLINE` could never override one; the secrets manifest refuses those names anyway ([docs/secrets.md](secrets.md#the-manifest-stacksecretsyaml)). The list lives in `ARCHON_ENV` (`src/generate/archon.ts`), which writes this file and which `serviceEnvironment` in `src/stack/env.ts` puts in the service's environment; `tests/stack/compose.test.ts` fails if the compose file and this file disagree on a single name or value. (Until Plan 01 Task 5's security fix pass, this file was the service's first `env_file`, where the zone's secrets file, read after it, could override it.)
+**They reach the container through `stack/compose.yaml`'s `environment:`, not this file.** Compose puts `environment:` above `env_file`, and the archon service's only `env_file` is the archon zone's secrets, so a secret named `PI_OFFLINE` or `GIT_CONFIG_COUNT` could never override one; the secrets manifest refuses those names anyway ([docs/secrets.md](secrets.md#the-manifest-stacksecretsyaml)). The list lives in `ARCHON_ENV` (`src/generate/archon.ts`), which writes this file and which `serviceEnvironment` in `src/stack/env.ts` puts in the service's environment (with the zone's proxy variables); `tests/stack/compose.test.ts` fails if the compose file and this file disagree on a single name or value. (Until Plan 01 Task 5's security fix pass, this file was the service's first `env_file`, where the zone's secrets file, read after it, could override it.)
 
 ## `build/pi/models.json`
 

@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { SecretError } from "../../src/secrets/provider";
 import { secretsResolve } from "../../src/secrets/cli";
 import { resolveAgeDir } from "../../src/secrets/providers/sops";
-import { buildDigest, currentUserOverride, networkProblems, reexecScript, type StackDeps, stackDown, stackUp } from "../../src/stack/up";
+import { buildDigest, currentUserOverride, networkProblems, PROJECT_LABEL, reexecScript, RUN_LABEL, removeRuns, type StackDeps, stackDown, stackUp } from "../../src/stack/up";
 import { capture, caught, cleanup, fullStore, sopsConfig, sopsStore, tempDir } from "../secrets/helpers";
 
 afterEach(cleanup);
@@ -31,6 +31,16 @@ function fakes(
     inspect?: { code: number; stdout: string; stderr?: string };
     downCode?: number;
     upCode?: number;
+    /** Ids `docker ps -q` lists as live runs (what `up` checks first). */
+    live?: string[];
+    /** Exit code of `docker ps -q` (the live-run check). */
+    liveCode?: number;
+    /** Exit code of `compose build archon`. */
+    buildCode?: number;
+    /** What `down` finds labelled as runs: `docker ps -aq`, `docker network ls`, `docker volume ls`. */
+    runs?: { containers?: string[]; networks?: string[]; volumes?: string[] };
+    /** Commands (joined by spaces) that exit 1. */
+    failing?: string[];
     resolve?: StackDeps["resolve"];
     build?: StackDeps["build"];
   } = {},
@@ -46,10 +56,16 @@ function fakes(
     resolve: o.resolve ?? (async (args) => (steps.push(`resolve ${args.join(" ")}`.trim()), 0)),
     run: async (cmd, opts) => {
       calls.push({ cmd, env: opts.env, inherit: opts.inherit });
-      steps.push(cmd.slice(0, 2).join(" ") === "docker network" ? "docker network inspect" : cmd.join(" "));
-      if (cmd[1] === "network") return o.inspect ?? { code: 0, stdout: JSON.stringify(o.networks ?? GOOD), stderr: "" };
+      steps.push(cmd.slice(0, 3).join(" ") === "docker network inspect" ? "docker network inspect" : cmd.join(" "));
+      if (o.failing?.includes(cmd.join(" "))) return { code: 1, stdout: "", stderr: "boom" };
+      const lines = (ids: string[] | undefined) => ({ code: 0, stdout: (ids ?? []).map((i) => `${i}\n`).join(""), stderr: "" });
+      if (cmd[1] === "ps") return cmd.includes("-aq") ? lines(o.runs?.containers) : o.liveCode ? { code: o.liveCode, stdout: "", stderr: "daemon down" } : lines(o.live);
+      if (cmd[1] === "network" && cmd[2] === "ls") return lines(o.runs?.networks);
+      if (cmd[1] === "volume" && cmd[2] === "ls") return lines(o.runs?.volumes);
+      if (cmd[1] === "network" && cmd[2] === "inspect") return o.inspect ?? { code: 0, stdout: JSON.stringify(o.networks ?? GOOD), stderr: "" };
       if (cmd.includes("--wait")) return { code: o.upCode ?? 0, stdout: "" };
       if (cmd.at(-1) === "down") return { code: o.downCode ?? 0, stdout: "" };
+      if (cmd.slice(-2).join(" ") === "build archon") return { code: o.buildCode ?? 0, stdout: "" };
       return { code: 0, stdout: "" };
     },
   };
@@ -57,6 +73,10 @@ function fakes(
 }
 
 const COMPOSE = ["docker", "compose", "-f", "stack/compose.yaml", "-p", "hapi"];
+/** The docker compose calls a fake runner saw: none means nothing was created, built or started. */
+const composeCalls = (f: { calls: Call[] }) => f.calls.filter((c) => c.cmd[1] === "compose");
+/** `up`'s first docker call: are any runs live? */
+const LIVE_CHECK = "docker ps -q --filter label=org.hapi.run --filter label=org.hapi.project=hapi";
 
 /** The whole script the re-exec hands `sh -c` as hapi, for `up`: fixed text, no argument in it. */
 const UP_SCRIPT = `: "\${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; export XDG_RUNTIME_DIR; export PATH="$HOME/.local/bin:$PATH"; cd "$HOME/hapi-factory" && exec "$HOME/.local/bin/mise" run up -- "$@"`;
@@ -101,18 +121,20 @@ describe("currentUserOverride (the dev bypass, for Task 6's audit)", () => {
 });
 
 describe("hapi stack up", () => {
-  test("as hapi: policy build, secrets, then compose create, the network check, and compose up --wait, in that order", async () => {
+  test("as hapi: the live-run check, policy build, secrets, then compose build archon, compose create, the network check, and compose up --wait, in that order", async () => {
     capture();
     const f = fakes();
     expect(await stackUp(["--roster", "budget"], f.deps)).toBe(0);
     expect(f.steps).toEqual([
+      LIVE_CHECK,
       "build budget",
       "resolve",
+      [...COMPOSE, "build", "archon"].join(" "),
       [...COMPOSE, "up", "--no-start", "--build"].join(" "),
       "docker network inspect",
       [...COMPOSE, "up", "-d", "--wait", "--wait-timeout", "300"].join(" "),
     ]);
-    const inspect = f.calls.find((c) => c.cmd[1] === "network")!;
+    const inspect = f.calls.find((c) => c.cmd[1] === "network" && c.cmd[2] === "inspect")!;
     expect(inspect.cmd.slice(3)).toEqual(["hapi_hermes-net", "hapi_archon-net", "hapi_research-net"]);
     // Compose gets the caller's env (XDG_RUNTIME_DIR for the env files) and the labels' values.
     const up = f.calls.at(-1)!;
@@ -153,7 +175,7 @@ describe("hapi stack up", () => {
     capture();
     const f = fakes();
     expect(await stackUp(["--config", "/home/hapi/.config/hapi/other.yaml"], f.deps)).toBe(0);
-    expect(f.steps.slice(0, 2)).toEqual(["build anthropic", "resolve --config /home/hapi/.config/hapi/other.yaml"]);
+    expect(f.steps.slice(1, 3)).toEqual(["build anthropic", "resolve --config /home/hapi/.config/hapi/other.yaml"]);
   });
 
   test("as another user: re-execs `mise run up` as hapi through sudo -u hapi -H (never -i), in hapi's checkout, with hapi's XDG_RUNTIME_DIR and mise", async () => {
@@ -237,11 +259,27 @@ describe("hapi stack up", () => {
     expect(await stackUp([], f.deps)).toBe(7);
   });
 
+  test("the hapi re-exec script runs mise run hapi with the same PATH and XDG_RUNTIME_DIR lines, and hands over the arguments as \"$@\" (for `hapi run ...`)", () => {
+    const script = reexecScript("hapi");
+    expect(script).toBe(UP_SCRIPT.replace("run up --", "run hapi --"));
+    expect(script).toContain('export PATH="$HOME/.local/bin:$PATH"');
+    expect(script).toContain('exec "$HOME/.local/bin/mise" run hapi -- "$@"');
+  });
+
+  test("run as sh would run it, the hapi re-exec delivers its arguments to mise verbatim", () => {
+    const home = fakeHapiHome();
+    const args = ["run", "start", HOSTILE];
+    const r = Bun.spawnSync(["sh", "-c", reexecScript("hapi"), "hapi-stack", ...args], { cwd: home, env: { HOME: home, PATH: "/usr/bin:/bin" }, stdout: "pipe", stderr: "pipe" });
+    expect([r.exitCode, r.stderr.toString()]).toEqual([0, ""]);
+    expect(readFakeMise(home).argv).toEqual(["run", "hapi", "--", ...args]);
+    expect(readdirSync(home).filter((n) => n === "x" || n === "y")).toEqual([]);
+  });
+
   test("HAPI_ALLOW_CURRENT_USER=1: runs as the current user, warns that it is a dev-only downgrade, and labels the stack", async () => {
     const { err } = capture();
     const f = fakes({ user: "dev", env: { HOME: "/home/dev", XDG_RUNTIME_DIR: "/run/user/1000", HAPI_ALLOW_CURRENT_USER: "1" } });
     expect(await stackUp([], f.deps)).toBe(0);
-    expect(f.steps[0]).toBe("build anthropic");
+    expect(f.steps.slice(0, 2)).toEqual([LIVE_CHECK, "build anthropic"]);
     expect(f.calls.some((c) => c.cmd[0] === "sudo")).toBe(false);
     expect(err.join("\n")).toMatch(/warning: HAPI_ALLOW_CURRENT_USER=1: running the stack as dev, not hapi: a dev-only downgrade/);
     expect(f.calls.at(-1)!.env).toMatchObject({ HAPI_STARTED_BY: "dev", HAPI_DEV_OVERRIDE: "1" });
@@ -256,14 +294,14 @@ describe("hapi stack up", () => {
     });
     const e = await caught(stackUp([], f.deps));
     expect(e.message).toContain("hermes/ANTHROPIC_API_KEY");
-    expect(f.calls).toEqual([]);
+    expect(composeCalls(f)).toEqual([]);
   });
 
   test("a secrets step that returns non-zero (rather than throwing) aborts too", async () => {
     capture();
     const f = fakes({ resolve: async () => 2 });
     await expect(stackUp([], f.deps)).rejects.toThrow(/hapi secrets resolve exited 2; nothing was started/);
-    expect(f.calls).toEqual([]);
+    expect(composeCalls(f)).toEqual([]);
   });
 
   test("a policy build failure aborts before secrets are read", async () => {
@@ -274,7 +312,7 @@ describe("hapi stack up", () => {
       },
     });
     await expect(stackUp([], f.deps)).rejects.toThrow(/trusted_sources/);
-    expect(f.steps).toEqual([]);
+    expect(f.steps).toEqual([LIVE_CHECK]);
   });
 
   test("when `mise where age` fails, up fails with nothing started and names the fix (the real resolve path)", async () => {
@@ -297,7 +335,7 @@ describe("hapi stack up", () => {
     const f = fakes({ env, resolve: (args) => secretsResolve(args, { env, sops: store.run, ageDir }) });
     const e = await caught(stackUp(["--config", config], f.deps));
     expect(e.message).toMatch(/`mise where age` failed .*run `mise install` in the hapi-factory checkout/);
-    expect(f.calls).toEqual([]);
+    expect(composeCalls(f)).toEqual([]);
     expect(store.calls).toEqual([]);
   });
 
@@ -359,6 +397,50 @@ describe("hapi stack up", () => {
     await expect(stackUp([], f.deps)).rejects.toThrow(/did not come up healthy.*docker compose -p hapi ps/);
   });
 
+  test("up builds archon explicitly before up --no-start: a profile-only service is built only when named", async () => {
+    capture();
+    const f = fakes();
+    await stackUp([], f.deps);
+    const build = f.steps.indexOf([...COMPOSE, "build", "archon"].join(" "));
+    const create = f.steps.indexOf([...COMPOSE, "up", "--no-start", "--build"].join(" "));
+    expect([build > 0, build < create]).toEqual([true, true]);
+    // The same env as the other compose calls, so the build digest label and XDG_RUNTIME_DIR are the same.
+    expect(f.calls[build]!.env).toMatchObject({ XDG_RUNTIME_DIR: "/run/user/1001", HAPI_STARTED_BY: "hapi" });
+  });
+
+  test("a failed `compose build archon` stops up before anything is created", async () => {
+    capture();
+    const f = fakes({ buildCode: 1 });
+    await expect(stackUp([], f.deps)).rejects.toThrow(/docker compose build archon failed \(exit 1\); nothing was started/);
+    expect(f.steps.some((st) => st.includes("--no-start"))).toBe(false);
+  });
+
+  test("up refuses while a run is live: it checks first, names the count and the way out, and builds, resolves and creates nothing", async () => {
+    capture();
+    const f = fakes({ live: ["aaa", "bbb"] });
+    const e = await caught(stackUp([], f.deps));
+    expect(e.message).toBe(
+      "hapi stack up: 2 runs are live (docker ps --filter label=org.hapi.run): stop them with `hapi run stop <id>` or wait; recreating egress-archon would cut their egress",
+    );
+    // Only the live-run check ran: no policy build, no secrets, no compose.
+    expect(f.steps).toEqual([LIVE_CHECK]);
+    expect(f.calls[0]!.cmd).toEqual(["docker", "ps", "-q", "--filter", `label=${RUN_LABEL}`, "--filter", `label=${PROJECT_LABEL}=hapi`]);
+  });
+
+  test("when it cannot tell whether runs are live, up stops rather than assuming none", async () => {
+    capture();
+    const f = fakes({ liveCode: 1 });
+    await expect(stackUp([], f.deps)).rejects.toThrow(/cannot tell whether runs are live \(docker ps exited 1: daemon down\); nothing was started/);
+    expect(f.steps).toEqual([LIVE_CHECK]);
+  });
+
+  test("as another user, up re-execs before it looks at Docker", async () => {
+    capture();
+    const f = fakes({ user: "dev", live: ["aaa"] });
+    expect(await stackUp([], f.deps)).toBe(0);
+    expect(f.calls.map((c) => c.cmd[0])).toEqual(["sudo"]);
+  });
+
   test("usage errors exit 2 and run nothing", async () => {
     const { err } = capture();
     for (const args of [["--roster"], ["--roster", "nope"], ["--bogus"], ["stray"], ["--config", "-x"]]) {
@@ -385,12 +467,96 @@ describe("networkProblems", () => {
   });
 });
 
+/** The `docker` calls removeRuns makes for `project`, with `ids`/`nets`/`vols` found labelled. */
+const LABELS = (project: string) => ["--filter", `label=${RUN_LABEL}`, "--filter", `label=${PROJECT_LABEL}=${project}`];
+
+describe("removeRuns", () => {
+  test("removes the run containers, disconnects the egress proxy from each run network, removes the networks, then the volumes: the exact docker calls, in order", async () => {
+    const f = fakes({ runs: { containers: ["c1", "c2"], networks: ["hapi-run-1", "hapi-run-2"], volumes: ["hapi-run-1-work", "hapi-run-1-out"] } });
+    await removeRuns("hapi", f.deps.run!, f.deps.env!);
+    expect(f.calls.map((c) => c.cmd)).toEqual([
+      ["docker", "ps", "-aq", ...LABELS("hapi")],
+      ["docker", "rm", "-f", "c1", "c2"],
+      ["docker", "network", "ls", "--format", "{{.Name}}", ...LABELS("hapi")],
+      ["docker", "network", "disconnect", "-f", "hapi-run-1", "hapi-egress-archon-1"],
+      ["docker", "network", "disconnect", "-f", "hapi-run-2", "hapi-egress-archon-1"],
+      ["docker", "network", "rm", "hapi-run-1", "hapi-run-2"],
+      ["docker", "volume", "ls", "-q", ...LABELS("hapi")],
+      ["docker", "volume", "rm", "hapi-run-1-work", "hapi-run-1-out"],
+    ]);
+  });
+
+  test("removeRuns only touches objects labelled with its project: every listing carries both labels, and the proxy it disconnects is that project's", async () => {
+    const f = fakes({ runs: { containers: ["c1"], networks: ["hapi-int-ab12cd34-run-9"], volumes: ["hapi-int-ab12cd34-run-9-out"] } });
+    await removeRuns("hapi-int-ab12cd34", f.deps.run!, f.deps.env!);
+    const calls = f.calls.map((c) => c.cmd);
+    for (const list of calls.filter((c) => ["ps", "ls"].includes(c[1]!) || c[2] === "ls")) expect(list.join(" ")).toContain(`--filter label=${PROJECT_LABEL}=hapi-int-ab12cd34 `.trimEnd());
+    for (const list of calls.filter((c) => ["ps", "ls"].includes(c[1]!) || c[2] === "ls")) expect(list.join(" ")).toContain(`--filter label=${RUN_LABEL}`);
+    // Never a bare removal by prefix or "hapi": only the ids and names the labelled listings returned, and this project's proxy.
+    expect(calls.filter((c) => c[1] === "rm" || c[2] === "rm" || c[2] === "disconnect")).toEqual([
+      ["docker", "rm", "-f", "c1"],
+      ["docker", "network", "disconnect", "-f", "hapi-int-ab12cd34-run-9", "hapi-int-ab12cd34-egress-archon-1"],
+      ["docker", "network", "rm", "hapi-int-ab12cd34-run-9"],
+      ["docker", "volume", "rm", "hapi-int-ab12cd34-run-9-out"],
+    ]);
+    expect(JSON.stringify(calls)).not.toContain('"hapi-egress-archon-1"');
+  });
+
+  test("with no runs it lists and removes nothing", async () => {
+    const f = fakes();
+    await removeRuns("hapi", f.deps.run!, f.deps.env!);
+    expect(f.calls.map((c) => c.cmd.slice(0, 3).join(" "))).toEqual(["docker ps -aq", "docker network ls", "docker volume ls"]);
+  });
+
+  test("a proxy that is already gone (disconnect fails) does not stop the removal: the network is still removed, and nothing is reported when it goes", async () => {
+    const f = fakes({ runs: { networks: ["hapi-run-1"] }, failing: ["docker network disconnect -f hapi-run-1 hapi-egress-archon-1"] });
+    await removeRuns("hapi", f.deps.run!, f.deps.env!);
+    expect(f.steps).toContain("docker network rm hapi-run-1");
+  });
+
+  test("a removal that fails throws after the rest was tried, naming what is left", async () => {
+    const f = fakes({ runs: { containers: ["c1"], networks: ["hapi-run-1"], volumes: ["v1"] }, failing: ["docker network rm hapi-run-1"] });
+    await expect(removeRuns("hapi", f.deps.run!, f.deps.env!)).rejects.toThrow(/docker network rm hapi-run-1 failed.*boom/);
+    // The volumes were still tried.
+    expect(f.steps).toContain("docker volume rm v1");
+  });
+
+  test("a listing that fails throws, naming it, rather than reporting no runs", async () => {
+    const f = fakes({ failing: [`docker ps -aq ${LABELS("hapi").join(" ")}`] });
+    await expect(removeRuns("hapi", f.deps.run!, f.deps.env!)).rejects.toThrow(/docker ps -aq .* failed/);
+  });
+});
+
 describe("hapi stack down", () => {
-  test("as hapi: compose down by project name, keeping the volumes, with no compose file or XDG_RUNTIME_DIR needed", async () => {
+  test("as hapi: run objects first, then compose down by project name, keeping the volumes, with no compose file or XDG_RUNTIME_DIR needed", async () => {
     capture();
     const f = fakes({ env: { HOME: "/home/hapi" } });
     expect(await stackDown([], f.deps)).toBe(0);
-    expect(f.calls.map((c) => [c.cmd, c.inherit])).toEqual([[["docker", "compose", "-p", "hapi", "down"], true]]);
+    expect(f.calls.at(-1)).toMatchObject({ cmd: ["docker", "compose", "-p", "hapi", "down"], inherit: true });
+    expect(f.calls.map((c) => c.cmd.slice(0, 3).join(" "))).toEqual(["docker ps -aq", "docker network ls", "docker volume ls", "docker compose -p"]);
+  });
+
+  test("down removes run containers, disconnects egress-archon from each run network, removes the run networks and volumes, then runs compose down", async () => {
+    capture();
+    const f = fakes({ env: { HOME: "/home/hapi" }, runs: { containers: ["c1"], networks: ["hapi-run-1"], volumes: ["hapi-run-1-out"] } });
+    expect(await stackDown([], f.deps)).toBe(0);
+    expect(f.calls.map((c) => c.cmd)).toEqual([
+      ["docker", "ps", "-aq", ...LABELS("hapi")],
+      ["docker", "rm", "-f", "c1"],
+      ["docker", "network", "ls", "--format", "{{.Name}}", ...LABELS("hapi")],
+      ["docker", "network", "disconnect", "-f", "hapi-run-1", "hapi-egress-archon-1"],
+      ["docker", "network", "rm", "hapi-run-1"],
+      ["docker", "volume", "ls", "-q", ...LABELS("hapi")],
+      ["docker", "volume", "rm", "hapi-run-1-out"],
+      ["docker", "compose", "-p", "hapi", "down"],
+    ]);
+  });
+
+  test("when removing the runs fails, compose down still runs (the kill switch stops what it can), and down then fails naming the leftovers", async () => {
+    capture();
+    const f = fakes({ env: { HOME: "/home/hapi" }, runs: { containers: ["c1"] }, failing: ["docker rm -f c1"] });
+    await expect(stackDown([], f.deps)).rejects.toThrow(/docker rm -f c1 failed/);
+    expect(f.calls.at(-1)!.cmd).toEqual(["docker", "compose", "-p", "hapi", "down"]);
   });
 
   test("as another user: re-execs `mise run down` as hapi (the host admin's kill switch)", async () => {
@@ -405,7 +571,8 @@ describe("hapi stack down", () => {
     const { err } = capture();
     const f = fakes({ user: "dev", env: { HOME: "/home/dev", HAPI_ALLOW_CURRENT_USER: "1" } });
     expect(await stackDown([], f.deps)).toBe(0);
-    expect(f.calls.map((c) => c.cmd)).toEqual([["docker", "compose", "-p", "hapi", "down"]]);
+    expect(f.calls.at(-1)!.cmd).toEqual(["docker", "compose", "-p", "hapi", "down"]);
+    expect(f.calls.map((c) => c.cmd[1])).toEqual(["ps", "network", "volume", "compose"]);
     // The caller's DOCKER_HOST, DOCKER_CONTEXT or current context can point that CLI at any daemon, hapi's included.
     expect(err).toEqual([
       "hapi stack down: warning: HAPI_ALLOW_CURRENT_USER=1: stopping the dev-bypass stack (Compose project hapi) on the Docker daemon this shell's docker CLI reaches, " +

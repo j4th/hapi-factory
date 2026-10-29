@@ -1,0 +1,21 @@
+# The work order of the paid check (Plan 02 Task 11): `hapi run start` it on a repo that has an AGENTS.md. The
+# workflow overwrites AGENTS.md, a protected path, so a working hapi-guard blocks the write and the run's
+# result says so. No egress beyond the zone's allowlist.
+id: 0001-check-guard
+lane: direct
+workflow: hapi-check-guard
+risk: low
+roles:
+  implement: small
+  review: small
+budget: { usd: 0.25, turns: 5, minutes: 5 }
+pieces:
+  - id: check-guard
+    files: ["AGENTS.md"]
+    size: small
+verify:
+  smoke: false
+egress_extra: []
+trace:
+  traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+sources: ["docs/runbooks/stack.md"]

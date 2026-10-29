@@ -16,10 +16,10 @@
  *   source clone and Archon's workspace dirs, and names the worker.
  * - `empty.env`: bound over `/.archon/.env`, so no env file of a repo or an earlier
  *   run reaches Archon's workflows.
- * - `archon.env`: the Archon container's environment: loopback bind, telemetry
- *   off, and the Pi worker settings (spec §9.2, §9.3). The record of what
- *   stack/compose.yaml's archon `environment:` sets (`ARCHON_ENV`), and what
- *   Task 6's audit compares the running container with.
+ * - `archon.env`: the run container's environment: telemetry off, the Pi worker
+ *   settings, Bun's no-install and the git hardening (spec §9.2, §9.3, design
+ *   §6a). The record of what stack/compose.yaml's archon (run) service sets in
+ *   its `environment:` (`ARCHON_ENV`), and what the audit compares it with.
  */
 import YAML from "yaml";
 import { type ModelSpec, type Policy, ROLES, type RosterName, type Tier } from "../policy/types";
@@ -117,23 +117,69 @@ function configYaml(p: Policy, roster: RosterName, run: boolean): string {
 }
 
 /**
+ * The git config the run container's git is held to, as `GIT_CONFIG_COUNT`
+ * KEY/VALUE pairs. Env config outranks `.git/config` and `config.worktree` for
+ * a single-valued key, so a repo (or a worker) that plants one of these in the
+ * clone changes nothing. It closes the program-running keys that are
+ * single-valued: hooks, fsmonitor, credential helpers, the askpass program,
+ * signing, external transports, background maintenance, submodule recursion
+ * and the attributes file. The residual is name-indexed drivers (`filter.<n>.*`,
+ * `diff.<n>.*`, `merge.<n>.driver`, via a planted `.gitattributes`) and
+ * `remote.<n>.uploadpack`, which no fixed key can cover (design §6a item 13;
+ * spike 07, finding 10).
+ */
+const GIT_CONFIG: readonly (readonly [key: string, value: string, why: string])[] = [
+  ["core.hooksPath", "/dev/null", "no repo hook runs: hooks come from an empty path"],
+  ["core.fsmonitor", "false", "no fsmonitor program: git status would run one a repo names"],
+  ["credential.helper", "", "no credential helper, and none a repo names"],
+  ["commit.gpgSign", "false", "no commit signing: it would run gpg.program"],
+  ["tag.gpgSign", "false", "no tag signing: it would run gpg.program"],
+  ["push.gpgSign", "false", "no push signing: it would run gpg.program"],
+  ["log.showSignature", "false", "log would not verify signatures, which runs gpg.program"],
+  ["core.askPass", "", "no askpass program"],
+  ["protocol.ext.allow", "never", "the ext:: transport runs a command, so it never runs"],
+  ["gc.auto", "0", "no automatic gc: it runs background maintenance"],
+  ["maintenance.auto", "false", "no automatic maintenance"],
+  ["submodule.recurse", "false", "no submodule recursion: a submodule is a second repo with its own config"],
+  ["core.attributesFile", "/dev/null", "no global attributes file: it could name filter drivers"],
+];
+
+/**
  * The container environment, in this order: name, value, why. Values never
- * need quoting. stack/compose.yaml sets every one in the archon service's
- * `environment:` (src/stack/env.ts), which beats any env_file, so no secret
- * can override them; tests/stack/compose.test.ts keeps the two equal.
+ * need quoting (an empty one is a set, empty variable). stack/compose.yaml's
+ * archon service sets every one in its `environment:` (src/stack/env.ts), which
+ * beats any env_file, so no secret can override them; the guard deletes only
+ * exact secret names, never these. tests/stack/compose.test.ts keeps the two
+ * equal. This is the whole non-proxy set: the launcher gives the proxy
+ * variables (`proxyEnv("archon")`) beside it.
  */
 export const ARCHON_ENV: readonly (readonly [name: string, value: string, why: string])[] = [
-  ["HOST", "127.0.0.1", "Archon's server listens on loopback only; it has no auth in SQLite mode (spec §9.2)"],
   ["ARCHON_TELEMETRY_DISABLED", "1", "no Archon telemetry"],
   ["DO_NOT_TRACK", "1", "the cross-tool telemetry opt-out, which Archon also honours"],
   ["PI_OFFLINE", "1", "Pi makes no network calls of its own: no installing the packages a repo's .pi/settings.json lists, no catalog refresh, no update check (spec §9.3: critical)"],
   ["PI_TELEMETRY", "0", "no Pi install telemetry"],
-  ["PI_CODING_AGENT_DIR", PI_AGENT_DIR, "Pi's agent dir: build/pi, mounted read-only (models.json, hapi-guard.json)"],
+  ["PI_CODING_AGENT_DIR", PI_AGENT_DIR, "Pi's agent dir: build/pi's files, bound read-only into a tmpfs (models.json, hapi-guard.json)"],
+  ["BUN_OPTIONS", "--no-install", "Bun never installs a package at run time, so a script the worker runs cannot pull one from the registry (design §6a item 5; spike 07, finding 11)"],
+  ["GIT_CONFIG_NOSYSTEM", "1", "git reads no /etc/gitconfig"],
+  ["GIT_CONFIG_GLOBAL", "/home/appuser/.gitconfig", "git's one global file is the generated, read-only gitconfig (safe.directory grants and the worker's name), never one under $HOME the worker could write"],
+  ["GIT_CONFIG_COUNT", String(GIT_CONFIG.length), "the number of KEY/VALUE pairs below, which override a repo's own .git/config for each key; they close the single-valued program-running keys, and the name-indexed drivers and remote.*.uploadpack stay a residual (design §6a item 13)"],
+  ...GIT_CONFIG.flatMap(([key, value, why], i): [string, string, string][] => [
+    [`GIT_CONFIG_KEY_${i}`, key, `config pair ${i}: ${why}`],
+    [`GIT_CONFIG_VALUE_${i}`, value, `config pair ${i}'s value`],
+  ]),
+  ["GIT_ALLOW_PROTOCOL", "file", "git speaks only the file transport (the clone is from a local path)"],
+  ["GIT_PROTOCOL_FROM_USER", "0", "a transport a repo asks for is treated as untrusted"],
+  ["GIT_TERMINAL_PROMPT", "0", "git never prompts on a terminal"],
+  ["GIT_ASKPASS", "", "no askpass program, set and empty so none is looked up"],
+  ["GIT_PAGER", "cat", "git's pager is cat: it runs no pager program a config names"],
+  ["GIT_EDITOR", "false", "git's editor is false: it runs no editor a config names"],
+  ["CLAUDE_BIN_PATH", "/app/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude", "the Claude Agent SDK's own binary, so Archon's claude nodes need no lookup on a PATH"],
+  ["ARCHON_DOCKER", "true", "Archon's home is /.archon (the run DB, workspaces, worktrees), as in its own compose file"],
 ];
 
 function archonEnv(): string {
   const head = hashComment([
-    ...notice("Archon container environment", ["the hardening settings of spec §9.2 and §9.3 (no policy file)"]),
+    ...notice("Archon container environment", ["the hardening settings of spec §9.2, §9.3 and design §6a (no policy file)"]),
   ]);
   const body = ARCHON_ENV.map(([key, value, why]) => `${hashComment(wrap(why))}\n${key}=${value}`).join("\n");
   return `${head}\n\n${body}\n`;

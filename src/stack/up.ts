@@ -3,6 +3,12 @@
  * and stop the stack in stack/compose.yaml (spec §4.3, §11.3-11.5, §11.8).
  * docs/runbooks/stack.md is the operator's procedure.
  *
+ * A run (Plan 02, `hapi run`) is a container of its own, made from the `archon`
+ * service of the compose file, on a network of its own that the launcher joins
+ * `egress-archon` to; compose does not know it. Every such object carries
+ * `RUN_LABEL` and `PROJECT_LABEL`, which is how `up` sees a live run and
+ * `removeRuns` (and so `down`) finds what to remove.
+ *
  * `up`, in order, aborting at the first failure:
  * 1. Run as the `hapi` user. Anyone else re-execs `mise run up` as hapi with
  *    `sudo -u hapi -H -- sh -c '<fixed script>' hapi-stack <args>`, in hapi's
@@ -22,8 +28,9 @@
  *    (loadSecretsConfig), its provider (providerFor), then resolveSecrets
  *    into $XDG_RUNTIME_DIR/hapi/env/<zone>.env, all or nothing. A missing
  *    secret, a provider failure or a missing pinned age stops here.
- * 4. `docker compose up --no-start --build`: build the images, create the
- *    networks and containers, start nothing.
+ * 4. `docker compose build archon` (a profile-only service is built only when
+ *    named, spike 07 finding 17), then `docker compose up --no-start --build`:
+ *    build the images, create the networks and containers, start nothing.
  * 5. Check the zone networks Docker made (`networkProblems`): internal, and
  *    inside the proxies' zone_clients ranges. If any check fails, or can't
  *    be made (`docker network inspect` fails, prints something that isn't
@@ -33,8 +40,14 @@
  *    healthy.
  * Nothing starts unless steps 1-5 pass.
  *
- * `down` is `docker compose -p hapi down`, by project name, so it needs no
- * compose file, build/ or XDG_RUNTIME_DIR: it is kill switch 3 (spec §11.8).
+ * As the hapi user, and before step 2, `up` refuses if any run container is
+ * running (`liveRuns`): recreating egress-archon would cut its egress, and
+ * nothing has been built or written yet.
+ *
+ * `down` is `removeRuns` (the run containers, then egress-archon's hold on each
+ * run network, then the run networks and volumes), then `docker compose -p hapi
+ * down`, by project name, so it needs no compose file, build/ or
+ * XDG_RUNTIME_DIR: it is kill switch 3 (spec §11.8).
  * It does load the whole CLI (`bun run src/cli.ts`), so it needs a checkout
  * that loads (src/ parses, node_modules installed) and a working mise;
  * without them, use kill switch 3b (docs/runbooks/kill-switches.md). Volumes
@@ -54,6 +67,11 @@ import { secretsResolve } from "../secrets/cli";
 import { cidrContains } from "./cidr";
 
 export type Env = Record<string, string | undefined>;
+
+/** On every run object (container, network, volumes) `hapi run` makes: found by `up`, `down` and the kill switches. */
+export const RUN_LABEL = "org.hapi.run";
+/** On every run object too: the Compose project it belongs to, so a test project's cleanup never touches hapi's. */
+export const PROJECT_LABEL = "org.hapi.project";
 
 /** The dedicated host user that runs the stack (spec §4.3, §11.3). */
 export const HAPI_USER = "hapi";
@@ -201,7 +219,7 @@ const definedEnv = (env: Env): Record<string, string> => Object.fromEntries(Obje
  * - mise by its absolute path, where scripts/host-setup.sh installs it.
  * `mise run` puts the pinned tools (bun) on the task's PATH itself, from the checkout's mise.toml.
  */
-export function reexecScript(task: "up" | "down"): string {
+export function reexecScript(task: "up" | "down" | "hapi"): string {
   return `: "\${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; export XDG_RUNTIME_DIR; export PATH="$HOME/${HAPI_BIN}:$PATH"; cd "$HOME/${HAPI_CHECKOUT}" && exec "$HOME/${HAPI_MISE}" run ${task} -- "$@"`;
 }
 
@@ -210,12 +228,56 @@ export function reexecScript(task: "up" | "down"): string {
  * shell re-parses the command's words and leaves `$` unescaped (sudo(8)). `reexecScript` is the whole script,
  * and the arguments are its "$@".
  */
-async function reexec(task: "up" | "down", args: string[], run: Runner, env: Env, user: string): Promise<number> {
+async function reexec(task: "up" | "down" | "hapi", args: string[], run: Runner, env: Env, user: string): Promise<number> {
   console.error(
     `hapi stack ${task}: running as ${HAPI_USER} (sudo -u ${HAPI_USER} -H), not ${user}. For development only, HAPI_ALLOW_CURRENT_USER=1 runs it as ${user} instead (docs/runbooks/stack.md).`,
   );
   const r = await run(["sudo", "-u", HAPI_USER, "-H", "--", "sh", "-c", reexecScript(task), "hapi-stack", ...args], { env: definedEnv(env), inherit: true });
   return r.code;
+}
+
+/** The `--filter` arguments that select the run objects of `project`. */
+const runFilters = (project: string): string[] => ["--filter", `label=${RUN_LABEL}`, "--filter", `label=${PROJECT_LABEL}=${project}`];
+
+const lines = (out: string): string[] => out.split("\n").map((l) => l.trim()).filter((l) => l !== "");
+
+/** The ids (or names) a listing printed, one per line. Throws, naming the command, when it fails. */
+async function listed(run: Runner, env: Env, cmd: string[]): Promise<string[]> {
+  const r = await run(cmd, { env: definedEnv(env), inherit: false });
+  if (r.code !== 0) throw new Error(`${cmd.join(" ")} failed (exit ${r.code}): ${r.stderr?.trim() || "(no error output)"}`);
+  return lines(r.stdout);
+}
+
+/** The running containers `hapi run` made for `project`. Throws when Docker can't say: `up` must not assume none. */
+async function liveRuns(run: Runner, env: Env, project: string): Promise<string[]> {
+  const r = await run(["docker", "ps", "-q", ...runFilters(project)], { env: definedEnv(env), inherit: false });
+  if (r.code !== 0) throw new Error(`hapi stack up: cannot tell whether runs are live (docker ps exited ${r.code}: ${r.stderr?.trim() || "(no error output)"}); nothing was started`);
+  return lines(r.stdout);
+}
+
+/**
+ * Removes every run object of `project`: the labelled containers (`rm -f`), then `<project>-egress-archon-1`'s
+ * attachment to each labelled network (Docker refuses to remove a network with an endpoint attached, spike 07
+ * finding 13), then the networks, then the volumes. Only what the two labels select, never by name or prefix.
+ * It tries every step and throws at the end naming the ones that failed: `down` is kill switch 3 and goes on to
+ * `compose down` regardless. A disconnect that fails is not an error by itself (the proxy may be gone, or not
+ * attached); the network removal after it says whether anything is left.
+ */
+export async function removeRuns(project: string, run: Runner, env: Env): Promise<void> {
+  const failures: string[] = [];
+  const attempt = async (cmd: string[]) => {
+    const r = await run(cmd, { env: definedEnv(env), inherit: false });
+    if (r.code !== 0) failures.push(`${cmd.join(" ")} failed (exit ${r.code}): ${r.stderr?.trim() || "(no error output)"}`);
+  };
+  const filters = runFilters(project);
+  const containers = await listed(run, env, ["docker", "ps", "-aq", ...filters]);
+  if (containers.length > 0) await attempt(["docker", "rm", "-f", ...containers]);
+  const networks = await listed(run, env, ["docker", "network", "ls", "--format", "{{.Name}}", ...filters]);
+  for (const n of networks) await run(["docker", "network", "disconnect", "-f", n, `${project}-egress-archon-1`], { env: definedEnv(env), inherit: false });
+  if (networks.length > 0) await attempt(["docker", "network", "rm", ...networks]);
+  const volumes = await listed(run, env, ["docker", "volume", "ls", "-q", ...filters]);
+  if (volumes.length > 0) await attempt(["docker", "volume", "rm", ...volumes]);
+  if (failures.length > 0) throw new Error(`removing the runs of ${project} left something behind: ${failures.join("; ")}`);
 }
 
 const UP_USAGE = "usage: hapi stack up [--roster budget|anthropic|portable] [--config file]";
@@ -253,6 +315,13 @@ export async function stackUp(args: string[], deps: StackDeps = {}): Promise<num
     );
   }
 
+  const live = await liveRuns(run, env, PROJECT);
+  if (live.length > 0) {
+    throw new Error(
+      `hapi stack up: ${live.length} runs are live (docker ps --filter label=${RUN_LABEL}): stop them with \`hapi run stop <id>\` or wait; recreating egress-archon would cut their egress`,
+    );
+  }
+
   const written = await (deps.build ?? ((roster) => buildAll(loadPolicy("policy"), "build", { roster })))(opts.roster);
   console.log(`policy build: wrote ${written.length} files under build/ (roster ${opts.roster})`);
   const resolved = await (deps.resolve ?? ((a) => secretsResolve(a)))(opts.config === undefined ? [] : ["--config", opts.config]);
@@ -260,6 +329,9 @@ export async function stackUp(args: string[], deps: StackDeps = {}): Promise<num
 
   const composeEnv = { ...definedEnv(env), HAPI_STARTED_BY: who.user, HAPI_DEV_OVERRIDE: who.override ? "1" : "0", HAPI_BUILD_SHA256: buildDigest(written) };
   const compose = (rest: string[], inherit = true) => run(["docker", "compose", "-f", COMPOSE_FILE, "-p", PROJECT, ...rest], { env: composeEnv, inherit });
+  // A profile-only service is built only when named (spike 07, finding 17): `up --no-start --build` skips archon.
+  const built = await compose(["build", "archon"]);
+  if (built.code !== 0) throw new Error(`docker compose build archon failed (exit ${built.code}); nothing was started`);
   const created = await compose(["up", "--no-start", "--build"]);
   if (created.code !== 0) throw new Error(`docker compose up --no-start failed (exit ${created.code}); nothing was started`);
 
@@ -281,11 +353,11 @@ export async function stackUp(args: string[], deps: StackDeps = {}): Promise<num
   if (up.code !== 0) {
     throw new Error(`the stack did not come up healthy (docker compose exit ${up.code}): see \`docker compose -p ${PROJECT} ps\` and \`docker compose -p ${PROJECT} logs <service>\` (docs/runbooks/stack.md#troubleshooting)`);
   }
-  console.log(`the stack is up (Compose project ${PROJECT}): egress-hermes, egress-archon, egress-research, hermes, archon`);
+  console.log(`the stack is up (Compose project ${PROJECT}): egress-hermes, egress-archon, egress-research, hermes (archon is built, and a container of it starts per run)`);
   return 0;
 }
 
-/** `hapi stack down`: stop and remove the stack's containers and networks, keeping its volumes. */
+/** `hapi stack down`: remove the runs, then stop and remove the stack's containers and networks, keeping its volumes. */
 export async function stackDown(args: string[], deps: StackDeps = {}): Promise<number> {
   if (args.length > 0) {
     console.error("usage: hapi stack down");
@@ -304,7 +376,16 @@ export async function stackDown(args: string[], deps: StackDeps = {}): Promise<n
         `To stop ${HAPI_USER}'s stack, run \`mise run down\` in a shell without HAPI_ALLOW_CURRENT_USER, or use kill switch 3b (docs/runbooks/kill-switches.md#3b-without-a-checkout-or-mise).`,
     );
   }
+  // The runs first: Docker won't remove a network with an endpoint attached. A failure here must not stop
+  // `compose down` (this is kill switch 3), so it is reported after.
+  let leftover: Error | undefined;
+  try {
+    await removeRuns(PROJECT, run, env);
+  } catch (e) {
+    leftover = e as Error;
+  }
   const r = await run(["docker", "compose", "-p", PROJECT, "down"], { env: definedEnv(env), inherit: true });
-  if (r.code !== 0) throw new Error(`docker compose -p ${PROJECT} down failed (exit ${r.code})`);
+  if (r.code !== 0) throw new Error(`docker compose -p ${PROJECT} down failed (exit ${r.code})${leftover === undefined ? "" : `; also ${leftover.message}`}`);
+  if (leftover !== undefined) throw leftover;
   return 0;
 }

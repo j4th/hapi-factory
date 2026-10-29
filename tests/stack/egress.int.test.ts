@@ -7,7 +7,7 @@
  * No real secret is used. The zone env files are written by hapi's own
  * resolver (`resolveSecrets`) from a fake provider into a temp
  * XDG_RUNTIME_DIR; then the test appends lines to them that try to override
- * hapi's own settings (HOST, PI_OFFLINE, HTTPS_PROXY, ...), which compose's
+ * hapi's own settings (HERMES_HOME, HTTPS_PROXY, ...), which compose's
  * `environment:` must win against. The test's override (a second compose
  * file) adds only `extra_hosts` on the proxies, which plant names that resolve
  * to private, NAT64, public and other addresses, so the DNS-rebinding checks
@@ -20,9 +20,10 @@
  * afterAll checks that the checkout's build/ was not written to.
  *
  * External network: the tests whose names say "(internet)" need this host to
- * reach api.anthropic.com, github.com, example.com and 1.1.1.1, and the zone
- * services' images are built on first run (the Archon image downloads Node,
- * uv and Python 3.14.9). Offline, those tests are skipped, with a warning;
+ * reach api.anthropic.com, github.com, example.com and 1.1.1.1, and Hermes's
+ * image is built on first run. (Archon is a run template, not a service: its
+ * run containers are the run integration test's.) Offline, those tests are
+ * skipped, with a warning;
  * every refusal is decided by the proxy before it connects anywhere, so those
  * run offline.
  *
@@ -81,9 +82,8 @@ const PLANTED = {
  * env file could override compose's `environment:` (the manifest loader refuses these names, so only a hand
  * edit of the file could put them there).
  */
-const OVERRIDES: Record<"hermes" | "archon", Record<string, string>> = {
+const OVERRIDES: Record<"hermes", Record<string, string>> = {
   hermes: { HERMES_HOME: "/tmp/elsewhere", HTTPS_PROXY: "http://203.0.113.9:3128", NO_PROXY: "*" },
-  archon: { HOST: "0.0.0.0", PI_OFFLINE: "0", ARCHON_TELEMETRY_DISABLED: "0", PI_CODING_AGENT_DIR: "/tmp/elsewhere", HTTPS_PROXY: "http://203.0.113.9:3128", no_proxy: "*" },
 };
 
 describe.skipIf(!INT)("the stack's egress boundary (throwaway compose project)", () => {
@@ -106,7 +106,7 @@ describe.skipIf(!INT)("the stack's egress boundary (throwaway compose project)",
     // As `mise run up` does: the generated configs (into the project's own build dir), then the zone env files, then the stack.
     await buildAll(loadPolicy(join(REPO, "policy")), p.build);
     const manifest: Manifest = loadManifest(join(REPO, "stack", "secrets.yaml"));
-    manifest.archon = { ...manifest.archon, HAPI_INT_PROBE: "hapi-int-probe" };
+    manifest.hermes = { ...manifest.hermes, HAPI_INT_PROBE: "hapi-int-probe" };
     await resolveSecrets(manifest, fakeProvider, { outDir: join(p.xdg, "hapi") });
     for (const [zone, lines] of Object.entries(OVERRIDES)) {
       appendFileSync(join(p.xdg, "hapi", "env", `${zone}.env`), Object.entries(lines).map(([k, v]) => `${k}='${v}'\n`).join(""));
@@ -358,20 +358,21 @@ describe.skipIf(!INT)("the stack's egress boundary (throwaway compose project)",
     }, 120_000);
   });
 
-  describe.skipIf(!ONLINE)("(internet) the zone services: archon and hermes, hardened, with fake secrets", () => {
+  // archon is the run template, not a service: its run containers are checked by the run integration test (Plan 02 Task 8).
+  describe.skipIf(!ONLINE)("(internet) the hermes zone service, hardened, with fake secrets", () => {
     beforeAll(async () => {
-      await p.mustCompose(["build", "archon", "hermes"], 900_000);
-      await p.mustCompose(["up", "-d", "--wait", "--wait-timeout", "240", "archon", "hermes"], 600_000);
+      await p.mustCompose(["build", "hermes"], 900_000);
+      await p.mustCompose(["up", "-d", "--wait", "--wait-timeout", "240", "hermes"], 600_000);
     }, 1_200_000);
 
-    test("with the zone services up, only the proxies join outbound, and each zone service is on its own zone network only", async () => {
+    test("with hermes up, only the proxies join outbound, and hermes is on its own zone network only", async () => {
       expect(await members()).toEqual({
         "hermes-net": ["egress-hermes", "hermes"],
-        "archon-net": ["archon", "egress-archon"],
+        "archon-net": ["egress-archon"],
         "research-net": ["egress-research"],
         outbound: ["egress-archon", "egress-hermes", "egress-research"],
       });
-      for (const service of ["hermes", "archon"] as const) {
+      for (const service of ["hermes"] as const) {
         const id = (await p.mustCompose(["ps", "-q", service])).trim();
         const nets = Object.keys(JSON.parse(await must(["docker", "inspect", "--format", "{{json .NetworkSettings.Networks}}", id])));
         expect([service, nets]).toEqual([service, [p.network(`${service}-net`)]]);
@@ -379,7 +380,7 @@ describe.skipIf(!INT)("the stack's egress boundary (throwaway compose project)",
     });
 
     test("a zone's env file can't override hapi's own settings: compose's environment: wins, though the file says otherwise", async () => {
-      for (const service of ["hermes", "archon"] as const) {
+      for (const service of ["hermes"] as const) {
         // The control: the env file the container read does hold the overriding lines.
         const file = readFileSync(join(p.xdg, "hapi", "env", `${service}.env`), "utf8");
         for (const [k, v] of Object.entries(OVERRIDES[service])) expect(file).toContain(`${k}='${v}'\n`);
@@ -390,15 +391,6 @@ describe.skipIf(!INT)("the stack's egress boundary (throwaway compose project)",
             .map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)] as const),
         );
         for (const [k, v] of Object.entries(serviceEnvironment(service))) expect([service, k, env.get(k)]).toEqual([service, k, v]);
-      }
-    });
-
-    test("archon listens on loopback only: 127.0.0.1:3090 answers inside; archon:3090 (and :3000) is refused from archon-net", async () => {
-      const inside = await p.exec("archon", ["curl", "-fsS", "--max-time", "5", "http://127.0.0.1:3090/api/health"]);
-      expect(inside.code).toBe(0);
-      for (const port of [3090, 3000]) {
-        const r = await p.curl("archon-net", `http://archon:${port}/api/health`, undefined, ["--max-time", "5"]);
-        expect([port, r.exit, r.status]).toEqual([port, 7, 0]); // 7: couldn't connect
       }
     });
 
@@ -416,62 +408,31 @@ describe.skipIf(!INT)("the stack's egress boundary (throwaway compose project)",
       expect(listening).toContain("0100007F");
     });
 
-    test("each runs as its image's non-root user, with no capabilities, no new privileges and a read-only root", async () => {
-      for (const [service, uid] of [["archon", "1001"], ["hermes", "10000"]] as const) {
+    test("hermes runs as its image's non-root user, with no capabilities, no new privileges and a read-only root", async () => {
+      for (const [service, uid] of [["hermes", "10000"]] as const) {
         const status = (await p.exec(service, ["cat", "/proc/1/status"])).stdout;
         expect([service, /^Uid:\s+(\d+)/m.exec(status)?.[1]]).toEqual([service, uid]);
         expect([service, /^CapEff:\s+(\w+)/m.exec(status)?.[1]]).toEqual([service, "0000000000000000"]);
         expect([service, /^NoNewPrivs:\s+(\d)/m.exec(status)?.[1]]).toEqual([service, "1"]);
       }
-      await expectMounts("archon", { ro: ["/", "/.archon/config.yaml"], rw: ["/tmp", "/.archon", "/home/appuser"] });
       await expectMounts("hermes", { ro: ["/", "/opt/data/config.yaml"], rw: ["/tmp", "/run", "/opt/data"] });
     });
 
-    test("each sees only its own zone's secrets, never host.env, and its own proxy", async () => {
-      const envOf = async (service: string) => (await p.exec(service, ["env"])).stdout;
-      const archon = await envOf("archon");
-      const hermes = await envOf("hermes");
-      expect(archon).toContain("ANTHROPIC_API_KEY=fake-hapi-archon-anthropic-api-key-value");
-      expect(archon).not.toContain("fake-hapi-hermes-");
+    test("hermes sees only its own zone's secrets, never host.env, and its own proxy", async () => {
+      const hermes = (await p.exec("hermes", ["env"])).stdout;
       expect(hermes).toContain("ANTHROPIC_API_KEY=fake-hapi-hermes-anthropic-api-key-value");
       expect(hermes).not.toContain("fake-hapi-archon-");
-      for (const [service, env] of [["archon", archon], ["hermes", hermes]] as const) {
-        expect([service, env.includes("fake-hapi-host-"), env.includes("fake-hapi-research-"), env.includes("APP_PRIVATE_KEY")]).toEqual([service, false, false, false]);
-        for (const v of ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"]) expect(env).toContain(`${v}=http://egress-${service}:3128`);
-      }
-    });
-
-    test("archon gets the generated environment and build/pi read-only at PI_CODING_AGENT_DIR", async () => {
-      const env = (await p.exec("archon", ["env"])).stdout;
-      for (const line of ["HOST=127.0.0.1", "ARCHON_TELEMETRY_DISABLED=1", "DO_NOT_TRACK=1", "PI_OFFLINE=1", "PI_TELEMETRY=0", "PI_CODING_AGENT_DIR=/opt/hapi/pi-agent"]) {
-        expect(env.split("\n")).toContain(line);
-      }
-      expect((await p.exec("archon", ["cat", "/opt/hapi/pi-agent/models.json"])).stdout).toBe(readFileSync(join(p.build, "pi", "models.json"), "utf8"));
-      await expectMounts("archon", { ro: ["/opt/hapi/pi-agent"], rw: [] }, "/opt/hapi/pi-agent/models.json");
-      expect((await p.exec("archon", ["cat", "/.archon/config.yaml"])).stdout).toBe(readFileSync(join(p.build, "archon", "config.yaml"), "utf8"));
+      expect([hermes.includes("fake-hapi-host-"), hermes.includes("fake-hapi-research-"), hermes.includes("APP_PRIVATE_KEY")]).toEqual([false, false, false]);
+      for (const v of ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"]) expect(hermes).toContain(`${v}=http://egress-hermes:3128`);
     });
 
     test("a single-quoted env_file value reaches the container byte for byte (newline, $, #, spaces, backslash, quote)", async () => {
-      const r = await p.exec("archon", ["printenv", "HAPI_INT_PROBE"]);
+      const r = await p.exec("hermes", ["printenv", "HAPI_INT_PROBE"]);
       expect(r.stdout).toBe(`${PROBE}\n`);
     });
 
-    test("the pinned versions and toolchains: Hermes v0.22.5; Archon 0.12.1 with Pi 1.3.0, Node 24.22.1, uv 0.13.5, Python 3.14.9", async () => {
+    test("the pinned version: Hermes v0.22.5 (Archon's toolchains are read from a run container, by the run integration test)", async () => {
       expect((await p.exec("hermes", ["hermes", "--version"])).stdout).toContain("Hermes Agent v0.22.5");
-      const pkg = JSON.parse((await p.exec("archon", ["cat", "/app/package.json"])).stdout);
-      expect(pkg.version).toBe("0.12.1");
-      const pi = JSON.parse((await p.exec("archon", ["cat", "/app/node_modules/@earendil-works/pi-coding-agent/package.json"])).stdout);
-      expect(pi.version).toBe("1.3.0");
-      expect((await p.exec("archon", ["node", "--version"])).stdout.trim()).toBe("v24.22.1");
-      expect((await p.exec("archon", ["uv", "--version"])).stdout).toStartWith("uv 0.13.5");
-      expect((await p.exec("archon", ["python3.14", "--version"])).stdout.trim()).toBe("Python 3.14.9");
-    });
-
-    test("(internet) from inside archon, its proxy env reaches an allowed host and is refused the forge", async () => {
-      const ok = await p.exec("archon", ["curl", "-sS", "-o", "/dev/null", "--max-time", "20", "-w", "%{http_connect}", "https://api.anthropic.com/"]);
-      expect(ok.stdout).toBe("200");
-      const forge = await p.exec("archon", ["curl", "-sS", "-o", "/dev/null", "--max-time", "20", "-w", "%{http_connect}", "https://github.com/"]);
-      expect(forge.stdout).toBe("403");
     });
   });
 });

@@ -2,15 +2,15 @@
  * The environment hapi sets in each zone container itself: stack/compose.yaml's
  * `environment:` for each zone service (tests/stack/compose.test.ts checks the
  * file against `serviceEnvironment`). These are hardening settings, not
- * secrets: each zone's proxy, loopback going direct, Archon's loopback bind and
- * telemetry switches, Pi's offline mode and read-only agent dir, and where each
- * tool reads its generated config.
+ * secrets: each zone's proxy, loopback going direct, Archon's telemetry
+ * switches, Pi's offline mode and read-only agent dir, Bun's no-install, the git
+ * hardening, and where each tool reads its generated config.
  *
  * Compose gives `environment:` precedence over `env_file`, so a zone's secrets
  * file (`$XDG_RUNTIME_DIR/hapi/env/<zone>.env`, the service's only env_file)
  * can't override any of them. And the secrets manifest may not name one at
  * all (`RESERVED_ENV_NAMES`, enforced by src/secrets/manifest.ts), so a secret
- * called HOST or HTTPS_PROXY is refused when the manifest loads, before it can
+ * called PI_OFFLINE or HTTPS_PROXY is refused when the manifest loads, before it can
  * mean anything.
  *
  * Nor may it name an env var that changes how a process in the container runs,
@@ -46,8 +46,6 @@ export function serviceEnvironment(service: ZoneService): Record<string, string>
     return { HERMES_HOME, ...proxyEnv("hermes") };
   }
   return {
-    // Archon's home is /.archon (the run DB, workspaces, worktrees), as in its own compose file.
-    ARCHON_DOCKER: "true",
     ...Object.fromEntries(ARCHON_ENV.map(([name, value]) => [name, value])),
     ...proxyEnv("archon"),
   };

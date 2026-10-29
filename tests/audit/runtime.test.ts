@@ -29,13 +29,13 @@ describe("runtime.archon-env", () => {
 
   test("a different or missing value fails, naming the variable and the value policy sets, never the running one", async () => {
     const w = await cleanWorld();
-    setEnv(svc(w, "archon"), "HOST", "0.0.0.0");
+    setEnv(svc(w, "archon"), "PI_TELEMETRY", "1");
     setEnv(svc(w, "archon"), "PI_OFFLINE", undefined);
     const r = await check(w, "runtime.archon-env");
     expect(r.status).toBe("fail");
-    expect(r.detail).toContain("HOST is not 127.0.0.1");
+    expect(r.detail).toContain("PI_TELEMETRY is not 0");
     expect(r.detail).toContain("PI_OFFLINE is not set");
-    expect(r.detail).not.toContain("0.0.0.0");
+    expect(r.detail).not.toContain("PI_TELEMETRY=1");
   });
 
   test("a writable Pi agent dir fails (Global Constraints: read-only PI_CODING_AGENT_DIR)", async () => {
