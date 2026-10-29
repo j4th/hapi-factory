@@ -357,6 +357,9 @@ protected_paths:
   ".factory/**": { interactive: ask, unattended: deny, workers: deny }
   ".github/**":  { interactive: ask, unattended: deny, workers: deny }
   "mise.toml":   { interactive: ask, unattended: deny, workers: deny }
+  "**/mise.toml":           { interactive: ask, unattended: deny, workers: deny }
+  "**/mise.lock":           { interactive: ask, unattended: deny, workers: deny }
+  "**/mise.*.lock":         { interactive: ask, unattended: deny, workers: deny }
   "**/.mise.toml":          { interactive: ask, unattended: deny, workers: deny }
   "**/mise.local.toml":     { interactive: ask, unattended: deny, workers: deny }
   "**/.mise.local.toml":    { interactive: ask, unattended: deny, workers: deny }
@@ -389,7 +392,7 @@ protected_paths:
 - **workers** covers Pi or Claude Code inside Archon. Always deny.
 - **Agent instruction files at any depth** (added 2026-10-27, the operator's ruling; it replaced the root-only `AGENTS.md`): Pi, Hermes, the later Claude Code lane and CodeRabbit read nested `AGENTS.md`, `CLAUDE.md` and the rest as instructions for that subtree, so a write persists into every later session there. Matching ignores case (Pi also loads `AGENTS.MD` and `CLAUDE.MD`, Hermes's own gate ignores case, and on a case-insensitive filesystem `Agents.md` is `AGENTS.md`). Workers read them and never need to write one: a work order that needs one says so in its PR, and the operator adds it.
 - **`.coderabbit.*`** (added 2026-10-27, the operator's ruling): CodeRabbit reviews a same-repo PR with that PR branch's own config, so a PR that edits it could weaken its own review (§9.6).
-- **Every mise config file at any depth** (added 2026-10-28, in Plan 01's final review), with `mise.toml`'s modes: mise loads each over `mise.toml` (`mise config ls`), so a `.mise.toml` could redefine the `test` task the gates run. hapi-factory's own CI fails on any of them, and the in-run gates will too.
+- **Every mise config file and lockfile at any depth** (added 2026-10-28, in Plan 01's final review), with `mise.toml`'s modes: mise loads each over `mise.toml` (`mise config ls`), so a `.mise.toml` could redefine the `test` task the gates run, a nested `mise.toml` does when mise starts in its directory, and a `mise.lock` names the URL and checksum mise installs each tool from. hapi-factory's own CI fails on any of them, and the in-run gates will too.
 - **git's own files at any depth** (`**/.git/**`, deny everywhere; added the same day): git runs the commands `.git/config` names (`core.fsmonitor`, `diff.external`, `credential.helper`) from the git argv Hermes's rules allow, and a linked worktree's `.git` file names the git dir git uses. No agent edits them directly.
 - **gitleaks's `.gitleaks.toml` and `.gitleaksignore`** (added the same day): either could turn a repo's secret scan off. hapi-factory's own scans name their config, and its CI refuses a `.gitleaksignore`.
 - **Backstop:** CODEOWNERS plus the ruleset. A guard failing locally can't land a change.

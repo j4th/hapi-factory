@@ -84,8 +84,9 @@ describe("effectiveModes", () => {
     expect(effectiveModes(p, ".github/workflows/ci.yml")).toEqual(ASK);
   });
 
-  test("every other file mise reads config or tasks from is protected like mise.toml, at any depth", () => {
-    // From the pinned mise's `mise config ls` and task dirs; a later file overrides mise.toml's tasks.
+  test("every other file mise reads config, tasks or locked tools from is protected like mise.toml, at any depth", () => {
+    // From the pinned mise's `mise config ls` and task dirs; a later file overrides mise.toml's tasks. A lockfile
+    // (mise.lock, mise.<env>.lock, mise.local.lock) names the URL and checksum mise installs each tool from.
     for (const path of [
       ".mise.toml",
       "mise.local.toml",
@@ -108,10 +109,18 @@ describe("effectiveModes", () => {
       ".tool-versions",
       "pkg/.mise.toml",
       "pkg/.tool-versions",
+      "pkg/mise.toml",
+      "a/b/MISE.toml",
+      "mise.lock",
+      "mise.ci.lock",
+      "mise.local.lock",
+      "mise.ci.local.lock",
+      "pkg/mise.lock",
+      ".config/mise/mise.lock",
     ]) {
       expect([path, effectiveModes(p, path)]).toEqual([path, ASK]);
     }
-    for (const path of ["src/mise.ts", "docs/mise.md", "misery.toml", ".config/other.toml", "mise-notes/a.md"]) expect([path, effectiveModes(p, path)]).toEqual([path, ALLOW]);
+    for (const path of ["src/mise.ts", "docs/mise.md", "misery.toml", ".config/other.toml", "mise-notes/a.md", "docs/mise.lockfile.md"]) expect([path, effectiveModes(p, path)]).toEqual([path, ALLOW]);
   });
 
   test("gitleaks's config and ignore file are protected at any depth: one could turn the secret scans off", () => {

@@ -35,7 +35,7 @@ protected_paths:
   "AGENTS.md":   { interactive: ask, unattended: deny, workers: deny }
   ".pi/**":      { interactive: deny, unattended: deny, workers: deny }
   # ... and the other agent instruction files at any depth (**/CLAUDE.md, **/.claude/** ...), .factory/**, .github/**, mise.toml and every
-  # other mise config file at any depth (**/.mise.toml, **/mise.local.toml, **/mise.*.toml, **/mise/**, **/.tool-versions ...), .agents/**,
+  # other mise config file and lockfile at any depth (**/mise.toml, **/.mise.toml, **/mise.*.toml, **/mise/**, **/.tool-versions, **/mise.lock ...), .agents/**,
   # .archon/**, .coderabbit.yaml, .coderabbit.yml, .coderabbit.config.ts, git's own files (**/.git/**, deny everywhere), and gitleaks's
   # **/.gitleaks.toml and **/.gitleaksignore (exactly spec §8.2)
 ```
