@@ -45,6 +45,9 @@ test("strict mode, and it refuses to run without root before it changes anything
 test("idempotent: each step checks before it acts", () => {
   expect(text).toContain(`id -u "$HAPI_USER" >/dev/null 2>&1`);
   expect(text).toContain("systemctl --user is-active --quiet docker");
+  // A re-run leaves hapi's docker context alone once it is rootless (stage b saw `docker context use` reprint it).
+  // The calls start their line, where hapi-home.test.ts checks what reaches sudo -i.
+  expect(text).toContain("if ! as_hapi docker context show 2>/dev/null | grep -qx rootless && as_hapi docker context inspect rootless >/dev/null 2>&1; then");
   expect(text).toContain(`as_hapi_sh '[ -d "$1/.git" ]' "$HAPI_CHECKOUT"`);
   expect(text).toMatch(/hapi_mise_version \| grep -q "\^\$MISE_VERSION "/);
   expect(text).toContain(`as_hapi_sh 'grep -qxF "$1" .bashrc 2>/dev/null || printf "%s\\n" "$1" >>.bashrc'`);

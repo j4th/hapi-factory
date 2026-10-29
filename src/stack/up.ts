@@ -186,7 +186,7 @@ const definedEnv = (env: Env): Record<string, string> => Object.fromEntries(Obje
  * ever in it. The forwarded arguments follow it on sudo's command line as argv entries of their own, and reach
  * mise as "$@", so no shell parses them on the way to mise: a `$`, a `$(...)`, a backtick, a quote or a space in
  * one arrives as it was typed. mise then quotes them into its task's `run` line for its own `sh -c`; that quoting
- * is mise's, checked by hand once and in stage b (H-146(e)), not by a unit test.
+ * is mise's, checked by hand once and live in stage b (H-146(e), 2026-10-28), not by a unit test.
  *
  * It sets up what hapi's login shell used to give `sudo -iu` (H-148), and nothing else:
  * - XDG_RUNTIME_DIR, defaulting to hapi's /run/user/<uid> when sudo has cleared it (lingering keeps that, H-004);

@@ -1,8 +1,8 @@
 /**
  * The strict audit commands the docs tell the operator to run. A strict run
  * without `--github-token-file` always fails: GitHub shows a ruleset's
- * `bypass_actors` only to a token with write access to it, which the Apps
- * never get, so the bypass parts of github.rulesets and github.app-perms
+ * `bypass_actors` only to a user with write access to it, which the Apps
+ * never have, so the bypass parts of github.rulesets and github.app-perms
  * skip, and `--strict` makes each skip a fail (docs/audit.md). So every
  * `mise run audit -- --strict ...` the docs show passes the operator's token
  * file. The plans and specs under docs/superpowers/ are history, not

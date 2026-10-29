@@ -11,7 +11,7 @@ These are spec §11.8's four kill switches, **fastest first**. The operator runs
 
 Two marks on this page:
 - **[verify]**: a provider's UI path that its docs didn't confirm on 2026-10-27. Check it the first time you open that dashboard (H-160), and fix this page.
-- **[verify in stage b]**: a command never run on the real host. Stage b runs each once (H-146(b) for switch 4, H-160 for the rest) and removes the mark.
+- **[verify in stage b]**: a command never run on the real host. H-160 runs each once on the real host and removes the mark. Switch 4's ran in stage b, on 2026-10-28 (H-146(b)), and its marks are gone.
 
 Where a command runs as the `hapi` user, it is `sudo -u hapi -H -- sh -c '<script>'` with the whole script in single quotes: your shell expands nothing in it, and hapi's own `sh` runs it. The runbooks use `sudo -iu hapi` only for fixed commands (`sudo -iu hapi docker info ...`), because a login shell (`-i`) re-parses the command's words and expands a `$` in them (sudo(8); H-148). So nothing from you, a variable or a path, ever goes through `sudo -i`.
 
@@ -91,7 +91,7 @@ sudo systemctl stop "user@$(id -u hapi).service"         # hapi's user manager a
 
 Here `$(id -u hapi)` is your own shell looking up hapi's uid for root's `systemctl`: nothing runs in a shell of hapi's.
 
-What to check in stage b: after the first command, as root, `ps -eo user,pid,cmd | grep -E 'rootlesskit|dockerd|containerd|slirp4netns|pasta'` shows nothing of hapi's (container processes run as hapi's subordinate uids, so don't look for them by user); after the second, `systemctl status "user@$(id -u hapi).service"` says inactive and the same `ps` is empty. Also check what comes back on the undo (below).
+What to check the first time you run it (H-160(c)): after the first command, `pgrep -a -u hapi -f 'rootlesskit|dockerd|containerd|slirp4netns|pasta'` prints nothing, and the CGroup tree in `systemctl status --no-pager -l "user@$(id -u hapi).service"` has no `docker-<id>.scope`, the scope each container runs in. pgrep never lists itself, and `-u hapi` leaves out a rootful Docker's own `dockerd` and `containerd`, which run as root (the stage b host has one). The containers run as hapi's subordinate uids, so a search by user misses them, but the cgroup tree holds them whatever uid they run as. After the second, the same `systemctl status` says inactive and the same `pgrep` prints nothing. Also check what comes back on the undo (below).
 
 - **Stops:** every container: Hermes, Archon with Pi, and the three proxies, so every agent action and all egress from the zones. 3c also stops hapi's other user services: later, the poller and harvester timers (Plan 03).
 - **Doesn't stop:** keys or tokens already copied out (switches 1 and 2), anything already on GitHub, or your own processes. The volumes (`hermes-data`, `archon-data`, `archon-home`) are kept, so the state is there to inspect, and `mise run up` starts from it. A dev-bypass stack (`HAPI_ALLOW_CURRENT_USER=1`) runs on your own Docker, not hapi's: stop it with `HAPI_ALLOW_CURRENT_USER=1 mise run down`; 3b and 3c don't touch it.
@@ -101,13 +101,13 @@ What to check in stage b: after the first command, as root, `ps -eo user,pid,cmd
   sudo -u hapi -H -- sh -c 'export XDG_RUNTIME_DIR="/run/user/$(id -u)" DOCKER_HOST="unix:///run/user/$(id -u)/docker.sock"; exec docker compose -p hapi ps --all'
   ```
 
-  After 3c, see what to check in stage b, above.
+  After 3c, see what to check, above.
 - **Undo:** `mise run up`. After the first 3c command only (linger is still on, so hapi's user manager is up), first `sudo systemctl --user -M hapi@ start docker.service`. After the full 3c stop, first `sudo loginctl enable-linger hapi`, which starts hapi's user manager, and with it hapi's Docker, again. Either way Docker then restarts each container that was running when it stopped (`restart: unless-stopped`, in `stack/compose.yaml`), so run 3b at once if you don't want them back yet **[verify in stage b]**.
 - **Takes effect:** seconds. Compose stops each container with SIGTERM, then SIGKILL after its stop timeout (10 seconds by default). 3c waits for systemd's stop timeout for each unit.
 
 ## 4. Firewall-drop the hapi user
 
-Under rootless Docker, the containers' traffic leaves the host from hapi's own network helper (slirp4netns or pasta), so a rule that matches hapi's uid catches all of it, the proxies' included **[verify in stage b]** (H-146(b)). Put the rule in a table of its own, so the undo is one command:
+Under rootless Docker, the containers' traffic leaves the host from hapi's own network helper, which runs as hapi, so a rule that matches hapi's uid catches all of it, the proxies' included. On the stage b host the helper was rootlesskit's own `gvisor-tap-vsock` (Docker 29.9.2, with neither slirp4netns nor pasta installed); another host may use one of those, and they run as hapi too. Put the rule in a table of its own, so the undo is one command:
 
 ```bash
 sudo nft add table inet hapi_kill
@@ -131,8 +131,8 @@ sudo ip6tables -I OUTPUT -m owner --uid-owner hapi -j REJECT
 
 - **Stops:** every packet hapi's processes send: the containers' egress through the proxies, and hapi's own `git`, `mise`, `curl` and image pulls (so `mise run up` and `mise install` as hapi fail while it is on). Loopback too; no stack service needs it, since none publishes a port.
 - **Doesn't stop:** the containers or the agents' local work (switch 3 does); keys or tokens already out; a stack on rootful Docker. Under the dev bypass the containers run on your own Docker, their traffic is forwarded rather than sent by a user, and no owner match sees it: use switch 3.
-- **Confirm:** `sudo nft list table inet hapi_kill` shows the rule, its counter rising while anything of hapi's tries to reach out. `sudo -u hapi -H -- curl -sS -m 5 -o /dev/null https://example.com` fails at once. For the containers: as hapi, `docker compose -p hapi logs egress-archon` shows the proxy's connections failing, and the counter rises as they do **[verify in stage b]** (H-146(b)).
-- **Undo:** `sudo nft delete table inet hapi_kill` (or the iptables lines with `-D`).
+- **Confirm:** `sudo nft list table inet hapi_kill` shows the rule, its counter rising while anything of hapi's tries to reach out. `sudo -u hapi -H -- curl -sS -m 5 -o /dev/null https://example.com` fails at once. For the containers: as hapi, `docker compose -p hapi logs egress-archon` shows the proxy's connections failing, and the counter rises as they do. In stage b (H-146(b)), `docker exec hapi-archon-1 curl -sS -m 10 -o /dev/null https://api.anthropic.com/` got `CONNECT tunnel failed, response 503`, the proxy logged `TCP_TUNNEL/503 0 CONNECT api.anthropic.com:443 - HIER_NONE/- -` (it took the request but couldn't reach out), and `nft list` afterwards showed 69 packets rejected.
+- **Undo:** `sudo nft delete table inet hapi_kill` (or the iptables lines with `-D`). In stage b, hapi's curl got its `200` again at once, and Hermes answered a DM, with no restart.
 - **Takes effect:** at once, from the next packet. The table isn't saved, so a reboot clears it; to make it survive one, add it to the host's nftables config as well.
 
 ## After a kill switch

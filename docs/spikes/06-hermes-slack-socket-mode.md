@@ -79,5 +79,5 @@ The gateway design stands as spec §9.1 has it: Socket Mode, so there is no inbo
 ## Consequences
 
 - **Plan 04** compiles `slack.unauthorized_dm_behavior: ignore` into the generated config, since the spike set it by hand. Without it, a stranger's DM gets a pairing prompt. Plan 04 also takes findings 1–5 (H-179).
-- **Stage b (H-080)** runs the same three checks on the real stack, as hapi on rootless Docker.
+- **Stage b (H-080)** runs the same three checks on the real stack, as hapi on rootless Docker. (2026-10-28: stage b checked only the operator's DM, answered; the stranger check on the real stack is H-179(a).)
 - **The threat model:** AC-12 stays documented, not verified live until stage b and Plan 04's setting. Its status records this run.
