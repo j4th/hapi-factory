@@ -254,11 +254,27 @@ describe.skipIf(gitleaks === undefined)("committing with the hooks", () => {
     expect(s.commit({ "f.txt": "f\n" }, "Add f").code).toBe(0);
   });
 
-  test('a "#" line of a -m message counts, since git keeps it; the diff under the scissors line doesn\'t', () => {
+  test('a "#" line of a -m message counts, since git keeps it, and so does what follows a scissors line', () => {
     const s = sandbox();
     expect(s.commit({ "h.txt": "h\n" }, `Add h\n# ${LOGIN}`).code).not.toBe(0);
-    const scissors = `Add i\n# ------------------------ >8 ------------------------\n+${LOGIN}\n`;
-    expect(s.commit({ "i.txt": "i\n" }, scissors).code).toBe(0);
+    // git cuts at a scissors line only with -v or --cleanup=scissors; -m keeps what follows it.
+    const scissors = `Add i\n# ------------------------ >8 ------------------------\nby ${LOGIN}\n`;
+    const r = s.commit({ "i.txt": "i\n" }, scissors);
+    expect(r.code).not.toBe(0);
+    expect(r.out).toContain("on line 3.");
+  });
+
+  test("below git's own cut block (`commit -v`), which git removes, nothing is checked", () => {
+    const s = sandbox();
+    // An editor that writes the message above git's template and a personal string at its very end, in the diff.
+    const editor = join(temp("hapi-hooks-editor-"), "editor");
+    writeFileSync(editor, `#!/bin/sh\n{ printf 'Add v\\n'; cat "$1"; printf '+${LOGIN}\\n'; } >"$1.new" && mv "$1.new" "$1"\n`);
+    chmodSync(editor, 0o755);
+    writeFileSync(join(s.root, "v.txt"), "v\n");
+    expect(s.git("add", "-A").code).toBe(0);
+    const r = s.git("-c", `core.editor=${editor}`, "commit", "-q", "-v");
+    expect([r.code, r.out]).toEqual([0, ""]);
+    expect(s.git("log", "-1", "--format=%B").out).toBe("Add v\n\n");
   });
 
   test("a secret in the staged changes stops the commit, and gitleaks's output is redacted", () => {
