@@ -6,15 +6,18 @@
  * - mise.toml: every [tools] entry is an exact version (MAJOR.MINOR.PATCH,
  *   optionally with a pre-release or build suffix): never `latest`, a range
  *   or a prefix such as `3.14`, which mise reads as "the newest 3.14.x".
+ *   And it is the checkout's only mise file: no other config, task dir or
+ *   `.tool-versions` that mise would load over it.
  * - stack/compose.yaml: every service's `image:` is pinned by digest, except
  *   a service built here, which must have `pull_policy: build` (so nothing
  *   pulls a registry image of that name) and whose Dockerfile is checked.
  * - each Dockerfile: every `FROM` and `COPY --from=` image by digest (an
  *   earlier stage's name is fine), and every package a `RUN` installs by
  *   name (apt-get, apt, apk, pip, uv, npm, bun, pnpm, yarn, go) at an exact
- *   version.
+ *   version, behind any BuildKit flag, wrapper or shell keyword.
  */
-import { readFile } from "node:fs/promises";
+import type { Dirent } from "node:fs";
+import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import YAML from "yaml";
 import { COMPOSE_FILE } from "../../stack/up";
@@ -152,11 +155,38 @@ export function pipesDownloadIntoShell(command: string): boolean {
   return PIPE_TO_SHELL.test(command.replace(/"[^"]*"|'[^']*'/g, '""')) || SUBSTITUTED_DOWNLOAD.test(command);
 }
 
+/**
+ * The checkout's mise files other than the root mise.toml, as `.config/mise/` or `.tool-versions`, a directory with a
+ * trailing slash. mise loads every one it finds there (`.mise.toml`, `mise.local.toml`, `mise.<env>.toml`,
+ * `mise/config.toml`, `.config/mise.toml`, `.config/mise/conf.d/*.toml`, the task dirs `mise-tasks/`, `.mise/tasks/`
+ * and the rest, `.tool-versions`), and one can override mise.toml's tools and tasks. It fails closed: any entry at
+ * the root or in `.config/` whose name starts with `mise` or `.mise` counts.
+ */
+async function otherMiseFiles(root: string): Promise<string[]> {
+  const entries = async (dir: string) => {
+    try {
+      return await readdir(join(root, dir), { withFileTypes: true });
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT" || (e as NodeJS.ErrnoException).code === "ENOTDIR") return [];
+      throw e;
+    }
+  };
+  const named = (dir: string, e: Dirent) => `${dir}${e.name}${e.isDirectory() ? "/" : ""}`;
+  return [
+    ...(await entries(".")).filter((e) => (/^\.?mise/.test(e.name) && e.name !== "mise.toml") || e.name === ".tool-versions").map((e) => named("", e)),
+    ...(await entries(".config")).filter((e) => /^\.?mise/.test(e.name)).map((e) => named(".config/", e)),
+  ].sort();
+}
+
 /** pins.versions */
 export async function pinsVersions(run: AuditRun): Promise<CheckResult[]> {
   const id = "pins.versions";
   const root = run.ctx.root;
   const problems: string[] = [];
+
+  for (const file of await otherMiseFiles(root)) {
+    problems.push(`${file}: mise loads it as well as mise.toml, and it can override mise.toml's tools and tasks, but this check reads only mise.toml: remove it`);
+  }
 
   const mise = Bun.TOML.parse(await readFile(join(root, "mise.toml"), "utf8")) as { tools?: Record<string, unknown> };
   const tools = Object.entries(mise.tools ?? {});

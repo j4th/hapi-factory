@@ -6,7 +6,7 @@
  * break one.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { runAudit } from "../../src/audit/index";
 import { cleanup, cleanWorld, only, rootCopy } from "./helpers";
@@ -47,6 +47,47 @@ describe("pins.versions", () => {
       expect([tool, r.status]).toEqual([tool, "fail"]);
       expect(r.detail).toContain(`mise.toml: ${tool} = "${value}" is not an exact version`);
     }
+  });
+
+  test("a mise config, task dir or .tool-versions besides the root mise.toml fails, naming it: mise loads it over mise.toml, the one file read here", async () => {
+    // [file written, entry named]
+    const cases: [string, string][] = [
+      [".mise.toml", ".mise.toml"],
+      ["mise.local.toml", "mise.local.toml"],
+      [".mise.local.toml", ".mise.local.toml"],
+      ["mise.ci.toml", "mise.ci.toml"],
+      [".mise.ci.toml", ".mise.ci.toml"],
+      ["mise.ci.local.toml", "mise.ci.local.toml"],
+      ["mise/config.toml", "mise/"],
+      ["mise/conf.d/extra.toml", "mise/"],
+      [".mise/config.toml", ".mise/"],
+      ["mise-tasks/build", "mise-tasks/"],
+      [".mise-tasks/build", ".mise-tasks/"],
+      ["mise/tasks/build", "mise/"],
+      [".mise/tasks/build", ".mise/"],
+      [".config/mise.toml", ".config/mise.toml"],
+      [".config/mise.local.toml", ".config/mise.local.toml"],
+      [".config/mise/config.toml", ".config/mise/"],
+      [".config/mise/conf.d/extra.toml", ".config/mise/"],
+      [".config/mise/tasks/build", ".config/mise/"],
+      [".tool-versions", ".tool-versions"],
+      // Anything else named like one fails too, rather than guessing which of them mise reads.
+      [".miserc.toml", ".miserc.toml"],
+    ];
+    for (const [file, named] of cases) {
+      const r = await pins((root) => {
+        mkdirSync(join(root, file, ".."), { recursive: true });
+        writeFileSync(join(root, file), "");
+      });
+      expect([file, r.status]).toEqual([file, "fail"]);
+      expect([file, r.detail]).toEqual([file, expect.stringContaining(`${named}: mise loads it as well as mise.toml`)]);
+    }
+    // Other files under .config are not mise's.
+    const r = await pins((root) => {
+      mkdirSync(join(root, ".config", "git"), { recursive: true });
+      writeFileSync(join(root, ".config", "git", "config"), "");
+    });
+    expect(r.status).toBe("pass");
   });
 
   test("a mise tool in table form is read by its version", async () => {
