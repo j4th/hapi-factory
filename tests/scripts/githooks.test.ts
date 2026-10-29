@@ -10,7 +10,7 @@
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { randomBytes } from "node:crypto";
-import { chmodSync, cpSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -142,6 +142,34 @@ describe.skipIf(gitleaks === undefined)("committing with the hooks", () => {
     const r = s.commit({ [`notes/${LOGIN}.md`]: "notes\n" });
     expect(r.code).not.toBe(0);
     expect(r.out).toContain(`in the path notes/${LOGIN}.md`);
+  });
+
+  test("a personal string in a binary file stops the commit (a PDF's or an image's metadata)", () => {
+    const s = sandbox();
+    const r = s.commit({ "scan.pdf": `%PDF-1.7\n\u0000\u0001\u0002\n/Author\u0000${NAME}\u0000\n` });
+    expect(r.code).not.toBe(0);
+    expect(r.out).toContain("at scan.pdf:3");
+    expect(r.out).not.toContain("null byte"); // bash's warning when it drops a NUL
+    expect(r.out.toLowerCase()).not.toContain(NAME.toLowerCase());
+  });
+
+  test("a personal string in a file that replaces a symlink stops the commit (a type change)", () => {
+    const s = sandbox();
+    symlinkSync("README.md", join(s.root, "link.md"));
+    expect(s.commit({ "README.md": "# A project\n" }).code).toBe(0);
+    rmSync(join(s.root, "link.md"));
+    const r = s.commit({ "link.md": `By ${LOGIN}.\n` }, "replace the link");
+    expect(r.code).not.toBe(0);
+    expect(r.out).toContain("at link.md:1");
+  });
+
+  test("a personal string in a path git has to quote (a tab or newline in the name) stops the commit", () => {
+    for (const sep of ["\t", "\n"]) {
+      const s = sandbox();
+      const r = s.commit({ [`notes${sep}${LOGIN}.md`]: "notes\n" });
+      expect([JSON.stringify(sep), r.code === 0]).toEqual([JSON.stringify(sep), false]);
+      expect(r.out).toContain(`${LOGIN}.md`);
+    }
   });
 
   test('an added line that starts with "++ " is still checked (it reads "+++ " in the diff)', () => {
