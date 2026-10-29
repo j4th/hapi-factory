@@ -34,7 +34,10 @@ The schemas are in `policy/schemas/`, named `<schema>.schema.json`. `policy-defs
 protected_paths:
   "AGENTS.md":   { interactive: ask, unattended: deny, workers: deny }
   ".pi/**":      { interactive: deny, unattended: deny, workers: deny }
-  # ... and the other agent instruction files at any depth (**/CLAUDE.md, **/.claude/** ...), .factory/**, .github/**, mise.toml, .agents/**, .archon/**, .coderabbit.yaml, .coderabbit.yml, .coderabbit.config.ts (exactly spec §8.2)
+  # ... and the other agent instruction files at any depth (**/CLAUDE.md, **/.claude/** ...), .factory/**, .github/**, mise.toml and every
+  # other mise config file at any depth (**/.mise.toml, **/mise.local.toml, **/mise.*.toml, **/mise/**, **/.tool-versions ...), .agents/**,
+  # .archon/**, .coderabbit.yaml, .coderabbit.yml, .coderabbit.config.ts, git's own files (**/.git/**, deny everywhere), and gitleaks's
+  # **/.gitleaks.toml and **/.gitleaksignore (exactly spec §8.2)
 ```
 
 Keys are globs relative to a repo's root. Each entry sets all three modes:
@@ -542,7 +545,7 @@ The schema is `policy/schemas/work-order.schema.json`. **Every field is required
 | `trace.traceparent` | A W3C traceparent matching `^00-[0-9a-f]{32}-[0-9a-f]{16}-0[01]$` |
 | `sources` | A list of repo files the order rests on (it may be empty) |
 
-**Paths** in `files` and `sources` must be relative to the repo root. An absolute path, a `..` segment or a backslash is rejected, so a declared scope can't point outside the repo.
+**Paths** in `files` and `sources` must be relative to the repo root. An absolute path, a `..` segment, the repo root itself (`.`, `./`, or any path of only `.` segments), a backslash or a control character (U+0000–U+001F and U+007F–U+009F, as `src/policy/paths.ts` defines it) is rejected, so a declared scope can't point outside the repo or name all of it, and the schema refuses what `effectiveModes` refuses (the `repoPath` definition).
 
 `id` and `traceparent` are written by deterministic code (Hermes's `new-work-order` tool), never by the model. The same schema check runs in three places:
 - in Hermes, before the planning PR is opened;
