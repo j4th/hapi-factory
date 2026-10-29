@@ -84,6 +84,36 @@ describe("effectiveModes", () => {
     expect(effectiveModes(p, ".github/workflows/ci.yml")).toEqual(ASK);
   });
 
+  test("every other file mise reads config or tasks from is protected like mise.toml, at any depth", () => {
+    // From the pinned mise's `mise config ls` and task dirs; a later file overrides mise.toml's tasks.
+    for (const path of [
+      ".mise.toml",
+      "mise.local.toml",
+      ".mise.local.toml",
+      "mise.ci.toml",
+      ".mise.ci.toml",
+      "mise/config.toml",
+      "mise/conf.d/a.toml",
+      "mise/tasks/test",
+      ".mise/config.toml",
+      ".mise/tasks/test",
+      ".config/mise.toml",
+      ".config/mise.local.toml",
+      ".config/mise.ci.toml",
+      ".config/mise/config.toml",
+      ".config/mise/conf.d/a.toml",
+      ".config/mise/tasks/test",
+      "mise-tasks/test",
+      ".mise-tasks/test",
+      ".tool-versions",
+      "pkg/.mise.toml",
+      "pkg/.tool-versions",
+    ]) {
+      expect([path, effectiveModes(p, path)]).toEqual([path, ASK]);
+    }
+    for (const path of ["src/mise.ts", "docs/mise.md", "misery.toml", ".config/other.toml", "mise-notes/a.md"]) expect([path, effectiveModes(p, path)]).toEqual([path, ALLOW]);
+  });
+
   test("the strictest mode across every matching glob wins, per session, whatever the order", () => {
     const broad: PathModes = { interactive: "allow", unattended: "deny", workers: "ask" };
     const narrow: PathModes = { interactive: "ask", unattended: "allow", workers: "allow" };

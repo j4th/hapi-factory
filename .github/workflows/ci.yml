@@ -38,6 +38,22 @@ jobs:
         with:
           version: 2026.10.9
 
+      # mise reads config and tasks from more files than mise.toml (.mise.toml, mise.local.toml,
+      # .config/mise.toml, mise/config.toml, .tool-versions, mise-tasks/, ...), and a later file
+      # overrides mise.toml, so a commit that adds one could change what the next step runs. Only
+      # the root mise.toml may configure mise here (policy/protected_paths.yaml protects the rest).
+      - name: Only the root mise.toml configures mise
+        run: |
+          configs="$(mise config ls --json)"
+          tasks="$(mise tasks ls --json --hidden)"
+          extra="$(jq -rn --arg root "$PWD/" --argjson configs "$configs" --argjson tasks "$tasks" \
+            '[$configs[].path, $tasks[].source] | unique[] | select(type == "string" and startswith($root) and . != $root + "mise.toml")')"
+          if [[ -n "$extra" ]]; then
+            echo "::error::mise config or tasks outside the root mise.toml. Move what is needed into mise.toml and remove:"
+            printf '%s\n' "$extra"
+            exit 1
+          fi
+
       # `mise run lint` first runs `setup` (bun install --frozen-lockfile), so a stale bun.lock fails here.
       - name: Install tools, type-check, unit tests
         run: mise install && mise run lint && mise run test

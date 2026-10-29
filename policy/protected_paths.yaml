@@ -45,6 +45,23 @@ protected_paths:
   ".factory/**": { interactive: ask, unattended: deny, workers: deny }
   ".github/**":  { interactive: ask, unattended: deny, workers: deny }
   "mise.toml":   { interactive: ask, unattended: deny, workers: deny }
+  # Every other file mise reads config or tasks from (`mise config ls`), at any
+  # depth, with mise.toml's modes. mise reads them all, and a later one overrides
+  # mise.toml, so a .mise.toml could redefine the `test` task the gates run. CI
+  # fails when any of them is present (.github/workflows/ci.yml).
+  "**/.mise.toml":          { interactive: ask, unattended: deny, workers: deny }
+  "**/mise.local.toml":     { interactive: ask, unattended: deny, workers: deny }
+  "**/.mise.local.toml":    { interactive: ask, unattended: deny, workers: deny }
+  "**/mise.*.toml":         { interactive: ask, unattended: deny, workers: deny }
+  "**/.mise.*.toml":        { interactive: ask, unattended: deny, workers: deny }
+  "**/mise/**":             { interactive: ask, unattended: deny, workers: deny }
+  "**/.mise/**":            { interactive: ask, unattended: deny, workers: deny }
+  "**/.config/mise.toml":   { interactive: ask, unattended: deny, workers: deny }
+  "**/.config/mise.*.toml": { interactive: ask, unattended: deny, workers: deny }
+  "**/.config/mise/**":     { interactive: ask, unattended: deny, workers: deny }
+  "**/mise-tasks/**":       { interactive: ask, unattended: deny, workers: deny }
+  "**/.mise-tasks/**":      { interactive: ask, unattended: deny, workers: deny }
+  "**/.tool-versions":      { interactive: ask, unattended: deny, workers: deny }
   ".pi/**":      { interactive: deny, unattended: deny, workers: deny }
   ".agents/**":  { interactive: ask, unattended: deny, workers: deny }
   ".archon/**":  { interactive: deny, unattended: deny, workers: deny }
