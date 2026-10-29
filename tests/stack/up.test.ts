@@ -401,6 +401,17 @@ describe("hapi stack down", () => {
     expect(reexecScript("down")).toBe(UP_SCRIPT.replace("run up --", "run down --"));
   });
 
+  test("with HAPI_ALLOW_CURRENT_USER=1: stops the dev-bypass stack on the caller's own Docker, and says hapi's is not stopped", async () => {
+    const { err } = capture();
+    const f = fakes({ user: "dev", env: { HOME: "/home/dev", HAPI_ALLOW_CURRENT_USER: "1" } });
+    expect(await stackDown([], f.deps)).toBe(0);
+    expect(f.calls.map((c) => c.cmd)).toEqual([["docker", "compose", "-p", "hapi", "down"]]);
+    expect(err).toEqual([
+      "hapi stack down: warning: HAPI_ALLOW_CURRENT_USER=1: stopping the dev-bypass stack on dev's own Docker, not hapi's. " +
+        "This doesn't touch hapi's stack: stop that with `mise run down` in a shell without HAPI_ALLOW_CURRENT_USER, or with kill switch 3b (docs/runbooks/kill-switches.md#3b-without-a-checkout-or-mise).",
+    ]);
+  });
+
   test("down takes no arguments", async () => {
     capture();
     const f = fakes();

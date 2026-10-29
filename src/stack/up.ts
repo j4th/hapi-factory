@@ -35,7 +35,9 @@
  *
  * `down` is `docker compose -p hapi down`, by project name, so it needs no
  * compose file, build/ or XDG_RUNTIME_DIR: it is kill switch 3 (spec §11.8)
- * and must work whatever state the checkout is in. Volumes are kept.
+ * and must work whatever state the checkout is in. Volumes are kept. With
+ * HAPI_ALLOW_CURRENT_USER=1 it stops the dev-bypass stack on the caller's own
+ * Docker instead, and warns that hapi's is untouched.
  */
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -290,6 +292,13 @@ export async function stackDown(args: string[], deps: StackDeps = {}): Promise<n
   const run = deps.run ?? runCommand;
   const who = currentUserOverride(env, deps.user);
   if (!who.isHapi && !who.override) return reexec("down", args, run, env, who.user);
+  if (who.override) {
+    // A shell that exported the dev bypass would otherwise stop nothing of hapi's and exit 0, in silence, on the kill-switch path.
+    console.error(
+      `hapi stack down: warning: HAPI_ALLOW_CURRENT_USER=1: stopping the dev-bypass stack on ${who.user}'s own Docker, not ${HAPI_USER}'s. ` +
+        `This doesn't touch ${HAPI_USER}'s stack: stop that with \`mise run down\` in a shell without HAPI_ALLOW_CURRENT_USER, or with kill switch 3b (docs/runbooks/kill-switches.md#3b-without-a-checkout-or-mise).`,
+    );
+  }
   const r = await run(["docker", "compose", "-p", PROJECT, "down"], { env: definedEnv(env), inherit: true });
   if (r.code !== 0) throw new Error(`docker compose -p ${PROJECT} down failed (exit ${r.code})`);
   return 0;
