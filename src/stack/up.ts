@@ -34,10 +34,12 @@
  * Nothing starts unless steps 1-5 pass.
  *
  * `down` is `docker compose -p hapi down`, by project name, so it needs no
- * compose file, build/ or XDG_RUNTIME_DIR: it is kill switch 3 (spec §11.8)
- * and must work whatever state the checkout is in. Volumes are kept. With
- * HAPI_ALLOW_CURRENT_USER=1 it stops the dev-bypass stack on the caller's own
- * Docker instead, and warns that hapi's is untouched.
+ * compose file, build/ or XDG_RUNTIME_DIR: it is kill switch 3 (spec §11.8).
+ * It does load the whole CLI (`bun run src/cli.ts`), so it needs a checkout
+ * that loads (src/ parses, node_modules installed) and a working mise;
+ * without them, use kill switch 3b (docs/runbooks/kill-switches.md). Volumes
+ * are kept. With HAPI_ALLOW_CURRENT_USER=1 it stops the dev-bypass stack on
+ * the caller's own Docker instead, and warns that hapi's is untouched.
  */
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
