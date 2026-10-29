@@ -13,7 +13,8 @@
 # point its `origin` at GitHub later.
 #
 # What it does, each step skipped when already done:
-#   1. creates the user hapi, with 1,048,576 subordinate UIDs and GIDs;
+#   1. creates the user hapi, with 1,048,576 subordinate UIDs and GIDs, and stops
+#      if a hapi that exists can become root (a group such as docker, a sudo rule);
 #   2. installs uidmap and the Docker rootless extras if they are missing (apt);
 #   3. turns on lingering for hapi, so its systemd user manager, its
 #      /run/user/<uid> (XDG_RUNTIME_DIR) and its Docker survive logout and reboot;
@@ -85,9 +86,41 @@ ensure_user() {
       -K SUB_UID_COUNT="$SUBID_COUNT" -K SUB_GID_COUNT="$SUBID_COUNT" "$HAPI_USER"
     log "created user $HAPI_USER"
   fi
-  if id -nG "$HAPI_USER" | tr ' ' '\n' | grep -qx docker; then
-    die "$HAPI_USER is in the docker group, which is root on this host's rootful Docker: remove it (gpasswd -d $HAPI_USER docker) and run this again"
+  refuse_root_equivalent
+}
+
+# Groups whose members are root on this host, or can become it: docker (the rootful
+# daemon), sudo, admin and wheel (sudo's usual groups), lxd and incus-admin (their
+# daemons run privileged containers), libvirt (it starts VMs with any host disk) and
+# disk (raw block devices).
+readonly ROOT_GROUPS=(docker sudo admin wheel lxd incus-admin libvirt disk)
+
+# hapi is less trusted than root (a rootless container escape lands as hapi), so stop
+# if a hapi made by an earlier run or by hand is in one of ROOT_GROUPS or has any sudo
+# rule, naming what was found. Root can list another user's sudo rules; LC_ALL=C keeps
+# sudo's messages in English for the match, and an answer it can't read stops it too.
+refuse_root_equivalent() {
+  local groups group root_group found=() fix="" rules listed
+  read -ra groups <<<"$(id -nG "$HAPI_USER")"
+  for group in "${groups[@]}"; do
+    for root_group in "${ROOT_GROUPS[@]}"; do
+      if [[ "$group" == "$root_group" ]]; then
+        found+=("$group")
+        fix+="${fix:+ && }gpasswd -d $HAPI_USER $group"
+      fi
+    done
+  done
+  if [[ ${#found[@]} -gt 0 ]]; then
+    die "$HAPI_USER is in ${found[*]}, which can become root on this host: remove it ($fix) and run this again"
   fi
+  rules=$(LC_ALL=C sudo -n -l -U "$HAPI_USER" 2>&1) || true
+  if grep -q "^User $HAPI_USER may run the following commands" <<<"$rules"; then
+    # The rules sudo lists under that line, on one line.
+    listed="$(sed -n '/may run the following commands/,$p' <<<"$rules" | tail -n +2 | sed 's/^ *//' | paste -sd ';' -)"
+    die "$HAPI_USER has sudo rules, so it can become root ($listed): remove them with visudo, from /etc/sudoers, /etc/sudoers.d or the group that grants them, and run this again"
+  fi
+  grep -q "^User $HAPI_USER is not allowed to run sudo" <<<"$rules" ||
+    die "could not read $HAPI_USER's sudo rules (sudo -n -l -U $HAPI_USER said: $(head -n 1 <<<"$rules")): check them by hand and run this again"
 }
 
 # The widest subordinate range hapi has in /etc/subuid or /etc/subgid.

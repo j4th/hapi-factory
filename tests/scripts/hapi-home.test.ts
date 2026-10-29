@@ -92,16 +92,19 @@ describe("the scripts' root-side code never acts on hapi's home", () => {
     }
   });
 
-  test("host-setup.sh: every sudo runs as hapi, and nothing it gives sudo -i holds a `$` (sudo -i leaves `$` unescaped for hapi's login shell)", () => {
+  test("host-setup.sh: every sudo runs as hapi or only lists hapi's sudo rules, and nothing it gives sudo -i holds a `$` (sudo -i leaves `$` unescaped for hapi's login shell)", () => {
     // The commands, not the text: the next steps' here-document and the double-quoted messages dropped.
     const code = rootCode(HOST_SETUP)
       .join("\n")
       .replace(/<<EOF\n[\s\S]*?\nEOF\n/g, "<<EOF\n")
       .split("\n")
       .map((l) => l.replace(/"[^"\n]*"/g, '""'));
-    const sudos = code.filter((l) => /\bsudo\b/.test(l));
-    expect(sudos.length).toBe(2);
-    for (const l of sudos) expect([l, /sudo -u "" -H -- sh -c "|sudo -iu "" -- env /.test(l)]).toEqual([l, true]);
+    // sudo as a command, with its options ("sudo" alone is also the name of a group, in ROOT_GROUPS).
+    const sudos = code.filter((l) => /\bsudo -/.test(l));
+    expect(sudos.length).toBe(3);
+    // The listing (sudo -l -U) runs nothing: it is how root reads hapi's rules (refuse_root_equivalent).
+    for (const l of sudos) expect([l, /sudo -u "" -H -- sh -c "|sudo -iu "" -- env |\$\(LC_ALL=C sudo -n -l -U "" 2>&1\)/.test(l)]).toEqual([l, true]);
+    expect(code.filter((l) => /\bsudo\b(?! -)/.test(l) && !/^readonly ROOT_GROUPS=/.test(l))).toEqual([]);
     for (const l of code.filter((l) => /^\s*(if\s+)?(! )?as_hapi\s/.test(l))) expect([l, l.replace(/^\s*(if\s+)?(! )?as_hapi\s/, "").includes("$")]).toEqual([l, false]);
   });
 
