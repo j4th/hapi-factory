@@ -4,8 +4,11 @@
  *
  * - `runtimeDir`: `$XDG_RUNTIME_DIR/hapi`, the only place hapi writes a
  *   resolved secret. XDG_RUNTIME_DIR is the user's own tmpfs (systemd makes it
- *   at login, mode 0700), so nothing survives a reboot. There is no fallback:
- *   never /tmp, never the repo.
+ *   at login, mode 0700), so the env files don't survive a reboot. There is
+ *   no fallback: never /tmp, never the repo. Docker keeps a copy, though:
+ *   each zone container's env sits in its container config on hapi's disk
+ *   (under hapi's rootless data root) for as long as the container exists,
+ *   reboots included, until `mise run down` removes it (H-189).
  * - `secureDir`: the directory is ours, a real directory (not a symlink) and
  *   mode 0700, under a runtime root (XDG_RUNTIME_DIR) that is itself ours and
  *   exactly 0700, as systemd makes it.
