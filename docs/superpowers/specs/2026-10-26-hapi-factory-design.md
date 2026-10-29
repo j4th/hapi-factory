@@ -10,6 +10,7 @@ Tags used throughout:
 - **[user]** — decided by the operator in the brainstorm.
 - **[call]** — the designer's call. Open to override; the builder may refine within the stated intent.
 - **[verify]** — a fact or behavior the builder must confirm early, usually with a throwaway spike, before depending on it.
+- **As built (noted <date>, H-NNN)** — a quoted note added after the build, beside text that no longer matches what was built. It says what was built and where to see it; the text it follows is kept as written.
 
 ---
 
@@ -151,6 +152,8 @@ You ── chat / TUI ──► HERMES  (container, user `hapi`)
 | Hermes container | `hapi` | A capped Anthropic key (Hermes workspace), search API key, chat gateway token, a 1-hour `hapi-planner` GitHub token minted per session | Merge rights, Archon or Pi keys, write access to protected branches |
 | Archon container | `hapi` | Capped model keys (factory workspace), read-only local git mirror, run DB | **Any forge write credential.** No egress to the forge. |
 | o11y (optional) | A separate Unix user | Collector and trace store | Anything the agents can write to or delete |
+
+> **As built (noted 2026-10-29, H-083):** the Hermes container row: it holds no search API key. The search keys are in the research zone, as §9.1 #4 and §10.1 say (docs/secrets.md, the zone table).
 
 Two facts drive this layout:
 1. Archon approvals can be answered by any local process, including a Pi step via `ARCHON_CLI_COMMAND`.
@@ -333,6 +336,8 @@ The onboarding PR must also **remove or harden any CI workflow that runs an AI a
 | `roles.yaml` + `rosters/*.yaml` | Archon tiers and aliases; Hermes model, auxiliary and delegation settings (§12) |
 | `flags.yaml` | Metrics and observability switches and thresholds (§13) |
 
+> **As built (noted 2026-10-29, H-083):** the `protected_paths.yaml` row: Hermes's `security.protected_instruction_files` is only an on/off switch (`true`), as §9.1's note says. The globs that end in a file name compile into `security.protected_instruction_extra_patterns`, as basenames matched in any directory and in any case. A directory glob (one ending in `**`) can't be written as a basename, so the generated config only names it in a comment, for hapi-path-guard to enforce (`src/generate/hermes.ts`, docs/generated-configs.md; H-094).
+
 ### 8.2 Protected paths, per mode [user]
 
 ```yaml
@@ -405,6 +410,8 @@ protected_paths:
 
 **Install:** pinned stable tag, whole process in a container (Hermes ships Docker and Compose), run as `hapi`. Install through mise if feasible, otherwise mise wraps the official installer [verify].
 
+> **As built (noted 2026-10-29, H-083):** Hermes isn't installed through mise. It is the official image at the stable tag v0.22.5, pinned by digest (`stack/hermes/Dockerfile`; docs/runbooks/stack.md, Pinned images), which `mise run up` builds through Compose and runs under hapi's rootless Docker, as the image's own hermes user (`stack/compose.yaml`).
+
 **Defaults to flip on day one** [call; from report §Hermes]:
 
 | Setting | Value |
@@ -422,6 +429,8 @@ protected_paths:
 | `cache_ttl` | `auto` (opt-in) |
 | `container_persistent` | `false` for sessions touching external input |
 | Gateway | **Slack**, Socket Mode, so there's no inbound endpoint [user leaning; call]. Allowlist the operator's Slack user ID only. Collaborators are added later by ID. |
+
+> **As built (noted 2026-10-29, H-083):** three rows use shorthand for Hermes v0.22.5's keys (`src/generate/hermes.ts`, docs/generated-configs.md). `cache_ttl` is `prompt_caching.cache_ttl: auto`. `container_persistent` is `terminal.container_persistent: false`, which has no effect with the `local` terminal backend the Hermes container runs (`stack/compose.yaml`). `security.protected_instruction_files` is an on/off switch (`true`), and the protected file names go in `security.protected_instruction_extra_patterns`, as fnmatch patterns matched on the basename.
 
 **Chat** [user leaning to Slack over Telegram, for collaborators; call on details]:
 - A dedicated free Slack workspace or private channels:
@@ -446,6 +455,7 @@ protected_paths:
 
 **Build** [call]:
 1. **`hapi-path-guard`**, a Python plugin. Prompts on glob matches in interactive sessions and blocks in unattended ones (via `ctx.current_cron_execution()` and `ctx.session_surface()`); blocks under yolo. It must also cover shell writes, since the core gate misses them (#143266; seen in spike T9, docs/spikes/02-hermes-path-guard.md). Spike T9 also found that returning `approve` already gets the interactive/unattended split from Hermes's approval modes.
+   > **As built (noted 2026-10-29, H-083):** spike T9 found that the guard can't cover shell writes. It sees only the file tools' path arguments, and a `terminal` call carries a command, so `echo hi > AGENTS.md` wrote past both gates unasked. hapi-cmd-allow (#2) closes that hole by refusing shell redirection outside quotes (H-095), so it is required, not optional (docs/spikes/02-hermes-path-guard.md, finding 3 and Decision). T9 also found that `write_file` and `patch` edit a skill's files with `skills.write_approval` on, so the guard covers the skills directories too (H-093).
 2. **`hapi-cmd-allow`**, a default-deny `pre_tool_call` shell hook with `fail_closed: true`.
 3. **`hapi-planning` skill**: brainstorm → research brief → design and threat model → work orders → planning PR. It uses `new-work-order` (deterministic id and `traceparent`, schema validation).
 4. **`hapi-research` profile**, quarantined in **its own container**: web tools only, no terminal, no repo write, no secrets except spend-capped, search-only keys (§10.1). It returns a schema-validated brief, and the **`hapi-research-note` skill** writes `docs/research/<topic>.md` with retrieval dates, source hashes and a `recheck_by` date.
@@ -453,11 +463,14 @@ protected_paths:
 6. **`hapi-status` tool**, fixed-argv: `archon workflow status/list/cancel/resume`.
    - `resume` re-drives a run that a merge already approved, with no new inputs. It's also available to the operator as `mise run factory:resume -- <run-id>` [call].
    - Hermes **cannot answer Archon approvals or start new factory runs** in v1. New runs start only from merges.
+   > **As built (noted 2026-10-29, H-083):** the Hermes and Archon containers have no network route to each other (§11.3's note; threat model B3, DS-1), and Archon's server listens on 127.0.0.1 inside its own container (`stack/compose.yaml`). So a tool in the Hermes container can neither reach Archon's API nor run Archon's CLI against its run DB, and how `hapi-status` gets run state is still open (Plan 04, H-198). The command policy's rule for it allows only `hapi status [<run-id>]`, with no flags (`policy/commands.yaml`, docs/policy.md).
 7. **`hapi-gh-token` helper**: mints a 1-hour `hapi-planner` GitHub App installation token scoped to one repo, outside the agent. Overrides the bundled skill's advice to use a classic PAT.
 
 ### 9.2 Archon (run engine)
 
 **Install:** pinned release binary and provider executables, with checksums recorded by us. Runs in a container as `hapi`. Re-run `archon provider add` after each upgrade.
+
+> **As built (noted 2026-10-29, H-083):** Archon is the official image at 0.12.1, pinned by tag and digest, with the workers' toolchains baked in (`stack/archon/Dockerfile`; docs/runbooks/stack.md, Pinned images), not a release binary. The image runs Archon from source, where Pi is an in-process provider on the Pi SDK Archon embeds, so there is no `archon provider add` to re-run. The build checks that the embedded SDK is 1.3.0 instead.
 
 **Hardening** [call; verified options]:
 - `HOST=127.0.0.1`
@@ -487,6 +500,8 @@ protected_paths:
 
 **Budgets:** `budget: {max_spend_usd, max_work_units}` sits on `factory-task`, which has no loops. A dispatcher with `fan_out` can't carry a budget, so each child carries its own.
 
+> **As built (noted 2026-10-29, H-083):** spike T10 found the budget loads and stops a run, but its ceiling is soft by one node. Archon admits each AI attempt while spend is below `max_spend_usd`, so the attempt that crosses it finishes, and then every remaining node is refused, bash ones too. By Archon's source, a spend-limited run is also refused once any node's cost is unknown, such as after a provider error. So `max_spend_usd` bounds the number of nodes, not dollars: hapi-guard's `budgets.run_usd` is the in-node cap (H-087), and the providers' caps are the hard one (docs/spikes/03-archon-budget-trigger-env.md, finding 1; H-183(a)).
+
 **Not used in v1:** the SDLC pack, the Archon merge queue, Archon approval nodes as security controls, the Slack plugin (optional later).
 
 ### 9.3 Pi (worker)
@@ -496,10 +511,12 @@ protected_paths:
   - `PI_OFFLINE=1`. Blocks the repo-settings package auto-install, which otherwise runs even with extensions off. **Critical.**
   - `PI_TELEMETRY=0`
   - A `PI_CODING_AGENT_DIR` whose `models.json` (with `maxTokens` around 64K) nothing in the container can change. Spike T8 found Pi must write its own cache and sessions there, so the directory is a tmpfs with hapi's files bound read-only into it (docs/spikes/01-pi-under-archon.md).
+    > **As built (noted 2026-10-29, H-083):** not yet. Plan 01's `stack/compose.yaml` still mounts the whole directory read-only (`../build/pi:/opt/hapi/pi-agent:ro`), which spike T8 found fails every Pi node: Pi can't write `models-store.json` at Archon's credential preflight (`EROFS`). Plan 02 makes it the tmpfs (H-181(a)).
   - `hapi-guard` as the only user-level extension.
 - **Repo `.pi/` can't be excluded under Archon today.** Pi trusts every project under the SDK, and Archon only toggles extensions all-on or all-off. So `prepare` strips `.pi/` and `.agents/`, and hapi-guard blocks writes to them.
   - Longer term: upstream an Archon PR to honor Pi's native project trust [call; good showcase contribution].
   - **[verify]:** the user-level extension loads with the repo dirs stripped, and `PI_OFFLINE=1` blocks the install path.
+    > **As built (noted 2026-10-29, H-083):** settled by spike T8 (docs/spikes/01-pi-under-archon.md). With `.pi/` and `.agents/` stripped, a user-level extension loaded, blocked a write to `AGENTS.md`, and failed its node when it threw. In a control run with the repo's `.pi/` left in place, `PI_OFFLINE=1` alone kept Pi from installing the package its `.pi/settings.json` listed. That run also showed that Archon trusts a repo's `.pi/` outright: the repo's extension ran in the Pi worker, so the strip is the only thing that stops it. The strip node is Plan 03's (H-161), and hapi-guard's backstop check for the two dirs is Plan 02's (H-181(d)).
 - **`hapi-guard`**, built in-house from Pi's official `protected-paths.ts` and `permission-gate.ts`, and the `pi-budget`/`pi-spend-guard` patterns. Sketch in `pi_extensions.md` §Q3.
   - `tool_call`: block protected paths, including `.pi/**`, `.agents/**`, `.archon/**` and `.factory/**`.
   - Budgets: sum `ctx.sessionManager.getEntries()` usage; hard-stop by throwing from a hook, which makes Archon fail the node.
@@ -578,6 +595,8 @@ Small scripts run by `hapi` (systemd user timers, installed by `mise run up`):
 | `hapi-heads-up` | "Is there something worth flagging to the operator now?" gates whether a note is posted | 3 |
 | Freshness job | "Has this source materially changed since the note?" | v1 |
 
+> **As built (noted 2026-10-29, H-083):** the "7 Should I compact" row: spike T11 settled its [verify] for the harnesses' own compaction, not for a Jev-driven one (docs/spikes/04-anthropic-history-and-billing.md). On an account that enforces the check, Pi's compaction survives through `drop_block`, but only for the models its catalog flags (H-184). A Hermes compression gets one rejected request, then strips the stale thinking blocks and resends (H-185). A compaction at a cut point Jev picks wasn't tested.
+
 **Lessons carried over from ten-levels' "Where it can still fail":**
 - **The agent can read its own environment.** Pi gets the minimum env, and the Jev key is its **own** OpenRouter key with a tiny monthly cap ($2), since it's visible inside the Archon zone.
 - **The mock is shape, not intelligence.** CI tests the decision files' contracts and thresholds on the mock. Eval runs exercise live Jev.
@@ -612,6 +631,7 @@ Who gets which tier:
 - **The Hermes main session** gets T0–T1. T2 and T3 content reaches it only as schema-validated briefs from `hapi-research` (amended 2026-10-26 after the MCP research, §10.1).
 - **Pi workers** get T0–T1, and in practice no web tools at all. Their egress is model APIs, the local mirror, package registries and the work order's `egress_extra` hosts.
 - Enforcement lives below the agent: a default-deny egress proxy per container. The builder picks the tool, such as sandbox-runtime, iron-proxy (Docker backend only) or Smokescreen.
+  > **As built (noted 2026-10-29, H-083):** the tool is Squid, Canonical's `ubuntu/squid` image pinned by digest, as one proxy per zone, not per container (`stack/compose.yaml`; configs from `src/generate/egress.ts`). The research zone's proxy isn't default-deny: it allows any public host by name (§11.4's note; threat model DS-4).
 
 For the mtg pilot, Hermes confirms the endpoint change **from a first-party source** and records it. The worker never researches it.
 
@@ -643,6 +663,8 @@ MCP servers are packages that put text into an agent's context. Each one is ther
 | Archon Pi workers / Claude review nodes | **None** | Workers see T0–T1 only. Docs reach them as research notes and reviewed, hashed snapshots. |
 | Claude Code lane (phase 4) | Generated from the same catalog, with `--strict-mcp-config` | Context7 only under research-zone quarantine. |
 
+> **As built (noted 2026-10-29, H-083):** the `hapi-research` row: `policy/mcp.yaml` gives Context7 `egress: [context7.com]`, but that list is for review only (docs/mcp.md). The research zone's proxy allows any public host by name (§11.4's note; threat model DS-4), so nothing at the network level limits Context7 to `context7.com` in v1 (H-199). Context7 doesn't run yet: the research container is H-099, and its per-server image H-100.
+
 **Web search is NOT an MCP server.** The research zone uses Hermes's **native** `web_search` / `web_extract`:
 - **Brave** for search, **Exa contents** (or Firecrawl) for extract;
 - `keyless_fallback: false`, never `web.backend: nous`;
@@ -668,6 +690,7 @@ Why native beats an MCP server here:
 - **Pin:** one image per server, built from a committed lockfile and pinned by digest. A bare `npx`/`uvx pkg@x.y.z` doesn't pin the dependency tree.
 - **Cooldown:** 14-day release cooldown, with a **security-fix exception** recorded in the catalog.
 - **Run stdio servers inside their zone's container,** so the zone's Squid allowlist binds them. Egress is per zone, not per server, in v1. Accepted, because no research-zone server holds a second secret. Per-server isolation (e.g. ToolHive with explicit deny-by-default profiles) is a phase-2 option.
+  > **As built (noted 2026-10-29, H-083):** the research zone's proxy has no allowlist to bind them: it allows any public host by name, and refuses only IP literals and private ranges (§11.4's note; threat model DS-4). The hermes zone's proxy is an allowlist. A catalog entry's `egress` hosts are for review, and for the phase-2 per-server isolation (docs/mcp.md).
 - **Rug-pull defense:** `hapi mcp pin` records `mcp.lock.json`. Every connect, `hapi audit` (`mcp.tool-hashes`) and stack start-up fail closed on drift. Re-approval is a planning PR, since `new_skill_or_mcp` is on the approvals list. Remote-only endpoints count as review events.
 - **CI scanning** on every change to the catalog or lockfile:
   1. Cisco `mcp-scanner` (offline YARA and static checks over the lockfile; never runs servers);
@@ -691,7 +714,9 @@ Why native beats an MCP server here:
   - OWASP MCP Top 10 and the Agentic Skills Top 10 (draft)
   - **MITRE ATLAS** v2026.09 agent techniques
 - **Controls:** **OWASP AISVS** levels 1–2.
+  > **As built (noted 2026-10-29, H-083):** three of these aren't in threat model v0 yet (docs/security/threat-model.md, section 2): the LLM Top 10's 2026 crosswalk (v0 uses the 2025 IDs), the Agentic Skills Top 10 (draft), and an AISVS mapping of the controls, which v0 groups by the SANS domains only. H-158 adds the first two, and H-159 the AISVS mapping, at v1 acceptance (Plan 07).
 - **Grouping:** the six **SANS Critical AI Security Guidelines** domains.
+  > **As built (noted 2026-10-29, H-083):** the six domains are the v1.1 draft's. The current v1.4 (March 2026) has eight control categories. Threat model v0 groups by the six and lists v1.4 in its Sources (docs/security/threat-model.md); H-158 regroups it or adds a crosswalk.
 - **Anchors:**
   - NIST SP 800-207/207A (zero trust, workload identity)
   - SSDF 800-218/218A, run as pipeline stages
@@ -707,20 +732,27 @@ Why native beats an MCP server here:
 | Review | The diff | Read-only | None | Separate session and model |
 | Harvester and merge | Indirect | Forge write | Yes | Deterministic code; the operator's approval; required checks |
 
+> **As built (noted 2026-10-29, H-083):** the hapi-research row: its sensitive access isn't none. The research zone holds spend-capped, search-only keys for Brave, Exa and Context7 (§10.1; docs/secrets.md; H-042), and hapi-research will also need a capped model key, since it runs Hermes (H-099).
+
 ### 11.3 Isolation
 
 **Baseline:**
 - Dedicated `hapi` Linux user
 - Rootless containers; Docker vs Podman is the builder's call [verify Hermes on rootless Podman]
+  > **As built (noted 2026-10-29, H-083):** the builder chose rootless Docker (`stack/compose.yaml`; `scripts/host-setup.sh` sets it up for hapi). Spike T12 ran every image under it, as hapi, and nothing in the hardening set had to be relaxed (docs/spikes/05-rootless-images.md). Rootless Podman was never tried, so this [verify] no longer applies to the build.
 - Hermes and Archon in separate containers on a private network
+  > **As built (noted 2026-10-29, H-083):** each zone has its own internal-only network (`hermes-net`, `archon-net`, `research-net` in `stack/compose.yaml`), and only the egress proxies also join `outbound`, so the Hermes and Archon containers can't reach each other at all (threat model DS-1).
 - Ephemeral worktrees
 - Non-persistent containers for externally fed sessions
+  > **As built (noted 2026-10-29, H-083):** not yet. The Hermes main session, which reads chat, PR comments and briefs, runs its `local` terminal inside the long-lived Hermes container (`restart: unless-stopped`), with `HERMES_HOME` on the persistent `hermes-data` volume (`stack/compose.yaml`), so `terminal.container_persistent: false` has no effect (docs/generated-configs.md). The Archon container also keeps `$HOME` (`archon-home`) and `/.archon` (`archon-data`: the run DB and worktrees) on persistent volumes. Plan 02 gives each run its own `$HOME`, and Plan 03 mounts the workflow pack and config read-only and never reuses a run's worktree (H-182). Non-persistent containers stay planned with DS-15: the run side H-161, the Hermes side H-200.
 
 **Next level:** a microVM per run, or one container per run [call].
 
 ### 11.4 Egress
 
 Default-deny proxy per container, generated from policy.
+> **As built (noted 2026-10-29, H-083):** one Squid proxy per zone, not per container (`egress-hermes`, `egress-archon` and `egress-research` in `stack/compose.yaml`; configs from `src/generate/egress.ts`). The hermes and archon proxies are default-deny allowlists. The research zone's isn't: it allows any public host by name (HTTPS to port 443, plain HTTP to port 80) and refuses IP literals and private ranges (threat model DS-4).
+
 - **Residual risk:** allowed hosts (package registries, smoke hosts) are exfiltration channels. Registry publishing would need attacker-supplied tokens.
 - **Next level:** a read-only method filter on registries, or pull-through caches.
 
@@ -764,10 +796,13 @@ Default-deny proxy per container, generated from policy.
 
 `mise run audit` verifies the flipped defaults (§9.1, §9.2, §9.3), rulesets, App permissions, spend limits and pins. It runs in CI on hapi-factory and on demand. This is the "worse controls" measure.
 
+> **As built (noted 2026-10-29, H-083):** two parts aren't built yet. No audit check reads the spend limits (H-151), and the audit doesn't run in CI, since `.github/workflows/ci.yml` has no audit step (H-154). Today it runs on demand, as hapi with the stack up (docs/audit.md, "Not covered yet").
+
 Kill switches, fastest first:
 1. Zero or revoke the provider keys.
 2. Suspend the GitHub App installations.
 3. `mise run down` as host admin.
+   > **As built (noted 2026-10-29, H-083):** the operator still runs it from their own account, but it re-execs as hapi (`sudo -u hapi -H -- sh -c '<fixed script>'`, `src/stack/up.ts`). docs/runbooks/kill-switches.md, section 3, adds a fallback with no checkout or mise, and a hard stop of hapi's Docker.
 4. Firewall-drop the `hapi` user.
 
 ### 11.9 Residual risks (accepted for v1, documented in the threat model)
@@ -805,6 +840,7 @@ Cost rules:
 - **`max_tokens` around 64K** for Opus.
 - **Escalate effort before changing model.**
 - **Hard caps live at the provider** (workspaces and keys). Archon budgets and hapi-guard are the in-run caps.
+  > **As built (noted 2026-10-29, H-083):** spike T10 found that Archon's budget bounds the number of nodes, not dollars (§9.2's note; H-183(a)), so hapi-guard's `budgets.run_usd` is the in-node dollar cap (H-087), and the providers' caps are the hard ones.
 - **Handle Anthropic's 429 `enforced_spend_limit_reached`** as terminal. Don't retry it.
 - **[verify early]:** Anthropic rejects edited conversation history for accounts created on or after 2026-08-31. Make sure Hermes compression and Pi compaction don't break on that. Settled by spike T11 (docs/spikes/04-anthropic-history-and-billing.md):
   - the operator's account isn't enforced, on Haiku 5.5, Sonnet 5.5 or Opus 5.5;
@@ -940,6 +976,8 @@ A flagged run gets `hapi:flagged` on its PR and an alert in `#hapi-alerts`.
 | 4. More lanes | Claude Code worker lane; Hermes → Pi direct lane (review the open Hermes PR #106739 pi-agent skill as a starting point) | Same eval cases pass with the Claude Code worker |
 | 5. GitLab | GitLab forge adapter (§16) | Pilot eval passes on GitLab |
 
+> **As built (noted 2026-10-29, H-083):** the "0. Foundations" row: `mise run up` brought the stack up as hapi in stage b on 2026-10-28 (H-080), but the strict audit can't pass yet. Until Plan 04 wires the live MCP fetch (H-101), `mcp.tool-hashes` is its one expected fail, so it ends `13 pass, 1 fail, 0 skip` and exits 1 (README.md, stage b step 5; docs/runbooks/stack.md, section 5).
+
 **v1 scope: one MCP server, minimal** [call; the subject reopened by the operator, 2026-10-27]:
 - A read-only MCP server over one data source. **The subject is uncommitted, and picking it is part of the v1 test:** the operator brainstorms it with Hermes in `#hapi-intake` (step 2 below), and nothing built before then assumes it (H-177) [user]. The candidates so far are Odoo's external API (the first pick) and public energy and weather data.
 - At most **two or three work orders**, bundled where related. For example, for Odoo:
@@ -1015,6 +1053,7 @@ Because v1 keeps Archon off the forge (§9.4), hapi-factory may need little or n
 - Deduplicating the trigger key when one merge carries several work orders: settled by spike T10, one delivery ID per work order (§9.4; docs/spikes/03-archon-budget-trigger-env.md).
 - The toolchain mise installs inside the Archon container.
 - How the ruleset lets the operator merge PRs they authored themselves (`lane:direct`). Rulesets don't let an author approve their own PR. Use an owner-only bypass that the Apps and agents can never use.
+  > **As built (noted 2026-10-29, H-083):** ruled as two rulesets on `main` (README.md, Publishing step 4; H-023, H-075). `main-protect` blocks deletion and force-pushes (`non_fast_forward`) and requires the `ci` check, with no bypass actors. `main-review` requires 1 approving review from a code owner, plus Restrict updates, and its one bypass is the repository Admin role, PR-only. So the operator merges their own PRs through that bypass, no one can bypass `ci`, and no App can merge.
 
 ## 19. Verify early (spikes)
 
@@ -1026,3 +1065,5 @@ Because v1 keeps Archon off the forge (§9.4), hapi-factory may need little or n
 6. Hermes install via mise; Hermes Docker backend on rootless Podman.
 7. Hermes's Slack gateway runs in Socket Mode, with no inbound endpoint, and supports a user-ID allowlist.
 8. A private smoke sidecar runs where the Archon container can reach it, and `mise run smoke` can seed or replay its data. As first written: the official Odoo and Postgres images, with minimal CRM and invoice data. Until the brainstorm picks the subject: a subject-agnostic one (H-177).
+
+> **As built (noted 2026-10-29, H-083):** spikes T8 to T13 ran on 2026-10-28 (docs/spikes/01 to 06). 1, T8: settled; the user-level extension loads with `.pi/` stripped, `PI_OFFLINE=1` blocks the install, and a throw fails the node. 2 wasn't run: Plan 01 ruled it settled by design, since Archon's Pi has its own `PI_CODING_AGENT_DIR`, mise.toml installs no standalone Pi CLI, and one added later is pinned to 1.3.0 (Plan 01, "Tasks 8–14"). 3, T9: the `approve` split works under `plugins.isolation: host`, but the path guard can't catch shell writes, which hapi-cmd-allow closes (H-095). 4, T10: the budget works but is soft by one node; inputs reach bash and script nodes only, as `INPUTS_*`, not Pi's shell; a `TRACEPARENT` exported into `trigger fire` does reach Pi's shell, and a queued run is untested (H-183). 5, T11: neither harness breaks on the history check (H-184, H-185), and the billing test waits on the Console (H-187). 6: rootless Docker was chosen, and T12 relaxed nothing; Hermes is the official image, not a mise install, and runs its `local` terminal backend, not its Docker one; Podman wasn't tried. 7, T13: passes, with `slack.unauthorized_dm_behavior: ignore`, which Plan 04 compiles (H-179). 8, T14, is on hold until the brainstorm picks the subject (H-177).

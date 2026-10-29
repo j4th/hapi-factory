@@ -38,7 +38,7 @@ pass  generated.drift         /home/hapi/hapi-factory/build equals a fresh build
 skip  mcp.tool-hashes         the live tool surfaces can't be compared with the lock until Plan 04 wires the live fetch (`hapi mcp verify`, H-101); ...
 skip  github.rulesets         no --repo given
 ...
-hapi audit: 9 pass, 0 fail, 4 skip
+hapi audit: 10 pass, 0 fail, 4 skip
 ```
 
 **Exit codes:** `0` when no check fails, `1` when any check fails (after `--strict`), `2` on a usage error (an unknown flag, a missing value, a `--repo` that isn't `owner/name`, a flag given twice). A check that throws is a fail naming the error: the audit fails closed.
