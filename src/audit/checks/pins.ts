@@ -94,21 +94,38 @@ function words(segment: string): string[] {
 const PIP_EXACT = /^[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[A-Za-z0-9,._-]*\])?==[A-Za-z0-9.+!_-]+$/;
 const NPM_EXACT = /^(?:@[A-Za-z0-9._-]+\/)?[A-Za-z0-9._-]+@v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
 
-/** The install command `w` starts with, and the packages it names, if it starts with one. */
+/**
+ * The install command `w` starts with, and the packages it names, if it starts with one. Its subcommand is the
+ * first place one stands among the words after the installer that don't start with `-`, so an option's value as
+ * its own word (`apt-get -o Acquire::Retries=3 install`, `pip --index-url URL install`) doesn't hide it. That fails
+ * closed: `go build -o install ./x` reads as an install.
+ */
 function installAt(w: string[]): { installer: string; pkgs: string[]; ok: (p: string) => boolean } | undefined {
   const cmd = (w[0] ?? "").split("/").at(-1)!;
-  const args = (from: number) => w.slice(from).filter((a) => !a.startsWith("-"));
-  const sub = (i: number) => args(i)[0];
-  if ((cmd === "apt-get" || cmd === "apt") && sub(1) === "install") return { installer: `${cmd} install`, pkgs: args(1).slice(1), ok: (p) => /^[^=]+=.+$/.test(p) };
-  if (cmd === "apk" && sub(1) === "add") return { installer: "apk add", pkgs: args(1).slice(1), ok: (p) => /^[^=]+=.+$/.test(p) };
-  if ((cmd === "pip" || cmd === "pip3") && sub(1) === "install") return { installer: `${cmd} install`, pkgs: args(1).slice(1), ok: (p) => PIP_EXACT.test(p) };
-  if (/^python[0-9.]*$/.test(cmd) && w[1] === "-m" && w[2] === "pip" && w[3] === "install") return { installer: "pip install", pkgs: args(4), ok: (p) => PIP_EXACT.test(p) };
-  if (cmd === "uv" && w[1] === "pip" && w[2] === "install") return { installer: "uv pip install", pkgs: args(3), ok: (p) => PIP_EXACT.test(p) };
-  if (cmd === "uv" && w[1] === "tool" && w[2] === "install") return { installer: "uv tool install", pkgs: args(3), ok: (p) => PIP_EXACT.test(p) };
-  if (cmd === "uv" && w[1] === "python" && w[2] === "install") return { installer: "uv python install", pkgs: args(3), ok: (p) => /^\d+\.\d+\.\d+$/.test(p) };
-  if (cmd === "npm" && ["install", "i", "add"].includes(sub(1) ?? "")) return { installer: `npm ${sub(1)}`, pkgs: args(1).slice(1), ok: (p) => NPM_EXACT.test(p) };
-  if ((cmd === "bun" || cmd === "pnpm" || cmd === "yarn") && sub(1) === "add") return { installer: `${cmd} add`, pkgs: args(1).slice(1), ok: (p) => NPM_EXACT.test(p) };
-  if (cmd === "go" && sub(1) === "install") return { installer: "go install", pkgs: args(1).slice(1), ok: (p) => /@v\d+\.\d+\.\d+/.test(p) };
+  const args = w.slice(1).filter((a) => !a.startsWith("-"));
+  /** The first of `subs` (each one or more words) to stand in args, and the words after it. */
+  const at = (...subs: string[][]) => {
+    for (let k = 0; k < args.length; k++) {
+      const s = subs.find((seq) => seq.every((word, j) => args[k + j] === word));
+      if (s !== undefined) return { sub: s.join(" "), pkgs: args.slice(k + s.length) };
+    }
+    return undefined;
+  };
+  const found = (installer: string, f: { pkgs: string[] } | undefined, ok: (p: string) => boolean) => (f === undefined ? undefined : { installer, pkgs: f.pkgs, ok });
+  if (cmd === "apt-get" || cmd === "apt") return found(`${cmd} install`, at(["install"]), (p) => /^[^=]+=.+$/.test(p));
+  if (cmd === "apk") return found("apk add", at(["add"]), (p) => /^[^=]+=.+$/.test(p));
+  if (cmd === "pip" || cmd === "pip3") return found(`${cmd} install`, at(["install"]), (p) => PIP_EXACT.test(p));
+  if (/^python[0-9.]*$/.test(cmd)) return found("pip install", at(["pip", "install"]), (p) => PIP_EXACT.test(p));
+  if (cmd === "uv") {
+    const f = at(["pip", "install"], ["tool", "install"], ["python", "install"]);
+    return f === undefined ? undefined : found(`uv ${f.sub}`, f, (p) => (f.sub === "python install" ? /^\d+\.\d+\.\d+$/.test(p) : PIP_EXACT.test(p)));
+  }
+  if (cmd === "npm") {
+    const f = at(["install"], ["i"], ["add"]);
+    return f === undefined ? undefined : found(`npm ${f.sub}`, f, (p) => NPM_EXACT.test(p));
+  }
+  if (cmd === "bun" || cmd === "pnpm" || cmd === "yarn") return found(`${cmd} add`, at(["add"]), (p) => NPM_EXACT.test(p));
+  if (cmd === "go") return found("go install", at(["install"]), (p) => /@v\d+\.\d+\.\d+/.test(p));
   return undefined;
 }
 
@@ -159,8 +176,9 @@ export function pipesDownloadIntoShell(command: string): boolean {
  * The checkout's mise files other than the root mise.toml, as `.config/mise/` or `.tool-versions`, a directory with a
  * trailing slash. mise loads every one it finds there (`.mise.toml`, `mise.local.toml`, `mise.<env>.toml`,
  * `mise/config.toml`, `.config/mise.toml`, `.config/mise/conf.d/*.toml`, the task dirs `mise-tasks/`, `.mise/tasks/`
- * and the rest, `.tool-versions`), and one can override mise.toml's tools and tasks. It fails closed: any entry at
- * the root or in `.config/` whose name starts with `mise` or `.mise` counts.
+ * and the rest, `.tool-versions`, the lockfiles `mise.lock` and `mise.<env>.lock`), and one can override mise.toml's
+ * tools, tasks or the builds it installs. It fails closed: any entry at the root or in `.config/` whose name starts
+ * with `mise` or `.mise` counts.
  */
 async function otherMiseFiles(root: string): Promise<string[]> {
   const entries = async (dir: string) => {

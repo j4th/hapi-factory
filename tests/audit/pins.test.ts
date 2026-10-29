@@ -49,7 +49,7 @@ describe("pins.versions", () => {
     }
   });
 
-  test("a mise config, task dir or .tool-versions besides the root mise.toml fails, naming it: mise loads it over mise.toml, the one file read here", async () => {
+  test("a mise config, task dir, lockfile or .tool-versions besides the root mise.toml fails, naming it: mise loads it over mise.toml, the one file read here", async () => {
     // [file written, entry named]
     const cases: [string, string][] = [
       [".mise.toml", ".mise.toml"],
@@ -71,6 +71,10 @@ describe("pins.versions", () => {
       [".config/mise/conf.d/extra.toml", ".config/mise/"],
       [".config/mise/tasks/build", ".config/mise/"],
       [".tool-versions", ".tool-versions"],
+      // A lockfile names the URL and checksum mise installs each tool from.
+      ["mise.lock", "mise.lock"],
+      ["mise.ci.lock", "mise.ci.lock"],
+      [".config/mise/mise.lock", ".config/mise/"],
       // Anything else named like one fails too, rather than guessing which of them mise reads.
       [".miserc.toml", ".miserc.toml"],
     ];
@@ -174,6 +178,17 @@ describe("pins.versions", () => {
       ['RUN ["sh", "-c", "apt-get install -y curl"]', "fail", "apt-get install curl has no version"],
       ["RUN sh -c 'apt-get install -y curl'", "fail", "apt-get install curl has no version"],
       ['RUN bash -lc "npm install -g left-pad@1.3.0"', "pass"],
+      // The installer's own options before its subcommand, a value as its own word.
+      ["RUN apt-get -o Acquire::Retries=3 install -y curl", "fail", "apt-get install curl has no version"],
+      ["RUN apk --repository https://packages.example/main add git", "fail", "apk add git has no version"],
+      ["RUN pip --index-url https://pypi.example/simple install requests", "fail", "pip install requests has no version"],
+      ["RUN python3 -I -m pip --index-url https://pypi.example/simple install requests", "fail", "pip install requests has no version"],
+      ["RUN uv --cache-dir /tmp/uv pip install --system requests", "fail", "uv pip install requests has no version"],
+      ["RUN uv --no-cache tool install ruff", "fail", "uv tool install ruff has no version"],
+      ["RUN npm --registry https://registry.example install -g left-pad", "fail", "npm install left-pad has no version"],
+      ["RUN bun --cwd /app add zod", "fail", "bun add zod has no version"],
+      ["RUN apt-get -o Acquire::Retries=3 install -y curl=8.5.0-2ubuntu10.6", "pass"],
+      ["RUN pip --index-url https://pypi.example/simple install requests==2.32.3", "pass"],
     ];
     for (const [line, status, says] of cases) {
       const r = await pins((root) => append(root, "stack/archon/Dockerfile", `${line}\n`));
