@@ -39,14 +39,21 @@ describe("env files", () => {
     expect(parseEnvFile(text)).toEqual({ ANTHROPIC_API_KEY: "a\nb", SLACK_BOT_TOKEN: "b" });
   });
 
-  test("envFileText refuses a value with a single quote or NUL, naming the key, never the value", () => {
+  test("envFileText refuses a value with a single quote or NUL, or ending in a backslash, naming the key, never the value", () => {
     expect(() => envFileText("archon", { OPENCODE_API_KEY: `${FAKE}'x` })).toThrow(/archon\/OPENCODE_API_KEY: .*single quote/);
     expect(() => envFileText("archon", { OPENCODE_API_KEY: `${FAKE}\0` })).toThrow(/archon\/OPENCODE_API_KEY: .*NUL/);
-    try {
-      envFileText("archon", { OPENCODE_API_KEY: `${FAKE}'x` });
-    } catch (e) {
-      expect((e as Error).message).not.toContain(FAKE);
+    // Compose's dotenv parser takes \' as an escaped quote even inside single quotes, so NAME='abc\' would run on to the next line.
+    expect(() => envFileText("archon", { OPENCODE_API_KEY: `${FAKE}\\` })).toThrow(/archon\/OPENCODE_API_KEY: the value ends in a backslash \(\\\), which Compose would take as escaping the closing quote/);
+    for (const bad of [`${FAKE}'x`, `${FAKE}\0`, `${FAKE}\\`]) {
+      try {
+        envFileText("archon", { OPENCODE_API_KEY: bad });
+      } catch (e) {
+        expect((e as Error).message).not.toContain(FAKE);
+      }
     }
+    // A backslash anywhere else arrives as stored.
+    const text = envFileText("archon", { OPENCODE_API_KEY: "a\\b\\\\c\\\nd" });
+    expect(parseEnvFile(text)).toEqual({ OPENCODE_API_KEY: "a\\b\\\\c\\\nd" });
   });
 
   test("parseEnvFile refuses anything but comments, blank lines and NAME='value', and never echoes the file", () => {
