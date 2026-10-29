@@ -290,12 +290,21 @@ export async function findInstallationId(o: {
   return id;
 }
 
-/** Delete token files (and leftover temp files) in `dir` last modified more than an hour before `nowMs`: their tokens have expired. */
+/**
+ * Delete token files (and leftover temp files) in `dir` last modified more than an hour before `nowMs`: their tokens have expired.
+ * A file that is gone by the time it is looked at (a concurrent mint renamed its temp file into place, or removed it) is skipped.
+ */
 async function removeExpiredTokens(dir: string, nowMs: number): Promise<void> {
   for (const name of await readdir(dir)) {
     if (!name.endsWith(".token") && !(name.startsWith(".") && name.endsWith(".tmp"))) continue;
     const path = join(dir, name);
-    const st = await lstat(path);
+    let st;
+    try {
+      st = await lstat(path);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw e;
+    }
     if (st.isFile() && st.mtimeMs < nowMs - 3_600_000) await rm(path, { force: true });
   }
 }
@@ -354,9 +363,12 @@ export interface TokenDeps {
  * `$XDG_RUNTIME_DIR/hapi/tokens/<app>.<owner>.<repo>.token` (mode 0600). Prints
  * the path and expiry, never the token. The App's id and key come from
  * `$XDG_RUNTIME_DIR/hapi/env/host.env`, which `hapi secrets resolve` writes.
- * XDG_RUNTIME_DIR is checked (ours, 0700) before host.env is read, and each
- * mint deletes the token files in tokens/ that are more than an hour old
- * (installation tokens last one hour).
+ * XDG_RUNTIME_DIR is checked (ours, 0700) before host.env is read, and
+ * tokens/ before GitHub is asked for anything. Once the new token is written,
+ * each mint deletes the token files in tokens/ that are more than an hour old
+ * (installation tokens last one hour). That cleanup is best effort: if it
+ * fails, the mint warns and still exits 0, so nothing after GitHub mints the
+ * token but writing it can lose it.
  */
 export async function tokenMint(args: string[], deps: TokenDeps = {}): Promise<number> {
   const flags: Record<string, string> = {};
@@ -385,14 +397,19 @@ export async function tokenMint(args: string[], deps: TokenDeps = {}): Promise<n
     ...(deps.fetch ? { fetch: deps.fetch } : {}),
     ...(deps.now ? { now: deps.now } : {}),
   };
+  const tokens = join(dir, "tokens");
+  await secureDir(tokens, dirname(dir));
   const installationId = await findInstallationId({ ...common, owner, repo });
   const { token, expiresAt } = await mintInstallationToken({ ...common, installationId, repositories: [repo], permissions: { ...spec.permissions } });
 
-  const tokens = join(dir, "tokens");
-  await secureDir(tokens, dirname(dir));
-  await removeExpiredTokens(tokens, (deps.now ?? Date.now)());
   const file = join(tokens, `${app}.${owner}.${repo}.token`);
   await writeSecretFile(file, `${token}\n`);
   console.log(`${file} (expires ${expiresAt})`);
+  try {
+    await removeExpiredTokens(tokens, (deps.now ?? Date.now)());
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    console.error(`hapi token mint: wrote the token, but could not remove the expired token files in ${tokens}${code ? ` (${code})` : ""}; the next mint tries again`);
+  }
   return 0;
 }
