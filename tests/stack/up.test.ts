@@ -401,14 +401,16 @@ describe("hapi stack down", () => {
     expect(reexecScript("down")).toBe(UP_SCRIPT.replace("run up --", "run down --"));
   });
 
-  test("with HAPI_ALLOW_CURRENT_USER=1: stops the dev-bypass stack on the caller's own Docker, and says hapi's is not stopped", async () => {
+  test("with HAPI_ALLOW_CURRENT_USER=1: stops the dev-bypass stack on the Docker this shell's CLI reaches, without claiming which one that is, and says how to stop hapi's", async () => {
     const { err } = capture();
     const f = fakes({ user: "dev", env: { HOME: "/home/dev", HAPI_ALLOW_CURRENT_USER: "1" } });
     expect(await stackDown([], f.deps)).toBe(0);
     expect(f.calls.map((c) => c.cmd)).toEqual([["docker", "compose", "-p", "hapi", "down"]]);
+    // The caller's DOCKER_HOST, DOCKER_CONTEXT or current context can point that CLI at any daemon, hapi's included.
     expect(err).toEqual([
-      "hapi stack down: warning: HAPI_ALLOW_CURRENT_USER=1: stopping the dev-bypass stack on dev's own Docker, not hapi's. " +
-        "This doesn't touch hapi's stack: stop that with `mise run down` in a shell without HAPI_ALLOW_CURRENT_USER, or with kill switch 3b (docs/runbooks/kill-switches.md#3b-without-a-checkout-or-mise).",
+      "hapi stack down: warning: HAPI_ALLOW_CURRENT_USER=1: stopping the dev-bypass stack (Compose project hapi) on the Docker daemon this shell's docker CLI reaches, " +
+        "through its DOCKER_HOST, DOCKER_CONTEXT or current context: normally dev's own, not hapi's. " +
+        "To stop hapi's stack, run `mise run down` in a shell without HAPI_ALLOW_CURRENT_USER, or use kill switch 3b (docs/runbooks/kill-switches.md#3b-without-a-checkout-or-mise).",
     ]);
   });
 

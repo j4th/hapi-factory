@@ -98,10 +98,13 @@ readonly ROOT_GROUPS=(docker sudo admin wheel lxd incus-admin libvirt disk)
 # hapi is less trusted than root (a rootless container escape lands as hapi), so stop
 # if a hapi made by an earlier run or by hand is in one of ROOT_GROUPS or has any sudo
 # rule, naming what was found. Root can list another user's sudo rules; LC_ALL=C keeps
-# sudo's messages in English for the match, and an answer it can't read stops it too.
+# sudo's messages in English for the match. A group list or a sudo answer it can't read
+# stops it too: a here-string drops its command's exit status, so `id` is checked first.
 refuse_root_equivalent() {
-  local groups group root_group found=() fix="" rules listed
-  read -ra groups <<<"$(id -nG "$HAPI_USER")"
+  local id_groups groups group root_group found=() fix="" rules listed
+  id_groups="$(id -nG "$HAPI_USER")" ||
+    die "could not read $HAPI_USER's groups (id -nG $HAPI_USER failed): check them by hand and run this again"
+  read -ra groups <<<"$id_groups"
   for group in "${groups[@]}"; do
     for root_group in "${ROOT_GROUPS[@]}"; do
       if [[ "$group" == "$root_group" ]]; then

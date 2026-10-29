@@ -83,13 +83,14 @@ describe("refuse_root_equivalent, run here with a stub id and sudo", () => {
   afterAll(() => {
     for (const d of temps) rmSync(d, { recursive: true, force: true });
   });
-  /** The check, with hapi in `groups` and `sudo -n -l -U hapi` printing `rules`; its exit code and stderr. */
-  const run = (groups: string, rules: string) => {
+  /** The check, with hapi in `groups` (or `id -nG hapi` failing, for null) and `sudo -n -l -U hapi` printing `rules`; its exit code and stderr. */
+  const run = (groups: string | null, rules: string) => {
     const bin = mkdtempSync(join(tmpdir(), "hapi-host-setup-"));
     temps.push(bin);
-    writeFileSync(join(bin, "groups.txt"), `${groups}\n`);
+    writeFileSync(join(bin, "groups.txt"), `${groups ?? ""}\n`);
     writeFileSync(join(bin, "rules.txt"), rules);
-    writeFileSync(join(bin, "id"), `#!/bin/sh\n[ "$*" = "-nG hapi" ] || exit 99\ncat "${bin}/groups.txt"\n`);
+    const lookup = groups === null ? `echo "id: 'hapi': no such user" >&2\nexit 1` : `cat "${bin}/groups.txt"`;
+    writeFileSync(join(bin, "id"), `#!/bin/sh\n[ "$*" = "-nG hapi" ] || exit 99\n${lookup}\n`);
     // Only the listing, and only in the C locale; it exits 1 as sudo does for a user with no rules.
     writeFileSync(join(bin, "sudo"), `#!/bin/sh\n[ "$*" = "-n -l -U hapi" ] && [ "$LC_ALL" = C ] || exit 99\ncat "${bin}/rules.txt"\ngrep -q 'may run' "${bin}/rules.txt"\n`);
     for (const f of ["id", "sudo"]) chmodSync(join(bin, f), 0o755);
@@ -123,6 +124,12 @@ describe("refuse_root_equivalent, run here with a stub id and sudo", () => {
     expect(r.err).toContain("hapi has sudo rules");
     expect(r.err).toContain("(ALL) NOPASSWD: /usr/bin/apt-get");
     expect(r.err).toContain("visudo");
+  });
+
+  test("refuses when it can't read hapi's groups, rather than take a failed lookup for no groups", () => {
+    const r = run(null, NONE);
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("could not read hapi's groups");
   });
 
   test("refuses when it can't read sudo's answer, rather than guess", () => {
