@@ -67,7 +67,13 @@ Code reads this with **`effectiveModes(policy, path)`** in `src/policy/paths.ts`
 
 The error names the problem, with the path JSON-escaped so it prints safely, e.g. `invalid path ".github\\workflows\\ci.yml": contains a backslash; separate segments with "/"` or `invalid path "a\u001bb": contains a control character (U+001B)`.
 
-A guard that isn't TypeScript, such as the Python hapi-path-guard (Plan 04), must implement the same rule and pass the same cases as `tests/policy/paths.test.ts`.
+**The shared vectors** are `tests/fixtures/path-vectors.json`, in the shape of `command-vectors.json`: `globs` lists `{glob, path, matches}` cases for `globMatches`, and `paths` lists `{path, interactive, unattended, workers, reason?}` cases against `policy/protected_paths.yaml`. A vector with `reason` is a path `effectiveModes` throws on, with an error containing `reason`, and every enforcer must deny it. Every enforcer runs the same file:
+
+- `tests/policy/paths.test.ts` runs it against `effectiveModes` itself;
+- **hapi-guard** (Plan 02, `src/guard/`), Pi's extension in a run container, bundles `effectiveModes` rather than reimplementing it. `tests/guard/paths.test.ts` runs every `paths` vector through its `write` and `edit` checks, and `tests/guard/bundle.test.ts` runs them through the built bundle, under `BUN_OPTIONS=--no-install`, as Pi loads it (H-087, H-089);
+- a guard that isn't TypeScript, such as the Python hapi-path-guard (Plan 04), must implement the same rule and pass the same vectors.
+
+When you change `protected_paths.yaml` or the matching rule, update the vectors in the same change.
 
 #### Glob syntax
 

@@ -170,14 +170,20 @@ describe("buildAll", () => {
     await expect(bundleEntry("tests/generate/fixtures/external-import.ts", REPO_ROOT)).rejects.toThrow(/bun:sqlite/);
   });
 
-  test("the guard bundle is the placeholder until Task 5: its factory registers session_start, which throws", async () => {
+  test("the built guard bundle, with no Pi agent dir to read, registers only a session_start that fails closed (tests/guard/bundle.test.ts covers the rest)", async () => {
     const dir = tempDir();
     await buildAll(p, dir);
     const mod = await import(join(dir, "pi/extensions/hapi-guard.js"));
     const handlers: Record<string, () => unknown> = {};
-    mod.default({ on: (event: string, fn: () => unknown) => void (handlers[event] = fn) });
+    const saved = process.env.PI_CODING_AGENT_DIR;
+    delete process.env.PI_CODING_AGENT_DIR;
+    try {
+      mod.default({ on: (event: string, fn: () => unknown) => void (handlers[event] = fn) });
+    } finally {
+      if (saved !== undefined) process.env.PI_CODING_AGENT_DIR = saved;
+    }
     expect(Object.keys(handlers)).toEqual(["session_start"]);
-    expect(handlers.session_start).toThrow("hapi-guard: placeholder (Plan 02 Task 5)");
+    expect(handlers.session_start).toThrow("hapi-guard: PI_CODING_AGENT_DIR is not set; the node fails closed");
   });
 
   test("the hapi-decide bundle, run with bun from a temp dir under BUN_OPTIONS=--no-install, answers bash-gate --mock from stdin", async () => {
