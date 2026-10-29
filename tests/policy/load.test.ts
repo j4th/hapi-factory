@@ -235,7 +235,7 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
       expect(vendor).toBe("opencode-go");
       expect(zeroRetention.has(id ?? "")).toBe(true);
     }
-    expect(r.large.model).toBe("opencode-go/kimi-k3.1-pro");
+    expect(r.large.model).toBe("opencode-go/kimi-k3");
     expect(r.medium.model).toBe("opencode-go/glm-5.3");
     const family = (m: string) => m.split("/")[1]?.match(/^[a-z]+/)?.[0];
     expect(family(r.large.model)).not.toBe(family(r.medium.model));

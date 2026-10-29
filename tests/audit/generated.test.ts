@@ -88,8 +88,9 @@ describe("generated.drift", () => {
 
   test("a path a fresh build doesn't have fails, naming it: archon reads build/pi wholesale as Pi's agent dir", async () => {
     const w = await cleanWorld();
-    // Pi inside Archon would read each of these: a planted settings.json or auth.json, an extensions/ dir.
-    writeFileSync(join(w.build, "pi", "settings.json"), '{"secret-planted-value": true}\n');
+    // Pi inside Archon would read each of these: a planted keybindings.json or auth.json, an extra extension.
+    // (settings.json, models-store.json and extensions/hapi-guard.js are generated since Plan 02 Task 4.)
+    writeFileSync(join(w.build, "pi", "keybindings.json"), '{"secret-planted-value": true}\n');
     writeFileSync(join(w.build, "pi", "auth.json"), "{}\n");
     mkdirSync(join(w.build, "pi", "extensions", "deep"), { recursive: true });
     writeFileSync(join(w.build, "pi", "extensions", "deep", "evil.ts"), "export default {}\n");
@@ -99,7 +100,7 @@ describe("generated.drift", () => {
     mkdirSync(join(w.build, "leftover"));
     const r = await drift(w);
     expect(r.status).toBe("fail");
-    for (const p of ["pi/settings.json", "pi/auth.json", "pi/extensions/", "pi/empty-dir/", "mcp/old.mcp.json", "leftover/"]) expect(r.detail).toContain(`${p}: not in a fresh build`);
+    for (const p of ["pi/keybindings.json", "pi/auth.json", "pi/extensions/deep/", "pi/empty-dir/", "mcp/old.mcp.json", "leftover/"]) expect(r.detail).toContain(`${p}: not in a fresh build`);
     // A directory is named once, not every file under it; and nothing is read from an unexpected path.
     expect(r.detail).not.toContain("evil.ts");
     expect(r.detail).not.toContain("secret-planted-value");
@@ -109,10 +110,10 @@ describe("generated.drift", () => {
 
   test("an extra file alone fails even when every generated file matches and every label is right", async () => {
     const w = await cleanWorld();
-    writeFileSync(join(w.build, "pi", "models-store.json"), "{}\n");
+    writeFileSync(join(w.build, "pi", "prompts.json"), "{}\n");
     const r = await drift(w);
     expect(r.status).toBe("fail");
-    expect(r.detail).toContain("pi/models-store.json: not in a fresh build");
+    expect(r.detail).toContain("pi/prompts.json: not in a fresh build");
     expect(r.detail).not.toContain("was started from another build");
   });
 

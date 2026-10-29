@@ -3,8 +3,10 @@
  * build/ (spec §8.1). docs/generated-configs.md describes every file.
  *
  *   build/hermes/config.yaml
- *   build/archon/config.yaml, build/archon/archon.env
- *   build/pi/models.json, build/pi/hapi-guard.json
+ *   build/archon/config.yaml, run-config.yaml, archon.env, empty.env, gitconfig
+ *   build/pi/models.json, models-store.json, settings.json, hapi-guard.json
+ *   build/pi/extensions/hapi-guard.js   (bundled from src/guard/index.ts)
+ *   build/decide/hapi-decide.js         (bundled from src/decide/cli.ts)
  *   build/egress/{hermes,archon,research}.squid.conf
  *   build/mcp/{hermes,research}.mcp.json
  *
@@ -13,15 +15,51 @@
  * edited them, which is how Task 6's audit detects drift.
  */
 import { mkdir, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { loadPolicy } from "../policy/load";
 import { o11yEnabled } from "../policy/mcp";
 import type { Policy, RosterName } from "../policy/types";
 import { emitArchon } from "./archon";
 import { emitEgress } from "./egress";
+import { notice, REPO_ROOT, slashComment } from "./header";
 import { emitHermes } from "./hermes";
 import { emitMcp } from "./mcp";
 import { emitPi } from "./pi";
+
+export { REPO_ROOT };
+
+/** The entries bundled into build/: hapi-guard (a Pi extension) and `hapi decide` (Hermes's and the guard's classifier CLI). */
+export const GUARD_ENTRY = "src/guard/index.ts";
+export const DECIDE_ENTRY = "src/decide/cli.ts";
+
+/**
+ * Bundle `entry` (a path under `root`) into one ESM file that imports nothing but
+ * `node:*`, so it runs under a bare Bun with no install (`--no-install`). The
+ * notice is its first lines. `target: "node"` keeps `node:` specifiers and puts
+ * the banner first; `"bun"` would rewrite them to bare names and put `// @bun`
+ * first. A fixed `root` keeps Bun's `// <path>` comments, and so the bytes, the same
+ * from one checkout to the next.
+ */
+export async function bundleEntry(entry: string, root: string): Promise<string> {
+  const result = await Bun.build({
+    entrypoints: [join(root, entry)],
+    root,
+    target: "node",
+    format: "esm",
+    minify: false,
+    banner: `${slashComment(notice(`Bundle of ${entry}`, [entry]))}\n`,
+  });
+  if (!result.success) throw new Error(`bundling ${entry}: ${result.logs.join("; ")}`);
+  const text = await result.outputs[0]!.text();
+  const kept = [...text.matchAll(/^(?:import|export)\b[^;\n]*?["']([^"']+)["']/gm)].map((m) => m[1]!).filter((spec) => !spec.startsWith("node:"));
+  if (kept.length > 0) throw new Error(`bundling ${entry}: the bundle imports ${[...new Set(kept)].join(", ")}, not only node:*`);
+  return text;
+}
+
+/** `files` plus the bundle of `entry` at `name`. */
+async function withBundle(files: Record<string, string>, name: string, entry: string): Promise<Record<string, string>> {
+  return { ...files, [name]: await bundleEntry(entry, REPO_ROOT) };
+}
 
 export const ROSTERS: readonly RosterName[] = ["budget", "anthropic", "portable"];
 
@@ -45,18 +83,22 @@ export async function buildAll(p: Policy, outDir: string, opts: BuildOptions = {
   const roster = opts.roster ?? "anthropic";
   if (!ROSTERS.includes(roster)) throw new Error(`unknown roster '${roster}'`);
   const o11y = o11yEnabled(p, opts);
-  const groups: [dir: string, files: Record<string, string>][] = [
+  // A group's emitter may be async (the bundles). Every one is awaited before anything is written,
+  // so a refusing emitter leaves the existing files alone.
+  const groups: [dir: string, files: Record<string, string> | Promise<Record<string, string>>][] = [
     ["hermes", emitHermes(p, { o11y })],
     ["archon", emitArchon(p, roster)],
-    ["pi", emitPi(p, roster)],
+    ["pi", withBundle(emitPi(p, roster), "extensions/hapi-guard.js", GUARD_ENTRY)],
     ["egress", emitEgress(p)],
     ["mcp", emitMcp(p)],
+    ["decide", withBundle({}, "hapi-decide.js", DECIDE_ENTRY)],
   ];
+  const built = await Promise.all(groups.map(async ([dir, files]) => [dir, await files] as const));
   const written: string[] = [];
-  for (const [dir, files] of groups) {
-    await mkdir(join(outDir, dir), { recursive: true });
+  for (const [dir, files] of built) {
     for (const [name, text] of Object.entries(files)) {
       const path = join(outDir, dir, name);
+      await mkdir(dirname(path), { recursive: true });
       await writeFile(path, text);
       written.push(path);
     }

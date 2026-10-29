@@ -284,7 +284,7 @@ large:  { provider: pi, model: anthropic/claude-opus-5-5, effort: low, retry_eff
 |---|---|---|---|---|
 | `anthropic` | Normal operation | Haiku 5.5 on Pi | Sonnet 5.5 via the Claude provider | Opus 5.5 on Pi, effort low, retry high |
 | `budget` | The first end-to-end runs | Haiku 5.5 on Pi | Haiku 5.5 via the Claude provider | Haiku 5.5 on Pi |
-| `portable` | Proving model portability | `opencode-go/glm-5.3-flash` | `opencode-go/glm-5.3` | `opencode-go/kimi-k3.1-pro`, retry high |
+| `portable` | Proving model portability | `opencode-go/glm-5.3-flash` | `opencode-go/glm-5.3` | `opencode-go/kimi-k3`, retry high |
 
 **The `portable` roster** runs every tier on Pi through OpenCode Go. It may use **only models with 0-day retention and no training**. The ids and terms were checked against <https://opencode.ai/docs/go/> on 2026-10-26. DeepSeek is left out because its zero-retention agreement is renewed monthly. Review (GLM) runs on a different model family from implement (Kimi).
 

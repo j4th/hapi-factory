@@ -8,7 +8,7 @@
 - [how protected paths stay strictest-wins](#protected-paths-stay-strictest-wins) in every output;
 - [the MCP servers](#mcp-servers-mcp_servers) in Hermes's config and [the per-zone `mcp.json` files](#buildmcpmcpjson) for the CI scanners.
 
-`build/` is generated and gitignored. **Never edit a file in it by hand**: change `policy/` and rebuild. Every file starts with a notice that names its policy sources and says not to edit it. The YAML, env and Squid files carry it as `#` comments. JSON has no comments, so `models.json`, `hapi-guard.json` and the `mcp.json` files carry it as a `$comment` string, their first key.
+`build/` is generated and gitignored. **Never edit a file in it by hand**: change `policy/` and rebuild. Every file starts with a notice that names its policy sources and says not to edit it. The YAML, env and Squid files carry it as `#` comments. JSON has no comments, so `models.json`, `settings.json`, `hapi-guard.json` and the `mcp.json` files carry it as a `$comment` string, their first key. The two bundled `.js` files carry it as `//` comments. The one exception is `build/pi/models-store.json`, which is exactly `{}` ([below](#buildpimodels-storejson)).
 
 ## Regenerating
 
@@ -39,13 +39,22 @@ It prints each path it wrote, one per line, and exits 0. A usage error (an unkno
 | `build/hermes/config.yaml` | Hermes's `config.yaml` (Hermes v0.22.5 keys) | `budgets.yaml`, `flags.yaml`, `mcp.yaml`, `protected_paths.yaml`, `roles.yaml`, `rosters/anthropic.yaml` | Mounted read-only at `/opt/data/config.yaml` (`$HERMES_HOME`) in the `hermes` container |
 | `build/archon/config.yaml` | Archon's global config, `~/.archon/config.yaml` (Archon v0.12.1): model tiers and aliases | `roles.yaml`, `rosters/<roster>.yaml` | Mounted read-only at `/.archon/config.yaml` (Archon's home in its container) in `archon` |
 | `build/archon/archon.env` | The Archon container's environment | Spec §9.2 and §9.3 (no policy file) | The record of the six settings the `archon` service's `environment:` sets, and what the audit's `runtime.archon-env` holds the running container to. Compose doesn't read the file ([below](#buildarchonarchonenv)) |
-| `build/pi/models.json` | Pi 1.3.0's model registry: `maxTokens` caps | `rosters/<roster>.yaml` | Mounted read-only at `PI_CODING_AGENT_DIR` (Plan 02 binds it into a tmpfs there instead, H-181) |
-| `build/pi/hapi-guard.json` | Settings for Plan 02's hapi-guard Pi extension | `protected_paths.yaml`, `budgets.yaml` | Mounted read-only at `PI_CODING_AGENT_DIR` (Plan 02 binds it into a tmpfs there instead, H-181) |
+| `build/archon/run-config.yaml` | Archon's per-run `--config` layer: the same tiers and aliases, `assistants.pi.enableExtensions: true`, `workflows.autoResumeOnQuotaReset: false` | `roles.yaml`, `rosters/<roster>.yaml` | Bound read-only at `/opt/hapi/run-config.yaml` in the run container (Plan 02 Task 7) |
+| `build/archon/gitconfig` | The run container's `~/.gitconfig`: `[safe]` directories and the worker's `[user]` | The container's paths (`RUN_PATHS`; no policy file) | Bound read-only at `/home/appuser/.gitconfig` in the run container |
+| `build/archon/empty.env` | An env file of only comments | No policy file | Bound read-only over `/.archon/.env` in the run container |
+| `build/pi/models.json` | Pi 1.3.0's model registry: `maxTokens`, `cost` and `compat` pins, and each provider's `baseUrl` | `rosters/<roster>.yaml`, Pi's 1.3.0 catalog (`src/generate/pi-catalog-1.3.0.json`) | Mounted read-only at `PI_CODING_AGENT_DIR` (Plan 02 binds it into a tmpfs there instead, H-181) |
+| `build/pi/models-store.json` | Exactly `{}`: Pi's own model store, bound read-only so a run can't plant one | None | Bound read-only at `/opt/hapi/pi-agent/models-store.json` (Plan 02 Task 7) |
+| `build/pi/settings.json` | Pi's `settings.json`, with nothing set | None | Bound read-only into Pi's agent dir (Plan 02 Task 7) |
+| `build/pi/extensions/hapi-guard.js` | The hapi-guard Pi extension, bundled from `src/guard/index.ts` | `src/guard/index.ts` | Bound read-only into Pi's agent dir. Until Plan 02 Task 5 it is a placeholder whose `session_start` throws |
+| `build/decide/hapi-decide.js` | `hapi decide`, bundled from `src/decide/cli.ts`: the level-6 classifier CLI | `src/decide/cli.ts` | Plan 04 ships it into the Hermes image |
+| `build/pi/hapi-guard.json` | Settings for Plan 02's hapi-guard Pi extension | `protected_paths.yaml`, `budgets.yaml`, `gates.yaml`, `flags.yaml`, `rosters/<roster>.yaml`, `stack/secrets.yaml` | Mounted read-only at `PI_CODING_AGENT_DIR` (Plan 02 binds it into a tmpfs there instead, H-181) |
 | `build/egress/hermes.squid.conf` | Squid config for the `hermes` zone's egress proxy | `trusted_sources.yaml` | The `egress-hermes` container, read-only |
 | `build/egress/archon.squid.conf` | Squid config for the `archon` zone's egress proxy | `trusted_sources.yaml` | The `egress-archon` container, read-only |
 | `build/egress/research.squid.conf` | Squid config for the `research` zone's egress proxy | `trusted_sources.yaml` | The `egress-research` container, read-only (the research zone's own service arrives in Plan 04) |
 | `build/mcp/hermes.mcp.json` | A standard `mcp.json` with the `hermes` zone's whole MCP catalog | `mcp.yaml` | The CI scanners (Plan 05) |
 | `build/mcp/research.mcp.json` | A standard `mcp.json` with the `research` zone's whole MCP catalog | `mcp.yaml` | The CI scanners (Plan 05) |
+
+Plan 02 Task 4 added the files the per-run container binds read-only (Task 7): Pi's `settings.json` and `models-store.json`, the bundled guard, Archon's `run-config.yaml`, `gitconfig` and `empty.env`, and the `hapi-decide` bundle.
 
 Not compiled yet: `commands.yaml` (the Hermes `hapi-cmd-allow` hook arrives in Plan 04; Archon `allowed_tools` sit on workflow nodes, Plan 03), `approvals.yaml`, and `flags.yaml` apart from `otel.enabled`, which gates the o11y MCP servers (later plans). `mcp.lock.json` isn't compiled: `hapi mcp verify` reads it ([docs/policy.md](policy.md#mcplockjson)).
 
@@ -122,9 +131,11 @@ The emitter checks the catalog again before it writes anything (the schema and `
 
 ## `build/archon/config.yaml`
 
-Archon is the run engine (spec §9.2). The file holds `tiers` and `aliases` only; workflows (Plan 03) carry budgets and tool lists on their nodes.
+Archon is the run engine (spec §9.2). The file holds `assistants`, `tiers` and `aliases`; workflows (Plan 03) carry budgets and tool lists on their nodes.
 
 ```yaml
+assistants:
+  pi: { enableExtensions: true }   # hapi-guard is a Pi extension (H-181(b))
 tiers:            # the selected roster, verbatim
   small:  { provider: pi, model: anthropic/claude-haiku-5-5, effort: low }
   medium: { provider: claude, model: claude-sonnet-5-5, effort: medium }
@@ -136,10 +147,21 @@ aliases:          # one per Archon role, at its roles.yaml tier
   # ... and @planner, @planner-retry, @scout, @router, @eval-judge
 ```
 
+- **`assistants.pi.enableExtensions: true`** is set explicitly, for every roster. Archon 0.12.1 defaults it on, but hapi-guard is a Pi extension, so the setting is written down and the audit can hold it (H-181(b)).
 - **Tiers** are the roster's `small`/`medium`/`large`, as `{provider, model, effort}` (Archon's `docs/reference/configuration.md`). A `pi` tier's model is a Pi ref `<vendor>/<model-id>`; a `claude` tier's is an Anthropic model id. Both pass through unchanged.
 - **Aliases** name each role that runs in Archon: `@planner`, `@implement`, `@review`, `@scout`, `@router` and `@eval-judge` (`roles.yaml`, with `_` written as `-`). The list is every role in `ROLES` (`src/policy/types.ts`, where the `Role` type comes from) except `hermes_*`, so a role added there gets an alias without a second edit. A workflow says `@implement` or `large`, never a model id (spec §8.1, §12). Moving a role to another tier in `roles.yaml` moves its alias.
 - **`-retry` aliases** exist for each role whose tier has a `retry_effort`: the same model at that effort. They encode "on failure, one retry at high effort before any change of model" (spec §9.2, §12).
 - `hermes_main` and `hermes_auxiliary` run in Hermes, so they get no Archon alias.
+
+## `build/archon/run-config.yaml`, `gitconfig` and `empty.env`
+
+The per-run container binds these three read-only (spike 07; Plan 02 Task 7).
+
+- **`run-config.yaml`** is passed as `--config /opt/hapi/run-config.yaml`. It holds `config.yaml`'s `assistants`, `tiers` and `aliases`, and adds `workflows.autoResumeOnQuotaReset: false`: a run never resumes itself, the launcher decides. Archon applies it above a repo's own `.archon/config.yaml`, so a repo can't turn `enableExtensions` off (spike 07, finding on `c1`/`c2`).
+- **`gitconfig`** is the run container's `~/.gitconfig`. `[safe] directory` names `/src/repo.git` (the source clone is bind-mounted from another uid, so Git's ownership check refuses it otherwise) and Archon's `/.archon/workspaces`, `/.archon/workspaces/*`, `/.archon/worktrees` and `/.archon/worktrees/*`. The last four are for worktrees, which `--no-worktree` doesn't use but which do no harm. `[user]` is `hapi-factory worker <worker@hapi.invalid>`. Being read-only and generated fresh, nothing a worker writes can plant a `core.fsmonitor` or `core.hooksPath` here (H-182).
+- **`empty.env`** holds only `#` lines. Bound over `/.archon/.env`, it leaves Archon no env file to load.
+
+`RUN_PATHS` and `RunFile` in `src/generate/archon.ts` name the container's fixed paths and the per-run input the launcher writes at `RUN_PATHS.runFile`; every consumer imports them.
 
 ## `build/archon/archon.env`
 
@@ -160,24 +182,51 @@ These are the Global Constraints' Archon and Pi values; the audit's `runtime.arc
 
 ```json
 {
-  "$comment": "Pi models.json: the output-token cap for each Pi model. Generated by `hapi policy build` from policy/rosters/anthropic.yaml. Do not edit it by hand: ...",
+  "$comment": "Pi models.json: the cost, output-token cap and compat pins for each Pi model, from Pi 1.3.0's catalog. Generated by `hapi policy build` from policy/rosters/anthropic.yaml. Do not edit it by hand: ...",
   "$schema": "https://pi.dev/schemas/models.schema.json",
   "providers": {
     "anthropic": {
+      "baseUrl": "https://api.anthropic.com",
       "modelOverrides": {
-        "claude-haiku-5-5": { "maxTokens": 64000 },
-        "claude-opus-5-5": { "maxTokens": 64000 }
+        "claude-haiku-5-5": { "maxTokens": 64000, "cost": { "input": 0.1, "...": "tiers included" }, "compat": { "supportsMidConvoEffort": true, "...": "the catalog's whole compat object" } },
+        "claude-opus-5-5": { "maxTokens": 64000, "cost": { "...": "..." }, "compat": { "...": "..." } }
       }
     }
   }
 }
 ```
 
-- Every **Pi** model in the selected roster gets `maxTokens: 64000`, the output-token cap (spec §9.3: "maxTokens around 64K"; §12). Models are grouped by the vendor part of their Pi ref and sorted.
-- It uses **`modelOverrides`** (Pi 1.3.0's `models.schema.json`): an override changes one field of a built-in model and keeps the rest of its catalog entry. A `models` entry would replace the model. Pi ignores an override whose id it doesn't know.
+- Every **Pi** model in the selected roster gets an override with `maxTokens: 64000`, the output-token cap (spec §9.3: "maxTokens around 64K"; §12), plus the catalog's `cost` (tiers included) and its **whole** `compat` object. Each provider also gets the catalog's `baseUrl`. Models are grouped by the vendor part of their Pi ref and sorted.
+- It uses **`modelOverrides`** (Pi 1.3.0's `models.schema.json`): an override changes fields of a built-in model and keeps the rest of its catalog entry. A `models` entry would replace the model.
 - `claude`-provider tiers run on Claude Code through the Agent SDK, not Pi, so they don't appear.
 - **The `$comment` notice is safe for Pi 1.3.0.** Its loader (`ModelConfig.load` in `packages/coding-agent/src/core/model-config.ts` at the tag) checks the file against `ModelsConfigSchema`, a TypeBox object that doesn't forbid other keys, and then reads only `providers`. The published `models.schema.json` has no `additionalProperties: false` either.
-- **[verify]** For a model whose provider allows fewer than 64000 output tokens, an override may raise Pi's request above that limit. The anthropic and budget rosters' Haiku 5.5 and Opus 5.5 aren't affected. Check the portable roster's GLM and Kimi output limits before the first portable run.
+- **[verify]** For a model whose provider allows fewer than 64000 output tokens, an override may raise Pi's request above that limit. The anthropic and budget rosters' Haiku 5.5 and Opus 5.5 aren't affected. Check the portable roster's GLM and Kimi output limits before the first portable run (H-119).
+
+### Why the pins exist
+
+A `models-store.json` planted in Pi's agent directory takes full effect over the built-in catalog (spike 08, finding 9). With no pins, Pi used a plant that set the cost to 0 (blinding the budget guard and Archon's `max_spend_usd`), dropped `compat` (so no `drop_block`, and budget-based thinking), and set a `baseUrl`, so **the request, with the API key, went to the planted host**. Pinning cost, `maxTokens`, the provider's `baseUrl` and the whole `compat` object restored the unplanted request exactly; pinning only `supportsMidConvoEffort` left the other five Anthropic compat flags lost, and the request gained `interleaved-thinking-2025-05-14`. The pins come only from `src/generate/pi-catalog-1.3.0.json` and the roster, so a policy edit can't loosen them (design §6a item 9).
+
+`pi-catalog-1.3.0.json` is the values of Pi 1.3.0's built-in catalog for every Pi model a roster names, read from the pinned Archon image with the command in [spike 08, finding 13](spikes/08-guard-hooks-offline.md); its `sources` hold the sha256 of the catalog files it came from. Bumping Pi means regenerating it.
+
+### What `hapi policy build` refuses
+
+- **Any Pi roster model the catalog lacks**, e.g. `policy/rosters/portable.yaml: opencode-go/<id>: not in Pi 1.3.0's catalog`: nothing could pin it, so a planted store could set its price.
+- **An `anthropic/*` model without `compat.supportsMidConvoEffort`** in the catalog (H-184): Pi sends `drop_block` and its beta only for such a model, and without them the first request after a compaction is a 400 on an account created on or after 2026-08-31.
+- **An `anthropic/*` tier whose `effort` or `retry_effort` the catalog's `thinkingLevelMap` maps to `null`**, since effort drives thinking and `drop_block` there. Other vendors build anyway: Pi 1.3.0 maps `opencode-go/kimi-k3`'s `low` and `high` to `max`, and `glm-5.3`'s `medium` to `high`, without a word. The portable roster's efforts must be chosen before its first run (H-202).
+
+No `models.json` entry carries an `anthropic-beta` header: Pi sends the beta itself, from `compat`.
+
+## `build/pi/models-store.json` and `settings.json`
+
+- **`models-store.json`** is exactly `{}`, with no `$comment`: Pi reads the file as its own model store, and a non-empty object might be taken as a catalog overlay. The run container binds it read-only over Pi's own store, which closes the planted-store vector offline; the pins and the guard's `session_start` check stay as defence in depth (spike 08, finding 9). Whether Pi needs to write it in a paid, online run is checked in Plan 02 Task 11. `tests/generate/index.test.ts`'s notice test exempts it, with a comment saying why.
+- **`settings.json`** is Pi's settings file with nothing set: only the `$comment` notice. A repo's `.pi/settings.json` is stripped before a run (H-181).
+
+## `build/pi/extensions/hapi-guard.js` and `build/decide/hapi-decide.js`
+
+Both are `Bun.build` bundles (`bundleEntry` in `src/generate/index.ts`): `target: "node"`, ESM, unminified, with a fixed `root` so two builds give identical bytes. They import nothing but `node:*` (the build throws otherwise), so they run under a bare Bun with `BUN_OPTIONS=--no-install` and no `node_modules` (spike 08, findings 1 and 2). `target: "node"` keeps the `node:` specifiers and puts the `//` notice on line 1; `"bun"` would rewrite them to bare names and put `// @bun` first.
+
+- `hapi-guard.js` is bundled from `src/guard/index.ts`. Until Task 5 it is a placeholder whose factory registers only a `session_start` handler that throws, so a node fails rather than running unguarded.
+- `hapi-decide.js` is bundled from `src/decide/cli.ts`, about 1.4 MB because the entry pulls in `loadPolicy` and its schema checker. `bun hapi-decide.js bash-gate --mock` answers from stdin with no policy directory.
 
 ## `build/pi/hapi-guard.json`
 
@@ -189,8 +238,14 @@ The settings Plan 02's hapi-guard extension enforces inside every Pi worker (spe
   "session": "workers",
   "combine": "strictest",
   "protected_paths": { "**/.claude/**": "deny", "**/.git/**": "deny", "**/.gitleaks.toml": "deny", "**/.mise.toml": "deny", "**/AGENTS.md": "deny", "**/mise.*.toml": "deny", ".agents/**": "deny", ".archon/**": "deny", ".coderabbit.yaml": "deny", ".factory/**": "deny", ".github/**": "deny", ".pi/**": "deny", "mise.toml": "deny", "...": "every other glob of policy/protected_paths.yaml, sorted" },
-  "budgets": { "run_usd": 3 },
-  "max_tokens": 64000
+  "budgets": { "run_usd": 3, "mode": "hard" },
+  "max_tokens": 64000,
+  "models": { "anthropic/claude-opus-5-5": { "base_url": "https://api.anthropic.com", "cost": {}, "compat": {}, "max_tokens": 64000, "require_compat": true } },
+  "secret_env": ["ANTHROPIC_API_KEY", "CLAUDE_API_KEY", "HAPI_JEV_OPENROUTER_API_KEY", "OPENCODE_API_KEY"],
+  "agent_dir_allowed": ["auth.json", "auth.json.lock", "extensions", "hapi-guard.json", "models-store.json", "models-store.json.lock", "models.json", "sessions", "settings.json"],
+  "gates": { "...": "policy/gates.yaml, as loaded" },
+  "jev": { "enabled": true, "fallback": "haiku" },
+  "paths": { "out": "/out", "runFile": "/run/hapi/run.json", "ledgerDir": "/tmp/hapi-guard" }
 }
 ```
 
@@ -200,7 +255,14 @@ The settings Plan 02's hapi-guard extension enforces inside every Pi worker (spe
 | `combine` | `strictest`: a file is blocked if **any** glob matches it. See below. |
 | `protected_paths` | Glob → `deny`, in the [glob syntax](policy.md#glob-syntax) of `src/policy/paths.ts`, sorted by glob. |
 | `budgets.run_usd` | `budgets.yaml`'s per-run target (spec §3: ≤ $3). A repo overlay may lower it. |
+| `budgets.mode` | `budgets.enforcement.hapi_guard`: `hard` stops the run at the budget, `soft` flags it. |
 | `max_tokens` | The same cap as `models.json`, for the guard's `before_provider_request` clamp (spec §9.3). |
+| `models` | Each Pi ref of the roster → `{ base_url, cost, compat, max_tokens, require_compat }`: the pinned catalog entry the guard compares with the resolved model at `session_start`. `require_compat` is true for `anthropic/*`. |
+| `secret_env` | The archon zone's env names from `stack/secrets.yaml`, sorted: what the guard keeps out of a worker's shell. |
+| `agent_dir_allowed` | The names that may sit in Pi's agent directory; the guard fails the node on any other. |
+| `gates` | `gates.yaml` exactly, classifiers nested: the guard passes it to `decide()` as `DecideOptions.gates`. |
+| `jev` | `flags.yaml`'s `jev.enabled` and `jev.fallback`. |
+| `paths` | `RUN_PATHS`' `out`, `runFile` and `ledgerDir`. |
 
 ## `build/egress/*.squid.conf`
 
