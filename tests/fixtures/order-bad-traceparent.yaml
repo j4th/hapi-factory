@@ -13,7 +13,7 @@ pieces:
     size: small
 verify:
   smoke: true                       # run `mise run smoke` against the local Odoo sidecar
-egress_extra: ["odoo.internal"]     # hosts the smoke check needs (here: the private sidecar)
+egress_extra: ["odoo.internal"]     # a host, so the validator's host rules run (a schema example only: H-192)
 trace:
   traceparent: "00-xyz"
 sources: ["docs/research/odoo-external-api.md", "docs/design/odoo-mcp.md"]

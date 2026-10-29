@@ -153,7 +153,7 @@ mise run down
 5. **The network check:** each zone network must be internal, with every subnet inside the proxies' `zone_clients` ranges (10/8, 172.16/12, 192.168/16, fc00::/7, fe80::/10). If a check fails, or can't be made (`docker network inspect` exits non-zero, which the error reports with its exit code and stderr, or prints something unreadable), it removes what step 4 made (`docker compose -p hapi down`) and stops. Nothing is left started or created.
 6. **`docker compose up -d --wait`:** starts the stack, and waits up to 5 minutes for every health check to pass. If one fails, `up` fails and says where to look; the containers are left for you to inspect.
 
-**`mise run down`** is `hapi stack down`, which runs `docker compose -p hapi down`. It goes by project name, so it needs no compose file, `build/` or `XDG_RUNTIME_DIR`, and it works whatever state the checkout is in. It keeps the volumes. As any other user, it re-execs as hapi, as `up` does.
+**`mise run down`** is `hapi stack down`, which runs `docker compose -p hapi down`. It goes by project name, so it needs no compose file, `build/` or `XDG_RUNTIME_DIR`. It does load the whole CLI (`bun run src/cli.ts`), so it needs a checkout that loads (`src/` parses, `node_modules` installed) and a working mise, yours and hapi's: a merge conflict in `src/`, or a pull that brought a new dependency without `mise run setup`, stops it before Compose runs. Then use [kill switch 3b](kill-switches.md#3b-without-a-checkout-or-mise), which needs neither. It keeps the volumes. As any other user, it re-execs as hapi, as `up` does.
 
 To see the stack, as hapi: `docker compose -p hapi ps`, `docker compose -p hapi logs <service>`. To change the proxies' rules, change `policy/trusted_sources.yaml` and run `mise run up`. The configs set `pid_filename none`, so a reload is a restart, and the build label makes `up` restart them.
 
@@ -167,7 +167,7 @@ With this set, `up` and `down` skip the re-exec and run the stack as **you**, on
 
 - `up` prints a warning. So does `down`: `hapi stack down: warning: HAPI_ALLOW_CURRENT_USER=1: stopping the dev-bypass stack on <you>'s own Docker, not hapi's. This doesn't touch hapi's stack: ...`. A shell that exported the bypass would otherwise stop nothing of hapi's, in silence, on the kill-switch path: stop hapi's stack with `mise run down` in a shell without `HAPI_ALLOW_CURRENT_USER`, or with [kill switch 3b](kill-switches.md#3b-without-a-checkout-or-mise).
 - Every container is labelled `org.hapi.dev-override=1` and `org.hapi.started-by=<you>`. (`up` as hapi sets `0` and `hapi`; a stack started some other way, such as a raw `docker compose up`, says `unknown` for both.)
-- `hapi audit` fails on it (`runtime.dev-override`): it reads those labels, and this shell's own setting through `currentUserOverride(env)` in `src/stack/up.ts`. `--dev` makes it a skip ([docs/audit.md](../audit.md#runtimedev-override)).
+- `hapi audit` fails on it (`runtime.dev-override`): it reads those labels, and this shell's own setting through `currentUserOverride(env)` in `src/stack/up.ts`. `--dev` makes it a skip ([docs/audit.md](../audit.md#runtimedev-override)). But it reads only the Docker of the user who runs it: the documented audit runs as hapi, so it never sees a bypass stack on your own Docker. It catches one only when it runs as the user who started it (H-193). Stop a bypass stack when you're done with it.
 - Only exactly `1` turns it on. It means nothing for the hapi user itself.
 
 Never use it for the real stack.

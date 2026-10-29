@@ -2,7 +2,7 @@
 
 hapi-factory is a public, best-practices reference stack for an end-to-end agentic software factory. **HAPi** stands for **H**ermes + **A**rchon + **Pi**: Hermes is the coordinator you talk to, Archon is the run engine and Pi is the worker. The stack puts existing tools together into one working system. It also covers the steps most factories skip: discovery research, architecture, threat modeling and breaking work into tasks. Security is designed in from the start: one policy compiled into every tool's config, rootless containers behind default-deny egress, secrets from a pluggable secret provider (sops + age by default), short-lived GitHub App tokens, and an audit that catches drift. Read the design in [docs/superpowers/specs/2026-10-26-hapi-factory-design.md](docs/superpowers/specs/2026-10-26-hapi-factory-design.md). It is the binding reference for everything here.
 
-> **Status: Plan 01 (Phase 0 foundations) is in progress.** Today the repo has the pinned toolchain, the `hapi` CLI skeleton, CI, `policy/` with its JSON Schemas, loader, tighten-only repo overlay and work-order validator, the generators that compile policy into Hermes, Archon, Pi and egress-proxy configs (`mise run policy:build`), the pinned per-zone MCP catalog with its tool-description lock, fail-closed secrets from a pluggable provider, sops + age by default (`mise run secrets:init`, `hapi secrets resolve`) with per-machine keys and a 10-word recovery key, scoped GitHub App token minting (`hapi token mint`), the stack itself (`stack/compose.yaml`: Hermes and Archon on internal-only networks behind per-zone Squid egress proxies, started by `mise run up` as the `hapi` user, with `scripts/host-setup.sh` for the one-time host setup and integration tests that prove the egress boundary on real Docker), the audit (`mise run audit`: config drift, the running stack's settings, pins, Archon's and Hermes's own validation, the MCP lock, the secrets setup, and each repo's rulesets, App permissions and AI workflows), the setup runbooks, the MAESTRO threat model v0 ([docs/security/threat-model.md](docs/security/threat-model.md)) and the kill-switch runbook ([docs/runbooks/kill-switches.md](docs/runbooks/kill-switches.md)). Anything marked *arrives in Plan 01 Task N* is not built yet. The plan is [docs/superpowers/plans/2026-10-26-hapi-factory-01-foundations.md](docs/superpowers/plans/2026-10-26-hapi-factory-01-foundations.md).
+> **Status: Plan 01 (Phase 0 foundations) is in progress.** Today the repo has the pinned toolchain, the `hapi` CLI skeleton, CI, `policy/` with its JSON Schemas, loader, tighten-only repo overlay and work-order validator, the generators that compile policy into Hermes, Archon, Pi and egress-proxy configs (`mise run policy:build`), the pinned per-zone MCP catalog with its tool-description lock, fail-closed secrets from a pluggable provider, sops + age by default (`mise run secrets:init`, `hapi secrets resolve`) with per-machine keys and a 10-word recovery key, scoped GitHub App token minting (`hapi token mint`), the stack itself (`stack/compose.yaml`: Hermes and Archon on internal-only networks behind per-zone Squid egress proxies, started by `mise run up` as the `hapi` user, with `scripts/host-setup.sh` for the one-time host setup and integration tests that prove the egress boundary on real Docker), the audit (`mise run audit`: config drift, the running stack's settings, pins, Archon's and Hermes's own validation, the MCP lock, the secrets setup, and each repo's rulesets, App permissions and AI workflows), the setup runbooks, the MAESTRO threat model v0 ([docs/security/threat-model.md](docs/security/threat-model.md)), the kill-switch runbook ([docs/runbooks/kill-switches.md](docs/runbooks/kill-switches.md)) and the notes of the verify-early spikes, Tasks 8–13 ([docs/spikes/](docs/spikes/); Task 14 is on hold, H-177). Anything marked *arrives in Plan 01 Task N* is not built yet. The plan is [docs/superpowers/plans/2026-10-26-hapi-factory-01-foundations.md](docs/superpowers/plans/2026-10-26-hapi-factory-01-foundations.md).
 
 ## Contents
 
@@ -43,7 +43,9 @@ mise run hapi -- --version   # run the CLI (prints 0.1.0)
 The unit tests need no secrets. To run the stack you also need a secrets store ([docs/secrets.md](docs/secrets.md#getting-started-with-sops--age)):
 
 ```bash
-mise run secrets:init        # this machine's key, a recovery key, the encrypted store (all empty) and the config
+mise run secrets:init -- --file private/secrets.enc.yaml
+                             # this machine's key, a recovery key, the encrypted store (all empty) and the config,
+                             # the store in private/, where the stack's handoff to hapi reads it;
                              # it shows 10 recovery words once: store them where you can't lose them
 mise run secrets:drill       # prove the words open the store
 mise run secrets:edit        # fill in each value in your editor; sops encrypts it again
@@ -98,12 +100,7 @@ What exists now:
 | `docs/superpowers/specs/` | The design spec. It is the binding authority. |
 | `docs/superpowers/plans/` | Implementation plans. Plan 01 is the current one. |
 | `docs/research/` | What the research behind the design covered, and which of its conclusions the spec adopted, by section. The sources themselves are private. |
-
-Still to come in Plan 01:
-
-| Path | What it will be | Arrives in |
-|---|---|---|
-| `docs/spikes/` | Results of the verify-early spikes. `spikes/scratch/` holds throwaway spike work and is gitignored. | Tasks 8–14 |
+| `docs/spikes/` | The verify-early spikes' notes (Plan 01 Tasks 8–13), each with its result, evidence, decision and consequence for the later plans. Task 14, the smoke sidecar, is on hold until the showcase's subject is picked (H-177). `spikes/scratch/` holds throwaway spike work and is gitignored. |
 
 ## mise tasks
 
@@ -210,7 +207,7 @@ Here is how commands work:
 - **A committed lockfile.** `bun.lock` is in git, and `mise run setup` installs with `--frozen-lockfile`.
 - **A release-age cooldown.** `bunfig.toml` sets `minimumReleaseAge` to 3 days, so Bun won't resolve a package version published less than 3 days ago.
 - **Pinned actions.** CI actions are pinned to full commit SHAs, CI runs with a read-only token, and checkout doesn't persist credentials.
-- **No plaintext secrets on disk.** `.env*`, `private/`, `keys.txt`, `*.agekey`, `secrets.env` and `mise.local.toml` are gitignored. The store is encrypted (sops + age) by default, and resolved secrets are written only to `0600` files on the user's tmpfs (`$XDG_RUNTIME_DIR/hapi/env/`), never to the repo or a `.env` file on disk.
+- **No plaintext secrets in the repo, or in a file hapi writes to disk.** `.env*`, `private/`, `keys.txt`, `*.agekey`, `secrets.env` and `mise.local.toml` are gitignored. The store is encrypted (sops + age) by default, and hapi writes resolved secrets only to `0600` files on the user's tmpfs (`$XDG_RUNTIME_DIR/hapi/env/`), never to the repo or a `.env` file on disk. Docker, though, keeps each running container's environment, its zone's secrets included, in the container's config on hapi's disk until `mise run down` removes the container: an accepted residual (H-189, [docs/secrets.md](docs/secrets.md#the-env-files)).
 
 **To upgrade a tool:**
 1. Find the version with `mise ls-remote <tool>` or `mise latest <tool>`.
@@ -400,7 +397,7 @@ Task 5 wrote the stack and proved its egress boundary on the build host's own Do
 | [MCP servers](docs/mcp.md) | Which zone gets which MCP server and why, how to add or upgrade one (a planning PR plus a re-pin), the release cooldown and its security-fix exception, advisory floors, the tool-description lock and the CI scanners |
 | [Plan 01: Foundations](docs/superpowers/plans/2026-10-26-hapi-factory-01-foundations.md) | Tasks 1–14: toolchain, policy, generators, secrets, stack, audit, threat model, spikes |
 | [Research](docs/research/README.md) | What the research behind the design covered, and the conclusions the spec adopted, by section (the sources are private) |
-| `docs/spikes/` | Spike results, which arrive in Plan 01 Tasks 8–14 |
+| [Spikes](docs/spikes/) | The notes of Plan 01's verify-early spikes, Tasks 8–13 (Task 14 is on hold, H-177): Pi under Archon, Hermes's path guard, Archon's budget, trigger and env, Anthropic's history check and billing, the images under rootless Docker, Hermes's Slack gateway |
 
 ## License
 

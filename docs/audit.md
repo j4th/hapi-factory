@@ -104,13 +104,13 @@ Without the stack and without `--repo`, as on a development machine, most checks
 
 **Credential.** None: `docker inspect`, and the mounted config's file on the host.
 
-**Fix.** Remove the flag or variable (it would have to come from a changed `stack/compose.yaml`, since no secret may use a `HERMES_` name), and restore build/ with `mise run up`.
+**Fix.** Remove the flag or variable, and restore build/ with `mise run up`. It can come from a changed `stack/compose.yaml` (no secret may use a `HERMES_` name), but this check reads only the container's command line and environment, never `$HERMES_HOME/.env` (`/opt/data/.env`, on the writable `hermes-data` volume), which Hermes v0.22.5 loads at startup over its environment. A `HERMES_YOLO_MODE` planted there passes this check (H-190), so if you suspect one, read that file's variable names too, never its values: it may hold `API_SERVER_KEY`, which the image's boot hook writes there.
 
 **Skip.** The stack or hermes isn't running, Docker isn't available, or the mounted config can't be read (run the audit as hapi).
 
 ### runtime.dev-override
 
-**Verifies.** The labels `hapi stack up` puts on every container: `org.hapi.dev-override=0` and `org.hapi.started-by=hapi` on every running one. `1` is the dev bypass (`HAPI_ALLOW_CURRENT_USER=1`); `unknown` or an empty value means a stack not started through `hapi stack up` (a raw `docker compose up`), never "no bypass". It also fails when this shell itself sets the bypass as a user other than hapi (`currentUserOverride`, `src/stack/up.ts`), since `mise run up` from it would run the stack as that user.
+**Verifies.** The labels `hapi stack up` puts on every container: `org.hapi.dev-override=0` and `org.hapi.started-by=hapi` on every running one. `1` is the dev bypass (`HAPI_ALLOW_CURRENT_USER=1`); `unknown` or an empty value means a stack not started through `hapi stack up` (a raw `docker compose up`), never "no bypass". It also fails when this shell itself sets the bypass as a user other than hapi (`currentUserOverride`, `src/stack/up.ts`), since `mise run up` from it would run the stack as that user. It reads only the Docker of the user running the audit (`docker ps` on whatever daemon that user's CLI reaches). Run as hapi, as documented, it never sees a bypass stack on the operator's own Docker: it catches one only when it runs as the user who started it (H-193).
 
 **Why.** The bypass is a dev-only downgrade: no dedicated user and no rootless Docker (spec §4.3, §11.3). It must never pass a normal audit.
 
@@ -222,7 +222,7 @@ Under `--strict` that skip is a fail, like any other. So until H-101 closes, a s
 
 Rules in a ruleset in `evaluate` or `disabled` mode don't apply to `main`, so they don't count.
 
-**Why.** Spec §5.1 and §11.5: every lane gets the same CI gates, and no App can merge or bypass. `main` is guarded by two rulesets, because one ruleset's owner bypass would also bypass `ci`. The other two keep the Apps to `plan/**` and `factory/**` and off tags (AC-8): an exclusion added to either would widen what the Apps may push.
+**Why.** Spec §5.1 and §11.5: every lane gets the same CI gates, and no App can merge or bypass. `main` is guarded by two rulesets, because one ruleset's owner bypass would also bypass `ci`. The other two keep the Apps to `plan/**` and `factory/**` and off tags (AC-8): an exclusion added to either would widen what the Apps may push. The Dependabot exclusion this check allows does too: with it, the Apps can push `dependabot/**` branches (H-174).
 
 **Credential.** The operator's token (`--github-token-file`), or else a read-only App installation token ([below](#github-credentials)). GitHub returns `bypass_actors` to the operator's token, but not to an App's, which has no Administration permission, so with an App token the bypass checks can't be made.
 
@@ -314,4 +314,6 @@ On 2026-10-27, against the pinned images (`ghcr.io/coleam00/archon:0.12.1@sha256
 - **Reusable workflows and other triggers:** `repo.ai-workflows` doesn't follow a job that calls a reusable workflow, or flag `workflow_run` (H-155).
 - **A job's default token:** a job with no `permissions` block, in a workflow with none, gets the repository's default GITHUB_TOKEN permissions (read and write under the permissive setting), which `repo.ai-workflows` doesn't read; such a job counts only through its expressions and its checkout. A read-only token (`read-all`, read scopes) doesn't count either, and neither does an action whose own `action.yml` defaults an input to `${{ github.token }}`, since the audit doesn't fetch the action (H-155).
 - **`pins.versions` and the `RUN`s it can't read:** the body of a heredoc `RUN <<EOF`, which isn't read as the `RUN`'s command, so a package it installs isn't checked; and an installer that is downloaded to a file and run without a checksum (`curl -o i.sh … && sh i.sh`), which isn't a pipe into a shell; and a download piped into an interpreter that runs code from stdin (`| python3`, `| python3 -`, `| node`, `| perl`, `| ruby`), which isn't a shell (H-157).
-- **`private/` tracked in this repo:** a check Task 7b adds (H-058). **Active skill forks:** Plan 04 (H-109).
+- **Hermes's `.env`:** `runtime.hermes-no-yolo` doesn't read `$HERMES_HOME/.env`, which Hermes loads at startup, so a yolo variable planted there passes; Plan 04 mounts an empty read-only file over it and has the check require that mount (H-190).
+- **A dev-bypass stack on another user's Docker:** `runtime.dev-override` reads only the auditing user's Docker, so the audit as hapi never sees a bypass stack on the operator's own Docker (H-193).
+- **Active skill forks:** Plan 04 (H-109).

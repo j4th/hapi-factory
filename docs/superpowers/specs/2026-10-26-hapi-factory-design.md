@@ -182,11 +182,11 @@ Lanes are routed by **PR labels**. The **work-order file** says what to build.
 |---|---|---|
 | `lane:planning` | Hermes only | Research, designs, threat models, work orders, context files, doc-only tweaks |
 | `lane:factory` | Archon + Pi | Building a merged work order |
-| `lane:direct` | The operator, hands-on in Pi (later Claude Code; later still, Hermes driving Pi for one-off work) | Work he wants to drive himself |
+| `lane:direct` | The operator, hands-on in Pi (later Claude Code; later still, Hermes driving Pi for one-off work) | Work they want to drive themselves |
 
 All lanes share:
 - the same CI gates;
-- The operator's approval at merge;
+- the operator's approval at merge;
 - commit trailers recording the lane (§13.2).
 
 Git tags are only for releasing and pinning hapi-factory itself.
@@ -270,13 +270,14 @@ pieces:
     size: small
 verify:
   smoke: true                       # run `mise run smoke` against the local Odoo sidecar
-egress_extra: ["odoo.internal"]     # hosts the smoke check needs (here: the private sidecar)
+egress_extra: []                    # public hosts the run needs beyond its zone's (none here: see the rules)
 trace:
   traceparent: "00-<trace-id>-<span-id>-01"     # minted by a script when the order is created
 sources: ["docs/research/odoo-external-api.md", "docs/design/odoo-mcp.md"]
 ```
 
 Rules:
+- `egress_extra` adds **public hosts only**. Every allowlisted zone's proxy refuses private addresses (`to_localnet`, before its allowlist) and allows only HTTPS to port 443, so a private smoke sidecar, such as an Odoo container on the zone's network, is never reached through it. The smoke check reaches the sidecar directly on the zone's internal network, with its name in the run's `NO_PROXY`. Never loosen `to_localnet` for it (H-192).
 - `traceparent` and `id` are written by **deterministic code**, Hermes's `dispatch`/`new-work-order` tool, never by the model.
 - The schema check runs:
   - in Hermes before the planning PR is opened;
@@ -735,7 +736,8 @@ Default-deny proxy per container, generated from policy.
   - **Optional: Bitwarden Secrets Manager** (`bws`), bound by name → id in the local config.
   - **Explicit downgrade: `env-file`** (plaintext, `0600`, outside every checkout). `hapi audit` reports it.
   - Never in a repo `.env` (Hermes's 1Password integration falls back to `.env`, which fails open).
-- **Residual risk:** model keys are visible inside their containers, bounded by spend caps and egress. **Next level:** a credential-injecting proxy.
+  - **Docker keeps a copy** (found in Plan 01's final review, 2026-10-28): Compose passes each zone's env file to the container as its environment, which hapi's Docker keeps in the container's config on hapi's disk for as long as the container exists, reboots included; `mise run down` removes it. An accepted residual (H-189), beside the next one.
+- **Residual risk:** model keys are visible inside their containers, and in Docker's config of each on hapi's disk, bounded by spend caps and egress. **Next level:** a credential-injecting proxy; for Docker's copy, secrets passed as files the containers read at start, or encrypted storage.
 
 ### 11.6 Supply chain
 

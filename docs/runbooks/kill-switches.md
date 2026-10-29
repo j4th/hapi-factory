@@ -36,17 +36,29 @@ The fastest switch: one browser tab per provider. Each key, its cap and its logi
 
 Do it for **both** Apps, `hapi-planner` and `hapi-factory`, on github.com: your profile picture → **Settings** → under **Integrations**, **Applications** → **Installed GitHub Apps** → **Configure** next to the App → **Suspend**. (GitHub's "Reviewing and modifying installed GitHub Apps", read 2026-10-27; the [GitHub Apps runbook](github-apps.md#kill-switch-suspend-an-installation) uses the same path.)
 
-If you hold App tokens, revoke them **before** you suspend: while the installation is active, GitHub accepts the token, so its own revoke call works; after the suspension that call may be refused **[verify in stage b]** (H-160(b)), leaving the token live up to its hour. Each is a file in `$XDG_RUNTIME_DIR/hapi/tokens/` of the user that minted it (hapi, or you). As that user:
+If you hold App tokens, revoke them **before** you suspend: while the installation is active, GitHub accepts the token, so its own revoke call works; after the suspension that call may be refused **[verify in stage b]** (H-160(b)), leaving the token live up to its hour. Each is a file in `$XDG_RUNTIME_DIR/hapi/tokens/` of the user that minted it (hapi, or you), so revoke each user's.
+
+hapi's, from your own shell (sudo clears `XDG_RUNTIME_DIR`, so the script sets it; `gh` is a mise tool, so it runs through hapi's mise in hapi's checkout):
 
 ```bash
-for f in "$XDG_RUNTIME_DIR"/hapi/tokens/*.token; do [ -s "$f" ] || continue; GH_TOKEN="$(cat "$f")" gh api -X DELETE /installation/token && rm "$f"; done
+sudo -u hapi -H -- sh -c 'd="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/hapi/tokens"; cd ~/hapi-factory || exit 1; n=0; for f in "$d"/*.token; do [ -s "$f" ] || continue; n=$((n+1)); GH_TOKEN="$(cat "$f")" ~/.local/bin/mise exec -- gh api -X DELETE /installation/token && rm "$f"; done; echo "$n token file(s) found in $d"'
 ```
 
-The `[ -s … ]` guard skips a missing or empty file: with an empty `GH_TOKEN`, `gh` would fall back to your own stored credentials.
+Yours, from your checkout:
+
+```bash
+d="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/hapi/tokens"; n=0; for f in "$d"/*.token; do [ -s "$f" ] || continue; n=$((n+1)); GH_TOKEN="$(cat "$f")" mise exec -- gh api -X DELETE /installation/token && rm "$f"; done; echo "$n token file(s) found in $d"
+```
+
+Each prints how many token files it found, so a loop that finds none says so instead of passing in silence: `0 token file(s)` means there was nothing to revoke there, not that a revoke worked. The `[ -s … ]` guard skips a missing or empty file: with an empty `GH_TOKEN`, `gh` would fall back to your own stored credentials. A revoke that fails leaves its file, and `gh` prints why.
 
 - **Stops:** new tokens: `hapi token mint`, and the audit's own read-only token, fail, naming the suspended installation. GitHub "temporarily block[s] it from accessing resources owned by your account" (its docs).
 - **Doesn't stop:** a token minted before the suspension may keep working until it expires, one hour after it was minted. GitHub's docs say a suspended App is blocked from your resources, but not in so many words that its unexpired tokens are refused **[verify in stage b]** (H-160): revoke the ones you hold, as above. Nor does it undo what is already on GitHub (a pushed `plan/**` or `factory/**` branch, an opened PR: close and delete them yourself; only you can merge), or stop the containers or your own credentials.
-- **Confirm:** the App's **Configure** page shows **Unsuspend**. As hapi, `hapi token mint --app planner --repo "$OWNER/hapi-factory"` fails, saying the installation is suspended.
+- **Confirm:** the App's **Configure** page shows **Unsuspend**. And a mint as hapi fails, saying `the App's installation on <owner>/hapi-factory is suspended`. Your shell passes the repo as an argument of its own, so nothing of yours is in the script:
+
+  ```bash
+  sudo -u hapi -H -- sh -c 'export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"; cd ~/hapi-factory && exec ~/.local/bin/mise run hapi -- token mint --app planner --repo "$1"' hapi-confirm "$OWNER/hapi-factory"
+  ```
 - **Undo:** the same page → **Unsuspend**.
 - **Takes effect:** at once for new tokens; up to an hour for a token minted before it, unless you revoked it.
 
