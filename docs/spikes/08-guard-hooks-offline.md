@@ -14,7 +14,7 @@
     - a `session_start` throw fails the node;
     - a factory throw leaves it unguarded, without a trace;
     - the guard-ran check can join on the attempt id.
-  - **The portable roster's large tier, `opencode-go/kimi-k3.1-pro`, isn't in Pi 1.3.0's catalog,** and fails every node (finding 13).
+  - **The portable roster's large tier as it stands, `opencode-go/kimi-k3.1-pro`, isn't in Pi 1.3.0's catalog,** and fails every node (finding 13). The operator has since chosen `opencode-go/kimi-k3`, which is in it. On it, Pi sends `reasoning_effort: max` for both `effort: low` and `effort: high`, without a word.
 
 ## Setup
 
@@ -45,6 +45,7 @@
   - `t16-pi`: `anthropic/claude-haiku-5-5`, and run r1 had `retry: { max_attempts: 1, delay_ms: 1000, on_error: all }`;
   - `t16-opencode`: `opencode-go/glm-5.3-flash`;
   - `t16-kimi`: `opencode-go/kimi-k3.1-pro`;
+  - `t16-kimi3` and `t16-kimi3-high`: `opencode-go/kimi-k3` at `effort: low` and `high`; `t16-glm-medium`: `opencode-go/glm-5.3` at `effort: medium`. All three ran against the 400 fake, which logs `reasoning_effort`;
   - `t16-plant`: a bash node copies a planted `models-store.json` into Pi's directory, then the Pi node runs;
   - `t16-tool`: the scripted tool call.
 - **The plant:** the catalog's Haiku 5.5 entry with cost 0, no `compat` and `baseUrl: http://127.0.0.1:18080`, under `{ "anthropic": { "models": [...], "lastModified": 4102444800000 } }` (the year 2100, after the catalog's `generatedAt`).
@@ -67,6 +68,7 @@ Raw output is in `spikes/scratch/16/evidence/t16-<run>/` (`stderr.txt`, `out/t16
 | r10: plant, the whole compat pinned | compat equals the catalog's six flags. Payload and betas are the same as r1's. |
 | r9: `models-store.json` bound read-only as `{}` | The node ran normally: one `session_start`, one request to the fake, no error or warning in any log. |
 | r11: `opencode-go/kimi-k3.1-pro` | `session_start` fired. Then: `Node 'work' failed: the provider's configuration must be fixed before it can run; retrying will not help: Pi model not found: provider='opencode-go' model='kimi-k3.1-pro'. … this model id is not in the Pi model catalog. If the model is newer than your catalog, refresh it with 'pi update --models'; Archon reads the refreshed store at /opt/hapi/pi-agent/m…`. No request was sent. |
+| r13: effort mapping on OpenCode Go | `opencode-go/kimi-k3` at `effort: low`: the hook and the wire both have **`reasoning_effort: "max"`**. At `effort: high`: also `"max"`. `opencode-go/glm-5.3` at `effort: medium`: `"high"`. No warning in stdout, stderr or the transcript. |
 | r12, r12b, r12c: `t16-tool`, scripted fake | **Completed.** `tool_call` bash: input keys `[command]`, cwd `/work/repo`; `process.env` still had every deleted name unset. `tool_result`: `[text]`, `structuredContent` keys `exit_code, output, truncated, wall_time_seconds`. **The shell's output (r12c): `ANTHROPIC_API_KEY`, `OPENCODE_API_KEY`, `CLAUDE_API_KEY`, `HAPI_JEV_OPENROUTER_API_KEY` and `T16_DELETE_ME` all `in the shell env`.** The Pi process's `/proc/$PPID/environ` and the Archon CLI's (the grandparent) both hold `ANTHROPIC_API_KEY`. `GIT_CONFIG_COUNT=13 BUN_OPTIONS=--no-install`, and `command /dev/null`. The tools sent to the model: `["bash","__pi_deferred_placeholder__"]`. Usage per call: 1000 in, 2000 out, `cost.total 0.0011` from the pinned prices. The node's `execution.spend.costUsd {source: provider, value: 0.0022}`, and `metadata.total_cost_usd 0.0022`. |
 | r12d: `unset-prefix` | The `tool_call` handler set `event.input.command = "unset <the five names>\n" + command`. **All five were `not in the shell env`.** `/proc/$PPID/environ` and the grandparent's still hold the key. The transcript's `tool_call` event shows the original command, without the `unset`. |
 | r1: the join (`out/result.json`, `out/transcript.jsonl`) | **`nodes[]` holds one entry for the node,** carrying the last attempt's `execution.attempt.id` (`8773e55b…`) and `sessionIds` for both attempts. The provider is at `execution.binding.provider: "pi"`; also `binding.model.requested: anthropic/claude-haiku-5-5` and `execution.node.kind: agent`. **The transcript holds a `node_start` and a `node_error` row per attempt.** Each has `execution.{runId, path: "work", attempt.id, binding.provider: "pi"}`: `ddd5f86b…`, then `8773e55b…`. These equal the guard's `ARCHON_NODE_EXECUTION` `runId`, `path` and `attempt.id`, attempt for attempt. `provider_event` rows carry `attemptId`. |
@@ -113,12 +115,14 @@ Raw output is in `spikes/scratch/16/evidence/t16-<run>/` (`stderr.txt`, `out/t16
 
    **Task 4's pins** (cost, `maxTokens`, `compat.supportsMidConvoEffort`, the provider's `baseUrl`) restored cost, `maxTokens`, `baseUrl` and `drop_block`, but not the other five compat flags. Without them the request gained `interleaved-thinking-2025-05-14`. **Pinning the catalog's whole `compat` object** gave exactly the unplanted request.
 
-   **Binding `models-store.json` read-only as `{}`** ran without error, and a read-only bind can't be written, as `models.json` shows (spike 07's `Read-only file system`): that closes the vector. Pi didn't overwrite the plant during a run either. And per r11's error text, a planted store can also add models.
+   **Binding `models-store.json` read-only as `{}`** ran without error in r9, an offline run, and a read-only bind can't be written, as `models.json` shows (spike 07's `Read-only file system`). Offline, that closes the vector. Pi didn't overwrite the plant during a run either. And per r11's error text, a planted store can also add models.
+
+   **Not verified:** whether Pi needs to write `models-store.json` in a paid, online run. Spike T8's EROFS on it came with the whole directory read-only. Task 11's paid check shows it: if a node fails there on that file, the bind goes, and the pins and the guard's check carry the vector alone.
    - **Ruling for Plan 02:**
      - **Task 4:** each roster model's `modelOverrides` pins the catalog's whole `compat` object, not only `supportsMidConvoEffort`. Task 4's `pi.test.ts` expectation changes to match. Task 4 also generates `build/pi/models-store.json` as `{}`.
      - **Task 7:** `runArgs` binds that `{}` read-only at `/opt/hapi/pi-agent/models-store.json`, beside `models.json`.
      - **Task 5:** at `session_start`, compare the whole resolved `compat`, `cost`, `maxTokens` and `baseUrl` with `hapi-guard.json`'s `models` entry, and fail the node on any difference.
-     - The read-only store closes the plant, and the pins and the guard's check stay as defence in depth.
+     - The read-only store closes the plant offline, and the pins and the guard's check stay as defence in depth. Task 11 confirms the bind in a paid run.
 10. **The guard-ran join.** `workflow get --json --verbose`'s `nodes[]` holds one entry per node, with only the last attempt's id (plus every attempt's `sessionIds`), so it can't show that each attempt was guarded. The transcript can: it has one `node_start` row per attempt. Each row's `execution.runId`, `execution.path` and `execution.attempt.id` equal the guard's `ARCHON_NODE_EXECUTION`. The provider is `execution.binding.provider` (`"pi"`), and the kind is `execution.node.kind` (`"agent"`).
     - **Ruling for Plan 02:** Task 7's guard-ran check reads `out/transcript.jsonl`.
       - **The attempts to check:** every `type: "node_start"` row with `execution.binding.provider == "pi"`.
@@ -129,25 +133,213 @@ Raw output is in `spikes/scratch/16/evidence/t16-<run>/` (`stderr.txt`, `out/t16
     - **Ruling for Plan 02:** matches the plan (Task 5 rule 3).
 12. **Tool events.** `tool_call` for `bash` carries `input.command`, and `ctx.cwd` is the clone. `tool_result` gives `content: [text]` plus `structuredContent {exit_code, output, truncated, wall_time_seconds}`. Pi also sends the model a `__pi_deferred_placeholder__` tool beside the node's `allowed_tools`.
     - **Ruling for Plan 02:** matches the plan (Task 5's rules 1, 6 and 7, and the result screen's wrap, which drops `structuredContent`). The placeholder goes in Task 5's notes. The scripted model never called it, so what a call to it does wasn't run.
-13. **The catalog** (`spikes/scratch/16/pi-catalog-1.3.0.json`, for Task 4).
-    - **Sources:** Pi 1.3.0's catalog, `generatedAt 2026-10-15T19:00:55.287Z`. sha256:
+13. **The catalog, for Task 4.** The values below are Pi 1.3.0's built-in catalog, read from the pinned image. They cover every Pi model in `policy/rosters/*.yaml`, with the portable large tier as `opencode-go/kimi-k3`, the operator's choice. `opencode-go/kimi-k3.1-pro` is left out: it isn't in the catalog (below).
+    - **The command that regenerates it,** from the checkout, prints exactly the JSON block below. It needs only the local image: no network and no pull.
+
+      ```sh
+      docker run --rm -i --network none --read-only --user 1001:1001 --entrypoint sh hapi-factory/archon:0.12.1 -s <<'EOF'
+      cd /app/node_modules/@earendil-works/pi-ai/dist/providers/data
+      jq -n --slurpfile a anthropic.json --slurpfile o opencode-go.json --slurpfile m .manifest.json \
+        --arg sa "$(sha256sum anthropic.json | cut -d' ' -f1)" --arg so "$(sha256sum opencode-go.json | cut -d' ' -f1)" \
+        --arg sm "$(sha256sum .manifest.json | cut -d' ' -f1)" --arg v "$(jq -r .version ../../../package.json)" '
+        def entry($d; $id): [$d[] | .["chat:" + $id] // empty][0]
+          | if . == null then null else {api, baseUrl, reasoning, cost, compat, maxTokens, contextWindow, thinkingLevelMap} end;
+        { pi_ai_version: $v, catalog_generatedAt: $m[0].generatedAt,
+          sources: { "anthropic.json": $sa, "opencode-go.json": $so, ".manifest.json": $sm },
+          models: {
+            "anthropic/claude-haiku-5-5": entry($a[0]; "claude-haiku-5-5"),
+            "anthropic/claude-opus-5-5": entry($a[0]; "claude-opus-5-5"),
+            "opencode-go/glm-5.3-flash": entry($o[0]; "glm-5.3-flash"),
+            "opencode-go/glm-5.3": entry($o[0]; "glm-5.3"),
+            "opencode-go/kimi-k3": entry($o[0]; "kimi-k3") } }'
+      EOF
+      ```
+
+    - **Sources:** `@earendil-works/pi-ai` 1.3.0, `/app/node_modules/@earendil-works/pi-ai/dist/providers/data/`, catalog `generatedAt 2026-10-15T19:00:55.287Z`. sha256:
       - `anthropic.json`: `91f5da01452c7746645d3405bc91e09f849e4e4687c7c7ff22d8976eafe64b87`;
       - `opencode-go.json`: `39408ee6da7302e3202d7f7b27d31d4d50a05c340bebd7da25ee23755d506475`;
       - `.manifest.json`: `894a2cf1ce96333027615324165a5d377ad2ad450b4fe04b3d1810f08c1be5d0`.
-    - **The roster models** (prices in USD per MTok: input / output / cache read / cache write):
+    - **The values** (cost in USD per MTok; `tiers` applies above `inputTokensAbove` input tokens):
 
-      | Model | Prices | maxTokens | contextWindow | `supportsMidConvoEffort` | baseUrl |
-      |---|---|---|---|---|---|
-      | `anthropic/claude-haiku-5-5` | 0.1 / 0.5 / 0.01 / 0.125, and above 100000 input tokens 0.5 / 2.5 / 0.05 / 0.625 | 128000 | 1000000 | true | `https://api.anthropic.com` |
-      | `anthropic/claude-opus-5-5` | 4 / 20 / 0.2 / 5 | 128000 | 1000000 | true | `https://api.anthropic.com` |
-      | `opencode-go/glm-5.3-flash` | 0.15 / 0.5 / 0.03 / 0 | 131072 | 1000000 | none | `https://opencode.ai/inference/go/v1` |
-      | `opencode-go/glm-5.3` | 1.4 / 4.4 / 0.26 / 0 | 131072 | 1000000 | none | `https://opencode.ai/inference/go/v1` |
+      ```json
+      {
+        "pi_ai_version": "1.3.0",
+        "catalog_generatedAt": "2026-10-15T19:00:55.287Z",
+        "sources": {
+          "anthropic.json": "91f5da01452c7746645d3405bc91e09f849e4e4687c7c7ff22d8976eafe64b87",
+          "opencode-go.json": "39408ee6da7302e3202d7f7b27d31d4d50a05c340bebd7da25ee23755d506475",
+          ".manifest.json": "894a2cf1ce96333027615324165a5d377ad2ad450b4fe04b3d1810f08c1be5d0"
+        },
+        "models": {
+          "anthropic/claude-haiku-5-5": {
+            "api": "anthropic-messages",
+            "baseUrl": "https://api.anthropic.com",
+            "reasoning": true,
+            "cost": {
+              "input": 0.1,
+              "output": 0.5,
+              "cacheRead": 0.01,
+              "cacheWrite": 0.125,
+              "tiers": [
+                {
+                  "inputTokensAbove": 100000,
+                  "input": 0.5,
+                  "output": 2.5,
+                  "cacheRead": 0.05,
+                  "cacheWrite": 0.625
+                }
+              ]
+            },
+            "compat": {
+              "supportsMidConvoEffort": true,
+              "supportsMidConvoSystemMessages": true,
+              "supportsMidConvoToolChanges": true,
+              "forceAdaptiveThinking": true,
+              "supportsTemperature": false,
+              "supportsStrictTools": true
+            },
+            "maxTokens": 128000,
+            "contextWindow": 1000000,
+            "thinkingLevelMap": {
+              "minimal": null,
+              "low": "low",
+              "medium": "medium",
+              "high": "high",
+              "xhigh": "xhigh",
+              "max": "max"
+            }
+          },
+          "anthropic/claude-opus-5-5": {
+            "api": "anthropic-messages",
+            "baseUrl": "https://api.anthropic.com",
+            "reasoning": true,
+            "cost": {
+              "input": 4,
+              "output": 20,
+              "cacheRead": 0.2,
+              "cacheWrite": 5
+            },
+            "compat": {
+              "supportsMidConvoEffort": true,
+              "supportsMidConvoSystemMessages": true,
+              "supportsMidConvoToolChanges": true,
+              "forceAdaptiveThinking": true,
+              "supportsTemperature": false,
+              "supportsStrictTools": true
+            },
+            "maxTokens": 128000,
+            "contextWindow": 1000000,
+            "thinkingLevelMap": {
+              "off": null,
+              "minimal": null,
+              "low": "low",
+              "medium": "medium",
+              "high": "high",
+              "xhigh": "xhigh",
+              "max": "max"
+            }
+          },
+          "opencode-go/glm-5.3-flash": {
+            "api": "openai-completions",
+            "baseUrl": "https://opencode.ai/inference/go/v1",
+            "reasoning": true,
+            "cost": {
+              "input": 0.15,
+              "output": 0.5,
+              "cacheRead": 0.03,
+              "cacheWrite": 0
+            },
+            "compat": {
+              "supportsStore": false,
+              "supportsDeveloperRole": false,
+              "supportsStrictMode": true,
+              "maxTokensField": "max_tokens"
+            },
+            "maxTokens": 131072,
+            "contextWindow": 1000000,
+            "thinkingLevelMap": {
+              "off": null,
+              "minimal": null,
+              "low": "low",
+              "medium": null,
+              "high": "high",
+              "xhigh": null,
+              "max": "max"
+            }
+          },
+          "opencode-go/glm-5.3": {
+            "api": "openai-completions",
+            "baseUrl": "https://opencode.ai/inference/go/v1",
+            "reasoning": true,
+            "cost": {
+              "input": 1.4,
+              "output": 4.4,
+              "cacheRead": 0.26,
+              "cacheWrite": 0
+            },
+            "compat": {
+              "supportsStore": false,
+              "supportsDeveloperRole": false,
+              "supportsStrictMode": true,
+              "maxTokensField": "max_tokens"
+            },
+            "maxTokens": 131072,
+            "contextWindow": 1000000,
+            "thinkingLevelMap": {
+              "off": null,
+              "minimal": null,
+              "low": "low",
+              "medium": null,
+              "high": "high",
+              "xhigh": null,
+              "max": "max"
+            }
+          },
+          "opencode-go/kimi-k3": {
+            "api": "openai-completions",
+            "baseUrl": "https://opencode.ai/inference/go/v1",
+            "reasoning": true,
+            "cost": {
+              "input": 3,
+              "output": 15,
+              "cacheRead": 0.3,
+              "cacheWrite": 0
+            },
+            "compat": {
+              "supportsStore": false,
+              "supportsDeveloperRole": false,
+              "supportsStrictMode": true,
+              "maxTokensField": "max_tokens",
+              "supportsMidConvoSystemMessages": true,
+              "supportsMidConvoToolAdditions": true
+            },
+            "maxTokens": 131072,
+            "contextWindow": 1048576,
+            "thinkingLevelMap": {
+              "off": null,
+              "minimal": null,
+              "low": null,
+              "medium": null,
+              "high": null,
+              "xhigh": null,
+              "max": "max"
+            }
+          }
+        }
+      }
+      ```
 
-    - **`opencode-go/kimi-k3.1-pro` (the portable roster's large tier) is not in the catalog.** The nearest are `kimi-k3` and `kimi-k2.7-code`. A node on it fails with `Pi model not found` (r11).
-    - **Not run:** `glm-5.3`'s `thinkingLevelMap.medium` is `null`, and the portable roster runs it at `effort: medium`.
+    - **`opencode-go/kimi-k3.1-pro` is not in the catalog.** The nearest are `kimi-k3` and `kimi-k2.7-code`. A node on it fails with `Pi model not found` (r11).
+    - **Efforts the catalog maps to `null` are silently moved up** (r13):
+      - `kimi-k3` maps only `max`, so `effort: low` and `effort: high` both send `reasoning_effort: max`;
+      - `glm-5.3` maps no `medium`, so the portable roster's medium tier sends `high`.
+
+      No warning appears anywhere. The cost and latency are the higher level's.
     - **Ruling for Plan 02:**
-      - **Task 4:** `pi-catalog-1.3.0.json` comes from this file. The generator refuses every Pi roster model the pinned catalog lacks, not only Anthropic ones (H-184's check, widened): `policy/rosters/portable.yaml: opencode-go/kimi-k3.1-pro: not in Pi 1.3.0's catalog`.
-      - **The register:** the portable roster's large tier needs the operator's choice of model, and the `glm-5.3` medium effort needs checking. `policy/rosters/portable.yaml` is protected, so both go to the register, not to an edit here.
+      - **Task 4:** `src/generate/pi-catalog-1.3.0.json` is this block, regenerated with the command above, with its sha256s in a `$comment`.
+        - The generator refuses every Pi roster model the pinned catalog lacks, not only Anthropic ones (H-184's check, widened), e.g. `policy/rosters/portable.yaml: opencode-go/<id>: not in Pi 1.3.0's catalog`.
+        - It also refuses a tier whose `effort` or `retry_effort` the model's `thinkingLevelMap` maps to `null`, naming the level Pi would send instead. With the swap to `kimi-k3` at `effort: low, retry_effort: high`, and `glm-5.3` at `effort: medium`, that refusal fires on the portable roster as it would stand.
+      - **The register:** the portable roster's efforts need the operator's choice: `kimi-k3` runs only at `max`, and `glm-5.3` has no `medium`. `policy/rosters/portable.yaml` is protected, so the roster change and the effort choice are the operator's.
 
 ## Decision
 
@@ -158,9 +350,17 @@ hapi-guard keeps the shape Task 5 plans: one `node`-target bundle that registers
 
 Four rulings change later tasks:
 - **Task 5:** the attempt is a string id; rule 8 adds an `unset` prefix to every bash command, since deleting from `process.env` doesn't reach the shell; and `session_start` compares the whole pinned model entry.
-- **Task 4:** the pins carry the catalog's whole `compat`; it generates a `{}` `models-store.json`; and it refuses any Pi roster model the catalog lacks.
+- **Task 4:** the pins carry the catalog's whole `compat`; it generates a `{}` `models-store.json`; and it refuses any Pi roster model the catalog lacks, or an effort the catalog maps to `null`.
 - **Task 7:** `runArgs` binds the `{}` `models-store.json` read-only, and the guard-ran check joins the transcript's per-attempt `node_start` rows on `(runId, path, attempt.id)`.
-- **The register:** the portable roster's `kimi-k3.1-pro` has no Pi 1.3.0 model behind it.
+- **The register:** the portable roster's `kimi-k3.1-pro` has no Pi 1.3.0 model behind it. Its replacement, `kimi-k3`, and `glm-5.3` both get efforts the catalog maps to `null`, which Pi silently moves up.
+
+**Not verified:**
+- **Whether Pi needs to write `models-store.json` in a paid, online run** (finding 9). Every run here was offline. If it does, the read-only `{}` bind breaks nodes, and the vector falls back to the pins and the guard's check. Task 11's paid check settles it.
+- **Any of this on hapi's rootless Docker,** including the run container's chown helper and copy-out (spike 07, findings 12 and 14). Every run used the operator's own daemon.
+- **The real Squid behind the `egress-archon` alias** (spike 07, finding 13). These runs had no network at all.
+- **A live provider.** The auth, beta and payload facts came from a loopback fake that answered 400, or a scripted fake. A real provider's answers (streaming, usage, errors) are Task 11's.
+
+Task 11's paid check runs as hapi on the rootless daemon, with the real `egress-archon` and a live model, so it exercises all of these. Its "Live check" addendum to this report records the outcome.
 
 ## Consequences
 
@@ -168,7 +368,7 @@ Four rulings change later tasks:
   - `src/generate/pi-catalog-1.3.0.json` from the capture, with its sha256s;
   - each pin's `compat` is the catalog's whole object;
   - `build/pi/models-store.json` is generated as `{}`;
-  - the refusal covers every Pi roster model.
+  - the refusal covers every Pi roster model, and every tier's `effort` and `retry_effort` against its `thinkingLevelMap`.
 - **Task 5:**
   - `attempt: string`;
   - the `unset` prefix on `bash`, plus its test;
@@ -182,4 +382,5 @@ Four rulings change later tasks:
   - the keys stay readable through `/proc/<parent>/environ` (finding 7);
   - a factory throw is silent (finding 8);
   - the catalog-overlay vector, and what closes it (finding 9).
-- **The register:** the portable roster's large tier (`opencode-go/kimi-k3.1-pro`, not in the catalog), and `glm-5.3` at `effort: medium` (not run).
+- **Task 11:** the paid check confirms the read-only `models-store.json` bind and the Decision's other unverified items, and records them in this report's "Live check" addendum.
+- **The register:** the portable roster's large tier (`opencode-go/kimi-k3.1-pro`, not in the catalog; the operator's replacement, `kimi-k3`, runs only at `max`), and `glm-5.3` at `effort: medium` (sent as `high`).

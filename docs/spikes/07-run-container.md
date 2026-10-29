@@ -145,13 +145,15 @@ Raw output is in `spikes/scratch/15/evidence/<tag>/` (`stdout.txt`, `stderr.txt`
 11. **`BUN_OPTIONS=--no-install` stops runtime installs in a bash node, with no registry request.** The same script with `BUN_OPTIONS` unset installed from the loopback registry, so the test discriminates. That unset is the worker-side residual.
     - **Ruling for Plan 02:** matches the plan (Task 6, design §6a item 5).
 12. **A fresh volume needs the chown helper.** Its root is `root:root 0755`, so uid 1001 gets EACCES. The one-shot helper needs `--cap-add CHOWN` and nothing else; without it, EPERM.
-    - **Ruling for Plan 02:** matches the plan (Task 7 Step 1, `start` step 4).
+    - **Not verified on hapi's rootless Docker:** there, container root is hapi's own uid and 1001 maps into hapi's subordinate range (spike 05). Whether `CAP_CHOWN` alone chowns a fresh volume's root to 1001 there wasn't run.
+    - **Ruling for Plan 02:** matches the plan (Task 7 Step 1, `start` step 4), pending the rootless check below.
 13. **The proxy needs `--alias` on the run's network.** `docker network connect --alias egress-archon <net> <proxy>` makes `egress-archon` resolve on an `--internal` network. A connect without it gives only the container's name, and an alias from another network doesn't carry over. Docker refuses `network rm` while an endpoint is attached (`has active endpoints`, exit 1), so `disconnect -f` has to come first.
-    - **Ruling for Plan 02:** matches the plan (Task 7 `start` step 3; Task 6 `removeRuns` steps 2 and 3).
+    - **Not verified:** the real `egress-archon` (Squid). The stand-in was a Python HTTP server, so whether Squid on its alias reaches the outside for a run, and refuses what its config refuses, wasn't run. Neither was a run's network when `egress-archon` is recreated.
+    - **Ruling for Plan 02:** matches the plan (Task 7 `start` step 3; Task 6 `removeRuns` steps 2 and 3), pending the Squid check below.
 14. **The copy-out helper's tests are right, and the host side needs two more rules.** `[ -f "$f" ] && [ ! -L "$f" ]` refuses a symlink, a FIFO and a missing name; `[ -f ]` alone follows the symlink. Reading `cap+1` bytes catches an oversize file. A binary file round-trips byte for byte through the docker CLI's stdout. The copy is owned by the invoking user, since the CLI writes it.
     - The two rules: the mode comes from the umask (664 here), and a refused or missing name still leaves an empty file wherever stdout was redirected.
     - An unguarded read of a FIFO blocks, so the helper's timeout matters even with the test.
-    - This ran on the operator's Docker, not rootless, but the CLI writes the file there too.
+    - This ran on the operator's Docker, not rootless. Under rootless, the docker CLI still writes the file, so it should be hapi's, but that wasn't run.
     - **Ruling for Plan 02:** Task 7 Step 3, `copyOut`: write each file through a temp file created 0600, and keep it only when the helper exits 0 and the size is at most the cap. Otherwise delete it and report the problem. Keep the per-helper timeout.
 15. **`docker logs --follow` is the only live view.** It streams the container's stdout and stderr and returns 0 when the container exits; the container's own exit code comes from `docker wait`. Archon's progress lines go to stderr (`[<node>] Started/Completed/Failed`, `[workflow] Transcript: …`). The transcript itself lives in the `/.archon` tmpfs, which the host can't read while the run is live.
     - **Ruling for Plan 02:** Task 8, `hapi run watch`: follow `docker logs --follow` of the run container while it runs (stripping control sequences), then print the copied `transcript.jsonl` and result after finalize. Design §3.2's "follows a run's transcript from the host" changes to this.
@@ -175,6 +177,14 @@ The run container ships as Tasks 6 and 7 describe it: the prelude, the env list,
 
 Two residuals go to the threat model: the repo's `bunfig.toml` preload for the worker's own `bun`, and git filter drivers.
 
+**Not verified** (everything ran on the operator's own Docker, with no real proxy):
+- **The chown helper on hapi's rootless daemon** (finding 12): whether `--user 0:0 --cap-add CHOWN` chowns a fresh volume's root to 1001 under rootless uid mapping.
+- **The copy-out on hapi's rootless daemon** (finding 14): the helper reading a 1001-owned file, and the copy being hapi's on the host.
+- **The real Squid behind the alias** (finding 13): egress through `egress-archon` on a run's network, its refusals, and what a recreated `egress-archon` does to a live run.
+- **Whether Pi writes `models-store.json` in a paid, online run** (spike 08, finding 9), which decides whether Task 7 can bind it read-only.
+
+Task 11's paid check runs as hapi on the rootless daemon, with the real `egress-archon` and a live model, so it exercises all four. Its runbook section says what to look for.
+
 ## Consequences
 
 - **Task 6:** `hapi-check-run` may use `$BUN_OPTIONS`/`$HOME`. `run.sh` stays as written.
@@ -190,4 +200,5 @@ Two residuals go to the threat model: the repo's `bunfig.toml` preload for the w
   - git filter drivers (finding 10);
   - `docker inspect` holding the zone's key values (finding 16);
   - `noexec` tmpfs as a posture fact (finding 18).
+- **Task 11:** the paid check's runbook section says what shows the four unverified items (the Decision's list) on the real host.
 - **Register:** finding 18's worker-tool question for Plan 03.
