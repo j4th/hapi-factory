@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# hapi-factory's pre-merge-commit hook: a merge commit gets pre-commit's checks
+# (gitleaks, then the personal strings) on everything the merge stages. git runs
+# pre-commit only for `git commit`, so without this a `git merge` of a branch
+# committed elsewhere (a clone without private/, or without these hooks) would
+# land unchecked. A fast-forward makes no commit, so no hook runs for it.
+# commit-msg checks the merge's own message.
+set -euo pipefail
+
+exec "$(dirname "$0")/pre-commit"

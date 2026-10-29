@@ -1,7 +1,8 @@
 /**
  * .githooks/ (Task 7b Step 5, H-057): the pre-commit hook (gitleaks on the
- * staged changes, then the personal-strings check) and the commit-msg hook
- * (the personal-strings check on the message). Each test commits in a
+ * staged changes, then the personal-strings check), the pre-merge-commit hook
+ * (the same, for a merge commit) and the commit-msg hook (the personal-strings
+ * check on the message). Each test commits in a
  * throwaway repo with the hooks installed (core.hooksPath), its own HOME and no
  * global or system git config. A stub `mise` on PATH runs the gitleaks that
  * mise.toml pins, so the hooks run exactly as they would in a checkout. The
@@ -26,19 +27,19 @@ const temp = (prefix: string) => {
 };
 
 describe("the hook files", () => {
-  test("bash parses each (bash -n), and the two hooks are executable", () => {
-    for (const f of ["pre-commit", "commit-msg", "lib.sh"]) {
+  test("bash parses each (bash -n), and the three hooks are executable", () => {
+    for (const f of ["pre-commit", "pre-merge-commit", "commit-msg", "lib.sh"]) {
       const r = Bun.spawnSync(["bash", "-n", join(HOOKS, f)], { stderr: "pipe" });
       expect([f, r.exitCode, r.stderr.toString()]).toEqual([f, 0, ""]);
     }
-    for (const f of ["pre-commit", "commit-msg"]) expect([f, statSync(join(HOOKS, f)).mode & 0o111]).toEqual([f, 0o111]);
+    for (const f of ["pre-commit", "pre-merge-commit", "commit-msg"]) expect([f, statSync(join(HOOKS, f)).mode & 0o111]).toEqual([f, 0o111]);
   });
 
   /** A shellcheck that runs (a mise shim with no version set doesn't). */
   const shellcheck = Bun.which("shellcheck") !== null && Bun.spawnSync(["shellcheck", "--version"], { stdout: "ignore", stderr: "ignore" }).exitCode === 0;
   test.skipIf(!shellcheck)("shellcheck finds nothing (when shellcheck is on PATH)", () => {
     // From the repo root: the hooks' `# shellcheck source=.githooks/lib.sh` is relative to it, as scripts/ are.
-    const r = Bun.spawnSync(["shellcheck", "-x", ".githooks/pre-commit", ".githooks/commit-msg", ".githooks/lib.sh"], { cwd: REPO, stdout: "pipe" });
+    const r = Bun.spawnSync(["shellcheck", "-x", ".githooks/pre-commit", ".githooks/pre-merge-commit", ".githooks/commit-msg", ".githooks/lib.sh"], { cwd: REPO, stdout: "pipe" });
     expect([r.exitCode, r.stdout.toString()]).toEqual([0, ""]);
   });
 });
@@ -78,10 +79,13 @@ function sandbox(personal: string | null = `# names\n${NAME}\n\n${LOGIN}\n`, mis
     GIT_COMMITTER_NAME: "Test",
     GIT_COMMITTER_EMAIL: "test@example.invalid",
   };
-  const git = (...args: string[]): Commit => {
-    const r = Bun.spawnSync(["git", ...args], { cwd: root, env, stdout: "pipe", stderr: "pipe" });
-    return { code: r.exitCode, out: r.stdout.toString() + r.stderr.toString() };
-  };
+  const gitIn =
+    (cwd: string) =>
+    (...args: string[]): Commit => {
+      const r = Bun.spawnSync(["git", ...args], { cwd, env, stdout: "pipe", stderr: "pipe" });
+      return { code: r.exitCode, out: r.stdout.toString() + r.stderr.toString() };
+    };
+  const git = gitIn(root);
   expect(git("init", "-q").code).toBe(0);
   cpSync(HOOKS, join(root, ".githooks"), { recursive: true });
   expect(git("config", "core.hooksPath", ".githooks").code).toBe(0);
@@ -90,18 +94,30 @@ function sandbox(personal: string | null = `# names\n${NAME}\n\n${LOGIN}\n`, mis
     writeFileSync(join(root, "private", "personal-strings.txt"), personal);
   }
   // The hooks run from the working tree (core.hooksPath); they are never staged here.
-  writeFileSync(join(root, ".gitignore"), personal === null ? ".githooks/\n" : "private/\n.githooks/\n");
-  const write = (path: string, text: string) => {
-    mkdirSync(join(root, path, ".."), { recursive: true });
-    writeFileSync(join(root, path), text);
+  // Linked worktrees go under .worktrees/, which git ignores, as in this repo.
+  writeFileSync(join(root, ".gitignore"), `${personal === null ? "" : "private/\n"}.githooks/\n.worktrees/\n`);
+  /** Stage these files in the checkout at `cwd` and commit with this message. */
+  const commitIn =
+    (cwd: string) =>
+    (files: Record<string, string>, message = "add files"): Commit => {
+      for (const [path, text] of Object.entries(files)) {
+        mkdirSync(join(cwd, path, ".."), { recursive: true });
+        writeFileSync(join(cwd, path), text);
+      }
+      expect(gitIn(cwd)("add", "-A").code).toBe(0);
+      return gitIn(cwd)("commit", "-q", "-m", message);
+    };
+  /**
+   * A linked worktree on a new branch at .worktrees/<name>, with the hooks (git reads a relative core.hooksPath
+   * from the worktree's root), or without them: then nothing checks its commits, as in a clone made elsewhere.
+   */
+  const worktree = (name: string, hooks = true) => {
+    const dir = join(root, ".worktrees", name);
+    expect(git("worktree", "add", "-q", "-b", name, dir).code).toBe(0);
+    if (hooks) cpSync(HOOKS, join(dir, ".githooks"), { recursive: true });
+    return { dir, git: gitIn(dir), commit: commitIn(dir) };
   };
-  /** Stage these files and commit with this message. */
-  const commit = (files: Record<string, string>, message = "add files"): Commit => {
-    for (const [path, text] of Object.entries(files)) write(path, text);
-    expect(git("add", "-A").code).toBe(0);
-    return git("commit", "-q", "-m", message);
-  };
-  return { root, git, commit };
+  return { root, git, commit: commitIn(root), worktree };
 }
 
 describe.skipIf(gitleaks === undefined)("committing with the hooks", () => {
@@ -163,6 +179,42 @@ describe.skipIf(gitleaks === undefined)("committing with the hooks", () => {
     const r = s.commit({ "d.txt": `${NAME}\n` });
     expect(r.code).toBe(0);
     expect(r.out).toContain("pre-commit: no personal strings to check (private/personal-strings.txt is missing or empty, as in a fresh clone)");
+  });
+
+  test("in a linked worktree, which has no private/, the main checkout's personal strings still apply", () => {
+    const s = sandbox();
+    expect(s.commit({ "README.md": "# A project\n" }).code).toBe(0); // a worktree needs a commit to branch from
+    const wt = s.worktree("plan-x");
+    const inFile = wt.commit({ "notes.md": `Written by ${NAME}.\n` });
+    expect(inFile.code).not.toBe(0);
+    expect(inFile.out).toContain("pre-commit: the staged changes hold a personal string");
+    expect(inFile.out).toContain("at notes.md:1");
+    expect(inFile.out).not.toContain("no personal strings to check");
+    const inMessage = wt.commit({ "notes.md": "Written by the operator.\n" }, `Add notes\n\nThanks to ${LOGIN}.`);
+    expect(inMessage.code).not.toBe(0);
+    expect(inMessage.out).toContain("commit-msg: the commit message holds a personal string");
+    expect(wt.commit({}, "Add notes").code).toBe(0);
+  });
+
+  test("a merge commit gets pre-commit's checks on what it merges (pre-merge-commit)", () => {
+    const s = sandbox();
+    expect(s.commit({ "README.md": "# A project\n" }).code).toBe(0);
+    const side = s.worktree("side", false); // a branch committed with no hooks
+    expect(side.commit({ "side.md": `By ${NAME}.\n` }).code).toBe(0);
+    expect(s.commit({ "main.md": "main\n" }, "Add main").code).toBe(0); // so the merge can't fast-forward
+    const r = s.git("merge", "--no-ff", "-q", "-m", "Merge side", "side");
+    expect(r.code).not.toBe(0);
+    expect(r.out).toContain("pre-commit: the staged changes hold a personal string");
+    expect(r.out).toContain("at side.md:1");
+    expect(r.out.toLowerCase()).not.toContain(NAME.toLowerCase());
+    expect(s.git("log", "--oneline").out).not.toContain("Merge side");
+    // The control: a clean branch merges.
+    const t = sandbox();
+    expect(t.commit({ "README.md": "# A project\n" }).code).toBe(0);
+    expect(t.worktree("side", false).commit({ "side.md": "By the operator.\n" }).code).toBe(0);
+    expect(t.commit({ "main.md": "main\n" }, "Add main").code).toBe(0);
+    expect(t.git("merge", "--no-ff", "-q", "-m", "Merge side", "side").code).toBe(0);
+    expect(t.git("log", "--oneline").out).toContain("Merge side");
   });
 
   test("a personal string in the commit message stops the commit, naming the line but not the string", () => {
