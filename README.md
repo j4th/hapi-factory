@@ -63,6 +63,7 @@ What exists now:
 | Path | What it is |
 |---|---|
 | `mise.toml` | Tool pins and the [mise tasks](#mise-tasks). This is a protected path (spec §8.2): an interactive agent session must ask the operator before editing it, and unattended sessions and workers may not edit it at all. |
+| `mise.lock` | What each `mise.toml` pin resolved to on linux-x64: the version, the download URL and its sha256, and the provenance where mise checked one. mise checks each download against it, and CI installs with `--locked`. Made by `mise lock --platform linux-x64` (see [To upgrade a tool](#toolchain-and-pinning)). A protected path, like `mise.toml`. |
 | `package.json`, `bun.lock` | JS project metadata and dependencies, pinned to exact versions: `ajv` (JSON Schema validation) and `yaml` at runtime, `typescript` and `@types/bun` for development. The lockfile is committed. |
 | `.factory/config.yaml` | hapi-factory's own repo overlay (spec §7): when the factory works on this repo, it also protects `policy/**`, `stack/**` and `.githooks/**`. An overlay can only tighten the central policy, and `.factory/**` is itself a protected path. Enforced once Plan 03's run engine loads overlays (H-172). |
 | `.githooks/` | The commit hooks, installed with `git config core.hooksPath .githooks`. `pre-commit` runs gitleaks, at the version `mise.toml` pins, on the staged changes, with `.githooks/gitleaks.toml` as its config and inline `gitleaks:allow` comments ignored, so neither a `.gitleaks.toml` nor an allow comment can turn the scan off (gitleaks still reads a root `.gitleaksignore` here, which [CI](#ci) refuses). Then it stops the commit if a staged line or path holds one of the operator's personal strings (`private/personal-strings.txt`): binary files, type changes and paths git would quote are checked too. `pre-merge-commit` runs the same checks on a merge commit. `commit-msg` checks the message the same way, down to git's own cut block only (the scissors line `commit -v` writes, then git's "Do not modify" line). The personal strings come from the main checkout's `private/`, also when you commit in a linked worktree. In a clone without `private/`, the personal-strings check is skipped with a notice. Don't bypass them with `--no-verify`. A protected path in hapi-factory's overlay, since they run on your machine at every commit. |
@@ -204,7 +205,7 @@ Here is how commands work:
 
 **Supply-chain defaults** (spec §11.6–11.7):
 - **Exact versions everywhere.** That covers `mise.toml`, `package.json` (`bunfig.toml` sets `exact = true`, so `bun add` never writes `^`) and the mise version CI uses.
-- **A committed lockfile.** `bun.lock` is in git, and `mise run setup` installs with `--frozen-lockfile`.
+- **Committed lockfiles.** `bun.lock` is in git, and `mise run setup` installs with `--frozen-lockfile`. `mise.lock` records each mise tool's download URL and sha256 for linux-x64, so a release file replaced after it was locked fails its checksum. CI installs with `mise install --locked`, so a `mise.toml` change without its lock fails there. The lockfile checks downloads only: a tool already installed, or restored from CI's cache, isn't checked again.
 - **A release-age cooldown.** `bunfig.toml` sets `minimumReleaseAge` to 3 days, so Bun won't resolve a package version published less than 3 days ago.
 - **Pinned actions.** CI actions are pinned to full commit SHAs, CI runs with a read-only token, and checkout doesn't persist credentials.
 - **No plaintext secrets in the repo, or in a file hapi writes to disk.** `.env*`, `private/`, `keys.txt`, `*.agekey`, `secrets.env` and `mise.local.toml` are gitignored. The store is encrypted (sops + age) by default, and hapi writes resolved secrets only to `0600` files on the user's tmpfs (`$XDG_RUNTIME_DIR/hapi/env/`), never to the repo or a `.env` file on disk. Docker, though, keeps each zone container's environment, its secrets included, in the container's config on hapi's disk until `mise run down` removes the container: an accepted residual (H-189, [docs/secrets.md](docs/secrets.md#the-env-files)).
@@ -212,8 +213,9 @@ Here is how commands work:
 **To upgrade a tool:**
 1. Find the version with `mise ls-remote <tool>` or `mise latest <tool>`.
 2. Bump it in `mise.toml`.
-3. Run `mise install && mise run lint && mise run test`.
-4. Say why in the PR.
+3. Run `mise lock --platform linux-x64`. It updates that tool's entry in `mise.lock` and nothing else. Run it before `mise install`: after a bump, a plain `mise install` updates the lock too, but it also adds three more linux-x64 variants for every tool.
+4. Run `mise install && mise run lint && mise run test`. The tests fail if the tool's linux-x64 entry has no sha256, which happens when a release publishes no checksum (shellcheck 0.10.0's, for one).
+5. Commit `mise.toml` and `mise.lock` together, and say why in the PR.
 
 For JS dependencies, use `bun add -d <pkg>@<exact-version>` (or without `-d` for a runtime dependency) and commit `bun.lock` with the change.
 
@@ -224,7 +226,7 @@ For JS dependencies, use `bun add -d <pkg>@<exact-version>` (or without `-d` for
 1. Checks out the repo.
 2. **Only the root `mise.toml` configures mise:** before mise is installed, a plain file scan fails, naming each one, on any mise file in the checkout besides the root `mise.toml` and the root `mise.lock` that locks it, at any depth and in any case (a `.mise.toml`, `mise.local.toml`, `mise.<env>.toml`, a nested `mise.toml`, `.config/mise.toml`, `mise/` or `.mise/`, `mise-tasks/`, `.tool-versions`, a nested `mise.lock`, `mise.local.lock` and `mise.<env>.lock`). mise loads them over `mise.toml`, and `jdx/mise-action` installs the tools they name and exports the env they set to every later step, so one could change what the job runs, a check after it included.
 3. Installs the pinned mise with `jdx/mise-action`, then, as a second net for a file the scan doesn't know by name, fails if `mise config ls` or `mise tasks ls` lists any config or task file in the checkout besides `mise.toml`.
-4. Runs `mise install && mise run lint && mise run test`.
+4. Runs `mise install --locked && mise run lint && mise run test`. `--locked` fails on a tool `mise.lock` doesn't cover, instead of resolving a version.
 5. Scans the whole history for secrets with gitleaks, with `--config .githooks/gitleaks.toml` and `--ignore-gitleaks-allow`, so a `.gitleaks.toml` or an inline `gitleaks:allow` a commit adds changes nothing. gitleaks always reads a root `.gitleaksignore`, and no flag turns that off, so the step fails if there is one. A false positive is allowed in `.githooks/gitleaks.toml`.
 
 The `main-protect` ruleset requires the `ci` check to pass, and nobody can bypass it, not even the repo admin (see the manual steps below). The reusable security-gates workflow for target repos (gitleaks, SAST, OSV-Scanner, zizmor, work-order schema, commit trailers) is separate; it arrives in Plan 05 (spec §11.7).

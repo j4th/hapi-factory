@@ -3,7 +3,8 @@
  * them run for real, as CI runs them (`bash -e`), on throwaway checkouts: the
  * mise-file scan, which needs only bash and find; the mise-config check with the
  * pinned mise, offline; and the history scan with the gitleaks mise.toml pins (a
- * stub `mise` on PATH runs it).
+ * stub `mise` on PATH runs it). Also: the root mise.lock CI installs from covers
+ * every mise.toml pin, with a checksum.
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { randomBytes } from "node:crypto";
@@ -32,6 +33,28 @@ test("the mise-file scan runs right after checkout, before mise-action reads, in
   const scan = at((s) => s.name === MISE_SCAN);
   expect(scan).toBeGreaterThan(at((s) => s.uses?.startsWith("actions/checkout@") === true));
   expect(scan).toBeLessThan(at((s) => s.uses?.startsWith("jdx/mise-action@") === true));
+});
+
+test("every mise install in CI is --locked, so a tool the root mise.lock doesn't cover fails instead of resolving a version", () => {
+  const installs = steps.flatMap((s) => (s.run ?? "").match(/\bmise install\b[^&|;\n]*/g) ?? []);
+  expect(installs.length).toBeGreaterThan(0);
+  for (const install of installs) expect(install).toMatch(/^mise install --locked\b/);
+});
+
+test("the root mise.lock locks every mise.toml tool at its pinned version, with a sha256 and an https URL for CI's linux-x64 runner", async () => {
+  const pinned = Bun.TOML.parse(await Bun.file(join(REPO, "mise.toml")).text()) as { tools: Record<string, string> };
+  const locked = Bun.TOML.parse(await Bun.file(join(REPO, "mise.lock")).text()) as {
+    tools: Record<string, { version: string; [platform: string]: unknown }[]>;
+  };
+  expect(Object.keys(locked.tools).sort()).toEqual(Object.keys(pinned.tools).sort());
+  for (const [tool, version] of Object.entries(pinned.tools)) {
+    const entry = locked.tools[tool]?.find((e) => e.version === version);
+    expect([tool, entry?.version]).toEqual([tool, version]);
+    expect([tool, entry?.["platforms.linux-x64"]]).toEqual([
+      tool,
+      expect.objectContaining({ checksum: expect.stringMatching(/^sha256:[0-9a-f]{64}$/), url: expect.stringMatching(/^https:\/\//) }),
+    ]);
+  }
 });
 
 test("the mise-config check runs once mise is installed, before any step that installs tools or runs a task", () => {

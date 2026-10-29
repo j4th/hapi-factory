@@ -7,7 +7,8 @@
 #   release tag it was resolved from (`gh api repos/<owner>/<repo>/git/ref/tags/<tag>`).
 # - Least privilege: the token can only read the repo, and checkout doesn't keep it in .git/config.
 # - mise itself is pinned to the version in mise.toml's `min_version`; mise then installs the
-#   exact tool versions from mise.toml.
+#   exact tool versions from mise.toml, each download checked against the checksum the root
+#   mise.lock records for it.
 name: ci
 
 on:
@@ -71,9 +72,11 @@ jobs:
             exit 1
           fi
 
+      # `--locked`, as mise-action adds to its own install: a tool the root mise.lock doesn't cover
+      # fails here instead of resolving a version, so a mise.toml change must come with its lock.
       # `mise run lint` first runs `setup` (bun install --frozen-lockfile), so a stale bun.lock fails here.
       - name: Install tools, type-check, unit tests
-        run: mise install && mise run lint && mise run test
+        run: mise install --locked && mise run lint && mise run test
 
       # The whole history, not just the diff: a secret in any commit stays public
       # even after a later commit removes it (H-057). Nothing in a commit can turn the scan
