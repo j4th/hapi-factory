@@ -16,6 +16,8 @@ import { join, resolve } from "node:path";
 
 const REPO = resolve(import.meta.dir, "../..");
 const HOOKS = join(REPO, ".githooks");
+/** gitleaks's config for both scans (pre-commit and CI), with the hooks. */
+const GITLEAKS_CONFIG = ".githooks/gitleaks.toml";
 const temps: string[] = [];
 afterAll(() => {
   for (const d of temps) rmSync(d, { recursive: true, force: true });
@@ -54,6 +56,12 @@ const gitleaks = (() => {
 const NAME = "Rowan Quillfeather"; // made up
 const LOGIN = "rquill-example"; // made up
 
+/** A GitHub token shape, built at run time so no scan of this repo flags this file. */
+function githubToken(): string {
+  const alnum = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  return `ghp_${[...randomBytes(36)].map((b) => alnum[b % alnum.length]).join("")}`;
+}
+
 interface Commit {
   code: number;
   out: string;
@@ -86,8 +94,10 @@ function sandbox(personal: string | null = `# names\n${NAME}\n\n${LOGIN}\n`, mis
       return { code: r.exitCode, out: r.stdout.toString() + r.stderr.toString() };
     };
   const git = gitIn(root);
+  /** The hooks, with the gitleaks config pre-commit names, into the checkout at `dir`. */
+  const installHooks = (dir: string) => cpSync(HOOKS, join(dir, ".githooks"), { recursive: true });
   expect(git("init", "-q").code).toBe(0);
-  cpSync(HOOKS, join(root, ".githooks"), { recursive: true });
+  installHooks(root);
   expect(git("config", "core.hooksPath", ".githooks").code).toBe(0);
   if (personal !== null) {
     mkdirSync(join(root, "private"));
@@ -114,7 +124,7 @@ function sandbox(personal: string | null = `# names\n${NAME}\n\n${LOGIN}\n`, mis
   const worktree = (name: string, hooks = true) => {
     const dir = join(root, ".worktrees", name);
     expect(git("worktree", "add", "-q", "-b", name, dir).code).toBe(0);
-    if (hooks) cpSync(HOOKS, join(dir, ".githooks"), { recursive: true });
+    if (hooks) installHooks(dir);
     return { dir, git: gitIn(dir), commit: commitIn(dir) };
   };
   return { root, git, commit: commitIn(root), worktree };
@@ -279,13 +289,34 @@ describe.skipIf(gitleaks === undefined)("committing with the hooks", () => {
 
   test("a secret in the staged changes stops the commit, and gitleaks's output is redacted", () => {
     const s = sandbox();
-    // A GitHub token shape, built at run time so no scan of this repo flags this file.
-    const alnum = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    const token = `ghp_${[...randomBytes(36)].map((b) => alnum[b % alnum.length]).join("")}`;
+    const token = githubToken();
     const r = s.commit({ "config.env": `GITHUB_TOKEN=${token}\n` });
     expect(r.code).not.toBe(0);
     expect(r.out).toContain("pre-commit: gitleaks found a possible secret in the staged changes");
     expect(r.out).not.toContain(token);
+  });
+
+  test("an inline gitleaks:allow comment doesn't hide a secret", () => {
+    const s = sandbox();
+    const r = s.commit({ "config.env": `GITHUB_TOKEN=${githubToken()} # gitleaks:allow\n` });
+    expect(r.code).not.toBe(0);
+    expect(r.out).toContain("pre-commit: gitleaks found a possible secret in the staged changes");
+  });
+
+  test("a .gitleaks.toml in the checkout doesn't turn the scan off (it uses .githooks/gitleaks.toml)", () => {
+    const s = sandbox();
+    const r = s.commit({ ".gitleaks.toml": "[allowlist]\npaths = ['''.*''']\n", "config.env": `GITHUB_TOKEN=${githubToken()}\n` });
+    expect(r.code).not.toBe(0);
+    expect(r.out).toContain("pre-commit: gitleaks found a possible secret in the staged changes");
+  });
+
+  test("a missing .githooks/gitleaks.toml stops the commit, saying so", () => {
+    const s = sandbox(null);
+    rmSync(join(s.root, GITLEAKS_CONFIG));
+    const r = s.commit({ "g.txt": "g\n" });
+    expect(r.code).not.toBe(0);
+    expect(r.out).toContain(`pre-commit: ${GITLEAKS_CONFIG} is missing`);
+    expect(r.out).not.toContain("found a possible secret");
   });
 
   test("a gitleaks that can't run stops the commit", () => {

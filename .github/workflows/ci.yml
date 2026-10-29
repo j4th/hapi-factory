@@ -59,6 +59,15 @@ jobs:
         run: mise install && mise run lint && mise run test
 
       # The whole history, not just the diff: a secret in any commit stays public
-      # even after a later commit removes it (H-057).
+      # even after a later commit removes it (H-057). Nothing in a commit can turn the scan
+      # off without changing a protected path: its config is .githooks/gitleaks.toml, not a
+      # .gitleaks.toml the commit adds; inline gitleaks:allow comments are ignored; and
+      # gitleaks always reads a root .gitleaksignore, which no flag turns off, so the step
+      # refuses one.
       - name: Scan the whole history for secrets (gitleaks)
-        run: mise exec -- gitleaks git --redact --no-banner --no-color -v .
+        run: |
+          if [[ -e .gitleaksignore ]]; then
+            echo "::error::.gitleaksignore would hide gitleaks findings. Remove it; the operator allows a false positive in .githooks/gitleaks.toml."
+            exit 1
+          fi
+          mise exec -- gitleaks git --config .githooks/gitleaks.toml --ignore-gitleaks-allow --redact --no-banner --no-color -v .

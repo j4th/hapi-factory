@@ -1,0 +1,12 @@
+# gitleaks's config for hapi-factory's two secret scans: the pre-commit hook
+# (.githooks/pre-commit) and CI (.github/workflows/ci.yml). Both name it with
+# --config, so a .gitleaks.toml a commit adds can't change what they find, and
+# both pass --ignore-gitleaks-allow, so an inline gitleaks:allow comment can't
+# either. It sits with the hooks, under .githooks/**, a protected path
+# (.factory/config.yaml). git runs only files named after a hook, never this one.
+#
+# gitleaks's own default rules, with nothing allowed. The operator allows a false
+# positive here, never with a .gitleaksignore (CI refuses one).
+
+[extend]
+useDefault = true

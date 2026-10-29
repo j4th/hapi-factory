@@ -22,8 +22,16 @@ cd "$root"
 
 # 1. Secrets. gitleaks exits 1 on a finding and something else when it fails. It is
 # quiet unless it finds something; then -v names the file, line and rule, redacted.
+# Its config is .githooks/gitleaks.toml, so a .gitleaks.toml in the commit can't turn
+# it off, and it ignores inline gitleaks:allow comments. gitleaks also exits 1 when it
+# can't load the config, so a missing one is caught first.
+gitleaks_config=".githooks/gitleaks.toml"
+if [[ ! -f "$gitleaks_config" ]]; then
+  echo "pre-commit: $gitleaks_config is missing, so gitleaks can't scan and the commit is stopped. Restore it: git checkout HEAD -- $gitleaks_config" >&2
+  exit 1
+fi
 status=0
-mise exec -- gitleaks git --pre-commit --staged --redact --no-banner --no-color --log-level warn -v . || status=$?
+mise exec -- gitleaks git --pre-commit --staged --config "$gitleaks_config" --ignore-gitleaks-allow --redact --no-banner --no-color --log-level warn -v . || status=$?
 if [[ "$status" -eq 1 ]]; then
   echo "pre-commit: gitleaks found a possible secret in the staged changes (above, redacted). Unstage it and keep it out of the repo." >&2
   exit 1

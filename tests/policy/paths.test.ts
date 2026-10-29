@@ -114,6 +114,10 @@ describe("effectiveModes", () => {
     for (const path of ["src/mise.ts", "docs/mise.md", "misery.toml", ".config/other.toml", "mise-notes/a.md"]) expect([path, effectiveModes(p, path)]).toEqual([path, ALLOW]);
   });
 
+  test("gitleaks's config and ignore file are protected at any depth: one could turn the secret scans off", () => {
+    for (const path of [".gitleaks.toml", ".gitleaksignore", "pkg/.gitleaks.toml", "pkg/.GitleaksIgnore"]) expect([path, effectiveModes(p, path)]).toEqual([path, ASK]);
+  });
+
   test("the strictest mode across every matching glob wins, per session, whatever the order", () => {
     const broad: PathModes = { interactive: "allow", unattended: "deny", workers: "ask" };
     const narrow: PathModes = { interactive: "ask", unattended: "allow", workers: "allow" };

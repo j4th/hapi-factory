@@ -75,3 +75,8 @@ protected_paths:
   # the git dir git uses. No agent edits these files directly. H-191 hardens the
   # argv side.
   "**/.git/**": { interactive: deny, unattended: deny, workers: deny }
+  # gitleaks's config and ignore file: either could turn a repo's secret scans
+  # off. hapi-factory's own scans (the pre-commit hook, CI) name their config,
+  # .githooks/gitleaks.toml, and CI refuses a .gitleaksignore.
+  "**/.gitleaks.toml":  { interactive: ask, unattended: deny, workers: deny }
+  "**/.gitleaksignore": { interactive: ask, unattended: deny, workers: deny }

@@ -98,6 +98,8 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
       ".coderabbit.yml": ask,
       ".coderabbit.config.ts": ask,
       "**/.git/**": deny,
+      "**/.gitleaks.toml": ask,
+      "**/.gitleaksignore": ask,
     });
   });
 

@@ -1,10 +1,12 @@
 /**
- * .github/workflows/ci.yml: where its checks sit among the steps, and the
- * mise-config check run for real, as CI runs it (`bash -e`), on throwaway
- * checkouts with the pinned mise, offline.
+ * .github/workflows/ci.yml: where its checks sit among the steps, and two of
+ * them run for real, as CI runs them (`bash -e`), on throwaway checkouts: the
+ * mise-config check with the pinned mise, offline, and the history scan with the
+ * gitleaks mise.toml pins (a stub `mise` on PATH runs it).
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { chmodSync, cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import YAML from "yaml";
@@ -80,4 +82,73 @@ describe.skipIf(!runs("mise") || !runs("jq"))("the mise-config check, run on a t
       expect(r.out).toContain(`/${path}`);
     });
   }
+});
+
+const SCAN = "Scan the whole history for secrets (gitleaks)";
+
+test("the history scan uses .githooks/gitleaks.toml and ignores inline gitleaks:allow comments", () => {
+  const run = steps.find((s) => s.name === SCAN)?.run ?? "";
+  expect(run).toContain("gitleaks git --config .githooks/gitleaks.toml --ignore-gitleaks-allow ");
+});
+
+/** The gitleaks mise.toml pins, or undefined when mise can't say (the scan tests then skip). */
+const gitleaks = (() => {
+  const r = Bun.spawnSync(["mise", "which", "gitleaks"], { cwd: REPO, stdout: "pipe", stderr: "ignore" });
+  const path = r.stdout.toString().trim();
+  return r.exitCode === 0 && path !== "" ? path : undefined;
+})();
+
+describe.skipIf(gitleaks === undefined)("the history scan, run on a throwaway repo", () => {
+  const script = steps.find((s) => s.name === SCAN)?.run ?? "exit 99";
+  /** A GitHub token shape, built at run time so no scan of this repo flags this file. */
+  const token = () => {
+    const alnum = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    return `ghp_${[...randomBytes(36)].map((b) => alnum[b % alnum.length]).join("")}`;
+  };
+  /** A repo whose one commit holds `files`, checked out with .githooks/gitleaks.toml; the step's exit code and output. */
+  const scan = (files: Record<string, string>) => {
+    const root = mkdtempSync(join(tmpdir(), "hapi-ci-scan-"));
+    const bin = mkdtempSync(join(tmpdir(), "hapi-ci-bin-"));
+    temps.push(root, bin);
+    writeFileSync(join(bin, "mise"), `#!/bin/sh\n[ "$1" = exec ] && [ "$2" = -- ] && [ "$3" = gitleaks ] || exit 127\nshift 3\nexec "${gitleaks}" "$@"\n`);
+    chmodSync(join(bin, "mise"), 0o755);
+    const gitConfig = join(bin, "gitconfig");
+    writeFileSync(gitConfig, "");
+    const env = {
+      PATH: `${bin}:${process.env.PATH}`,
+      HOME: bin,
+      GIT_CONFIG_GLOBAL: gitConfig,
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_AUTHOR_NAME: "Test",
+      GIT_AUTHOR_EMAIL: "test@example.invalid",
+      GIT_COMMITTER_NAME: "Test",
+      GIT_COMMITTER_EMAIL: "test@example.invalid",
+    };
+    cpSync(join(REPO, ".githooks", "gitleaks.toml"), join(root, ".githooks", "gitleaks.toml"));
+    for (const [path, text] of Object.entries(files)) writeFileSync(join(root, path), text);
+    for (const args of [["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "add files"]]) {
+      expect(Bun.spawnSync(["git", ...args], { cwd: root, env, stdout: "ignore", stderr: "ignore" }).exitCode).toBe(0);
+    }
+    const r = Bun.spawnSync(["bash", "-e", "-c", script], { cwd: root, env, stdout: "pipe", stderr: "pipe" });
+    return { code: r.exitCode, out: r.stdout.toString() + r.stderr.toString() };
+  };
+
+  test("passes on a clean history, and finds a token", () => {
+    expect(scan({ "README.md": "# A project\n" }).code).toBe(0);
+    expect(scan({ "config.env": `GITHUB_TOKEN=${token()}\n` }).code).toBe(1);
+  });
+
+  test("an inline gitleaks:allow comment doesn't hide a token", () => {
+    expect(scan({ "config.env": `GITHUB_TOKEN=${token()} # gitleaks:allow\n` }).code).toBe(1);
+  });
+
+  test("a .gitleaks.toml in the commit doesn't turn the scan off", () => {
+    expect(scan({ ".gitleaks.toml": "[allowlist]\npaths = ['''.*''']\n", "config.env": `GITHUB_TOKEN=${token()}\n` }).code).toBe(1);
+  });
+
+  test("a .gitleaksignore, which gitleaks always reads and no flag turns off, fails the step, saying so", () => {
+    const r = scan({ ".gitleaksignore": "config.env:generic-api-key:1\n", "README.md": "# A project\n" });
+    expect(r.code).not.toBe(0);
+    expect(r.out).toContain(".gitleaksignore would hide gitleaks findings");
+  });
 });
