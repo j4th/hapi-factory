@@ -545,7 +545,7 @@ Until the per-server images, an MCP stdio server launches as `npx --yes <pkg>@<v
 
 `bunfig.toml`'s `minimumReleaseAge` (3 days) covers npm only. A compromised mise tool or Action release has no cooldown window, and several Task 1 pins were under a week old when pinned.
 
-- **Owner control:** exact pins (DS-7: enforced, `pins.versions`); the mise Action's minisign check; `mise.lock`'s checksums (DS-7), which fail a release file replaced after it was locked, though not one that was bad when locked.
+- **Owner control:** exact pins (DS-7: enforced, `pins.versions`); the mise Action's check of the mise binary against its release's signed packslip (CI's log, for mise 2026.10.9); `mise.lock`'s checksums (DS-7), which fail a release file replaced after it was locked, though not one that was bad when locked.
 - **Next level:** a release-age cooldown for mise tools and SHA-pinned Actions (DS-8: planned, Plan 05, H-115), and a sha256 for the mise binary (H-116).
 - **Catalog:** ASI04; LLM03:2025; AML.T0010.001. **Status:** accepted residual.
 
