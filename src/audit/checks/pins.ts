@@ -91,32 +91,49 @@ function words(segment: string): string[] {
 const PIP_EXACT = /^[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[A-Za-z0-9,._-]*\])?==[A-Za-z0-9.+!_-]+$/;
 const NPM_EXACT = /^(?:@[A-Za-z0-9._-]+\/)?[A-Za-z0-9._-]+@v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
 
+/** The install command `w` starts with, and the packages it names, if it starts with one. */
+function installAt(w: string[]): { installer: string; pkgs: string[]; ok: (p: string) => boolean } | undefined {
+  const cmd = (w[0] ?? "").split("/").at(-1)!;
+  const args = (from: number) => w.slice(from).filter((a) => !a.startsWith("-"));
+  const sub = (i: number) => args(i)[0];
+  if ((cmd === "apt-get" || cmd === "apt") && sub(1) === "install") return { installer: `${cmd} install`, pkgs: args(1).slice(1), ok: (p) => /^[^=]+=.+$/.test(p) };
+  if (cmd === "apk" && sub(1) === "add") return { installer: "apk add", pkgs: args(1).slice(1), ok: (p) => /^[^=]+=.+$/.test(p) };
+  if ((cmd === "pip" || cmd === "pip3") && sub(1) === "install") return { installer: `${cmd} install`, pkgs: args(1).slice(1), ok: (p) => PIP_EXACT.test(p) };
+  if (/^python[0-9.]*$/.test(cmd) && w[1] === "-m" && w[2] === "pip" && w[3] === "install") return { installer: "pip install", pkgs: args(4), ok: (p) => PIP_EXACT.test(p) };
+  if (cmd === "uv" && w[1] === "pip" && w[2] === "install") return { installer: "uv pip install", pkgs: args(3), ok: (p) => PIP_EXACT.test(p) };
+  if (cmd === "uv" && w[1] === "tool" && w[2] === "install") return { installer: "uv tool install", pkgs: args(3), ok: (p) => PIP_EXACT.test(p) };
+  if (cmd === "uv" && w[1] === "python" && w[2] === "install") return { installer: "uv python install", pkgs: args(3), ok: (p) => /^\d+\.\d+\.\d+$/.test(p) };
+  if (cmd === "npm" && ["install", "i", "add"].includes(sub(1) ?? "")) return { installer: `npm ${sub(1)}`, pkgs: args(1).slice(1), ok: (p) => NPM_EXACT.test(p) };
+  if ((cmd === "bun" || cmd === "pnpm" || cmd === "yarn") && sub(1) === "add") return { installer: `${cmd} add`, pkgs: args(1).slice(1), ok: (p) => NPM_EXACT.test(p) };
+  if (cmd === "go" && sub(1) === "install") return { installer: "go install", pkgs: args(1).slice(1), ok: (p) => /@v\d+\.\d+\.\d+/.test(p) };
+  return undefined;
+}
+
 /**
  * Every package a RUN command installs by name, with whether it names an exact version. Each segment between
- * &&, ||, ;, | and newlines is one command; leading NAME=value words and sudo are skipped.
+ * &&, ||, ;, &, |, (, ), a backtick and newlines is one command. It fails closed: a segment is read from its first
+ * installer word followed by its install subcommand, wherever that stands, so no wrapper or keyword before it
+ * (env and its options, sudo -E, nice -n 10, command, exec, nohup, time, then, else, do, !, {) hides it, and an
+ * installer named as another command's argument (`echo apt-get install x`) counts too. A quoted word with a space in
+ * it, such as the script of `sh -c '…'`, is read as commands as well.
  */
 export function installs(run: string): { installer: string; pkg: string; pinned: boolean }[] {
   const out: { installer: string; pkg: string; pinned: boolean }[] = [];
-  for (const segment of run.split(/&&|\|\||;|\||\n/)) {
-    let w = words(segment);
-    while (w.length > 0 && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(w[0]!) || w[0] === "sudo")) w = w.slice(1);
-    const cmd = (w[0] ?? "").split("/").at(-1)!;
-    const args = (from: number) => w.slice(from).filter((a) => !a.startsWith("-"));
-    const add = (installer: string, pkgs: string[], ok: (p: string) => boolean) => pkgs.forEach((pkg) => out.push({ installer, pkg, pinned: ok(pkg) }));
-    const sub = (i: number) => args(i)[0];
-    if ((cmd === "apt-get" || cmd === "apt") && sub(1) === "install") add(`${cmd} install`, args(1).slice(1), (p) => /^[^=]+=.+$/.test(p));
-    else if (cmd === "apk" && sub(1) === "add") add("apk add", args(1).slice(1), (p) => /^[^=]+=.+$/.test(p));
-    else if ((cmd === "pip" || cmd === "pip3") && sub(1) === "install") add(`${cmd} install`, args(1).slice(1), (p) => PIP_EXACT.test(p));
-    else if (/^python[0-9.]*$/.test(cmd) && w[1] === "-m" && w[2] === "pip" && w[3] === "install") add("pip install", args(4), (p) => PIP_EXACT.test(p));
-    else if (cmd === "uv" && w[1] === "pip" && w[2] === "install") add("uv pip install", args(3), (p) => PIP_EXACT.test(p));
-    else if (cmd === "uv" && w[1] === "tool" && w[2] === "install") add("uv tool install", args(3), (p) => PIP_EXACT.test(p));
-    else if (cmd === "uv" && w[1] === "python" && w[2] === "install") add("uv python install", args(3), (p) => /^\d+\.\d+\.\d+$/.test(p));
-    else if (cmd === "npm" && ["install", "i", "add"].includes(sub(1) ?? "")) add(`npm ${sub(1)}`, args(1).slice(1), (p) => NPM_EXACT.test(p));
-    else if ((cmd === "bun" || cmd === "pnpm" || cmd === "yarn") && sub(1) === "add") add(`${cmd} add`, args(1).slice(1), (p) => NPM_EXACT.test(p));
-    else if (cmd === "go" && sub(1) === "install") add("go install", args(1).slice(1), (p) => /@v\d+\.\d+\.\d+/.test(p));
+  for (const segment of run.split(/[;&|\n()`]/)) {
+    const w = words(segment);
+    for (let i = 0; i < w.length; i++) {
+      const found = installAt(w.slice(i));
+      if (found === undefined) continue;
+      for (const pkg of found.pkgs) out.push({ installer: found.installer, pkg, pinned: found.ok(pkg) });
+      break;
+    }
+    for (const quoted of w) if (/\s/.test(quoted)) out.push(...installs(quoted));
   }
   return out;
 }
+
+/** BuildKit's flags before a RUN's command (`--mount=…`, `--network=…`, `--security=…`), a quoted value kept whole. */
+const RUN_FLAGS = /^(?:--(?:[^\s"']|"[^"]*"|'[^']*')*\s+)*/;
 
 /**
  * A shell that runs what it reads on stdin (`sh -c '…'` reads stdin as data, so it doesn't count), behind optional
@@ -176,10 +193,10 @@ export async function pinsVersions(run: AuditRun): Promise<CheckResult[]> {
     }
     for (const { op, args } of instructions(text)) {
       if (op !== "RUN") continue;
-      let command = args;
-      if (args.startsWith("[")) {
+      let command = args.replace(RUN_FLAGS, "");
+      if (command.startsWith("[")) {
         try {
-          command = (JSON.parse(args) as string[]).join(" ");
+          command = (JSON.parse(command) as string[]).join(" ");
         } catch {}
       }
       for (const i of installs(command)) {

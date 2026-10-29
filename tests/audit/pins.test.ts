@@ -103,6 +103,44 @@ describe("pins.versions", () => {
     }
   });
 
+  test("an install behind a BuildKit RUN flag, a wrapper or a shell keyword is still read (fail closed)", async () => {
+    const cases: [string, "pass" | "fail", string?][] = [
+      // BuildKit's RUN flags come before the command.
+      ["RUN --mount=type=cache,target=/var/cache/apt apt-get install -y curl", "fail", "apt-get install curl has no version"],
+      ["RUN --network=default npm install -g left-pad", "fail", "npm install left-pad has no version"],
+      ["RUN --mount=type=cache,target=/root/.cache/pip --network=default pip install requests", "fail", "pip install requests has no version"],
+      ['RUN --mount=type=cache,target=/root/.npm ["npm", "install", "-g", "left-pad"]', "fail", "npm install left-pad has no version"],
+      ["RUN --mount=type=cache,target=/var/cache/apt apt-get install -y curl=8.5.0-2ubuntu10.6", "pass"],
+      // Wrappers that run the rest as the command.
+      ["RUN env DEBIAN_FRONTEND=noninteractive apt-get install -y curl", "fail", "apt-get install curl has no version"],
+      ["RUN env -u HOME -i PATH=/usr/bin apt-get install -y curl", "fail", "apt-get install curl has no version"],
+      ["RUN sudo -E apt-get install -y curl", "fail", "apt-get install curl has no version"],
+      ["RUN nice -n 10 apt-get install -y curl", "fail", "apt-get install curl has no version"],
+      ["RUN command apt-get install -y curl", "fail", "apt-get install curl has no version"],
+      ["RUN exec apt-get install -y curl", "fail", "apt-get install curl has no version"],
+      ["RUN nohup npm install -g left-pad", "fail", "npm install left-pad has no version"],
+      ["RUN time pip install requests", "fail", "pip install requests has no version"],
+      ["RUN env DEBIAN_FRONTEND=noninteractive apt-get install -y curl=8.5.0-2ubuntu10.6", "pass"],
+      // Shell keywords and grouping.
+      ["RUN if true; then apt-get install -y curl; fi", "fail", "apt-get install curl has no version"],
+      ["RUN if false; then :; else apk add git; fi", "fail", "apk add git has no version"],
+      ["RUN for p in a; do pip install requests; done", "fail", "pip install requests has no version"],
+      ["RUN ! apt-get install -y curl", "fail", "apt-get install curl has no version"],
+      ["RUN { apt-get install -y curl; }", "fail", "apt-get install curl has no version"],
+      ["RUN (apt-get install -y curl)", "fail", "apt-get install curl has no version"],
+      ["RUN true & apt-get install -y curl", "fail", "apt-get install curl has no version"],
+      // The exec form and a shell's -c script are read too.
+      ['RUN ["sh", "-c", "apt-get install -y curl"]', "fail", "apt-get install curl has no version"],
+      ["RUN sh -c 'apt-get install -y curl'", "fail", "apt-get install curl has no version"],
+      ['RUN bash -lc "npm install -g left-pad@1.3.0"', "pass"],
+    ];
+    for (const [line, status, says] of cases) {
+      const r = await pins((root) => append(root, "stack/archon/Dockerfile", `${line}\n`));
+      expect([line, r.status]).toEqual([line, status]);
+      if (says !== undefined) expect([line, r.detail]).toEqual([line, expect.stringContaining(says)]);
+    }
+  });
+
   test("a comment line inside a continued RUN is dropped first, as Docker drops it: never read as packages, never ending the RUN", async () => {
     let r = await pins((root) => append(root, "stack/archon/Dockerfile", "RUN apt-get install -y \\\n    # the pinned tools\n    curl=8.5.0-2ubuntu10.6 \\\n  # and one more\n    jq=1.7.1-3build1\n"));
     expect(r.status).toBe("pass");
