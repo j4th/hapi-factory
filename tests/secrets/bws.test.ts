@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { SecretError } from "../../src/secrets/provider";
 import { type BwsRunner, bwsFailure, bwsProvider, isPlaceholderId } from "../../src/secrets/providers/bws";
 import { caught } from "./helpers";
@@ -114,5 +117,22 @@ describe("the bws provider (optional)", () => {
     expect(e2.message).toBe("hapi-a: bws printed something that is not JSON (not shown)");
     const e3 = await caught(bwsProvider({ ids: { "hapi-a": ID_A }, run: async () => '{"id":"x"}' }).fetch(["hapi-a"]));
     expect(e3.message).toBe("hapi-a: bws returned no string value");
+  });
+});
+
+describe("runBws", () => {
+  test("with no bws on PATH, it says how to pin one in the global mise config, not in a mise.local.toml the audit refuses", () => {
+    // In a child bun whose PATH is an empty dir from the start, so no real bws (or a mise shim for one) can resolve.
+    const empty = mkdtempSync(join(tmpdir(), "hapi-no-bws-"));
+    try {
+      const src = JSON.stringify(join(import.meta.dir, "../../src/secrets/providers/bws.ts"));
+      const script = `const { runBws } = await import(${src}); try { await runBws(["--version"]); console.log("ran"); } catch (e) { console.log(e.message); }`;
+      const r = Bun.spawnSync([process.execPath, "-e", script], { env: { PATH: empty, HOME: empty }, stdout: "pipe", stderr: "pipe" });
+      const out = r.stdout.toString();
+      expect(out).toContain("mise use -g bitwarden-secrets-manager@2.1.0");
+      expect(out).not.toContain("mise.local.toml");
+    } finally {
+      rmSync(empty, { recursive: true, force: true });
+    }
   });
 });

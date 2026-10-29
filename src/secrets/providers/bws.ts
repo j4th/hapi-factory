@@ -55,14 +55,15 @@ function oneLine(e: unknown): string {
  * The default `BwsRunner`: spawns the `bws` on PATH with the caller's
  * environment, which carries BWS_ACCESS_TOKEN. stdout is returned and never
  * shown; a failure reports the exit status and bws's stderr. bws is not in
- * mise.toml: a bws user adds it in their own mise.local.toml (docs/secrets.md).
+ * mise.toml: a bws user pins it in their global mise config (`mise use -g
+ * bitwarden-secrets-manager@2.1.0`, docs/secrets.md).
  */
 export const runBws: BwsRunner = async (args) => {
   let proc: Bun.Subprocess<"ignore", "pipe", "pipe">;
   try {
     proc = Bun.spawn(["bws", ...args], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
   } catch {
-    throw new Error("cannot run bws: is it on PATH? (add it in mise.local.toml, docs/secrets.md)");
+    throw new Error("cannot run bws: is it on PATH? (`mise use -g bitwarden-secrets-manager@2.1.0`, docs/secrets.md)");
   }
   const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
   if (code !== 0) throw bwsFailure(code, stderr);
