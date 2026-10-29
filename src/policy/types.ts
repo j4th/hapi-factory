@@ -74,6 +74,12 @@ export interface Commands {
 export type Workspace = "hapi-hermes" | "hapi-factory" | "hapi-evals";
 
 /** All amounts in USD. */
+/**
+ * What an enforcer does when the run budget is crossed: `hard` stops the run,
+ * `soft` flags it and lets it finish (spec §13.3). Tightening order: soft < hard.
+ */
+export type Enforcement = "hard" | "soft";
+
 export interface Budgets {
   /** Monthly spend limit per Anthropic Console workspace. */
   workspaces: Record<Workspace, number>;
@@ -81,6 +87,36 @@ export interface Budgets {
   jev_monthly_usd: number;
   run_usd: number;
   hermes_max_turns: number;
+  /** The mode per enforcer for `run_usd`: hapi-guard (Plan 02) and Archon's budget (Plan 03). */
+  enforcement: { hapi_guard: Enforcement; archon: Enforcement };
+}
+
+/** The run launcher's limits, from runs.yaml. A repo overlay may only lower them. */
+export interface Runs {
+  /** Runs live (queued or running) at once. */
+  max_live: number;
+  /** Days a finished run's files are kept. */
+  retention_days: number;
+  /** The largest, in MB, each file a run writes may be. */
+  output_limits_mb: { bundle: number; transcript: number; decisions: number; result: number };
+}
+
+/** The level-6 gate settings, from gates.yaml. Central only: an overlay can't name it. */
+export interface Gates {
+  bash_gate: {
+    enabled: boolean;
+    /** Argv prefixes (`git status`) that skip the screen. Empty screens every call. */
+    skip_commands: string[];
+  };
+  result_screen: { enabled: boolean; tools: ("bash" | "read")[] };
+  /** The most characters of run state a classifier is shown. */
+  max_state_chars: number;
+  classifiers: {
+    /** `model` is the OpenRouter id; `unknown_call_usd` is charged for a call with unknown usage. */
+    jev: { model: string; unknown_call_usd: number };
+    /** Prices are USD per million tokens. */
+    haiku: { model: "claude-haiku-5-5"; input_per_mtok: number; output_per_mtok: number };
+  };
 }
 
 /** The fixed short list of actions that always need the operator (spec §8.1). */
@@ -201,6 +237,8 @@ export interface Policy {
   commands: Commands;
   trustedSources: TrustedSources;
   budgets: Budgets;
+  runs: Runs;
+  gates: Gates;
   approvals: Approval[];
   roles: Roles;
   rosters: Record<RosterName, Roster>;
@@ -236,7 +274,13 @@ export interface RepoOverlay {
   /** Hosts added to the archon zone. Never a forge host. */
   egress_extra?: string[];
   /** Budgets to lower; each must be at most the base value. */
-  budgets?: Partial<Omit<Budgets, "workspaces">> & { workspaces?: Partial<Record<Workspace, number>> };
+  budgets?: Partial<Omit<Budgets, "workspaces" | "enforcement">> & {
+    workspaces?: Partial<Record<Workspace, number>>;
+    /** Modes to harden: soft may become hard, never the reverse. */
+    enforcement?: Partial<Budgets["enforcement"]>;
+  };
+  /** Run limits to lower; each must be at most the base value. */
+  runs?: Partial<Omit<Runs, "output_limits_mb">> & { output_limits_mb?: Partial<Runs["output_limits_mb"]> };
   default_risk?: Risk;
   workflow?: string;
 }

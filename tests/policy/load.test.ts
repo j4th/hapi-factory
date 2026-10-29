@@ -124,6 +124,7 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
       jev_monthly_usd: 2,
       run_usd: 3,
       hermes_max_turns: 60,
+      enforcement: { hapi_guard: "hard", archon: "hard" },
     });
     expect(p.approvals).toEqual([
       "merge",
@@ -133,6 +134,58 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
       "outbound_message",
       "spend_above_threshold",
     ]);
+  });
+
+  test("loads the new limits exactly", () => {
+    expect(p.budgets.enforcement).toEqual({ hapi_guard: "hard", archon: "hard" });
+    expect(p.runs).toEqual({
+      max_live: 1,
+      retention_days: 14,
+      output_limits_mb: { bundle: 256, transcript: 64, decisions: 16, result: 4 },
+    });
+    // The design screens every bash call by default: the skip list starts empty.
+    expect(p.gates).toEqual({
+      bash_gate: { enabled: true, skip_commands: [] },
+      result_screen: { enabled: true, tools: ["bash", "read"] },
+      max_state_chars: 6000,
+      classifiers: {
+        jev: { model: "~typesafe/jev-latest", unknown_call_usd: 0.001 },
+        haiku: { model: "claude-haiku-5-5", input_per_mtok: 0.1, output_per_mtok: 0.5 },
+      },
+    });
+  });
+
+  test("rejects an unknown enforcement", () => {
+    const text = readFileSync("policy/budgets.yaml", "utf8").replace(/archon: hard/, "archon: off");
+    const e = policyError(policyWith("budgets.yaml", text));
+    expect(e.file).toEndWith("budgets.yaml");
+    expect(e.message).toContain("/enforcement/archon: must be one of: hard, soft");
+  });
+
+  test("rejects max_live 0", () => {
+    const text = readFileSync("policy/runs.yaml", "utf8").replace(/max_live: 1/, "max_live: 0");
+    const e = policyError(policyWith("runs.yaml", text));
+    expect(e.file).toEndWith("runs.yaml");
+    expect(e.path).toBe("/max_live");
+  });
+
+  test("a gate left on with no classifier fails to load", () => {
+    const noJev = readFileSync("policy/flags.yaml", "utf8").replace(/^jev:.*$/m, "jev:          { enabled: false, fallback: none, via: openrouter }");
+    const gates = readFileSync("policy/gates.yaml", "utf8");
+    const message = "on, but flags.jev has no classifier (enabled: false, fallback: none): turn the gate off here instead";
+    const off = (gate: string) => gates.replace(new RegExp(`(${gate}:\\s*enabled:) true`), "$1 false");
+    for (const gate of ["bash_gate", "result_screen"]) {
+      const dir = policyWith("flags.yaml", noJev);
+      // Leave only this gate on.
+      writeFileSync(join(dir, "gates.yaml"), off(gate === "bash_gate" ? "result_screen" : "bash_gate"));
+      const e = policyError(dir);
+      expect(e.file).toEndWith("gates.yaml");
+      expect(e.issues).toEqual([{ path: `/${gate}/enabled`, message }]);
+    }
+    // Turning both gates off makes the policy load again.
+    const dir = policyWith("flags.yaml", noJev);
+    writeFileSync(join(dir, "gates.yaml"), off("result_screen").replace(/(bash_gate:\s*enabled:) true/, "$1 false"));
+    expect(loadPolicy(dir).gates.bash_gate.enabled).toBe(false);
   });
 
   test("roles map every role to a tier", () => {

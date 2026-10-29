@@ -8,3 +8,4 @@ openrouter_monthly_usd: 20
 jev_monthly_usd: 2
 run_usd: 3.00
 hermes_max_turns: 60
+enforcement: { hapi_guard: hard, archon: hard }

@@ -1,0 +1,21 @@
+# yaml-language-server: $schema=schemas/policy-gates.schema.json
+#
+# Level-6 gates (Plan 02): the screens Pi's hapi-guard runs on a worker's bash
+# calls and on what its tools return (Tasks 3 and 5). Central policy only: a repo
+# overlay can't name this file. A gate may be on only while flags.jev has a
+# classifier (jev enabled, or fallback haiku); otherwise loadPolicy refuses it.
+bash_gate:
+  enabled: true
+  skip_commands: []     # argv prefixes that skip the screen, e.g. "git status"; empty screens every call
+result_screen:
+  enabled: true
+  tools: [bash, read]   # the tools whose results are screened
+max_state_chars: 6000   # the most run state a classifier is shown
+classifiers:
+  jev:
+    model: ~typesafe/jev-latest   # OpenRouter's id; Task 11 confirms it passes the hapi-jev guardrail
+    unknown_call_usd: 0.001       # charged to the run for a Jev call with unknown usage
+  haiku:                          # the fallback when flags.jev.fallback is haiku
+    model: claude-haiku-5-5
+    input_per_mtok: 0.1           # Anthropic first-party rates, for prompts up to 100K tokens
+    output_per_mtok: 0.5

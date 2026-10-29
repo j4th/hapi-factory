@@ -190,6 +190,35 @@ describe("applyOverlay", () => {
     );
   });
 
+  test("an overlay may harden an enforcement but not soften it", () => {
+    const soft = structuredClone(p);
+    soft.budgets.enforcement = { hapi_guard: "soft", archon: "soft" };
+    const r = applyOverlay(soft, { budgets: { enforcement: { hapi_guard: "hard" } } });
+    expect(r.budgets.enforcement).toEqual({ hapi_guard: "hard", archon: "soft" });
+    // Naming the current mode, or leaving an enforcer out, changes nothing.
+    expect(applyOverlay(soft, { budgets: { enforcement: { archon: "soft" } } }).budgets.enforcement).toEqual(soft.budgets.enforcement);
+    const e = loosenError(() => applyOverlay(p, { budgets: { enforcement: { hapi_guard: "soft" } } }));
+    expect(e.path).toBe("/budgets/enforcement/hapi_guard");
+    expect(e.message).toContain("softens budgets.enforcement.hapi_guard from hard to soft");
+    expect(loosenError(() => applyOverlay(p, { budgets: { enforcement: { archon: "soft" } } })).path).toBe("/budgets/enforcement/archon");
+  });
+
+  test("an overlay may lower max_live and the output limits but not raise them", () => {
+    const r = applyOverlay(p, { runs: { retention_days: 7, output_limits_mb: { bundle: 128 } } });
+    expect(r.runs).toEqual({ max_live: 1, retention_days: 7, output_limits_mb: { bundle: 128, transcript: 64, decisions: 16, result: 4 } });
+    expect(p.runs.output_limits_mb.bundle).toBe(256);
+    const e = loosenError(() => applyOverlay(p, { runs: { max_live: 2 } }));
+    expect(e.path).toBe("/runs/max_live");
+    expect(e.message).toContain("raises runs.max_live from 1 to 2");
+    expect(loosenError(() => applyOverlay(p, { runs: { output_limits_mb: { result: 5 } } })).path).toBe("/runs/output_limits_mb/result");
+    expect(loosenError(() => applyOverlay(p, { runs: { retention_days: 30 } })).path).toBe("/runs/retention_days");
+  });
+
+  test("gates is central only: an overlay naming it is an unknown key", () => {
+    const bad = { gates: { bash_gate: { enabled: false } } } as unknown as RepoOverlay;
+    expect(() => applyOverlay(p, bad)).toThrow("/gates: unknown key");
+  });
+
   test("an empty overlay changes nothing", () => {
     expect(applyOverlay(p, {})).toEqual(p);
   });

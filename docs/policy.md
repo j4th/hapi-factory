@@ -19,6 +19,8 @@
 | `commands.yaml` | `policy-commands` | Hermes's command allowlist, as argv-exact rules; the Pi built-in tools workers get | The Hermes `hapi-cmd-allow` hook (default-deny, fail-closed; Plan 04); Archon `allowed_tools` per node |
 | `trusted_sources.yaml` | `policy-trusted-sources` | Source tiers T0–T3, and the hosts each egress zone may reach | The egress proxy allowlists (the real boundary); Hermes's web backend pins and blocklist; Anthropic `allowed_domains` |
 | `budgets.yaml` | `policy-budgets` | Workspace and key caps, the per-run target, Hermes's turn limit | Hermes `max_turns`; Archon `budget` on per-task children; hapi-guard limits; provider key limits (documented, applied by hand or API) |
+| `runs.yaml` | `policy-runs` | The run launcher's limits: live runs, retention, output sizes | The run launcher (Plan 02 Task 7) |
+| `gates.yaml` | `policy-gates` | The level-6 gates: the bash gate, the result screen and their classifiers | Pi hapi-guard and the gate classifiers (Plan 02 Tasks 3 and 5) |
 | `approvals.yaml` | `policy-approvals` | The fixed short list of actions that always need the operator | Not compiled in Plan 01; later plans enforce it |
 | `roles.yaml` | `policy-roles` | The default model tier per role | With the rosters: Archon tiers and aliases; Hermes model, auxiliary and delegation settings |
 | `rosters/{budget,anthropic,portable}.yaml` | `policy-roster` | Tier → provider, model and effort, one file per roster | See `roles.yaml` |
@@ -211,8 +213,44 @@ All amounts are in USD.
 | `jev_monthly_usd` | 2 | Monthly cap on Jev's own OpenRouter key |
 | `run_usd` | 3.00 | Target spend per factory run |
 | `hermes_max_turns` | 60 | Hermes `agent.max_turns` |
+| `enforcement.hapi_guard` | `hard` | What Pi's hapi-guard does when the run crosses `run_usd` (Plan 02 Task 5) |
+| `enforcement.archon` | `hard` | The same for Archon's `factory-task` budget (Plan 03) |
+
+`enforcement` is a setting per enforcement point: `hard` stops the run at `run_usd`; `soft` lets it finish and flags it (`hapi:flagged`, spec §13.3). Both default to `hard`. An overlay may harden a mode but never soften it (soft < hard).
 
 The monthly caps are enforced at the provider. The operator sets them on the Console workspaces and OpenRouter keys; the [provider-keys runbook](runbooks/provider-keys.md) covers it. An OpenRouter key's cap is set as a limit that resets daily, the monthly cap divided by 31 (the runbook's rule), so a leaked key can spend only one day's share. The workspaces add up to the $200/month credit, and the default workspace is unused.
+
+### `runs.yaml`
+
+The run launcher's limits (Plan 02 Task 7). Every key is required. An overlay may lower any of them, never raise one.
+
+| Key | Value | Meaning |
+|---|---|---|
+| `max_live` | 1 | Runs live (queued or running) at once; the launcher refuses the next |
+| `retention_days` | 14 | Days a finished run's files are kept before they are pruned |
+| `output_limits_mb.bundle` | 256 | The largest the result bundle may be, in MB |
+| `output_limits_mb.transcript` | 64 | The largest the run transcript may be |
+| `output_limits_mb.decisions` | 16 | The largest the decisions log may be |
+| `output_limits_mb.result` | 4 | The largest the result summary may be |
+
+All counts are whole numbers, at least 1 (`max_live: 0` is rejected).
+
+### `gates.yaml`
+
+The level-6 gate settings (Plan 02 Tasks 3 and 5). Every key is required. The file is central only: an overlay naming `gates` is an unknown key. A gate that is on needs a classifier, so `loadPolicy` refuses `enabled: true` while `flags.yaml` has `jev: { enabled: false, fallback: none }`; turn the gate off in `gates.yaml` instead.
+
+| Key | Value | Meaning |
+|---|---|---|
+| `bash_gate.enabled` | true | Screen each worker bash call before it runs |
+| `bash_gate.skip_commands` | `[]` | Argv prefixes (such as `git status`) that skip the screen. The design screens every call, so the list starts empty; adding a prefix is the operator's choice. |
+| `result_screen.enabled` | true | Screen what a tool returns before the worker reads it |
+| `result_screen.tools` | `[bash, read]` | The tools whose results are screened (`bash`, `read`) |
+| `max_state_chars` | 6000 | The most characters of run state a classifier is shown |
+| `classifiers.jev.model` | `~typesafe/jev-latest` | Jev's OpenRouter model id (Task 11 confirms it passes the `hapi-jev` guardrail) |
+| `classifiers.jev.unknown_call_usd` | 0.001 | Cost charged to the run for a Jev call with unknown usage |
+| `classifiers.haiku.model` | `claude-haiku-5-5` | The fallback classifier, used when `flags.jev.fallback` is `haiku` |
+| `classifiers.haiku.input_per_mtok` | 0.1 | USD per million input tokens (Anthropic first-party rate, prompts up to 100K tokens) |
+| `classifiers.haiku.output_per_mtok` | 0.5 | USD per million output tokens (same rate card) |
 
 ### `approvals.yaml`
 
@@ -453,13 +491,14 @@ In a JSON Pointer, a `/` inside a key is written `~1` and a `~` is written `~0`.
 
 A target repo can adjust the central policy with an overlay in its `.factory/config.yaml` (spec §7). **An overlay may only tighten policy.** The one exception is `egress_extra`: it may add hosts, and the overlay file is itself protected (`.factory/**`), so adding one goes through a reviewed planning PR.
 
-An overlay has the five keys below. **Any other key is rejected.** Three of them change policy, and those may only tighten it, except for `egress_extra`. The other two, `default_risk` and `workflow`, are repo settings (spec §7). They don't loosen any policy, so the tighten-only rule doesn't apply to them.
+An overlay has the six keys below. **Any other key is rejected.** Four of them change policy, and those may only tighten it, except for `egress_extra`. The other two, `default_risk` and `workflow`, are repo settings (spec §7). They don't loosen any policy, so the tighten-only rule doesn't apply to them.
 
 | Key | What it may do |
 |---|---|
 | `protected_paths` | **Add** a glob, or **raise** a listed glob's modes (allow < ask < deny). An entry may name only some of the three modes. For a glob the base policy lists, the others keep their base value. A **new** glob may name only `ask` or `deny`; naming `allow` is rejected, because under [strictest-wins](#how-globs-combine) it can't change anything and so reads as a loosening attempt. Its unnamed modes are stored as `allow`, which adds no rule. A new glob that overlaps a protected one can tighten files under it but never loosen them. `null` asks to remove the glob, and that is **always rejected**. |
 | `egress_extra` | **Add** hosts to the `archon` zone's allowlist. The rules are the same as for any host. A [**forge host**](#trusted_sourcesyaml) (`github.com`, `githubusercontent.com`, `githubassets.com`, `ghcr.io`, `gitlab.com`, `bitbucket.org`, or a subdomain of one) is rejected, because the Archon zone must never reach the forge (spec §4.3). |
-| `budgets` | **Lower** any budget in `budgets.yaml`. Each value must be at most the base value. |
+| `budgets` | **Lower** any budget in `budgets.yaml`. Each value must be at most the base value. `enforcement` modes may be **hardened** (soft to hard), never softened. |
+| `runs` | **Lower** any limit in `runs.yaml` (`max_live`, `retention_days`, `output_limits_mb.*`). Never raise one. |
 | `default_risk` | The risk new work orders for this repo start from: `low`, `medium` or `high`. A repo setting, not policy: any value is accepted, `low` included. |
 | `workflow` | The Archon workflow this repo's work orders use by default. A lowercase slug, the same rule as a work order's `workflow` (so `factory-task`, not `Factory_Task` or `factory-`). A repo setting, not policy. |
 
@@ -502,6 +541,8 @@ These are the real error messages:
 | `default_risk: extreme` | `PolicyError: .factory/config.yaml: /default_risk: must be one of: low, medium, high` |
 | `workflow: Factory_Task` | `PolicyError: .factory/config.yaml: /workflow: must match pattern "^[a-z0-9]+(?:-[a-z0-9]+)*$"` |
 | `budgets: { run_usd: 5.00 }` | `PolicyLoosenError: /budgets/run_usd: raises budgets.run_usd from 3 to 5; overlays may only tighten policy` |
+| `budgets: { enforcement: { hapi_guard: soft } }` | `PolicyLoosenError: /budgets/enforcement/hapi_guard: softens budgets.enforcement.hapi_guard from hard to soft; overlays may only tighten policy` |
+| `runs: { max_live: 2 }` | `PolicyLoosenError: /runs/max_live: raises runs.max_live from 1 to 2; overlays may only tighten policy` |
 | `commands: { hermes: { allow: ["*"] } }` | `PolicyError: .factory/config.yaml: /commands: unknown key` |
 
 ## Work orders
