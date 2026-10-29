@@ -500,7 +500,7 @@ A zone's allowlist is its own `hosts` plus its tiers' hosts, so the hermes zone 
 
 Each recipient's age key (or, with bws, the one machine account) decrypts the hermes, archon, research and host values alike.
 
-- **Owner control:** keys are never copied and are checked before every decrypt (owned by the user, no group or other bits, outside the checkout); each machine's key can be revoked on its own; decrypted values exist only in memory, the tmpfs files and Docker's config of each running container (DP-2, DP-4: enforced; Docker's copy, H-189). hapi's key is hapi's alone.
+- **Owner control:** keys are never copied and are checked before every decrypt (owned by the user, no group or other bits, outside the checkout); each machine's key can be revoked on its own; decrypted values exist only in memory, the tmpfs files and Docker's config of each zone container (DP-2, DP-4: enforced; Docker's copy, H-189). hapi's key is hapi's alone.
 - **Next level:** a key, or a bws machine account, per zone, so one leak exposes one zone ([docs/secrets.md](../secrets.md#open-items)). Unscheduled.
 - **Catalog:** LLM02:2025; AML.T0055. **Status:** accepted residual.
 

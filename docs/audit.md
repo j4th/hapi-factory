@@ -104,7 +104,7 @@ Without the stack and without `--repo`, as on a development machine, most checks
 
 **Credential.** None: `docker inspect`, and the mounted config's file on the host.
 
-**Fix.** Remove the flag or variable, and restore build/ with `mise run up`. It can come from a changed `stack/compose.yaml` (no secret may use a `HERMES_` name), but this check reads only the container's command line and environment, never `$HERMES_HOME/.env` (`/opt/data/.env`, on the writable `hermes-data` volume), which Hermes v0.22.5 loads at startup over its environment. A `HERMES_YOLO_MODE` planted there passes this check (H-190), so if you suspect one, read that file's variable names too, never its values: it may hold `API_SERVER_KEY`, which the image's boot hook writes there.
+**Fix.** Remove the flag or variable, and restore build/ with `mise run up`. It can come from a changed `stack/compose.yaml` (no secret may use a `HERMES_` name), but this check reads only the container's command line, its environment and the mounted `config.yaml`, never `$HERMES_HOME/.env` (`/opt/data/.env`, on the writable `hermes-data` volume), which Hermes v0.22.5 loads at startup over its environment. A `HERMES_YOLO_MODE` planted there passes this check (H-190), so if you suspect one, read that file's variable names too, never its values: it may hold `API_SERVER_KEY`, which the image's boot hook writes there.
 
 **Skip.** The stack or hermes isn't running, Docker isn't available, or the mounted config can't be read (run the audit as hapi).
 

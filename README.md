@@ -207,7 +207,7 @@ Here is how commands work:
 - **A committed lockfile.** `bun.lock` is in git, and `mise run setup` installs with `--frozen-lockfile`.
 - **A release-age cooldown.** `bunfig.toml` sets `minimumReleaseAge` to 3 days, so Bun won't resolve a package version published less than 3 days ago.
 - **Pinned actions.** CI actions are pinned to full commit SHAs, CI runs with a read-only token, and checkout doesn't persist credentials.
-- **No plaintext secrets in the repo, or in a file hapi writes to disk.** `.env*`, `private/`, `keys.txt`, `*.agekey`, `secrets.env` and `mise.local.toml` are gitignored. The store is encrypted (sops + age) by default, and hapi writes resolved secrets only to `0600` files on the user's tmpfs (`$XDG_RUNTIME_DIR/hapi/env/`), never to the repo or a `.env` file on disk. Docker, though, keeps each running container's environment, its zone's secrets included, in the container's config on hapi's disk until `mise run down` removes the container: an accepted residual (H-189, [docs/secrets.md](docs/secrets.md#the-env-files)).
+- **No plaintext secrets in the repo, or in a file hapi writes to disk.** `.env*`, `private/`, `keys.txt`, `*.agekey`, `secrets.env` and `mise.local.toml` are gitignored. The store is encrypted (sops + age) by default, and hapi writes resolved secrets only to `0600` files on the user's tmpfs (`$XDG_RUNTIME_DIR/hapi/env/`), never to the repo or a `.env` file on disk. Docker, though, keeps each zone container's environment, its secrets included, in the container's config on hapi's disk until `mise run down` removes the container: an accepted residual (H-189, [docs/secrets.md](docs/secrets.md#the-env-files)).
 
 **To upgrade a tool:**
 1. Find the version with `mise ls-remote <tool>` or `mise latest <tool>`.
