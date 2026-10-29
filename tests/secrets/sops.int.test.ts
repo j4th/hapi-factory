@@ -20,22 +20,25 @@
  *
  * Also checked on the real binaries: every sops rotate (add-machine, revoke,
  * recover) leaves the store at mode 0600; decoy gpg-agent sockets in each
- * machine's HOME and XDG_RUNTIME_DIR are never dialled; and the two sops
- * 3.13.3 behaviours hapi relies on (it reads its own default key file as well
- * as SOPS_AGE_KEY_FILE, which `checkSopsKeys` checks for that reason, and it
- * leaves "" unencrypted, which `sopsFileProblem` allows).
+ * machine's HOME and XDG_RUNTIME_DIR are never dialled; and the sops 3.13.3
+ * behaviours hapi relies on (it reads its own default key file as well as
+ * SOPS_AGE_KEY_FILE, which `checkSopsKeys` checks for that reason; it leaves
+ * "" unencrypted, which `sopsFileProblem` allows; and an unencrypted_regex
+ * planted over names still "" keeps the MAC valid and makes `sops edit` write
+ * plaintext, which `sopsFileProblem` refuses and `edit` checks for again
+ * after sops).
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import type { UnixSocketListener } from "bun";
 import { chmodSync, cpSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { parse, stringify } from "yaml";
-import { secretsAddMachine, secretsCheck, secretsDrill, secretsInit, secretsJoin, secretsNewRecovery, secretsRecover, secretsResolve, secretsRevoke } from "../../src/secrets/cli";
+import { secretsAddMachine, secretsCheck, secretsDrill, secretsEdit, secretsInit, secretsJoin, secretsNewRecovery, secretsRecover, secretsResolve, secretsRevoke } from "../../src/secrets/cli";
 import { parseEnvFile } from "../../src/secrets/files";
 import { recoveryDigest } from "../../src/secrets/recipients";
 import { passphraseOf, unwrapIdentity } from "../../src/secrets/recovery";
-import { ageEnv, commandRunner, pinnedAgeDir, runSops, type SopsRunner } from "../../src/secrets/providers/sops";
-import { capture, cleanup, fakeTty, fullStore, mode, tempDir, tree } from "./helpers";
+import { ageEnv, commandRunner, pinnedAgeDir, runSops, type SopsRunner, sopsFileProblem } from "../../src/secrets/providers/sops";
+import { capture, caught, cleanup, fakeTty, fullStore, mode, tempDir, tree } from "./helpers";
 
 afterEach(cleanup);
 
@@ -272,5 +275,64 @@ describe.skipIf(!process.env.HAPI_INT)("sops + age key lifecycle (real binaries,
     rmSync(defaultKey);
     const only = await real(["--config", "/dev/null", "decrypt", "--output-type", "json", store], { env: env({ SOPS_AGE_KEY_FILE: other }) });
     expect(only.code).not.toBe(0);
+  }, 60_000);
+
+  test("a planted unencrypted_regex keeps the MAC valid and makes sops edit write plaintext, so edit refuses it first and checks the store after", async () => {
+    capture();
+    const root = tempDir("hapi-sops-settings-int-");
+    const sops = join(pinnedDir("sops"), "sops");
+    const real = commandRunner(sops);
+    const home = join(root, "home");
+    const xdg = join(root, "run");
+    mkdirSync(home, { recursive: true, mode: 0o700 });
+    mkdirSync(xdg, { recursive: true, mode: 0o700 });
+    chmodSync(xdg, 0o700);
+    const env = { HOME: home, XDG_RUNTIME_DIR: xdg, PATH: [dirname(sops), "/usr/bin", "/bin"].join(":") };
+    const store = join(root, "private", "secrets.enc.yaml");
+    const runs: string[][] = [];
+    const deps = (editor?: string) => ({
+      env: editor === undefined ? env : { ...env, EDITOR: editor },
+      cwd: root,
+      tty: fakeTty().tty,
+      attended: false,
+      machineName: "machine-a",
+      sops: runSops,
+      interactive: async (_cmd: string, args: string[], o: { env: Record<string, string> }) => (runs.push(args), (await real(args, { env: o.env })).code),
+    });
+    // init writes every name as "", with sops's default suffix: that passes.
+    expect(await secretsInit(["--file", store], deps())).toBe(0);
+    const good = readFileSync(store, "utf8");
+    expect(good).toMatch(/^ {4}unencrypted_suffix: _unencrypted$/m);
+    expect(sopsFileProblem(good)).toBeUndefined();
+
+    // Someone who can write the store, but holds no key, swaps the suffix for a regex aimed at names still "".
+    const planted = good.replace(/^ {4}unencrypted_suffix: _unencrypted$/m, "    unencrypted_regex: ^hapi-hermes-slack-");
+    writeFileSync(store, planted);
+    const sopsEnv = { PATH: env.PATH, HOME: home, SOPS_AGE_KEY_FILE: join(home, ".config", "sops", "age", "keys.txt"), SOPS_DISABLE_VERSION_CHECK: "1", GPG_AGENT_INFO: "" };
+    // The MAC still verifies: "" is the same value either way.
+    expect((await real(["--config", "/dev/null", "decrypt", "--output-type", "json", store], { env: sopsEnv })).code).toBe(0);
+    // And sops edit, given the chance, writes a value entered for such a name in plaintext.
+    const setSlack = join(root, "set-slack.sh");
+    writeFileSync(setSlack, `#!/bin/sh\nsed -i 's/^hapi-hermes-slack-bot-token: .*/hapi-hermes-slack-bot-token: xoxb-FAKE-SLACK-TOKEN/' "$1"\n`, { mode: 0o700 });
+    const copy = join(root, "copy.enc.yaml");
+    writeFileSync(copy, planted, { mode: 0o600 });
+    expect((await real(["--config", "/dev/null", "edit", copy], { env: { ...sopsEnv, EDITOR: setSlack, TMPDIR: xdg } })).code).toBe(0);
+    expect(readFileSync(copy, "utf8")).toMatch(/^hapi-hermes-slack-bot-token: xoxb-FAKE-SLACK-TOKEN$/m);
+    // hapi refuses the setting before sops runs, naming it and not its value.
+    const refused = await caught(secretsEdit([], deps(setSlack)));
+    expect(refused.message).toMatch(/secrets\.enc\.yaml has sops\.unencrypted_regex in its sops metadata: a setting that picks which values sops leaves in plaintext/);
+    expect(refused.message).not.toContain("hapi-hermes-slack-");
+    expect(runs).toEqual([]);
+    expect(readFileSync(store, "utf8")).toBe(planted);
+
+    // On a good store, sops's default suffix still leaves a name ending in _unencrypted in plaintext: the check after edit catches it.
+    writeFileSync(store, good);
+    const addPlain = join(root, "add-plain.sh");
+    writeFileSync(addPlain, `#!/bin/sh\nprintf 'hapi-extra_unencrypted: fake-extra-value\\n' >> "$1"\n`, { mode: 0o700 });
+    const after = await caught(secretsEdit([], deps(addPlain)));
+    expect(runs.length).toBe(1);
+    expect(readFileSync(store, "utf8")).toMatch(/^hapi-extra_unencrypted: fake-extra-value$/m);
+    expect(after.message).toMatch(/^sops edit left .*secrets\.enc\.yaml failing hapi's store check: .* is not encrypted.*Don't commit or push it/);
+    expect(after.message).not.toContain("fake-extra-value");
   }, 60_000);
 });

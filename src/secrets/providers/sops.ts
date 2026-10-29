@@ -25,9 +25,10 @@
  * 2. parses the raw file and checks its shape before decrypting
  *    (`sopsFileProblem`): a sops block with an age recipient and nothing else
  *    but sops's bookkeeping (any other master key, or a field hapi doesn't
- *    know, could open the store unseen by the recipients file), and every
- *    top-level value encrypted, so a value
- *    `unencrypted_suffix` or `unencrypted_regex` left in plaintext is refused;
+ *    know, could open the store unseen by the recipients file), no setting
+ *    that picks which values stay in plaintext but sops's default suffix (one
+ *    would let `sops edit` write a new value in plaintext), and every
+ *    top-level value encrypted;
  * 3. runs `sops decrypt --output-type json <file>` through a `SopsRunner`,
  *    with the minimal env of `sopsEnv`. `--config /dev/null` keeps any
  *    .sops.yaml out of it. No value goes through argv; stderr is never echoed
@@ -228,8 +229,8 @@ const isRecord = (v: unknown): v is Record<string, unknown> => v !== null && typ
 /**
  * The sops whose metadata fields hapi knows: the version mise.toml pins (a
  * test keeps the two in step). A new sops may add a field, so bumping it
- * means checking `OTHER_MASTER_KEYS` and `SOPS_BOOKKEEPING` against its
- * metadata struct again.
+ * means checking `OTHER_MASTER_KEYS`, `SOPS_BOOKKEEPING` and
+ * `ENCRYPTION_SETTINGS` against its metadata struct again.
  */
 export const SOPS_METADATA_VERSION = "3.13.3";
 
@@ -251,23 +252,27 @@ const OTHER_MASTER_KEYS = new Map<string, string>([
   ["key_groups", "sops key groups"],
 ]);
 /**
- * The rest of sops 3.13.3's metadata struct: its bookkeeping, scalars that
- * hold no key (the last-modified time, the MAC, the version, the Shamir
- * threshold and the encrypted/unencrypted suffix, regex and comment-regex
- * settings).
+ * sops 3.13.3's bookkeeping, scalars that hold no key: the last-modified
+ * time, the MAC, the version and the Shamir threshold.
  */
-const SOPS_BOOKKEEPING = new Set([
-  "lastmodified",
-  "mac",
-  "version",
-  "shamir_threshold",
-  "mac_only_encrypted",
-  "unencrypted_suffix",
-  "encrypted_suffix",
-  "unencrypted_regex",
-  "encrypted_regex",
-  "unencrypted_comment_regex",
-  "encrypted_comment_regex",
+const SOPS_BOOKKEEPING = new Set(["lastmodified", "mac", "version", "shamir_threshold"]);
+const unset = (v: unknown) => v === null || v === undefined || v === "";
+/**
+ * The rest of sops 3.13.3's metadata struct: the settings that pick which
+ * values sops leaves in plaintext, and what its MAC covers, each with the
+ * values hapi's store may have. That is none of them set but sops's default
+ * `unencrypted_suffix: _unencrypted`, which `sops encrypt` writes. Any other
+ * lets `sops edit` write a value still "", or a name not added yet, in
+ * plaintext, and the MAC still verifies ("" is the same either way).
+ */
+const ENCRYPTION_SETTINGS = new Map<string, (v: unknown) => boolean>([
+  ["unencrypted_suffix", (v) => unset(v) || v === "_unencrypted"],
+  ["encrypted_suffix", unset],
+  ["unencrypted_regex", unset],
+  ["encrypted_regex", unset],
+  ["unencrypted_comment_regex", unset],
+  ["encrypted_comment_regex", unset],
+  ["mac_only_encrypted", (v) => v === null || v === undefined || v === false],
 ]);
 const isEmpty = (v: unknown) => v === null || v === undefined || v === "" || (Array.isArray(v) && v.length === 0) || (isRecord(v) && Object.keys(v).length === 0);
 /** A metadata field's name as a message shows it: `sops.<field>` if it is a plain identifier, else masked. */
@@ -283,7 +288,7 @@ const shownField = (field: string) => (/^[a-z][a-z0-9_]{0,39}$/.test(field) ? `s
 function otherMasterKeys(meta: Record<string, unknown>): string[] {
   const found: string[] = [];
   for (const [field, value] of Object.entries(meta)) {
-    if (field === "age" || SOPS_BOOKKEEPING.has(field)) continue;
+    if (field === "age" || SOPS_BOOKKEEPING.has(field) || ENCRYPTION_SETTINGS.has(field)) continue;
     const kind = OTHER_MASTER_KEYS.get(field);
     if (kind === undefined) found.push(`a field hapi doesn't know (${shownField(field)}: it may hold a key)`);
     else if (!isEmpty(value)) found.push(`${kind} (sops.${field})`);
@@ -291,12 +296,18 @@ function otherMasterKeys(meta: Record<string, unknown>): string[] {
   return found;
 }
 
+/** Each of `ENCRYPTION_SETTINGS` the sops block sets to a value hapi's store may not have, as `sops.<field>`. Never its value. */
+function encryptionSettings(meta: Record<string, unknown>): string[] {
+  return [...ENCRYPTION_SETTINGS].filter(([field, allowed]) => Object.hasOwn(meta, field) && !allowed(meta[field])).map(([field]) => `sops.${field}`);
+}
+
 /**
  * Why the raw text of a sops file is not a usable encrypted store, or
  * undefined: it must be a YAML mapping with a `sops` block that lists at least
  * one age recipient and nothing else but sops's bookkeeping (`otherMasterKeys`:
  * a PGP, cloud KMS or Vault key, or key groups, would open the store without
- * being in its recipients file, and so might a field hapi doesn't know), and
+ * being in its recipients file, and so might a field hapi doesn't know), with
+ * no encryption setting but sops's default suffix (`encryptionSettings`), and
  * every other top-level value must be a string sops
  * encrypted (`ENC[AES256_GCM,...`). The one exception is "": sops leaves an
  * empty string as it is (there is nothing to encrypt), and it holds nothing.
@@ -326,12 +337,20 @@ export function sopsFileProblem(text: string): string | undefined {
       "(docs/secrets.md#threat-notes)"
     );
   }
+  const settings = encryptionSettings(meta);
+  if (settings.length > 0) {
+    return (
+      `has ${settings.join(" and ")} in its sops metadata: ${settings.length === 1 ? "a setting that picks" : "settings that pick"} which values sops leaves in plaintext, or what its MAC covers, ` +
+      `so sops edit could write a value you enter in plaintext, with the MAC still verifying. hapi's store has none of them but sops's default unencrypted_suffix (_unencrypted), as sops encrypt writes it. ` +
+      "Restore the store from a commit without it; unless you set it yourself, someone who can write the store did (docs/secrets.md#threat-notes)"
+    );
+  }
   const plain = Object.entries(doc)
     .filter(([k, v]) => k !== "sops" && v !== "" && !(typeof v === "string" && ENCRYPTED.test(v)))
     .map(([k]) => shownName(k));
   if (plain.length > 0) {
     return (
-      `${plain.join(", ")} ${plain.length === 1 ? "is" : "are"} not encrypted (an unencrypted_suffix or unencrypted_regex, a nested value, or a hand edit?); ` +
+      `${plain.join(", ")} ${plain.length === 1 ? "is" : "are"} not encrypted (a name ending in _unencrypted, a nested value, or a hand edit?); ` +
       "every value must be a top-level string that sops encrypted. Re-encrypt the file with sops"
     );
   }

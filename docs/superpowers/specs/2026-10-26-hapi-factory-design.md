@@ -182,11 +182,11 @@ Lanes are routed by **PR labels**. The **work-order file** says what to build.
 |---|---|---|
 | `lane:planning` | Hermes only | Research, designs, threat models, work orders, context files, doc-only tweaks |
 | `lane:factory` | Archon + Pi | Building a merged work order |
-| `lane:direct` | The operator, hands-on in Pi (later Claude Code; later still, Hermes driving Pi for one-off work) | Work he wants to drive himself |
+| `lane:direct` | The operator, hands-on in Pi (later Claude Code; later still, Hermes driving Pi for one-off work) | Work they want to drive themselves |
 
 All lanes share:
 - the same CI gates;
-- The operator's approval at merge;
+- the operator's approval at merge;
 - commit trailers recording the lane (§13.2).
 
 Git tags are only for releasing and pinning hapi-factory itself.
@@ -270,13 +270,14 @@ pieces:
     size: small
 verify:
   smoke: true                       # run `mise run smoke` against the local Odoo sidecar
-egress_extra: ["odoo.internal"]     # hosts the smoke check needs (here: the private sidecar)
+egress_extra: []                    # public hosts the run needs beyond its zone's (none here: see the rules)
 trace:
   traceparent: "00-<trace-id>-<span-id>-01"     # minted by a script when the order is created
 sources: ["docs/research/odoo-external-api.md", "docs/design/odoo-mcp.md"]
 ```
 
 Rules:
+- `egress_extra` adds **public hosts only**. Every allowlisted zone's proxy refuses private addresses (`to_localnet`, before its allowlist) and allows only HTTPS to port 443, so a private smoke sidecar, such as an Odoo container on the zone's network, is never reached through it. The smoke check reaches the sidecar directly on the zone's internal network, with its name in the run's `NO_PROXY`. Never loosen `to_localnet` for it (H-192).
 - `traceparent` and `id` are written by **deterministic code**, Hermes's `dispatch`/`new-work-order` tool, never by the model.
 - The schema check runs:
   - in Hermes before the planning PR is opened;
@@ -298,7 +299,7 @@ A target repo needs only these files [user: central engine, small contract]:
 | `.factory/work/<id>/` | Work orders (§6) |
 | `docs/research/`, `docs/design/` | Hermes's dated research notes, designs and threat models |
 | `.github/workflows/hapi-gates.yml` | A thin wrapper calling hapi-factory's **reusable workflow, pinned by tag**: runs `mise run check` and the secret, SAST and dependency scans, validates work-order schemas, enforces commit trailers |
-| `.github/CODEOWNERS` | The operator owns every protected path (§8.2): the agent instruction files at any depth, `.factory/**`, `.github/**`, `mise.toml`, `.coderabbit.yaml` |
+| `.github/CODEOWNERS` | The operator owns every protected path (§8.2): the agent instruction files at any depth, `.factory/**`, `.github/**`, `mise.toml` and every other mise config file, `.coderabbit.yaml`, `.gitleaks.toml` |
 | Ruleset (forge setting, not a file) | `main` protected; one approving review required, and the PR author can't approve; required checks; no bypass for the Apps |
 
 **New repos (v1):** `mise run new-repo -- <name>`, run by the operator with their own credentials, creates the repo from `templates/repo-contract/` [call]. That template holds:
@@ -356,12 +357,31 @@ protected_paths:
   ".factory/**": { interactive: ask, unattended: deny, workers: deny }
   ".github/**":  { interactive: ask, unattended: deny, workers: deny }
   "mise.toml":   { interactive: ask, unattended: deny, workers: deny }
+  "**/mise.toml":           { interactive: ask, unattended: deny, workers: deny }
+  "**/mise.lock":           { interactive: ask, unattended: deny, workers: deny }
+  "**/mise.*.lock":         { interactive: ask, unattended: deny, workers: deny }
+  "**/.mise.toml":          { interactive: ask, unattended: deny, workers: deny }
+  "**/mise.local.toml":     { interactive: ask, unattended: deny, workers: deny }
+  "**/.mise.local.toml":    { interactive: ask, unattended: deny, workers: deny }
+  "**/mise.*.toml":         { interactive: ask, unattended: deny, workers: deny }
+  "**/.mise.*.toml":        { interactive: ask, unattended: deny, workers: deny }
+  "**/mise/**":             { interactive: ask, unattended: deny, workers: deny }
+  "**/.mise/**":            { interactive: ask, unattended: deny, workers: deny }
+  "**/.config/mise.toml":   { interactive: ask, unattended: deny, workers: deny }
+  "**/.config/mise.*.toml": { interactive: ask, unattended: deny, workers: deny }
+  "**/.config/mise/**":     { interactive: ask, unattended: deny, workers: deny }
+  "**/mise-tasks/**":       { interactive: ask, unattended: deny, workers: deny }
+  "**/.mise-tasks/**":      { interactive: ask, unattended: deny, workers: deny }
+  "**/.tool-versions":      { interactive: ask, unattended: deny, workers: deny }
   ".pi/**":      { interactive: deny, unattended: deny, workers: deny }
   ".agents/**":  { interactive: ask, unattended: deny, workers: deny }
   ".archon/**":  { interactive: deny, unattended: deny, workers: deny }
   ".coderabbit.yaml":      { interactive: ask, unattended: deny, workers: deny }
   ".coderabbit.yml":       { interactive: ask, unattended: deny, workers: deny }
   ".coderabbit.config.ts": { interactive: ask, unattended: deny, workers: deny }
+  "**/.git/**": { interactive: deny, unattended: deny, workers: deny }
+  "**/.gitleaks.toml":  { interactive: ask, unattended: deny, workers: deny }
+  "**/.gitleaksignore": { interactive: ask, unattended: deny, workers: deny }
 ```
 
 - **interactive** means the operator is in a Hermes session (or later a direct-lane Pi session).
@@ -372,6 +392,9 @@ protected_paths:
 - **workers** covers Pi or Claude Code inside Archon. Always deny.
 - **Agent instruction files at any depth** (added 2026-10-27, the operator's ruling; it replaced the root-only `AGENTS.md`): Pi, Hermes, the later Claude Code lane and CodeRabbit read nested `AGENTS.md`, `CLAUDE.md` and the rest as instructions for that subtree, so a write persists into every later session there. Matching ignores case (Pi also loads `AGENTS.MD` and `CLAUDE.MD`, Hermes's own gate ignores case, and on a case-insensitive filesystem `Agents.md` is `AGENTS.md`). Workers read them and never need to write one: a work order that needs one says so in its PR, and the operator adds it.
 - **`.coderabbit.*`** (added 2026-10-27, the operator's ruling): CodeRabbit reviews a same-repo PR with that PR branch's own config, so a PR that edits it could weaken its own review (§9.6).
+- **Every mise config file and lockfile at any depth** (added 2026-10-28, in Plan 01's final review), with `mise.toml`'s modes: mise loads each over `mise.toml` (`mise config ls`), so a `.mise.toml` could redefine the `test` task the gates run, a nested `mise.toml` does when mise starts in its directory, and a `mise.lock` names the URL and checksum mise installs each tool from. hapi-factory's own CI fails on any of them but the root `mise.lock`, which locks the root `mise.toml` and is reviewed like it (the operator, 2026-10-29), and the in-run gates will too.
+- **git's own files at any depth** (`**/.git/**`, deny everywhere; added the same day): git runs the commands `.git/config` names (`core.fsmonitor`, `diff.external`, `credential.helper`) from the git argv Hermes's rules allow, and a linked worktree's `.git` file names the git dir git uses. No agent edits them directly.
+- **gitleaks's `.gitleaks.toml` and `.gitleaksignore`** (added the same day): either could turn a repo's secret scan off. hapi-factory's own scans name their config, and its CI refuses a `.gitleaksignore`.
 - **Backstop:** CODEOWNERS plus the ruleset. A guard failing locally can't land a change.
 
 ---
@@ -716,7 +739,8 @@ Default-deny proxy per container, generated from policy.
   - **Optional: Bitwarden Secrets Manager** (`bws`), bound by name → id in the local config.
   - **Explicit downgrade: `env-file`** (plaintext, `0600`, outside every checkout). `hapi audit` reports it.
   - Never in a repo `.env` (Hermes's 1Password integration falls back to `.env`, which fails open).
-- **Residual risk:** model keys are visible inside their containers, bounded by spend caps and egress. **Next level:** a credential-injecting proxy.
+  - **Docker keeps a copy** (found in Plan 01's final review, 2026-10-28): Compose passes each zone's env file to the container as its environment, which hapi's Docker keeps in the container's config on hapi's disk for as long as the container exists, reboots included; `mise run down` removes it. An accepted residual (H-189), beside the next one.
+- **Residual risk:** model keys are visible inside their containers, and in Docker's config of each on hapi's disk, bounded by spend caps and egress. **Next level:** a credential-injecting proxy; for Docker's copy, secrets passed as files the containers read at start, or encrypted storage.
 
 ### 11.6 Supply chain
 

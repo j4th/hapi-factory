@@ -74,6 +74,59 @@ describe("effectiveModes", () => {
     expect(effectiveModes(p, "src/cli.ts")).toEqual(ALLOW);
   });
 
+  test("git's own files are deny in every session: a .git dir at any depth, all of it, and a worktree's .git file", () => {
+    // git runs commands that .git/config names (core.fsmonitor, diff.external) from argv commands.yaml allows.
+    for (const path of [".git", ".git/config", ".git/hooks/pre-commit", "sub/.git/config", "sub/.git", ".GIT/Config", "a/b/.git/worktrees/x/gitdir"]) {
+      expect([path, effectiveModes(p, path)]).toEqual([path, DENY]);
+    }
+    // Names that only start with ".git" are not git's own.
+    for (const path of [".gitignore", ".gitattributes", "docs/.gitkeep", "src/.github/x.yml"]) expect([path, effectiveModes(p, path)]).toEqual([path, ALLOW]);
+    expect(effectiveModes(p, ".github/workflows/ci.yml")).toEqual(ASK);
+  });
+
+  test("every other file mise reads config, tasks or locked tools from is protected like mise.toml, at any depth", () => {
+    // From the pinned mise's `mise config ls` and task dirs; a later file overrides mise.toml's tasks. A lockfile
+    // (mise.lock, mise.<env>.lock, mise.local.lock) names the URL and checksum mise installs each tool from.
+    for (const path of [
+      ".mise.toml",
+      "mise.local.toml",
+      ".mise.local.toml",
+      "mise.ci.toml",
+      ".mise.ci.toml",
+      "mise/config.toml",
+      "mise/conf.d/a.toml",
+      "mise/tasks/test",
+      ".mise/config.toml",
+      ".mise/tasks/test",
+      ".config/mise.toml",
+      ".config/mise.local.toml",
+      ".config/mise.ci.toml",
+      ".config/mise/config.toml",
+      ".config/mise/conf.d/a.toml",
+      ".config/mise/tasks/test",
+      "mise-tasks/test",
+      ".mise-tasks/test",
+      ".tool-versions",
+      "pkg/.mise.toml",
+      "pkg/.tool-versions",
+      "pkg/mise.toml",
+      "a/b/MISE.toml",
+      "mise.lock",
+      "mise.ci.lock",
+      "mise.local.lock",
+      "mise.ci.local.lock",
+      "pkg/mise.lock",
+      ".config/mise/mise.lock",
+    ]) {
+      expect([path, effectiveModes(p, path)]).toEqual([path, ASK]);
+    }
+    for (const path of ["src/mise.ts", "docs/mise.md", "misery.toml", ".config/other.toml", "mise-notes/a.md", "docs/mise.lockfile.md"]) expect([path, effectiveModes(p, path)]).toEqual([path, ALLOW]);
+  });
+
+  test("gitleaks's config and ignore file are protected at any depth: one could turn the secret scans off", () => {
+    for (const path of [".gitleaks.toml", ".gitleaksignore", "pkg/.gitleaks.toml", "pkg/.GitleaksIgnore"]) expect([path, effectiveModes(p, path)]).toEqual([path, ASK]);
+  });
+
   test("the strictest mode across every matching glob wins, per session, whatever the order", () => {
     const broad: PathModes = { interactive: "allow", unattended: "deny", workers: "ask" };
     const narrow: PathModes = { interactive: "ask", unattended: "allow", workers: "allow" };

@@ -63,7 +63,7 @@ describe("the sops provider", () => {
       expect(e.message).toMatch(why);
       expect(e.message).not.toContain(FAKE);
     };
-    // unencrypted_suffix (or _regex) leaves a value in plaintext: refused, by name, without the value.
+    // A value left in plaintext (a hand edit, or a name ending in sops's default _unencrypted): refused, by name, without the value.
     const plain = sopsFileText({ "hapi-a": "enc" }, { unencrypted_suffix: "_unencrypted" }).replace(/^hapi-a: .*$/m, `hapi-a: ${FAKE}`);
     await refuse(plain, /hapi-a is not encrypted/);
     await refuse(sopsFileText({ "hapi-a": "enc" }).replace(/^hapi-a: .*$/m, "hapi-a: 12345"), /hapi-a is not encrypted/);
@@ -133,21 +133,63 @@ describe("the sops provider", () => {
     expect(sopsFileProblem(store({ "Future-Setting": "x" }))).toMatch(/a field hapi doesn't know \(name not shown: it may hold a key\)/);
     // A known key list and an unknown field are both named.
     expect(sopsFileProblem(store({ pgp: [{ fp: "F" }], future_setting: 1 }))).toMatch(/^has a PGP key \(sops\.pgp\) and a field hapi doesn't know \(sops\.future_setting: it may hold a key\) in its sops metadata/);
-    // Every bookkeeping field sops 3.13.3 writes passes, as real sops output does.
+    // Every bookkeeping field sops 3.13.3 writes passes, as real sops output does, and so do its encryption settings when unset.
     const bookkeeping = {
       lastmodified: "2026-10-26T12:00:00Z",
       mac: ENC,
       version: "3.13.3",
       shamir_threshold: 1,
-      mac_only_encrypted: true,
+      mac_only_encrypted: false,
       unencrypted_suffix: "_unencrypted",
-      encrypted_suffix: "_encrypted",
-      unencrypted_regex: "^x$",
-      encrypted_regex: "^y$",
-      unencrypted_comment_regex: "^a",
-      encrypted_comment_regex: "^b",
+      encrypted_suffix: "",
+      unencrypted_regex: null,
+      encrypted_regex: "",
+      unencrypted_comment_regex: null,
+      encrypted_comment_regex: "",
     };
     expect(sopsFileProblem(store(bookkeeping))).toBeUndefined();
+  });
+
+  test("a setting that picks which values sops leaves in plaintext, or what its MAC covers, is refused by name before sops runs", async () => {
+    // Each would let `sops edit` write a value still "" (or a name not added yet) in plaintext, with the MAC still verifying.
+    const settings: [string, unknown][] = [
+      ["unencrypted_suffix", `-${FAKE}`],
+      ["unencrypted_suffix", "_plain"],
+      ["encrypted_suffix", `_${FAKE}`],
+      ["unencrypted_regex", `^${FAKE}$`],
+      ["unencrypted_regex", ".*"],
+      ["encrypted_regex", `^${FAKE}$`],
+      ["unencrypted_comment_regex", `^${FAKE}`],
+      ["encrypted_comment_regex", `^${FAKE}`],
+      ["mac_only_encrypted", true],
+      ["mac_only_encrypted", "true"],
+      ["unencrypted_regex", 0],
+      ["encrypted_suffix", []],
+    ];
+    const s = setup();
+    for (const [field, value] of settings) {
+      const text = sopsFileText({ "hapi-a": "enc", "hapi-b": "" }, { [field]: value });
+      const problem = sopsFileProblem(text);
+      expect([field, value, problem]).toEqual([
+        field,
+        value,
+        expect.stringMatching(new RegExp(`^has sops\\.${field} in its sops metadata: a setting that picks which values sops leaves in plaintext, or what its MAC covers`)),
+      ]);
+      expect(problem).toMatch(/hapi's store has none of them but sops's default unencrypted_suffix \(_unencrypted\)/);
+      expect(problem).toMatch(/restore the store from a commit without it/i);
+      // The setting is named; its value never is.
+      expect(problem).not.toContain(FAKE);
+      writeFileSync(s.store.file, text);
+      await expect(s.provider.fetch(["hapi-a"])).rejects.toThrow(new RegExp(`has sops\\.${field} in its sops metadata`));
+      await expect(s.provider.list()).rejects.toThrow(new RegExp(`has sops\\.${field} in its sops metadata`));
+    }
+    // Several are all named; a master key that is not age is still reported first.
+    expect(sopsFileProblem(sopsFileText({ "hapi-a": "enc" }, { unencrypted_regex: "^x$", mac_only_encrypted: true }))).toMatch(/^has sops\.unencrypted_regex and sops\.mac_only_encrypted in its sops metadata: settings that pick/);
+    expect(sopsFileProblem(sopsFileText({ "hapi-a": "enc" }, { unencrypted_regex: "^x$", pgp: [{ fp: "F" }] }))).toMatch(/^has a PGP key \(sops\.pgp\) in its sops metadata/);
+    // sops's default suffix, as `sops encrypt` writes it, or none at all, passes.
+    expect(sopsFileProblem(sopsFileText({ "hapi-a": "enc", "hapi-b": "" }, { unencrypted_suffix: "_unencrypted" }))).toBeUndefined();
+    expect(sopsFileProblem(sopsFileText({ "hapi-a": "enc", "hapi-b": "" }))).toBeUndefined();
+    expect(s.store.calls).toEqual([]); // sops never ran
   });
 
   test("a metadata field named like an Object.prototype member is an unknown field, named sanely or masked", () => {

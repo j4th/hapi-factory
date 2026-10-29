@@ -6,10 +6,10 @@
 # 1. gitleaks, at the version mise.toml pins, scans the staged changes. A
 #    finding stops the commit; its output is redacted, so the secret itself is
 #    never printed.
-# 2. No staged line or path holds one of the operator's personal strings
-#    (private/personal-strings.txt, .githooks/lib.sh). It names the file and
-#    line, never the string. In a clone without private/, as anyone but the
-#    operator has, this step is skipped with a notice.
+# 2. No staged line (binary files included) or path holds one of the operator's
+#    personal strings (private/personal-strings.txt, .githooks/lib.sh). It names
+#    the file and line, never the string. In a clone without private/, as anyone
+#    but the operator has, this step is skipped with a notice.
 #
 # Don't skip it with --no-verify: CI scans for secrets too, but nothing else
 # checks personal strings before a push.
@@ -22,8 +22,16 @@ cd "$root"
 
 # 1. Secrets. gitleaks exits 1 on a finding and something else when it fails. It is
 # quiet unless it finds something; then -v names the file, line and rule, redacted.
+# Its config is .githooks/gitleaks.toml, so a .gitleaks.toml in the commit can't turn
+# it off, and it ignores inline gitleaks:allow comments. gitleaks also exits 1 when it
+# can't load the config, so a missing one is caught first.
+gitleaks_config=".githooks/gitleaks.toml"
+if [[ ! -f "$gitleaks_config" ]]; then
+  echo "pre-commit: $gitleaks_config is missing, so gitleaks can't scan and the commit is stopped. Restore it: git checkout HEAD -- $gitleaks_config" >&2
+  exit 1
+fi
 status=0
-mise exec -- gitleaks git --pre-commit --staged --redact --no-banner --no-color --log-level warn -v . || status=$?
+mise exec -- gitleaks git --pre-commit --staged --config "$gitleaks_config" --ignore-gitleaks-allow --redact --no-banner --no-color --log-level warn -v . || status=$?
 if [[ "$status" -eq 1 ]]; then
   echo "pre-commit: gitleaks found a possible secret in the staged changes (above, redacted). Unstage it and keep it out of the repo." >&2
   exit 1
@@ -44,13 +52,18 @@ trap 'rm -f "$patterns"' EXIT
 # The prefixes are explicit, so a diff.noprefix or diff.mnemonicPrefix setting can't change "+++ b/<path>".
 # "+++ " is a file header only between "diff --git" and the first "@@": an added line
 # that starts with "++ " is "+++ ..." in the diff too, and must still be checked.
-added="$(git -c core.quotePath=false diff --cached -U0 --no-color --no-ext-diff --src-prefix=a/ --dst-prefix=b/ --diff-filter=ACMR |
+# --text diffs binary files as text too (a PDF's or an image's metadata), with each NUL
+# made a space, which bash can't hold and grep -w still reads as a word break. T is a
+# type change (a symlink replaced by a file). grep -a prints a match in any bytes.
+added="$(git -c core.quotePath=false diff --cached -U0 --text --no-color --no-ext-diff --src-prefix=a/ --dst-prefix=b/ --diff-filter=ACMRT |
+  tr '\0' ' ' |
   awk '/^diff --git / { header = 1; next }
        header && /^\+\+\+ / { file = substr($0, 7); next }
        /^@@ / { header = 0; match($0, /\+[0-9]+/); line = substr($0, RSTART + 1, RLENGTH - 1) + 0; next }
        !header && /^\+/ { print file "\t" line "\t" substr($0, 2); line++ }')"
-lines="$(printf '%s\n' "$added" | grep -F -i -w -f "$patterns" | cut -f1,2 | tr '\t' ':' || true)"
-paths="$(git -c core.quotePath=false diff --cached --name-only --diff-filter=ACMR | grep -F -i -w -f "$patterns" || true)"
+lines="$(printf '%s\n' "$added" | grep -a -F -i -w -f "$patterns" | cut -f1,2 | tr '\t' ':' || true)"
+# The paths NUL-separated (-z), so git doesn't quote one with a tab or newline in it ("x\tname").
+paths="$(git diff --cached --name-only -z --diff-filter=ACMRT | tr '\0' '\n' | grep -a -F -i -w -f "$patterns" || true)"
 
 if [[ -n "$lines" || -n "$paths" ]]; then
   echo "pre-commit: the staged changes hold a personal string from $PERSONAL_STRINGS:" >&2

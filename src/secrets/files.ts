@@ -4,8 +4,11 @@
  *
  * - `runtimeDir`: `$XDG_RUNTIME_DIR/hapi`, the only place hapi writes a
  *   resolved secret. XDG_RUNTIME_DIR is the user's own tmpfs (systemd makes it
- *   at login, mode 0700), so nothing survives a reboot. There is no fallback:
- *   never /tmp, never the repo.
+ *   at login, mode 0700), so the env files don't survive a reboot. There is
+ *   no fallback: never /tmp, never the repo. Docker keeps a copy, though:
+ *   each zone container's env sits in its container config on hapi's disk
+ *   (under hapi's rootless data root) for as long as the container exists,
+ *   reboots included, until `mise run down` removes it (H-189).
  * - `secureDir`: the directory is ours, a real directory (not a symlink) and
  *   mode 0700, under a runtime root (XDG_RUNTIME_DIR) that is itself ours and
  *   exactly 0700, as systemd makes it.
@@ -25,7 +28,8 @@
  * - `envFileText` and `parseEnvFile`: the env-file format, `NAME='value'`.
  *   Docker Compose reads a single-quoted value literally: no `${...}`
  *   interpolation, no escapes, newlines kept. So a key with `$` or a
- *   multi-line PEM arrives intact. A value can't hold a single quote or NUL;
+ *   multi-line PEM arrives intact. A value can't hold a single quote or NUL,
+ *   or end in a backslash (Compose would take `\'` as an escaped quote);
  *   such a value is refused, by key.
  * - `privateFileProblem`, `ensurePrivateDir` and `defaultRepoRoot`: a key or a
  *   plaintext store must be ours, closed to group and other, and outside the
@@ -249,6 +253,8 @@ export async function writeSecretFiles(link: string, files: Record<string, strin
 export function envValueProblem(value: string): string | undefined {
   if (value.includes("'")) return "the value holds a single quote ('), which an env file can't carry literally; rotate the secret to one without";
   if (value.includes("\0")) return "the value holds a NUL character, which no env var can carry";
+  // Compose's dotenv parser takes \' as an escaped quote even inside single quotes; with ' refused, only a last \ can meet one.
+  if (value.endsWith("\\")) return "the value ends in a backslash (\\), which Compose would take as escaping the closing quote; rotate the secret to one without";
   return undefined;
 }
 

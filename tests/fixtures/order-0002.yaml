@@ -1,5 +1,8 @@
 # The spec §6 work-order example, with a real traceparent in place of the
-# "00-<trace-id>-<span-id>-01" placeholder (the W3C Trace Context example value).
+# "00-<trace-id>-<span-id>-01" placeholder (the W3C Trace Context example value),
+# and one egress_extra host where the spec has none. egress_extra is for public
+# hosts only: the archon proxy refuses private addresses, so a private sidecar
+# such as odoo.internal is reached directly on the zone's network (H-192).
 id: 0002-search-partners-tool
 lane: factory
 workflow: factory-task              # Archon workflow name (home-scoped pack)
@@ -14,7 +17,7 @@ pieces:
     size: small
 verify:
   smoke: true                       # run `mise run smoke` against the local Odoo sidecar
-egress_extra: ["odoo.internal"]     # hosts the smoke check needs (here: the private sidecar)
+egress_extra: ["odoo.internal"]     # a host, so the validator's host rules run (a schema example only: H-192)
 trace:
   traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 sources: ["docs/research/odoo-external-api.md", "docs/design/odoo-mcp.md"]

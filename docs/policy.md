@@ -34,7 +34,10 @@ The schemas are in `policy/schemas/`, named `<schema>.schema.json`. `policy-defs
 protected_paths:
   "AGENTS.md":   { interactive: ask, unattended: deny, workers: deny }
   ".pi/**":      { interactive: deny, unattended: deny, workers: deny }
-  # ... and the other agent instruction files at any depth (**/CLAUDE.md, **/.claude/** ...), .factory/**, .github/**, mise.toml, .agents/**, .archon/**, .coderabbit.yaml, .coderabbit.yml, .coderabbit.config.ts (exactly spec §8.2)
+  # ... and the other agent instruction files at any depth (**/CLAUDE.md, **/.claude/** ...), .factory/**, .github/**, mise.toml and every
+  # other mise config file and lockfile at any depth (**/mise.toml, **/.mise.toml, **/mise.*.toml, **/mise/**, **/.tool-versions, **/mise.lock ...), .agents/**,
+  # .archon/**, .coderabbit.yaml, .coderabbit.yml, .coderabbit.config.ts, git's own files (**/.git/**, deny everywhere), and gitleaks's
+  # **/.gitleaks.toml and **/.gitleaksignore (exactly spec §8.2)
 ```
 
 Keys are globs relative to a repo's root. Each entry sets all three modes:
@@ -473,14 +476,14 @@ The overlay is checked in two stages:
 protected_paths:
   "src/secrets/**": { interactive: deny, unattended: deny, workers: deny }   # a new path
   "AGENTS.md": { interactive: deny }      # ask -> deny is tighter; unattended and workers stay deny
-egress_extra: ["odoo.internal"]           # the private Odoo sidecar the smoke check needs
+egress_extra: ["odoo.internal"]           # joins the archon zone's hosts (a schema example: see below)
 budgets:
   run_usd: 2.00                           # lower than the base's 3.00
 default_risk: medium                      # repo settings (spec §7), not policy:
 workflow: factory-task                    #   exposed as applyOverlay(...).repo
 ```
 
-The result has `src/secrets/**` and `AGENTS.md` denied in every mode, and `odoo.internal` in the archon zone's hosts. Its `budgets.run_usd` is 2, and its `repo` is `{ default_risk: medium, workflow: factory-task }`. This file is `tests/fixtures/overlay-tighten.yaml`.
+The result has `src/secrets/**` and `AGENTS.md` denied in every mode, and `odoo.internal` in the archon zone's hosts. Its `budgets.run_usd` is 2, and its `repo` is `{ default_risk: medium, workflow: factory-task }`. This file is `tests/fixtures/overlay-tighten.yaml`. Its `odoo.internal` only shows how a host joins the zone: a real overlay adds public hosts only, since the proxy refuses private addresses, so a private sidecar is reached another way ([`egress_extra`](#work-orders), H-192).
 
 A new glob may also overlap a protected one. `".github/workflows/**": { interactive: deny }` is accepted: the workflow files become denied in every mode, and the rest of `.github/**` stays `{ask, deny, deny}`.
 
@@ -520,7 +523,7 @@ pieces:
     size: small
 verify:
   smoke: true                       # run `mise run smoke` against the local Odoo sidecar
-egress_extra: ["odoo.internal"]     # hosts the smoke check needs (here: the private sidecar)
+egress_extra: []                    # public hosts the run needs beyond its zone's (none here: see egress_extra below)
 trace:
   traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 sources: ["docs/research/odoo-external-api.md", "docs/design/odoo-mcp.md"]
@@ -538,11 +541,11 @@ The schema is `policy/schemas/work-order.schema.json`. **Every field is required
 | `budget` | `usd` greater than 0; `turns` and `minutes` whole numbers, at least 1 |
 | `pieces` | At least one. Each has a unique slug `id`, a non-empty list of `files` and a `size` tier. |
 | `verify.smoke` | `true` or `false` |
-| `egress_extra` | A list of hosts (it may be empty), with the same host rules as policy. The hosts join the archon zone for the run (spec §10), so a [forge host](#trusted_sourcesyaml) is rejected, e.g. `/egress_extra/1: "api.github.com" is a forge host (github.com); the archon zone has no forge route (spec §4.3)`. That is the same list an overlay's `egress_extra` is checked against. |
+| `egress_extra` | A list of hosts (it may be empty), with the same host rules as policy. The hosts join the archon zone for the run (spec §10), so a [forge host](#trusted_sourcesyaml) is rejected, e.g. `/egress_extra/1: "api.github.com" is a forge host (github.com); the archon zone has no forge route (spec §4.3)`. That is the same list an overlay's `egress_extra` is checked against. **Public hosts only:** every allowlisted zone's proxy refuses private addresses (`to_localnet`, before its allowlist) and allows only HTTPS to port 443, so a private smoke sidecar (the local Odoo container, say) is never reached this way. The smoke check reaches it directly on the zone's internal network, with its name in the run's `NO_PROXY` (H-192). The schema doesn't refuse a private name yet, so `odoo.internal` still passes it. |
 | `trace.traceparent` | A W3C traceparent matching `^00-[0-9a-f]{32}-[0-9a-f]{16}-0[01]$` |
 | `sources` | A list of repo files the order rests on (it may be empty) |
 
-**Paths** in `files` and `sources` must be relative to the repo root. An absolute path, a `..` segment or a backslash is rejected, so a declared scope can't point outside the repo.
+**Paths** in `files` and `sources` must be relative to the repo root. An absolute path, a `..` segment, the repo root itself (`.`, `./`, or any path of only `.` segments), a backslash or a control character (U+0000–U+001F and U+007F–U+009F, as `src/policy/paths.ts` defines it) is rejected, so a declared scope can't point outside the repo or name all of it, and the schema refuses what `effectiveModes` refuses (the `repoPath` definition).
 
 `id` and `traceparent` are written by deterministic code (Hermes's `new-work-order` tool), never by the model. The same schema check runs in three places:
 - in Hermes, before the planning PR is opened;

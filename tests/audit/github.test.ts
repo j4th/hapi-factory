@@ -100,6 +100,22 @@ describe("github.rulesets", () => {
     });
   }
 
+  test("main-review's pull_request rule with no approval count, or one that isn't a number, fails even when main's rules have one", async () => {
+    for (const count of [undefined, "one", null]) {
+      const rulesets = mutate((r) => {
+        // Another ruleset on main requires one approval, so main's effective rules pass the count check.
+        named(r, "main-protect").rules.push({ type: "pull_request", parameters: { required_approving_review_count: 1 } });
+        const params = named(r, "main-review").rules[0].parameters;
+        if (count === undefined) delete params.required_approving_review_count;
+        else params.required_approving_review_count = count;
+      });
+      const r = await run(await withToken({ rulesets }));
+      expect([count, r.rulesets.status]).toEqual([count, "fail"]);
+      expect(r.rulesets.detail).toContain("main-review's required_approving_review_count");
+      expect(r.rulesets.detail).not.toContain("main has no pull_request rule");
+    }
+  });
+
   test("the pass names the branch and tag scope rulesets, and allows the Dependabot exclusion the runbook offers", async () => {
     let r = await run(await withToken());
     expect(r.rulesets.detail).toContain("agent-branch-scope and tags-admin-only");

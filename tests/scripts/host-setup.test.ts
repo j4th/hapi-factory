@@ -2,10 +2,12 @@
  * scripts/host-setup.sh, checked statically: it is never run here (it creates a
  * user and needs root). `bash -n` parses it; shellcheck, pinned in mise.toml,
  * lints it (the test skips only where shellcheck isn't installed); the rest reads the text for
- * what the script must do, in the order it must do it.
+ * what the script must do, in the order it must do it. One function, the
+ * root-equivalence check, is also run on its own, with a stub `id` and `sudo`.
  */
-import { expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { afterAll, describe, expect, test } from "bun:test";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { HAPI_BIN, HAPI_CHECKOUT, HAPI_MISE, HAPI_USER } from "../../src/stack/up";
 
@@ -58,8 +60,83 @@ test("creates the hapi user with subordinate IDs wide enough for the Squid rock'
   const count = Number(/readonly SUBID_COUNT=(\d+)/.exec(text)?.[1]);
   expect(count).toBeGreaterThan(584792);
   expect(text).toContain(`-K SUB_UID_COUNT="$SUBID_COUNT" -K SUB_GID_COUNT="$SUBID_COUNT"`);
-  // hapi must never be in the rootful daemon's docker group.
-  expect(text).toMatch(/grep -qx docker/);
+});
+
+/** A shell function of the script, `name() { ... }` to its closing brace at the start of a line. */
+const fn = (name: string) => new RegExp(`^${name}\\(\\) \\{\\n[\\s\\S]*?\\n\\}$`, "m").exec(text)?.[0] ?? "";
+
+test("refuses a hapi that can become root, on every run: one in a root-equivalent group, or with any sudo rule", () => {
+  // docker is the rootful daemon; sudo, admin and wheel are sudo's usual groups; lxd and incus-admin run
+  // privileged containers; libvirt starts VMs with any host disk; disk reads and writes raw block devices.
+  const groups = /^readonly ROOT_GROUPS=\(([^)]*)\)$/m.exec(text)?.[1]?.split(" ");
+  expect(groups?.sort()).toEqual(["admin", "disk", "docker", "incus-admin", "libvirt", "lxd", "sudo", "wheel"]);
+  const check = fn("refuse_root_equivalent");
+  expect(check).toContain(`id -nG "$HAPI_USER"`);
+  // As root, sudo lists another user's rules; in the C locale, so its English messages are what's matched.
+  expect(check).toContain(`$(LC_ALL=C sudo -n -l -U "$HAPI_USER" 2>&1)`);
+  // A hapi made by an earlier run or by hand is checked too: the last thing ensure_user does.
+  expect(fn("ensure_user").split("\n").at(-2)?.trim()).toBe("refuse_root_equivalent");
+});
+
+describe("refuse_root_equivalent, run here with a stub id and sudo", () => {
+  const temps: string[] = [];
+  afterAll(() => {
+    for (const d of temps) rmSync(d, { recursive: true, force: true });
+  });
+  /** The check, with hapi in `groups` (or `id -nG hapi` failing, for null) and `sudo -n -l -U hapi` printing `rules`; its exit code and stderr. */
+  const run = (groups: string | null, rules: string) => {
+    const bin = mkdtempSync(join(tmpdir(), "hapi-host-setup-"));
+    temps.push(bin);
+    writeFileSync(join(bin, "groups.txt"), `${groups ?? ""}\n`);
+    writeFileSync(join(bin, "rules.txt"), rules);
+    const lookup = groups === null ? `echo "id: 'hapi': no such user" >&2\nexit 1` : `cat "${bin}/groups.txt"`;
+    writeFileSync(join(bin, "id"), `#!/bin/sh\n[ "$*" = "-nG hapi" ] || exit 99\n${lookup}\n`);
+    // Only the listing, and only in the C locale; it exits 1 as sudo does for a user with no rules.
+    writeFileSync(join(bin, "sudo"), `#!/bin/sh\n[ "$*" = "-n -l -U hapi" ] && [ "$LC_ALL" = C ] || exit 99\ncat "${bin}/rules.txt"\ngrep -q 'may run' "${bin}/rules.txt"\n`);
+    for (const f of ["id", "sudo"]) chmodSync(join(bin, f), 0o755);
+    const script = ["set -euo pipefail", `readonly HAPI_USER=${HAPI_USER}`, /^readonly ROOT_GROUPS=.*$/m.exec(text)![0], fn("die"), fn("refuse_root_equivalent"), "refuse_root_equivalent"].join("\n");
+    const r = Bun.spawnSync(["bash", "-c", script], { env: { PATH: `${bin}:/usr/bin:/bin` }, stdout: "pipe", stderr: "pipe" });
+    return { code: r.exitCode, err: r.stderr.toString() };
+  };
+  const NONE = "User hapi is not allowed to run sudo on host.\n";
+
+  test("passes a hapi with only its own group and no sudo rule", () => {
+    expect(run("hapi", NONE)).toEqual({ code: 0, err: "" });
+  });
+
+  test("refuses each root-equivalent group, naming the groups and the command that removes hapi from them", () => {
+    for (const g of ["docker", "sudo", "admin", "wheel", "lxd", "incus-admin", "libvirt", "disk"]) {
+      const r = run(`hapi users ${g}`, NONE);
+      expect([g, r.code]).toEqual([g, 1]);
+      expect(r.err).toContain(`hapi is in ${g},`);
+      expect(r.err).toContain(`gpasswd -d hapi ${g}`);
+    }
+    const two = run("hapi lxd docker", NONE);
+    expect(two.err).toContain("hapi is in lxd docker,");
+    expect(two.err).toContain("gpasswd -d hapi lxd && gpasswd -d hapi docker");
+    expect(run("hapi dockers", NONE).code).toBe(0); // whole names only
+  });
+
+  test("refuses any sudo rule, naming it", () => {
+    const rules = "Matching Defaults entries for hapi on host:\n    env_reset\n\nUser hapi may run the following commands on host:\n    (ALL) NOPASSWD: /usr/bin/apt-get\n";
+    const r = run("hapi", rules);
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("hapi has sudo rules");
+    expect(r.err).toContain("(ALL) NOPASSWD: /usr/bin/apt-get");
+    expect(r.err).toContain("visudo");
+  });
+
+  test("refuses when it can't read hapi's groups, rather than take a failed lookup for no groups", () => {
+    const r = run(null, NONE);
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("could not read hapi's groups");
+  });
+
+  test("refuses when it can't read sudo's answer, rather than guess", () => {
+    const r = run("hapi", "sudo: unable to resolve host\n");
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("could not read hapi's sudo rules");
+  });
 });
 
 test("rootless Docker kept alive by lingering, and checked to be rootless", () => {

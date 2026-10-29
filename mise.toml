@@ -5,7 +5,9 @@
 #
 # Pinning rule (spec §3, §11.6): every tool is an exact version. Never `latest`,
 # never a range. To upgrade, bump the version here, run
-# `mise install && mise run lint && mise run test`, and say why in the PR.
+# `mise lock --platform linux-x64` (mise.lock pins each download's checksum),
+# then `mise install && mise run lint && mise run test`, commit both files, and
+# say why in the PR (README.md, "To upgrade a tool").
 #
 # This file is a protected path (spec §8.2): an interactive agent session must
 # ask the operator before editing it, and unattended sessions and workers may not

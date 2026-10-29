@@ -18,10 +18,18 @@ if [[ -z "$patterns" ]]; then
 fi
 trap 'rm -f "$patterns"' EXIT
 
-# Every line up to git's scissors line (`commit -v` puts the diff below it, and git
-# always cuts there). "#" lines count too: git strips them only when it cleans up an
-# edited message, and `commit -m` keeps them.
-hits="$(sed '/^# -\{24\} >8 -\{24\}$/,$d' "$1" | grep -n -F -i -w -f "$patterns" | cut -d: -f1 || true)"
+# Every line down to git's own cut block: a scissors line, then "# Do not modify or
+# remove the line above.". git writes the two when `commit -v` puts the diff below
+# them, and removes everything from there. A scissors line alone is checked like any
+# other, and so is what follows it: git cuts there only with -v or --cleanup=scissors,
+# and `commit -m` or -F keeps it. "#" lines count too: git strips them only when it
+# cleans up an edited message, and `commit -m` keeps them.
+hits="$(awk -v cut="# ------------------------ >8 ------------------------" '
+    held && $0 == "# Do not modify or remove the line above." { held = 0; exit }
+    held { print cut; held = 0 }
+    $0 == cut { held = 1; next }
+    { print }
+    END { if (held) print cut }' "$1" | grep -n -F -i -w -f "$patterns" | cut -d: -f1 || true)"
 if [[ -n "$hits" ]]; then
   echo "commit-msg: the commit message holds a personal string from $PERSONAL_STRINGS, on line $(echo "$hits" | paste -sd, -)." >&2
   echo "Replace it (\"the operator\", \$OWNER or <owner>) and commit again; your message is in .git/COMMIT_EDITMSG." >&2

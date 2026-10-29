@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { createPrivateKey, generateKeyPairSync, verify } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import * as fsp from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -310,6 +311,80 @@ describe("hapi token mint", () => {
     expect(await tokenMint(["--app", "planner", "--repo", "example-owner/odoo-mcp"], { fetch: f.fetch, env: { XDG_RUNTIME_DIR: xdg }, now: () => NOW_MS })).toBe(0);
     expect([old, fresh, leftover, other].map(existsSync)).toEqual([false, true, false, true]);
     expect(existsSync(join(tokens, "planner.example-owner.odoo-mcp.token"))).toBe(true);
+  });
+
+  test("the cleanup runs only once the new token is written, and a file a concurrent mint renames away mid-scan is already gone", async () => {
+    const { out, err } = capture();
+    const xdg = xdgWithHostEnv(planner);
+    const tokens = join(xdg, "hapi", "tokens");
+    mkdirSync(tokens, { mode: 0o700 });
+    // Another mint's temp file: it renames it into place between this cleanup's readdir and its lstat.
+    const theirs = join(tokens, ".factory.example-owner.other.token.0b1c.tmp");
+    writeFileSync(theirs, "fake\n", { mode: 0o600 });
+    const file = join(tokens, "planner.example-owner.odoo-mcp.token");
+    const realLstat = fsp.lstat;
+    let writtenFirst: boolean | undefined;
+    const spy = spyOn(fsp, "lstat").mockImplementation((async (path: string, ...rest: unknown[]) => {
+      if (path === theirs) {
+        writtenFirst = existsSync(file);
+        rmSync(theirs);
+      }
+      return (realLstat as (...a: unknown[]) => Promise<unknown>)(path, ...rest);
+    }) as typeof fsp.lstat);
+    const f = fakeFetch({
+      [`GET ${API}/repos/example-owner/odoo-mcp/installation`]: { status: 200, body: { id: 123, suspended_at: null } },
+      [MINT]: granted({ ...APPS.planner.permissions }),
+    });
+    try {
+      expect(await tokenMint(["--app", "planner", "--repo", "example-owner/odoo-mcp"], { fetch: f.fetch, env: { XDG_RUNTIME_DIR: xdg }, now: () => NOW_MS })).toBe(0);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(writtenFirst).toBe(true);
+    expect(readFileSync(file, "utf8")).toBe(`${TOKEN}\n`);
+    expect(out).toEqual([`${file} (expires 2023-11-14T23:13:20Z)`]);
+    expect(err).toEqual([]);
+  });
+
+  test("a cleanup that fails is only a warning: the token minted is already written, and nothing names it", async () => {
+    const { out, err } = capture();
+    const xdg = xdgWithHostEnv(planner);
+    const tokens = join(xdg, "hapi", "tokens");
+    mkdirSync(tokens, { mode: 0o700 });
+    const stuck = join(tokens, "planner.example-owner.stuck.token");
+    writeFileSync(stuck, "fake\n", { mode: 0o600 });
+    const realLstat = fsp.lstat;
+    const spy = spyOn(fsp, "lstat").mockImplementation((async (path: string, ...rest: unknown[]) => {
+      if (path === stuck) throw Object.assign(new Error(`EACCES: permission denied, lstat '${path}'`), { code: "EACCES" });
+      return (realLstat as (...a: unknown[]) => Promise<unknown>)(path, ...rest);
+    }) as typeof fsp.lstat);
+    const f = fakeFetch({
+      [`GET ${API}/repos/example-owner/odoo-mcp/installation`]: { status: 200, body: { id: 123, suspended_at: null } },
+      [MINT]: granted({ ...APPS.planner.permissions }),
+    });
+    try {
+      expect(await tokenMint(["--app", "planner", "--repo", "example-owner/odoo-mcp"], { fetch: f.fetch, env: { XDG_RUNTIME_DIR: xdg }, now: () => NOW_MS })).toBe(0);
+    } finally {
+      spy.mockRestore();
+    }
+    const file = join(tokens, "planner.example-owner.odoo-mcp.token");
+    expect(readFileSync(file, "utf8")).toBe(`${TOKEN}\n`);
+    expect(out).toEqual([`${file} (expires 2023-11-14T23:13:20Z)`]);
+    expect(err).toEqual([`hapi token mint: wrote the token, but could not remove the expired token files in ${tokens} (EACCES); the next mint tries again`]);
+    expect([...out, ...err].join("\n")).not.toContain(TOKEN);
+  });
+
+  test("a tokens/ that is a symlink is refused before GitHub mints anything", async () => {
+    const xdg = xdgWithHostEnv(planner);
+    const elsewhere = mkdtempSync(join(tmpdir(), "hapi-token-elsewhere-"));
+    temps.push(elsewhere);
+    symlinkSync(elsewhere, join(xdg, "hapi", "tokens"));
+    const f = fakeFetch({
+      [`GET ${API}/repos/example-owner/odoo-mcp/installation`]: { status: 200, body: { id: 123, suspended_at: null } },
+      [MINT]: granted({ ...APPS.planner.permissions }),
+    });
+    await expect(tokenMint(["--app", "planner", "--repo", "example-owner/odoo-mcp"], { fetch: f.fetch, env: { XDG_RUNTIME_DIR: xdg }, now: () => NOW_MS })).rejects.toThrow(/tokens is not a directory \(a symlink\?\)/);
+    expect(f.calls).toEqual([]);
   });
 
   test("a loose XDG_RUNTIME_DIR is refused before host.env is read", async () => {

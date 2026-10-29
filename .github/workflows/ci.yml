@@ -7,7 +7,8 @@
 #   release tag it was resolved from (`gh api repos/<owner>/<repo>/git/ref/tags/<tag>`).
 # - Least privilege: the token can only read the repo, and checkout doesn't keep it in .git/config.
 # - mise itself is pinned to the version in mise.toml's `min_version`; mise then installs the
-#   exact tool versions from mise.toml.
+#   exact tool versions from mise.toml, each download checked against the checksum the root
+#   mise.lock records for it.
 name: ci
 
 on:
@@ -34,15 +35,59 @@ jobs:
           persist-credentials: false
           fetch-depth: 0   # the whole history, for the gitleaks scan
 
+      # mise reads config, tasks and locked tools from more files than mise.toml (.mise.toml,
+      # mise.local.toml, mise.<env>.toml, .config/mise.toml, mise/ and .mise/, mise-tasks/,
+      # .tool-versions, mise.<env>.lock, ...), and a later file overrides mise.toml. mise-action installs
+      # the tools they name and exports the env they set to every later step, so a commit that adds
+      # one could change what this job runs, a check after it included. So this is a plain file
+      # scan, before mise-action, for the names policy/protected_paths.yaml protects, at any depth
+      # and in any case. Only the root mise.toml may configure mise here, and only the root
+      # mise.lock, which locks the tools it names (H-116), may sit beside it.
+      - name: Only the root mise.toml configures mise
+        run: |
+          extra="$(find . -path ./.git -prune -o \( -iname mise.toml -o -iname .mise.toml -o -iname 'mise.*.toml' -o -iname '.mise.*.toml' \
+            -o -iname mise.lock -o -iname 'mise.*.lock' -o -iname mise -o -iname .mise -o -iname mise-tasks -o -iname .mise-tasks \
+            -o -iname .tool-versions \) ! -path ./mise.toml ! -path ./mise.lock -print -prune)"
+          if [[ -n "$extra" ]]; then
+            echo "::error::mise files besides the root mise.toml and mise.lock. Move what is needed into mise.toml and remove:"
+            printf '%s\n' "$extra"
+            exit 1
+          fi
+
       - uses: jdx/mise-action@82a612c5ab8bcda7cc5db6b7e81a8e7584c3dc6e # v5.2.3
         with:
           version: 2026.10.9
 
+      # A second net, for a file the scan doesn't know by name (a newer mise's): ask mise what it
+      # loaded. It runs after mise-action has loaded it, so the scan above is the gate.
+      - name: mise loads no config or tasks but the root mise.toml
+        run: |
+          configs="$(mise config ls --json)"
+          tasks="$(mise tasks ls --json --hidden)"
+          extra="$(jq -rn --arg root "$PWD/" --argjson configs "$configs" --argjson tasks "$tasks" \
+            '[$configs[].path, $tasks[].source] | unique[] | select(type == "string" and startswith($root) and . != $root + "mise.toml")')"
+          if [[ -n "$extra" ]]; then
+            echo "::error::mise config or tasks outside the root mise.toml. Move what is needed into mise.toml and remove:"
+            printf '%s\n' "$extra"
+            exit 1
+          fi
+
+      # `--locked`, as mise-action adds to its own install: a tool the root mise.lock doesn't cover
+      # fails here instead of resolving a version, so a mise.toml change must come with its lock.
       # `mise run lint` first runs `setup` (bun install --frozen-lockfile), so a stale bun.lock fails here.
       - name: Install tools, type-check, unit tests
-        run: mise install && mise run lint && mise run test
+        run: mise install --locked && mise run lint && mise run test
 
       # The whole history, not just the diff: a secret in any commit stays public
-      # even after a later commit removes it (H-057).
+      # even after a later commit removes it (H-057). Nothing in a commit can turn the scan
+      # off without changing a protected path: its config is .githooks/gitleaks.toml, not a
+      # .gitleaks.toml the commit adds; inline gitleaks:allow comments are ignored; and
+      # gitleaks always reads a root .gitleaksignore, which no flag turns off, so the step
+      # refuses one.
       - name: Scan the whole history for secrets (gitleaks)
-        run: mise exec -- gitleaks git --redact --no-banner --no-color -v .
+        run: |
+          if [[ -e .gitleaksignore ]]; then
+            echo "::error::.gitleaksignore would hide gitleaks findings. Remove it; the operator allows a false positive in .githooks/gitleaks.toml."
+            exit 1
+          fi
+          mise exec -- gitleaks git --config .githooks/gitleaks.toml --ignore-gitleaks-allow --redact --no-banner --no-color -v .

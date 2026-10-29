@@ -95,7 +95,7 @@ describe("protected instruction files", () => {
     const c = config();
     expect(c.security.protected_instruction_files).toBe(true);
     expect(c.security.protected_instruction_extra_patterns).toEqual(
-      [".[cC][oO][dD][eE][rR][aA][bB][bB][iI][tT].[cC][oO][nN][fF][iI][gG].[tT][sS\u017F]", ".[cC][oO][dD][eE][rR][aA][bB][bB][iI][tT].[yY][aA][mM][lL]", ".[cC][oO][dD][eE][rR][aA][bB][bB][iI][tT].[yY][mM][lL]", ".[cC][uU][rR][sS\u017F][oO][rR][rR][uU][lL][eE][sS\u017F]", ".[hH][eE][rR][mM][eE][sS\u017F].[mM][dD]", ".[wW][iI][nN][dD][sS\u017F][uU][rR][fF][rR][uU][lL][eE][sS\u017F]", "[aA][gG][eE][nN][tT].[mM][dD]", "[aA][gG][eE][nN][tT][sS\u017F].[mM][dD]", "[aA][gG][eE][nN][tT][sS\u017F].[oO][vV][eE][rR][rR][iI][dD][eE].[mM][dD]", "[cC][lL][aA][uU][dD][eE].[lL][oO][cC][aA][lL].[mM][dD]", "[cC][lL][aA][uU][dD][eE].[mM][dD]", "[gG][eE][mM][iI][nN][iI].[mM][dD]", "[hH][eE][rR][mM][eE][sS\u017F].[mM][dD]", "[mM][iI][sS\u017F][eE].[tT][oO][mM][lL]", "[rR][eE][vV][iI][eE][wW].[mM][dD]", "[sS\u017F][oO][uU][lL].[mM][dD]"],
+      [".[cC][oO][dD][eE][rR][aA][bB][bB][iI][tT].[cC][oO][nN][fF][iI][gG].[tT][sS\u017F]", ".[cC][oO][dD][eE][rR][aA][bB][bB][iI][tT].[yY][aA][mM][lL]", ".[cC][oO][dD][eE][rR][aA][bB][bB][iI][tT].[yY][mM][lL]", ".[cC][uU][rR][sS\u017F][oO][rR][rR][uU][lL][eE][sS\u017F]", ".[gG][iI][tT][lL][eE][aA][kK\u212A][sS\u017F].[tT][oO][mM][lL]", ".[gG][iI][tT][lL][eE][aA][kK\u212A][sS\u017F][iI][gG][nN][oO][rR][eE]", ".[hH][eE][rR][mM][eE][sS\u017F].[mM][dD]", ".[mM][iI][sS\u017F][eE].*.[tT][oO][mM][lL]", ".[mM][iI][sS\u017F][eE].[lL][oO][cC][aA][lL].[tT][oO][mM][lL]", ".[mM][iI][sS\u017F][eE].[tT][oO][mM][lL]", ".[tT][oO][oO][lL]-[vV][eE][rR][sS\u017F][iI][oO][nN][sS\u017F]", ".[wW][iI][nN][dD][sS\u017F][uU][rR][fF][rR][uU][lL][eE][sS\u017F]", "[aA][gG][eE][nN][tT].[mM][dD]", "[aA][gG][eE][nN][tT][sS\u017F].[mM][dD]", "[aA][gG][eE][nN][tT][sS\u017F].[oO][vV][eE][rR][rR][iI][dD][eE].[mM][dD]", "[cC][lL][aA][uU][dD][eE].[lL][oO][cC][aA][lL].[mM][dD]", "[cC][lL][aA][uU][dD][eE].[mM][dD]", "[gG][eE][mM][iI][nN][iI].[mM][dD]", "[hH][eE][rR][mM][eE][sS\u017F].[mM][dD]", "[mM][iI][sS\u017F][eE].*.[lL][oO][cC][kK\u212A]", "[mM][iI][sS\u017F][eE].*.[tT][oO][mM][lL]", "[mM][iI][sS\u017F][eE].[lL][oO][cC][aA][lL].[tT][oO][mM][lL]", "[mM][iI][sS\u017F][eE].[lL][oO][cC][kK\u212A]", "[mM][iI][sS\u017F][eE].[tT][oO][mM][lL]", "[rR][eE][vV][iI][eE][wW].[mM][dD]", "[sS\u017F][oO][uU][lL].[mM][dD]"],
     );
   });
 
@@ -105,7 +105,9 @@ describe("protected instruction files", () => {
       .split("\n")
       .filter((l) => l.trimStart().startsWith("#"))
       .join("\n");
-    for (const glob of [".agents/**", ".archon/**", ".factory/**", ".github/**", ".pi/**"]) expect(comment).toContain(glob);
+    for (const glob of ["**/.git/**", "**/mise/**", "**/.mise/**", "**/.config/mise/**", "**/mise-tasks/**", "**/.mise-tasks/**", ".agents/**", ".archon/**", ".factory/**", ".github/**", ".pi/**"]) {
+      expect(comment).toContain(glob);
+    }
     expect(comment).toContain("hapi-path-guard");
   });
 

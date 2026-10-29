@@ -9,19 +9,24 @@
 # pattern would match every line.
 
 PERSONAL_STRINGS="private/personal-strings.txt"
+# The file itself is the main worktree's, also when the hook runs in a linked
+# worktree (under .worktrees/), which has no private/ of its own: the parent of
+# git's common dir, the same rule as repoRoots in src/secrets/files.ts.
+common_dir="$(git rev-parse --path-format=absolute --git-common-dir)"
+personal_strings_file="$(dirname "$common_dir")/$PERSONAL_STRINGS"
 
-# Write the usable lines of $PERSONAL_STRINGS to a new temp file and print its
-# path. Print nothing when the file doesn't exist (a clone without private/) or
-# has no usable line. Exit 1 if it exists but can't be read.
+# Write the usable lines of $personal_strings_file to a new temp file and print
+# its path. Print nothing when the file doesn't exist (a clone without private/)
+# or has no usable line. Exit 1 if it exists but can't be read.
 personal_patterns() {
-  [[ -e "$PERSONAL_STRINGS" ]] || return 0
-  if [[ ! -r "$PERSONAL_STRINGS" ]]; then
+  [[ -e "$personal_strings_file" ]] || return 0
+  if [[ ! -r "$personal_strings_file" ]]; then
     echo "${0##*/}: can't read $PERSONAL_STRINGS" >&2
     return 1
   fi
   local out
   out="$(mktemp)"
-  tr -d '\r' <"$PERSONAL_STRINGS" | grep -v -e '^[[:space:]]*$' -e '^#' >"$out" || true
+  tr -d '\r' <"$personal_strings_file" | grep -v -e '^[[:space:]]*$' -e '^#' >"$out" || true
   if [[ ! -s "$out" ]]; then
     rm -f "$out"
     return 0

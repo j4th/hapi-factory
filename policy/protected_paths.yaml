@@ -45,9 +45,45 @@ protected_paths:
   ".factory/**": { interactive: ask, unattended: deny, workers: deny }
   ".github/**":  { interactive: ask, unattended: deny, workers: deny }
   "mise.toml":   { interactive: ask, unattended: deny, workers: deny }
+  # Every other file mise reads config, tasks or locked tools from (`mise config
+  # ls`, its task dirs, its lockfiles), at any depth, with mise.toml's modes. mise
+  # reads them all, and a later one overrides mise.toml, so a .mise.toml could
+  # redefine the `test` task the gates run; a nested mise.toml does when mise
+  # starts in its directory; and a mise.lock names the URL and checksum mise
+  # installs each tool from. hapi-factory's own CI fails when any of them is
+  # present but the root mise.lock, which locks the root mise.toml (H-116), and
+  # the in-run gates will too (H-194).
+  "**/mise.toml":           { interactive: ask, unattended: deny, workers: deny }
+  "**/mise.lock":           { interactive: ask, unattended: deny, workers: deny }
+  "**/mise.*.lock":         { interactive: ask, unattended: deny, workers: deny }
+  "**/.mise.toml":          { interactive: ask, unattended: deny, workers: deny }
+  "**/mise.local.toml":     { interactive: ask, unattended: deny, workers: deny }
+  "**/.mise.local.toml":    { interactive: ask, unattended: deny, workers: deny }
+  "**/mise.*.toml":         { interactive: ask, unattended: deny, workers: deny }
+  "**/.mise.*.toml":        { interactive: ask, unattended: deny, workers: deny }
+  "**/mise/**":             { interactive: ask, unattended: deny, workers: deny }
+  "**/.mise/**":            { interactive: ask, unattended: deny, workers: deny }
+  "**/.config/mise.toml":   { interactive: ask, unattended: deny, workers: deny }
+  "**/.config/mise.*.toml": { interactive: ask, unattended: deny, workers: deny }
+  "**/.config/mise/**":     { interactive: ask, unattended: deny, workers: deny }
+  "**/mise-tasks/**":       { interactive: ask, unattended: deny, workers: deny }
+  "**/.mise-tasks/**":      { interactive: ask, unattended: deny, workers: deny }
+  "**/.tool-versions":      { interactive: ask, unattended: deny, workers: deny }
   ".pi/**":      { interactive: deny, unattended: deny, workers: deny }
   ".agents/**":  { interactive: ask, unattended: deny, workers: deny }
   ".archon/**":  { interactive: deny, unattended: deny, workers: deny }
   ".coderabbit.yaml":      { interactive: ask, unattended: deny, workers: deny }
   ".coderabbit.yml":       { interactive: ask, unattended: deny, workers: deny }
   ".coderabbit.config.ts": { interactive: ask, unattended: deny, workers: deny }
+  # git's own files, at any depth: a .git directory and all of it, and a linked
+  # worktree's .git file ("/**" covers ".git" itself). git runs the commands
+  # .git/config names (core.fsmonitor, diff.external, credential.helper) from
+  # the argv commands.yaml allows (git status, git diff), and a .git file names
+  # the git dir git uses. No agent edits these files directly. H-191 hardens the
+  # argv side.
+  "**/.git/**": { interactive: deny, unattended: deny, workers: deny }
+  # gitleaks's config and ignore file: either could turn a repo's secret scans
+  # off. hapi-factory's own scans (the pre-commit hook, CI) name their config,
+  # .githooks/gitleaks.toml, and CI refuses a .gitleaksignore.
+  "**/.gitleaks.toml":  { interactive: ask, unattended: deny, workers: deny }
+  "**/.gitleaksignore": { interactive: ask, unattended: deny, workers: deny }

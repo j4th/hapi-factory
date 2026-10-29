@@ -315,7 +315,8 @@ export async function githubRulesets(run: AuditRun): Promise<CheckResult[]> {
       if (!rr.some((r) => r.type === "update")) problems.push("main-review has no update (Restrict updates) rule, so an App could merge");
       const pr = rr.find((r) => r.type === "pull_request")?.parameters;
       if (pr?.require_code_owner_review !== true) problems.push("main-review's pull_request rule doesn't set require_code_owner_review");
-      if (Number(pr?.required_approving_review_count) < 1) problems.push("main-review's required_approving_review_count is below 1");
+      // Fail closed, as main's check above does: a missing or non-numeric count is NaN, and NaN < 1 is false.
+      if (!(Number(pr?.required_approving_review_count) >= 1)) problems.push("main-review's required_approving_review_count is missing or below 1");
       if (data.bypassVisible && JSON.stringify((review.bypass_actors ?? []).map(({ actor_id, actor_type, bypass_mode }) => ({ actor_id, actor_type, bypass_mode }))) !== JSON.stringify(ADMIN_PR_ONLY)) {
         problems.push("main-review's bypass actors are not exactly the Admin role (actor_id 5), PR-only");
       }

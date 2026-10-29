@@ -217,6 +217,8 @@ describe("loadManifest", () => {
       ...["GIT_CONFIG_SYSTEM", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME", "PERL5OPT", "RUBYOPT", "JAVA_TOOL_OPTIONS"],
       ...["OPENSSL_CONF", "SSLKEYLOGFILE", "XDG_CONFIG_HOME", "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "BUN_OPTIONS", "MISE_DATA_DIR", "UV_INDEX_URL"],
       ...["NPM_CONFIG_REGISTRY", "HERMES_CONFIG", "ARCHON_HOME"],
+      // Claude Code's config dir (settings.json hooks and env, credentials) for Archon's claude nodes, and s6-overlay's init in the Hermes image.
+      ...["CLAUDE_CONFIG_DIR", "S6_CMD_ARG0", "S6_KEEP_ENV"],
     ];
     for (const name of [...ruling, ...CONTROL_ENV_NAMES, ...CONTROL_ENV_PREFIXES.map((p) => `${p}X`), ...CONTROL_ENV_SUFFIXES.map((s) => `X${s}`)]) {
       expect([name, reservedEnvRule(name)?.startsWith(`${name} is reserved: `)]).toEqual([name, true]);
@@ -261,7 +263,7 @@ describe("loadManifest", () => {
     for (const name of [...CONTROL_ENV_NAMES, ...CONTROL_ENV_PREFIXES, ...CONTROL_ENV_SUFFIXES]) expect(name).toMatch(/^[A-Z_][A-Z0-9_]*$/);
     for (const name of CONTROL_ENV_NAMES) expect([name, CONTROL_ENV_SUFFIXES.filter((s) => name.endsWith(s))]).toEqual([name, []]);
     for (const name of CONTROL_ENV_NAMES) expect([name, CONTROL_ENV_PREFIXES.filter((p) => name.startsWith(p))]).toEqual([name, []]);
-    expect(CONTROL_ENV_PREFIXES).toEqual(["ARCHON_", "BUN_", "CLAUDE_CODE_", "DYLD_", "GIT_CONFIG_", "HERMES_", "LD_", "MISE_", "NODE_", "NPM_CONFIG_", "PIP_", "PI_", "PYTHON", "UV_"]);
+    expect(CONTROL_ENV_PREFIXES).toEqual(["ARCHON_", "BUN_", "CLAUDE_CODE_", "DYLD_", "GIT_CONFIG_", "HERMES_", "LD_", "MISE_", "NODE_", "NPM_CONFIG_", "PIP_", "PI_", "PYTHON", "S6_", "UV_"]);
   });
 
   test("the logical-name pattern", () => {

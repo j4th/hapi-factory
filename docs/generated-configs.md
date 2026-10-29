@@ -69,7 +69,7 @@ Hermes runs as the coordinator (spec §9.1). These are the "defaults to flip on 
 | `skills.guard_agent_created` | `true` | Scans skills the agent writes. A scanner, not a boundary (spec §9.1). |
 | `memory.write_approval` | `true` | Memory writes need approval: the same persistence risk as skills (spec §9.1). |
 | `security.protected_instruction_files` | `true` | Writes to instruction files (AGENTS.md, CLAUDE.md, SOUL.md and more) ask for approval, even under yolo, and are refused when nobody can answer (spec §8.2, §9.1). It sees the file tools' paths only: a shell redirect (`echo hi > AGENTS.md`) writes unasked (spike T9), which Plan 04's hapi-cmd-allow closes (H-095). |
-| `security.protected_instruction_extra_patterns` | The protected file names, each with its letters as `[xX]` classes so case doesn't matter (`AGENTS.md` is `[aA][gG][eE][nN][tT][sSſ].[mM][dD]`): the agent instruction files, `mise.toml` and `.coderabbit.*` | The protected-path globs Hermes's gate can express. See [protected paths](#protected-paths-stay-strictest-wins). |
+| `security.protected_instruction_extra_patterns` | The protected file names, each with its letters as `[xX]` classes so case doesn't matter (`AGENTS.md` is `[aA][gG][eE][nN][tT][sSſ].[mM][dD]`): the agent instruction files, `mise.toml` and mise's other config file and lockfile names (`.mise.toml`, `mise.local.toml`, `mise.*.toml`, `.tool-versions`, `mise.lock`, `mise.*.lock` and the rest), `.coderabbit.*`, `.gitleaks.toml` and `.gitleaksignore` | The protected-path globs Hermes's gate can express. See [protected paths](#protected-paths-stay-strictest-wins). |
 | `security.allow_lazy_installs` | `false` | No installing packages from PyPI at runtime when a backend is first used (spec §9.1, §11.6). |
 | `plugins.isolation` | `host` | Third-party plugins run in a separate host process that reaches Hermes only through its plugin API (spec §9.1). |
 | `auth.adopt_external_logins` | `false` | Hermes never borrows Claude Code or Codex CLI logins (spec §9.1). |
@@ -188,7 +188,7 @@ The settings Plan 02's hapi-guard extension enforces inside every Pi worker (spe
   "$comment": "...",
   "session": "workers",
   "combine": "strictest",
-  "protected_paths": { ".agents/**": "deny", ".archon/**": "deny", ".coderabbit.config.ts": "deny", ".coderabbit.yaml": "deny", ".coderabbit.yml": "deny", ".factory/**": "deny", ".github/**": "deny", ".pi/**": "deny", "AGENTS.md": "deny", "mise.toml": "deny" },
+  "protected_paths": { "**/.claude/**": "deny", "**/.git/**": "deny", "**/.gitleaks.toml": "deny", "**/.mise.toml": "deny", "**/AGENTS.md": "deny", "**/mise.*.toml": "deny", ".agents/**": "deny", ".archon/**": "deny", ".coderabbit.yaml": "deny", ".factory/**": "deny", ".github/**": "deny", ".pi/**": "deny", "mise.toml": "deny", "...": "every other glob of policy/protected_paths.yaml, sorted" },
   "budgets": { "run_usd": 3 },
   "max_tokens": 64000
 }
@@ -301,7 +301,7 @@ The binding rule ([docs/policy.md](policy.md#how-globs-combine)): a file's mode,
   - For each glob that adds a rule for a Hermes session (`interactive` or `unattended` isn't `allow`), it gets the glob's last segment.
   - The last segment means the same thing in `fnmatch`, because the glob syntax forbids `[`, `]` and `!`. Matching it everywhere covers at least every file the glob matches. `mise.toml` protects every `mise.toml`, and `docs/*.md` would become `*.md`.
   - Our globs ignore case and `fnmatch` on Linux doesn't, so each letter becomes a bracket class of every code point our matcher folds to it: `mise.toml` is emitted as `[mM][iI][sSſ][eE].[tT][oO][mM][lL]`. Unicode case folding maps two non-ASCII code points onto ASCII letters, the long s `ſ` (U+017F) and the Kelvin sign (U+212A), so `s` and `k` carry them too; globs are ASCII-only, so no other letter needs more. The brackets can only come from this folding, since the glob syntax forbids them.
-  - **Directory globs can't be expressed** (`.agents/**`, `.archon/**`, `.factory/**`, `.github/**`, `.pi/**`). The generated file names them in a comment. **Plan 04's hapi-path-guard plugin** enforces them.
+  - **Directory globs can't be expressed**: `.agents/**`, `.archon/**`, `.factory/**`, `.github/**`, `.pi/**`, and the ones at any depth, such as `**/.claude/**`, git's `**/.git/**` and mise's `**/mise/**`, `**/.mise/**`, `**/.config/mise/**`, `**/mise-tasks/**` and `**/.mise-tasks/**`. The generated file names them in a comment. **Plan 04's hapi-path-guard plugin** enforces them, so until then Hermes's own gate doesn't cover `.git/config`.
   - Hermes's gate **asks** in interactive sessions even where policy says `deny`. hapi-path-guard enforces `deny` there too.
 - Tests in `tests/generate/` cover an overlapping pair (`.github/**: ask` with `.github/workflows/**: deny`) in both key orders, and check that the output is identical and still denies. For `hapi-guard.json` that includes a pair where the broader glob's `workers` mode is `ask`.
 
