@@ -173,12 +173,12 @@ export function pipesDownloadIntoShell(command: string): boolean {
 }
 
 /**
- * The checkout's mise files other than the root mise.toml, as `.config/mise/` or `.tool-versions`, a directory with a
- * trailing slash. mise loads every one it finds there (`.mise.toml`, `mise.local.toml`, `mise.<env>.toml`,
- * `mise/config.toml`, `.config/mise.toml`, `.config/mise/conf.d/*.toml`, the task dirs `mise-tasks/`, `.mise/tasks/`
- * and the rest, `.tool-versions`, the lockfiles `mise.lock` and `mise.<env>.lock`), and one can override mise.toml's
- * tools, tasks or the builds it installs. It fails closed: any entry at the root or in `.config/` whose name starts
- * with `mise` or `.mise` counts.
+ * The checkout's mise files other than the root mise.toml and the root mise.lock that locks it, as `.config/mise/` or
+ * `.tool-versions`, a directory with a trailing slash. mise loads every one it finds there (`.mise.toml`,
+ * `mise.local.toml`, `mise.<env>.toml`, `mise/config.toml`, `.config/mise.toml`, `.config/mise/conf.d/*.toml`, the
+ * task dirs `mise-tasks/`, `.mise/tasks/` and the rest, `.tool-versions`, the lockfiles `mise.local.lock` and
+ * `mise.<env>.lock`), and one can override mise.toml's tools, tasks or the builds it installs. It fails closed: any
+ * entry at the root or in `.config/` whose name starts with `mise` or `.mise` counts.
  */
 async function otherMiseFiles(root: string): Promise<string[]> {
   const entries = async (dir: string) => {
@@ -191,7 +191,7 @@ async function otherMiseFiles(root: string): Promise<string[]> {
   };
   const named = (dir: string, e: Dirent) => `${dir}${e.name}${e.isDirectory() ? "/" : ""}`;
   return [
-    ...(await entries(".")).filter((e) => (/^\.?mise/.test(e.name) && e.name !== "mise.toml") || e.name === ".tool-versions").map((e) => named("", e)),
+    ...(await entries(".")).filter((e) => (/^\.?mise/.test(e.name) && e.name !== "mise.toml" && e.name !== "mise.lock") || e.name === ".tool-versions").map((e) => named("", e)),
     ...(await entries(".config")).filter((e) => /^\.?mise/.test(e.name)).map((e) => named(".config/", e)),
   ].sort();
 }

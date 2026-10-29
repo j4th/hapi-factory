@@ -36,18 +36,19 @@ jobs:
 
       # mise reads config, tasks and locked tools from more files than mise.toml (.mise.toml,
       # mise.local.toml, mise.<env>.toml, .config/mise.toml, mise/ and .mise/, mise-tasks/,
-      # .tool-versions, mise.lock, ...), and a later file overrides mise.toml. mise-action installs
+      # .tool-versions, mise.<env>.lock, ...), and a later file overrides mise.toml. mise-action installs
       # the tools they name and exports the env they set to every later step, so a commit that adds
       # one could change what this job runs, a check after it included. So this is a plain file
       # scan, before mise-action, for the names policy/protected_paths.yaml protects, at any depth
-      # and in any case. Only the root mise.toml may configure mise here.
+      # and in any case. Only the root mise.toml may configure mise here, and only the root
+      # mise.lock, which locks the tools it names (H-116), may sit beside it.
       - name: Only the root mise.toml configures mise
         run: |
           extra="$(find . -path ./.git -prune -o \( -iname mise.toml -o -iname .mise.toml -o -iname 'mise.*.toml' -o -iname '.mise.*.toml' \
             -o -iname mise.lock -o -iname 'mise.*.lock' -o -iname mise -o -iname .mise -o -iname mise-tasks -o -iname .mise-tasks \
-            -o -iname .tool-versions \) ! -path ./mise.toml -print -prune)"
+            -o -iname .tool-versions \) ! -path ./mise.toml ! -path ./mise.lock -print -prune)"
           if [[ -n "$extra" ]]; then
-            echo "::error::mise files besides the root mise.toml. Move what is needed into mise.toml and remove:"
+            echo "::error::mise files besides the root mise.toml and mise.lock. Move what is needed into mise.toml and remove:"
             printf '%s\n' "$extra"
             exit 1
           fi

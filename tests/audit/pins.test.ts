@@ -49,7 +49,12 @@ describe("pins.versions", () => {
     }
   });
 
-  test("a mise config, task dir, lockfile or .tool-versions besides the root mise.toml fails, naming it: mise loads it over mise.toml, the one file read here", async () => {
+  test("the root mise.lock passes: it locks the tools mise.toml names, at mise.toml's protected-path modes", async () => {
+    const r = await pins((root) => writeFileSync(join(root, "mise.lock"), ""));
+    expect(r.status).toBe("pass");
+  });
+
+  test("a mise config, task dir, lockfile or .tool-versions besides the root mise.toml and mise.lock fails, naming it: mise loads it over mise.toml, the one file read here", async () => {
     // [file written, entry named]
     const cases: [string, string][] = [
       [".mise.toml", ".mise.toml"],
@@ -71,9 +76,9 @@ describe("pins.versions", () => {
       [".config/mise/conf.d/extra.toml", ".config/mise/"],
       [".config/mise/tasks/build", ".config/mise/"],
       [".tool-versions", ".tool-versions"],
-      // A lockfile names the URL and checksum mise installs each tool from.
-      ["mise.lock", "mise.lock"],
+      // A lockfile names the URL and checksum mise installs each tool from; only the root mise.lock locks mise.toml.
       ["mise.ci.lock", "mise.ci.lock"],
+      ["mise.local.lock", "mise.local.lock"],
       [".config/mise/mise.lock", ".config/mise/"],
       // Anything else named like one fails too, rather than guessing which of them mise reads.
       [".miserc.toml", ".miserc.toml"],

@@ -51,7 +51,8 @@ protected_paths:
   # redefine the `test` task the gates run; a nested mise.toml does when mise
   # starts in its directory; and a mise.lock names the URL and checksum mise
   # installs each tool from. hapi-factory's own CI fails when any of them is
-  # present, and the in-run gates will too (H-194).
+  # present but the root mise.lock, which locks the root mise.toml (H-116), and
+  # the in-run gates will too (H-194).
   "**/mise.toml":           { interactive: ask, unattended: deny, workers: deny }
   "**/mise.lock":           { interactive: ask, unattended: deny, workers: deny }
   "**/mise.*.lock":         { interactive: ask, unattended: deny, workers: deny }

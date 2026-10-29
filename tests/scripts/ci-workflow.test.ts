@@ -60,8 +60,8 @@ describe("the mise-file scan, run on a throwaway checkout", () => {
     return { code: r.exitCode, out: r.stdout.toString() + r.stderr.toString() };
   };
 
-  test("passes with only the root mise.toml, whatever else is named like mise", () => {
-    const r = scan({ "src/mise.ts": "", "docs/mise.md": "", "misery.toml": "", "mise-notes/a.md": "", "docs/mise.lockfile.md": "", ".config/other.toml": "" });
+  test("passes with only the root mise.toml and mise.lock, whatever else is named like mise", () => {
+    const r = scan({ "mise.lock": "", "src/mise.ts": "", "docs/mise.md": "", "misery.toml": "", "mise-notes/a.md": "", "docs/mise.lockfile.md": "", ".config/other.toml": "" });
     expect([r.code, r.out]).toEqual([0, ""]);
   });
 
@@ -84,10 +84,11 @@ describe("the mise-file scan, run on a throwaway checkout", () => {
     "mise-tasks/extra",
     ".mise-tasks/extra",
     ".tool-versions",
-    "mise.lock",
     "mise.ci.lock",
     "mise.local.lock",
+    "MISE.LOCK",
     "src/mise.toml",
+    "pkg/mise.lock",
     "pkg/.mise.toml",
     "pkg/.tool-versions",
     "MISE.TOML",
