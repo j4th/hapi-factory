@@ -47,8 +47,9 @@ protected_paths:
   "mise.toml":   { interactive: ask, unattended: deny, workers: deny }
   # Every other file mise reads config or tasks from (`mise config ls`), at any
   # depth, with mise.toml's modes. mise reads them all, and a later one overrides
-  # mise.toml, so a .mise.toml could redefine the `test` task the gates run. CI
-  # fails when any of them is present (.github/workflows/ci.yml).
+  # mise.toml, so a .mise.toml could redefine the `test` task the gates run.
+  # hapi-factory's own CI fails when any of them is present, and the in-run
+  # gates will too (H-194).
   "**/.mise.toml":          { interactive: ask, unattended: deny, workers: deny }
   "**/mise.local.toml":     { interactive: ask, unattended: deny, workers: deny }
   "**/.mise.local.toml":    { interactive: ask, unattended: deny, workers: deny }
