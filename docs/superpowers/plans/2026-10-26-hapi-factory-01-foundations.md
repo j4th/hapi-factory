@@ -25,7 +25,7 @@ It also runs the design's "verify early" spikes, whose results shape Plans 02–
 - sops + age (the default secret provider; Bitwarden `bws` optional)
 - GitHub REST API
 - Hermes Agent v0.22.5 (official image)
-- Archon v0.12.1 (official image + Pi provider)
+- Archon v0.12.1 (official image + Pi provider; as built, Pi is the image's in-process provider on the Pi SDK 1.3.0 it embeds, with no `archon provider add`: H-015 in handoffs.md, docs/runbooks/stack.md#pinned-images)
 
 **Spec:** `docs/superpowers/specs/2026-10-26-hapi-factory-design.md` (approved 2026-10-26). Supporting evidence: [docs/research/README.md](../../research/README.md), which lists the private research and the conclusions the spec adopted.
 
@@ -81,7 +81,7 @@ Phases 2–5 (mtg brownfield; showcase depth plus VM; more lanes; GitLab) get th
   | `cache_ttl` | `auto` |
   | `hooks_auto_accept` | `false` |
 
-- Protected paths (spec §8.2), exactly:
+- Protected paths (spec §8.2), exactly (as built, the list is longer, and spec §8.2 and `policy/protected_paths.yaml` hold it. The agent instruction files are protected at any depth, `**/AGENTS.md` replacing the root-only `AGENTS.md` (H-170). Also added: `.coderabbit.yaml`, `.coderabbit.yml` and `.coderabbit.config.ts` (H-165); every mise config, task and lock file at any depth (H-194); git's `**/.git/**`, deny in every mode (H-191); and gitleaks's `**/.gitleaks.toml` and `**/.gitleaksignore`. Every glob matches ignoring case (docs/policy.md#glob-syntax), and a file takes the strictest mode of every glob that matches it (docs/policy.md#how-globs-combine); the items are in handoffs.md):
   - `AGENTS.md`, `.factory/**`, `.github/**`, `mise.toml`, `.agents/**`: `{interactive: ask, unattended: deny, workers: deny}`
   - `.pi/**`, `.archon/**`: `{interactive: deny, unattended: deny, workers: deny}`
 - Repo overlays may only **tighten** policy, except for `egress_extra` additions.
@@ -98,7 +98,7 @@ Phases 2–5 (mtg brownfield; showcase depth plus VM; more lanes; GitLab) get th
 ## Review Focus
 
 1. **Loosening overlays.** A repo's `.factory/config.yaml` that tries to loosen policy (e.g. `AGENTS.md: {interactive: allow}`, or removing a protected path) must be rejected with an error naming the path. It must never be silently merged. Test: Task 2, `applyOverlay rejects loosening`.
-2. **A missing secret.** If a secret is missing or the secret provider fails at `mise run up`, nothing starts, and the error names the missing secret key. Containers never start with an empty variable. Test: Task 4, `resolveSecrets fails closed on missing secret`.
+2. **A missing secret.** If a secret is missing or the secret provider fails at `mise run up`, nothing starts, and the error names the missing secret key. Containers never start with an empty variable. Test: Task 4, `resolveSecrets fails closed on missing secret` (as built: Task 4b replaced it with `resolve fails closed when the store lacks a manifest name, and writes nothing`, in tests/secrets/provider.test.ts).
 3. **The proxy is down or misconfigured.** Zone containers have no direct route out: requests fail, they don't bypass. Test: Task 5, `egress: direct connection is blocked even when proxy is stopped`.
 4. **Drift in deployed config.** A hand edit to deployed config (e.g. `approvals.mode: off`, or `HOST=0.0.0.0`) is detected by `mise run audit`, which exits non-zero. Test: Task 6, `audit detects drift from generated config`.
 5. **Upstream ignores a generated key** after an upgrade (a renamed key, an Archon parse warning). Audit checks each tool's own validation output, not only our files. Test: Task 6, `audit fails on archon parseWarnings`.
@@ -115,7 +115,7 @@ Phases 2–5 (mtg brownfield; showcase depth plus VM; more lanes; GitLab) get th
   - `.github/workflows/ci.yml`
   - `README.md`
 - Test: `tests/cli.test.ts`
-- Commit as-is: `docs/`, `reports/`, `research_notes/`
+- Commit as-is: `docs/`, `reports/`, `research_notes/` (as built: Task 7b moved `reports/` and `research_notes/` into the untracked `private/` and out of the history, and [docs/research/README.md](../../research/README.md) lists them; H-054 in handoffs.md)
 
 **Interfaces:**
 - Produces:
@@ -140,8 +140,8 @@ test("unknown command exits 2", async () => {
 - [ ] **Step 2: Run** `bun test tests/cli.test.ts`. Expected: FAIL, because `../src/cli` isn't found.
 
 - [ ] **Step 3: Implement `main(argv)` in `src/cli.ts`**, with `--version` and a subcommand registry (`register(name, handler)`). Write `mise.toml`:
-  - `[tools]` pins exact current stable `bun`, `node`, `uv`, `python`, `gh`, `gitleaks`;
-  - `[tasks]` covers `test = "bun test"`, `lint = "bunx tsc --noEmit"`, `hapi = "bun run src/cli.ts"`, and stubs for the others.
+  - `[tools]` pins exact current stable `bun`, `node`, `uv`, `python`, `gh`, `gitleaks` (as built: `node` is the 24.x LTS line and `python` the 3.14 line Hermes runs, from Task 1's review, `19bffcd`; `[tools]` has since gained `shellcheck` (H-145), `sops` and `age` (Task 4b): mise.toml, README "Toolchain and pinning");
+  - `[tasks]` covers `test = "bun test"`, `lint = "bunx tsc --noEmit"`, `hapi = "bun run src/cli.ts"`, and stubs for the others (as built, also `setup`, `bun install --frozen-lockfile`, which `lint` depends on so `bunx tsc` never fetches npm's unrelated `tsc`, and `test:int`, every `*.int.test.ts` with `HAPI_INT=1`; stubs exit 1, so one never passes as a check: mise.toml, and the Closed row for `1ca279b` in handoffs.md).
 
   `.gitignore` adds `build/`, `node_modules/`, `.env*` and `spikes/scratch/`. CI runs `mise install && mise run lint && mise run test` on `ubuntu-latest`, with actions pinned to full SHAs.
 
@@ -164,7 +164,7 @@ git commit -m "chore: hapi-factory skeleton, toolchain, CI; add design, recon re
 - Create:
   - policy files: `policy/{protected_paths,commands,trusted_sources,budgets,approvals,roles,flags}.yaml`, `policy/rosters/{budget,anthropic,portable}.yaml`
   - schemas: `policy/schemas/{policy-*,work-order,repo-overlay}.schema.json`
-  - `src/policy/types.ts`, `src/policy/load.ts`, `src/policy/overlay.ts`, `src/workorder/validate.ts`
+  - `src/policy/types.ts`, `src/policy/load.ts`, `src/policy/overlay.ts`, `src/workorder/validate.ts` (as built, also `src/policy/schema.ts`, and from the review fixes `src/policy/paths.ts`, `src/policy/commands.ts` and `src/policy/hosts.ts`, each of those three with its test in `tests/policy/`; H-081 in handoffs.md)
 - Test: `tests/policy/load.test.ts`, `tests/policy/overlay.test.ts`, `tests/workorder/validate.test.ts`, fixtures under `tests/fixtures/`
 
 **Interfaces:**
@@ -172,7 +172,7 @@ git commit -m "chore: hapi-factory skeleton, toolchain, CI; add design, recon re
   - **`loadPolicy(dir: string): Policy`** throws `PolicyError { file, path, message }`.
   - **`Policy` fields:**
     - `protectedPaths: Record<glob, {interactive: Mode; unattended: Mode; workers: Mode}>`, where `Mode = "allow"|"ask"|"deny"`;
-    - `commands: {hermes: {allow: string[]}; workers: {tools: string[]}}`;
+    - `commands: {hermes: {allow: string[]}; workers: {tools: string[]}}` (as built: `{hermes: {allow: Record<string, CommandRule>}; workers: {tools: WorkerTool[]}}`, argv-exact rules with `command`, `args`, `rest` and `flags`, matched by `matchCommand` in `src/policy/commands.ts`; Task 2's security fix pass replaced the glob strings: docs/policy.md#commandsyaml, the Closed row for `c7797e0` in handoffs.md);
     - `trustedSources: {tiers: Record<"T0"|"T1"|"T2"|"T3", {hosts: string[]}>; zones: Record<ZoneName, {tiers: Tier[]; hosts: string[]; openWeb?: boolean}>}`;
     - `budgets`, `approvals`, `roles`, `rosters: Record<"budget"|"anthropic"|"portable", Roster>`, `flags`.
   - **`ZoneName = "hermes"|"archon"|"research"`.**
@@ -198,7 +198,7 @@ git commit -m "chore: hapi-factory skeleton, toolchain, CI; add design, recon re
 // tests/policy/load.test.ts
 test("loads repo policy", () => {
   const p = loadPolicy("policy");
-  expect(p.protectedPaths["AGENTS.md"]).toEqual({ interactive: "ask", unattended: "deny", workers: "deny" });
+  expect(p.protectedPaths["**/AGENTS.md"]).toEqual({ interactive: "ask", unattended: "deny", workers: "deny" }); // (as built: "**/AGENTS.md", not the root-only "AGENTS.md"; H-170)
   expect(p.protectedPaths[".pi/**"].interactive).toBe("deny");
   expect(p.budgets.workspaces["hapi-factory"]).toBe(100);
   expect(p.flags.jev).toEqual({ enabled: true, fallback: "haiku", via: "openrouter" });
@@ -224,7 +224,7 @@ test("rejects malformed traceparent", () => { /* "00-xyz" → path /trace/tracep
 
 - [ ] **Step 3: Write the schemas and the policy files with the values above. Implement the loader, overlay and validator** using `ajv` (2020-12, `allErrors`, `additionalProperties: false` everywhere) and `yaml`.
   - **Tightening order:** `allow < ask < deny`. Overlay modes must be ≥ base.
-  - **Overlay restrictions:** an overlay may add protected paths and `egress_extra`, and may lower budgets. Anything else is rejected.
+  - **Overlay restrictions:** an overlay may add protected paths and `egress_extra`, and may lower budgets. Anything else is rejected. (As built: an overlay may also set `default_risk` and `workflow`, repo settings rather than policy (spec §7), exposed as `repo.default_risk` and `repo.workflow`. A new glob may name only `ask` or `deny`, `egress_extra` refuses forge hosts, and a file's mode is the strictest across every glob that matches it (`effectiveModes`, `src/policy/paths.ts`): docs/policy.md#repo-overlays-factoryconfigyaml; the Closed rows for `c7797e0` and `a0e0b87` in handoffs.md.)
   - **Traceparent regex:** `^00-[0-9a-f]{32}-[0-9a-f]{16}-0[01]$`.
 
 - [ ] **Step 4: Run** `bun test tests/policy tests/workorder`. Expected: PASS.
@@ -238,7 +238,7 @@ test("rejects malformed traceparent", () => { /* "00-xyz" → path /trace/tracep
 ### Task 3: Config generators and `hapi policy build`
 
 **Files:**
-- Create: `src/generate/{index,hermes,archon,pi,egress}.ts`
+- Create: `src/generate/{index,hermes,archon,pi,egress}.ts` (as built, also `src/generate/header.ts` and `src/policy/zones.ts`, with `tests/policy/zones.test.ts`; H-081 in handoffs.md)
 - Test: `tests/generate/*.test.ts`
 
 **Interfaces:**
@@ -278,7 +278,7 @@ test("pi models.json caps maxTokens at 64000", () => { /* every model entry maxT
 test("pi hapi-guard.json carries workers modes", () => { /* AGENTS.md → "deny"; budgets.run_usd 3 */ });
 test("egress archon allowlist is exact and denies by default", () => {
   const conf = emitEgress(p)["archon.squid.conf"];
-  expect(conf).toContain("acl allowed dstdomain .api.anthropic.com");
+  expect(conf).toContain("acl allowed dstdomain -n .api.anthropic.com"); // (as built: -n on every allowlist line, matching by name only, never by an IP literal's reverse lookup; docs/generated-configs.md)
   expect(conf).not.toMatch(/dstdomain .*github\.com/);      // Archon zone has no forge route
   expect(conf.trim().endsWith("http_access deny all")).toBe(true);
 });
@@ -288,15 +288,15 @@ test("research zone allows open web but blocks private ranges", () => { /* to_lo
 - [ ] **Step 2: Run** `bun test tests/generate`. Expected: FAIL.
 
 - [ ] **Step 3: Implement the emitters.**
-  - **Hermes key names:** take them from the pinned Hermes v0.22.5 `cli-config.yaml.example`, as quoted in `research_notes/Agentic software factory recon/hermes_agent.md`. Where a key's name differs at the pinned tag, follow the tag and update the test. That's a one-line decision, recorded in the commit message.
-  - **Archon tier syntax:** follow `archon_plugins_integration.md` §Q4. Squid configs deny `to_localnet` for every zone and allow `CONNECT` only to allowlisted domains on 443.
+  - **Hermes key names:** take them from the pinned Hermes v0.22.5 `cli-config.yaml.example`, as quoted in the Hermes Agent research note (private; [docs/research/README.md](../../research/README.md) lists it). Where a key's name differs at the pinned tag, follow the tag and update the test. That's a one-line decision, recorded in the commit message. (As built: docs/generated-configs.md#buildhermesconfigyaml records the keys at the pinned tag and the three that differ.)
+  - **Archon tier syntax:** follow §Q4 of the Archon integration research note (private, listed in docs/research/README.md; as built, docs/generated-configs.md#buildarchonconfigyaml gives the syntax). Squid configs deny `to_localnet` for every zone and allow `CONNECT` only to allowlisted domains on 443.
   - **Zone hosts from policy:**
     - `archon`: model APIs (`api.anthropic.com`, `openrouter.ai`, `opencode.ai`) plus package registries (`registry.npmjs.org`, `pypi.org`, `files.pythonhosted.org`). **No GitHub hosts.**
     - `hermes`: model APIs, `api.github.com`, `github.com`, and the Slack hosts listed in the policy.
 
 - [ ] **Step 4: Run** `bun test tests/generate`. Expected: PASS.
 
-- [ ] **Step 5: Wire up the build.** Add `hapi policy build` and point mise task `policy:build` at it. Run `mise run policy:build && ls build/*`. Expected: the 9 files above.
+- [ ] **Step 5: Wire up the build.** Add `hapi policy build` and point mise task `policy:build` at it. Run `mise run policy:build && ls build/*`. Expected: the 9 files above (as built: the 8 listed; since Task 3b, `build/mcp/{hermes,research}.mcp.json` make 10; H-081 in handoffs.md).
 
 - [ ] **Step 6: Commit** `git commit -am "feat(generate): compile policy into Hermes, Archon, Pi and egress configs"`
 
@@ -304,13 +304,13 @@ test("research zone allows open web but blocks private ranges", () => { /* to_lo
 
 ### Task 3b: MCP catalog, advisory floors, tool-description lock, per-zone emission
 
-The spec is §10.1. The evidence is in `research_notes/Hapi factory plugins and o11y/mcp_baseline.md`.
+The spec is §10.1. The evidence is in the MCP baseline research note (private; [docs/research/README.md](../../research/README.md) lists it). As built, `policy/mcp.yaml` and docs/mcp.md hold the catalog that came of it.
 
 **Files:**
 - Create:
   - `policy/mcp.yaml`, `policy/mcp.lock.json`
   - `policy/schemas/policy-mcp.schema.json`, `policy/schemas/mcp-lock.schema.json`
-  - `src/policy/mcp.ts`, `src/mcp/lock.ts`, `src/generate/mcp.ts`
+  - `src/policy/mcp.ts`, `src/mcp/lock.ts`, `src/generate/mcp.ts` (as built, also `docs/mcp.md`)
 - Modify:
   - `src/policy/types.ts`, `src/policy/load.ts` (add `mcp` to `Policy`)
   - `policy/trusted_sources.yaml` (drop T2 from the `hermes` zone; fix the Context7 comment)
@@ -331,8 +331,8 @@ The spec is §10.1. The evidence is in `research_notes/Hapi factory plugins and 
      url?: string /* http only, https, first-party */;
      floor?: {min: string; advisory: string} /* our own advisory floor */;
      cooldown_exception?: string /* advisory id */;
-     tools: {include: string[]};
-     env: Record<string, string> /* ENV → bws key name, or a literal for flags like OTEL_SDK_DISABLED */;
+     tools: {include: string[]; deny: string[] /* as built: deny is required (H-102) */};
+     env: Record<string, string> /* ENV → bws key name (as built: a secret:hapi-mcp-<slug> ref, renamed in Task 4b with no shim; H-102), or a literal for flags like OTEL_SDK_DISABLED */;
      egress: string[];
      trust: "untrusted";
      elicitation: "deny";
@@ -340,9 +340,9 @@ The spec is §10.1. The evidence is in `research_notes/Hapi factory plugins and 
     ```
   - **`serversForZone(p, zone, opts?: {o11y?: boolean}): [string, McpServer][]`.**
   - **`hashToolSurface(s: {tools: Tool[]; instructions?: string; prompts?: unknown[]; resources?: unknown[]}): string`**: sha256 of canonical JSON, with tools sorted by name.
-  - **`verifyLock(p, lock, fetchSurface: (name: string) => Promise<Surface>): Promise<{name: string; status: "ok"|"changed"|"unpinned"; expected?: string; actual: string}[]>`.**
+  - **`verifyLock(p, lock, fetchSurface: (name: string) => Promise<Surface>): Promise<{name: string; status: "ok"|"changed"|"unpinned"|"orphaned"; expected?: string; actual?: string}[]>`** (as built: `orphaned` is a lock entry for a server the catalog no longer has, which is never launched, so `actual` is optional; H-102 in handoffs.md).
   - **`emitMcpJson(p, zone): string`**: a standard `mcp.json` per zone, written to `build/mcp/<zone>.mcp.json`, for the CI scanners (Plan 05).
-  - **`hapi mcp verify`** and **`hapi mcp pin --server <name>`.** `fetchSurface` launches the pinned server inside a throwaway container on its zone's network. The live wiring is in Task 5; unit tests inject fakes.
+  - **`hapi mcp verify`** and **`hapi mcp pin --server <name>`.** `fetchSurface` launches the pinned server inside a throwaway container on its zone's network. The live wiring is in Task 5 (as built: Plan 04's, H-101 in handoffs.md; until then both commands exit 1, docs/mcp.md); unit tests inject fakes.
 - **Catalog values (v1):**
   - **`context7`:**
     - zones `[research]`, stdio;
@@ -370,7 +370,7 @@ test("context7 is research-only and hermes has no MCP outside o11y", () => {
   expect(serversForZone(p, "hermes", { o11y: true }).map(([n]) => n)).toEqual(["phoenix"]);
   expect(serversForZone(p, "archon")).toEqual([]);
 });
-test("rejects an inexact pin or a missing integrity", () => { /* version "^4.3.0" or "latest" → PolicyError at /mcp/servers/context7/package */ });
+test("rejects an inexact pin or a missing integrity", () => { /* version "^4.3.0" or "latest" → PolicyError at /mcp/servers/context7/package (as built: /servers/context7/package/version or .../integrity, pointers into mcp.yaml; H-102) */ });
 test("enforces the advisory floor", () => { /* context7 version 2.1.2 → PolicyError naming CVE-2026-75130 */ });
 test("rejects any server enabled for the archon zone", () => { /* zones: [archon] → PolicyError */ });
 test("rejects blocked packages", () => { /* package @modelcontextprotocol/server-brave-search → PolicyError */ });
@@ -386,7 +386,7 @@ test("emitMcpJson writes a scanner-compatible file per zone", () => { /* researc
 
 - [ ] **Step 3: Implement.**
   - Verify the Context7 integrity value against registry.npmjs.org. Fetch Phoenix's newest version that clears the cooldown, and its integrity.
-  - Use the Hermes `mcp_servers` keys from the research notes: `command`, `args`, `env` (explicit only), `tools.include`, `trust`.
+  - Use the Hermes `mcp_servers` keys from the research notes: `command`, `args`, `env` (explicit only), `tools.include`, `trust`. (As built: docs/mcp.md#open-items, "Hermes keys", lists the keys used, checked against the pinned image's source.)
   - `mcp.lock.json` starts as `{}`, and `verifyLock` treats a missing entry as `unpinned`.
 
 - [ ] **Step 4: Run** the tests. Expected: PASS. Then run `mise run lint && mise run test && mise run policy:build`. Expected: `build/mcp/{hermes,research}.mcp.json` exist.
@@ -401,7 +401,7 @@ test("emitMcpJson writes a scanner-compatible file per zone", () => { /* researc
 
 **Files:**
 - Create:
-  - `src/secrets/bws.ts`, `stack/secrets.map.yaml`, `src/forge/github/app-token.ts`
+  - `src/secrets/bws.ts`, `stack/secrets.map.yaml`, `src/forge/github/app-token.ts` (as built, also `src/secrets/files.ts` with `tests/secrets/files.test.ts`, `policy/schemas/secrets-map.schema.json`, `docs/secrets.md` and `docs/runbooks/slack.md`; Task 4b replaced `bws.ts`, the map and its schema; H-081 in handoffs.md)
   - runbooks: `docs/runbooks/github-apps.md`, `docs/runbooks/provider-keys.md`
 - Test: `tests/secrets/bws.test.ts`, `tests/forge/app-token.test.ts`
 
@@ -434,10 +434,10 @@ test("mintInstallationToken rejects broader permissions", async () => {
   - `bws`: shell out to `bws secret get <id> --output json` and read `value`. Resolve everything into memory first, then write the files atomically.
   - JWT: use `crypto.subtle` RS256, with no extra dependency.
   - **Runbooks:**
-    - `github-apps.md` covers the exact settings for **`hapi-planner`**: contents write, pull requests write, issues read, metadata read; branches restricted by ruleset to `plan/*`.
+    - `github-apps.md` covers the exact settings for **`hapi-planner`**: contents write, pull requests write, issues read, metadata read; branches restricted by ruleset to `plan/*`. (As built: a ruleset can't hold an App to its own prefix without making it a bypass actor, so `agent-branch-scope` limits both Apps to `plan/**` and `factory/**`, and either can push either, an accepted residual: docs/security/threat-model.md#h-038; H-038 in handoffs.md.)
     - The same file covers **`hapi-factory`**: contents write, pull requests write, metadata read; `factory/*` branches.
     - Neither App gets administration, a ruleset bypass or merge rights.
-    - Both private keys are stored in `bws`.
+    - Both private keys are stored in `bws` (as built: since Task 4b, in the configured secrets store, sops + age by default, as `hapi-host-planner-app-private-key` and `hapi-host-factory-app-private-key`: docs/runbooks/github-apps.md).
     - `provider-keys.md` covers creating the Console workspaces and limits above, the OpenRouter keys (`hapi-portable` $20/mo, `hapi-jev` $2/mo), and the OpenCode Go settings (training endpoints blocked, EU/US regions, **Extra Usage off**).
 
 - [ ] **Step 4: Run** `bun test tests/secrets tests/forge`. Expected: PASS.
@@ -500,13 +500,13 @@ The spec is §11.5 (as amended for 4b). The operator's call: "portable across se
   - Exactly the selected provider's block is required. A `~` at the start of a path expands to `$HOME`. Relative paths resolve against the config file's directory.
 - **`interface SecretProvider { readonly name: "sops"|"bws"|"env-file"; readonly downgrade: boolean; fetch(names: string[]): Promise<Map<string, string>> }`:**
   - Every name asked for is returned, or `fetch` throws `SecretError`.
-  - Errors name logical names, files and exit codes, never values. Unknown store entries are ignored by `fetch` and reported by `check`.
+  - Errors name logical names, files and exit codes, never values. Unknown store entries are ignored by `fetch` and reported by `check`. (As built: the interface also has `list(): Promise<string[]>`, which `check` uses; ratified, the Closed row for `37f373f` in handoffs.md.)
 - **`resolveSecrets(manifest, provider, opts: {outDir})`:**
   - Fetches the de-duplicated logical names once, then fills every zone's env vars.
   - An empty string counts as missing ("<zone>/<ENV> (<name>) is empty: fill it in with `mise run secrets:edit`").
   - Value validation (`envValueProblem`) is unchanged.
   - Writes the set with `writeSecretFiles` only after every value is good.
-- **`checkSecrets(manifest, provider)`:** returns `[{zone, key, name, status: "found"|"missing"|"empty"}]` plus `unknown: string[]` (store names not in the manifest). It never returns values.
+- **`checkSecrets(manifest, provider)`:** returns `[{zone, key, name, status: "found"|"missing"|"empty"}]` plus `unknown: string[]` (store names not in the manifest). It never returns values. (As built: a status can also be `invalid`, with a `reason`, for a value `resolveSecrets` would refuse; ratified with `list()`, and Task 6's `secrets.check` uses it, H-028 in handoffs.md.)
 - **`describeSecretsConfig(cfg)`:** returns `{provider, downgrade, files: string[]}`. Task 6's audit uses it: `env-file` is reported as a downgrade.
 - **CLI:**
   - `hapi secrets resolve [--config <p>] [--dry-run]`. `--dry-run` is the same as `check`.
@@ -518,18 +518,18 @@ The spec is §11.5 (as amended for 4b). The operator's call: "portable across se
 
 **Provider rules:**
 - **sops** (default):
-  - Runs `sops decrypt --output-type json <file>` through an injectable `SopsRunner = (args: string[], o: {env: Record<string,string>; stdin?: string}) => Promise<{code: number; stdout: string; stderr: string}>`.
+  - Runs `sops decrypt --output-type json <file>` (as built: every sops call, decrypt, encrypt, edit and rotate, also passes `--config /dev/null`, because a `.sops.yaml` with `unencrypted_regex` left values in plaintext; the Closed row for `37f373f` in handoffs.md) through an injectable `SopsRunner = (args: string[], o: {env: Record<string,string>; stdin?: string}) => Promise<{code: number; stdout: string; stderr: string}>`.
   - The child gets a **minimal env**: `PATH`, `HOME`, `SOPS_AGE_KEY_FILE` when configured, and **`SOPS_DISABLE_VERSION_CHECK=1`** (sops otherwise phones home for a version check). Nothing else is inherited.
   - No value ever goes through argv.
   - The child's stderr is never echoed raw. Report "sops could not decrypt <file> (exit N)" plus the first stderr line, scrubbed of anything after `:` that isn't a path. Follow the bws scrub pattern.
   - **Before decrypting,** parse the raw file as YAML and check that:
     - it has a `sops` metadata block with at least one `age` recipient;
-    - every top-level value other than `sops` is a string matching `^ENC\[AES256_GCM,`.
+    - every top-level value other than `sops` is a string matching `^ENC\[AES256_GCM,` (as built: or is exactly `""`, which sops leaves unencrypted; since Task 4c's fix passes the check also refuses any master key that isn't age (`b0c215a`) and any sops metadata field it doesn't know (H-133): docs/secrets.md#threat-notes).
 
     This refuses a file in which `unencrypted_suffix` or `unencrypted_regex` left a value in plaintext.
   - The decrypted JSON must be a flat object of logical name → string.
 - **age key file** (the configured one, else sops's default `${XDG_CONFIG_HOME:-$HOME/.config}/sops/age/keys.txt`):
-  - It must exist, be owned by the current uid and have no group or other permission bits.
+  - It must exist, be owned by the current uid and have no group or other permission bits. (As built: sops 3.13 reads its default key file as well as the configured one, so when that exists it must pass the same checks; and the key file must hold plain age identities only, never the store's `recovery.age` (H-133): docs/secrets.md#threat-notes.)
   - It must **not** sit inside the hapi-factory checkout, `private/` included: `private/` is pushed to hapi-factory-private next to the encrypted file, and the two together are the plaintext. Find the checkout through an injectable `repoRoot`; the default is `git rev-parse --show-toplevel` from the module's directory.
 - **The sops file** may live anywhere, `private/` included (the operator's choice: it's backed up to hapi-factory-private there).
 - **bws:**
@@ -575,8 +575,8 @@ The spec is §11.5 (as amended for 4b). The operator's call: "portable across se
 - `docs/policy.md` stops citing §11.5 for the "monthly cap / 31" rule; it's the runbook's rule.
 
 **Toolchain:**
-- Pin `sops` and `age` in `mise.toml`: the newest release of each that is **at least 14 days old** (check release dates with `gh release view` / `gh api repos/getsops/sops/releases` and `FiloSottile/age`). Record versions and dates in the report.
-- Remove `bitwarden-secrets-manager` from `[tools]`. The bws section of `docs/secrets.md` shows bws users how to add it in their own gitignored `mise.local.toml`.
+- Pin `sops` and `age` in `mise.toml`: the newest release of each that is **at least 14 days old** (check release dates with `gh release view` / `gh api repos/getsops/sops/releases` and `FiloSottile/age`). Record versions and dates in the report (as built: sops 3.13.3, released 2026-07-23, and age 1.3.2, released 2026-08-29, each the newest release and at least 14 days old on 2026-10-26, per Task 4b's report; pinned in mise.toml, and recorded in H-115).
+- Remove `bitwarden-secrets-manager` from `[tools]`. The bws section of `docs/secrets.md` shows bws users how to add it in their own gitignored `mise.local.toml`. (As built: no bws pin anywhere in the checkout, `mise.local.toml` included. A bws user pins it in their global mise config, `mise use -g bitwarden-secrets-manager@2.1.0`: CI fails on any mise file in the checkout but the root `mise.toml` and `mise.lock`, `pins.versions` on any at the root or in `.config/`, and `**/mise.local.toml` is a protected path. docs/secrets.md#optional-bitwarden-secrets-manager-bws; H-194 in handoffs.md.)
 - `.gitignore` adds `private/`, `mise.local.toml`, `*.agekey`, `keys.txt` and `secrets.env`.
 
 **Docs:**
@@ -590,7 +590,7 @@ The spec is §11.5 (as amended for 4b). The operator's call: "portable across se
   - the env-file downgrade and why it's audited;
   - the threat notes:
     - the age key is the master key;
-    - decrypted values exist only in memory and in the 0600 tmpfs files;
+    - decrypted values exist only in memory and in the 0600 tmpfs files (as built: Docker also keeps each zone's values in its container's config on hapi's disk until the container is removed; H-189 in handoffs.md, docs/secrets.md#threat-notes);
     - each container sees its own zone's values.
 - **Runbooks:** every "store it in bws" becomes "add it to your secrets store (`mise run secrets:edit`) as `<logical-name>`".
 - **`README.md`:** the setup section gains `mise run secrets:init` / `secrets:edit` / `secrets:check`.
@@ -630,7 +630,7 @@ test("no automatic fallback: a failing configured provider is the error", async 
 
 ### Task 4c: Recovery recipient, per-machine keys and secret-store lifecycle
 
-The spec is §11.5. The evidence comes from the ledger's 20:25 research entry and `.superpowers/sdd/…/research-age-key-recovery.json`: three researchers plus three adversarial verifiers, running experiments on sops 3.13.3 / age 1.3.2.
+The spec is §11.5. The evidence is the sops + age recovery research (private; [docs/research/README.md](../../research/README.md) lists it): three researchers plus three adversarial verifiers, running experiments on sops 3.13.3 / age 1.3.2. Its conclusions are in docs/secrets.md#keys-and-recovery.
 
 **Why:** Task 4b gives each store exactly one age key, on one machine. If that machine dies, the store is gone.
 
@@ -638,7 +638,7 @@ The standard pattern comes from the sops docs ("multiple master keys", with one 
 - **one key per machine or user**, generated where it lives and never copied (the operator's laptop, the VM, the `hapi` user);
 - **one recovery (break-glass) recipient**, whose identity is wrapped with a **tool-generated 10-word passphrase** (about 110 bits, behind scrypt) and stored as `recovery.age` beside the store.
 
-That leaves the end user one backup job: **store 10 words somewhere you won't lose them**, with no product named. The wrapped file is useless without the words, so it may sit in `private/` and be backed up with the store. This is the controller's default; the operator may override it.
+That leaves the end user one backup job: **store 10 words somewhere you won't lose them**, with no product named. The wrapped file is useless without the words, so it may sit in `private/` and be backed up with the store. This is the controller's default; the operator may override it. (As built: the operator confirmed it on 2026-10-27; H-070 in handoffs.md.)
 
 **Files:**
 - Create:
@@ -647,6 +647,7 @@ That leaves the end user one backup job: **store 10 words somewhere you won't lo
   - `src/secrets/lifecycle.ts`: `join`, `add-machine`, `recover`, `drill`, `revoke`, `new-recovery`
   - `src/secrets/cli.ts`: every `hapi secrets …` handler, moved out of `provider.ts` to break its import cycle
   - `src/secrets/wordlist.ts`: the vendored list, with its source and license header
+  - (as built, also `src/secrets/store-files.ts`, the shared no-replace writes and the store lock, from H-133's fix pass, and `src/secrets/interrupt.ts`, what a command undoes on SIGINT, SIGTERM or SIGHUP, from H-140's; in handoffs.md)
   - `policy/schemas/secrets-recipients.schema.json`
   - tests under `tests/secrets/`
 - Modify:
@@ -657,7 +658,7 @@ That leaves the end user one backup job: **store 10 words somewhere you won't lo
 **Interfaces:**
 - **Recipients file** `secrets.recipients.yaml`:
   - It sits beside the store, at the same dir and basename stem, e.g. `private/secrets.recipients.yaml`.
-  - Public keys only, schema-validated: `{pq: true, recipients: [{name, kind: "machine"|"recovery", recipient: "age1…", added: <ISO date>}]}`.
+  - Public keys only, schema-validated: `{pq: true, recipients: [{name, kind: "machine"|"recovery", recipient: "age1…", added: <ISO date>}]}` (as built: the recovery entry also records `recovery_age_sha256`, required there and refused on a machine entry, so `check` reports a `recovery.age` that doesn't match, and drill and recover stop before reading the words; H-140 in handoffs.md).
   - A `name` matches `^[a-z0-9][a-z0-9-]{0,62}$`.
   - `check` and every lifecycle command compare it with the store's `sops.age[].recipient` metadata, read without decrypting.
   - Drift in either direction is an error that names the extra or missing recipient by name or public key. Public keys are not secret.
@@ -680,10 +681,10 @@ That leaves the end user one backup job: **store 10 words somewhere you won't lo
   - Read from `/dev/tty` (injectable), with echo off where the terminal allows it.
   - Spaces, case and extra whitespace are normalised.
   - Each word is checked against the list, so a typo gets "word 4 is not in the list" instead of a scrypt failure.
-- **sops never sees a wrapped identity.** Wrapped identities make sops prompt through gpg-agent or the TTY, and sops's gpg-agent client ignores `GNUPGHOME`. So the tool unwraps the recovery identity itself and hands sops the plain identity in the child's env as **`SOPS_AGE_KEY`**, only for the recover, drill and new-recovery calls. Every sops child env also sets **`GPG_AGENT_INFO=`**, empty.
+- **sops never sees a wrapped identity.** Wrapped identities make sops prompt through gpg-agent or the TTY, and sops's gpg-agent client ignores `GNUPGHOME`. So the tool unwraps the recovery identity itself and hands sops the plain identity in the child's env as **`SOPS_AGE_KEY`**, only for the recover, drill and new-recovery calls (as built: recover and drill only, since new-recovery rotates with this machine's key; docs/secrets.md#threat-notes-keys-and-recovery). Every sops child env also sets **`GPG_AGENT_INFO=`**, empty.
 - **Recipient changes go through `sops --config /dev/null rotate -i --add-age … / --rm-age …`.** That re-keys the data key on every change. `updatekeys` doesn't re-key, and `--config /dev/null` stays. The recipients file is updated in the same step: write it atomically after sops succeeds; if sops fails, leave it untouched.
 
-**Commands** (each also a mise task `secrets:<name>`; `--config` as in Task 4b):
+**Commands** (each also a mise task `secrets:<name>`; `--config` as in Task 4b; as built, every lifecycle command and `edit` hold the store's lock, `$XDG_RUNTIME_DIR/hapi/locks/<sha256 of the store's real path>.lock`, released on SIGINT, SIGTERM and SIGHUP too, so they need `XDG_RUNTIME_DIR`; `edit` runs the store checks first; a recipient change renames the store, then `recovery.age` (for new-recovery), then the recipients file: docs/secrets.md#the-commands, H-133 and H-140 in handoffs.md):
 - **`hapi secrets init`** (extends Task 4b):
   1. Creates the machine key (`--name`, default `<hostname>-<user>`, normalised to the name pattern), unless one already exists.
   2. Creates the recovery identity and words in memory.
@@ -694,7 +695,7 @@ That leaves the end user one backup job: **store 10 words somewhere you won't lo
   Also:
   - It refuses coinciding paths among config, store, age key, `recovery.age` and the recipients file.
   - An abort at any step writes nothing.
-  - `--no-confirm` exists only for tests and non-interactive CI fixtures. It is refused when stdin is a TTY, so a human can't skip the check.
+  - `--no-confirm` exists only for tests and non-interactive CI fixtures. It is refused when stdin is a TTY, so a human can't skip the check (as built: also when `/dev/tty` opens, since under `mise run` stdin may not be the terminal; ratified, the Closed row for `6198bd0` in handoffs.md).
 - **`hapi secrets join --store <path to a copy of the store>`:** for a new machine or user.
   - Creates this machine's key (never overwriting one) and its local config.
   - Prints its recipient, plus the exact command to run on a machine that already has access: `mise run secrets:add-machine -- --name <n> --recipient <age1…>`.
@@ -713,7 +714,7 @@ That leaves the end user one backup job: **store 10 words somewhere you won't lo
   - Reads the words and unwraps the recovery identity.
   - Decrypts the store in a child with `HOME` and `XDG_CONFIG_HOME` pointed at a fresh temp dir under `$XDG_RUNTIME_DIR/hapi/`, so no machine key can be loaded, and only `SOPS_AGE_KEY` set.
   - Reports "recovery works: N names readable", never a value. It deletes the temp dir.
-  - It writes nothing else.
+  - It writes nothing else (as built: besides the store lock, removed when it ends; docs/secrets.md#hapi-secrets-drill).
 - **`hapi secrets revoke --name <n>`:**
   - Runs `rotate -i --rm-age <recipient>` and updates the recipients file.
   - It refuses to remove the last `machine` recipient, or the only `recovery` recipient (use `new-recovery`).
@@ -788,35 +789,35 @@ test("writeSecretFiles removes Task 4-era zone files and orphaned generations", 
 
 ### Task 5: Host setup and the stack (rootless Docker, internal networks, Squid egress, Hermes, Archon)
 
-**Binding amendments:** [handoffs.md § Plan 01 Task 5](handoffs.md#plan-01-task-5) (H-003–H-022, H-134, H-135) supersedes the steps below where they differ. In short: this task is stage a (proxies, networks and integration tests on the current Docker; no real secrets); five services with `egress-research` and `research-net`; env files at `$XDG_RUNTIME_DIR/hapi/env/<zone>.env`; the `secrets:join` / `add-machine` flow for the `hapi` user.
+**Binding amendments:** [handoffs.md § Plan 01 Task 5](handoffs.md#plan-01-task-5) (H-003–H-022, H-134, H-135; as built, also H-141, H-144 and H-148) supersedes the steps below where they differ. In short: this task is stage a (proxies, networks and integration tests on the current Docker; no real secrets); five services with `egress-research` and `research-net`; env files at `$XDG_RUNTIME_DIR/hapi/env/<zone>.env`; the `secrets:join` / `add-machine` flow for the `hapi` user.
 
 **Files:**
 - Create:
   - `scripts/host-setup.sh`
   - `stack/compose.yaml`, `stack/archon/Dockerfile`, `stack/hermes/Dockerfile`
-  - `src/stack/up.ts`
+  - `src/stack/up.ts` (as built, also `src/stack/cidr.ts`, `src/stack/env.ts` (H-004), `scripts/copy-secrets-to-hapi.sh` and `docs/runbooks/stack.md` (H-017), with the tests `tests/stack/{helpers.ts,compose.test.ts,up.test.ts,cidr.test.ts}`, `tests/scripts/{host-setup,hapi-home}.test.ts`, `tests/generate/policy-build.int.test.ts` (H-020) and `tests/docs/slack-manifest.test.ts` (H-144); in handoffs.md)
 - Test: `tests/stack/egress.int.test.ts` (integration; runs under `mise run test:int`)
 
 **Interfaces:**
 - Consumes: `buildAll` (Task 3), `resolveSecrets` (Task 4).
 - Produces:
-  - **`mise run up`:** policy build → resolve secrets → `docker compose up -d`. If `$USER != hapi`, it re-execs via `sudo -iu hapi`.
+  - **`mise run up`:** policy build → resolve secrets → `docker compose up -d`. If `$USER != hapi`, it re-execs via `sudo -iu hapi`. (As built: `buildAll`, then secrets exactly as `hapi secrets resolve`, then `docker compose up --no-start --build`, the zone-network check and `up -d --wait` (H-003). The check is the user the process runs as, never `$USER`, and the re-exec is `sudo -u hapi -H -- sh -c '<fixed script>' hapi-stack <args>`, never `sudo -i`, so no login shell re-parses the arguments (H-148); `HAPI_ALLOW_CURRENT_USER=1` skips it as a dev-only downgrade (H-013). docs/runbooks/stack.md#4-mise-run-up-and-mise-run-down; all in handoffs.md.)
   - **`mise run down`.**
-  - **Service names:** `hermes`, `archon`, `egress-hermes`, `egress-archon`.
-  - **Networks:** `hermes-net` and `archon-net`, both `internal: true`. Only the egress proxies also join `outbound`.
+  - **Service names:** `hermes`, `archon`, `egress-hermes`, `egress-archon` (as built: five, with `egress-research`; H-005 in handoffs.md).
+  - **Networks:** `hermes-net` and `archon-net`, both `internal: true`. Only the egress proxies also join `outbound` (as built: also the internal `research-net`, and the three proxies join `outbound`; H-005).
   - **Each zone container** gets `HTTP_PROXY`/`HTTPS_PROXY` pointing at its proxy.
-  - **The Archon image** = the pinned `ghcr.io/coleam00/archon` digest + `archon provider add` for Pi at the matching version + baked Python/uv/node toolchains. Runtime needs no GitHub egress. `build/pi` is mounted read-only at `PI_CODING_AGENT_DIR`.
+  - **The Archon image** = the pinned `ghcr.io/coleam00/archon` digest + `archon provider add` for Pi at the matching version + baked Python/uv/node toolchains. (As built: no `provider add`. The image runs Archon from source, where Pi is an in-process provider on the SDK Archon embeds, and the build fails unless that SDK is 1.3.0: stack/archon/Dockerfile, docs/runbooks/stack.md#pinned-images; H-015 in handoffs.md.) Runtime needs no GitHub egress. `build/pi` is mounted read-only at `PI_CODING_AGENT_DIR`.
   - **The Hermes image** = the pinned official image. `build/hermes` is mounted as config, and the `local` terminal backend runs inside the container, which is itself the boundary.
 
 - [ ] **Step 1: Write `scripts/host-setup.sh`** (idempotent; the operator runs it once with sudo). It:
   - creates user `hapi`;
   - installs and enables rootless Docker for `hapi` (`dockerd-rootless-setuptool.sh install`, `loginctl enable-linger hapi`);
   - installs mise for `hapi`;
-  - clones hapi-factory into `/home/hapi/hapi-factory` from the GitHub remote.
+  - clones hapi-factory into `/home/hapi/hapi-factory` from the GitHub remote (as built: from a `source` argument, by default the checkout's `origin` remote; hapi clones a URL itself, and a local path is cloned `--no-local` by root and unpacked by hapi; H-014 in handoffs.md, docs/runbooks/stack.md#1-host-setup).
 
   Run: `sudo scripts/host-setup.sh && sudo -iu hapi docker info --format '{{.SecurityOptions}}'`. Expected: the output contains `rootless`.
 
-- [ ] **Step 2: Write the failing integration tests** `tests/stack/egress.int.test.ts`, using a throwaway `curlimages/curl` container on `archon-net`:
+- [ ] **Step 2: Write the failing integration tests** `tests/stack/egress.int.test.ts`, using a throwaway `curlimages/curl` container on `archon-net` (as built: these four are among H-008's tests, which also cover the research zone; the first two run for both allowlist zones, archon and hermes, and all of them run in a throwaway Compose project; H-008 in handoffs.md):
 
 ```ts
 test("egress: allowed host via proxy succeeds", () => { expect(curlVia("archon", "https://api.anthropic.com")).toMatch(/^HTTP\/\S+ (2|4)\d\d/); });
@@ -831,9 +832,9 @@ test("archon listens on loopback only", () => { /* from another container on arc
 
 - [ ] **Step 4: Write `stack/compose.yaml`, both Dockerfiles (digest-pinned) and `src/stack/up.ts`** (`up()` calls `buildAll`, then `resolveSecrets`, then `compose up`, and aborts on any error).
   - Add `read_only: true` where the images allow, `cap_drop: [ALL]` and `security_opt: [no-new-privileges:true]` on every service.
-  - Env files come from `$XDG_RUNTIME_DIR/hapi/*.env`.
+  - Env files come from `$XDG_RUNTIME_DIR/hapi/*.env` (as built: each zone service's only `env_file` is `$XDG_RUNTIME_DIR/hapi/env/<zone>.env`, and `host.env` goes to no container; H-004 in handoffs.md).
 
-- [ ] **Step 5: Run** `mise run up && mise run test:int`. Expected: PASS (4 tests). Then `docker compose ps` shows all 4 services healthy.
+- [ ] **Step 5: Run** `mise run up && mise run test:int`. Expected: PASS (4 tests). Then `docker compose ps` shows all 4 services healthy. (As built: `test:int` runs every `*.int.test.ts`, H-008's egress tests among them, not 4; the stack has five services, with `egress-research` (H-005), seen with `docker compose -p hapi ps`; stage b ran both on the real host, H-080; all in handoffs.md.)
 
 - [ ] **Step 6: Commit** `git commit -am "feat(stack): rootless hapi user, internal-only networks, Squid egress, Hermes and Archon containers"`
 
@@ -844,7 +845,7 @@ test("archon listens on loopback only", () => { /* from another container on arc
 **Binding amendments:** [handoffs.md § Plan 01 Task 6](handoffs.md#plan-01-task-6) (H-023–H-037) supersedes the check list below where they differ: two rulesets on `main`, `runtime.dev-override`, `mcp.tool-hashes`, the secrets-provider downgrade and recipients checks, and `docs/audit.md`.
 
 **Files:**
-- Create: `src/audit/{index,types}.ts`, `src/audit/checks/{generated,runtime,pins,github,tools}.ts`
+- Create: `src/audit/{index,types}.ts`, `src/audit/checks/{generated,runtime,pins,github,tools}.ts` (as built, also `src/audit/checks/{mcp,secrets}.ts` and `docs/audit.md`, H-025; Task 7b added `src/audit/checks/repo.ts`, H-058; H-081 in handoffs.md)
 - Test: `tests/audit/*.test.ts`, with fixtures
 
 **Interfaces:**
@@ -852,13 +853,13 @@ test("archon listens on loopback only", () => { /* from another container on arc
 - Produces:
   - **`runAudit(ctx: AuditContext): Promise<CheckResult[]>`**, where `CheckResult = {id: string; status: "pass"|"fail"|"skip"; detail: string}`.
   - **`hapi audit [--repo owner/name ...]`** exits 1 if any check fails.
-  - **The checks:**
+  - **The checks** (as built: 14, docs/audit.md#the-checks. Task 6 built these eight plus `runtime.dev-override` (H-024), `tools.hermes-validate` (H-029), `mcp.tool-hashes` (H-026), `secrets.provider` (H-027) and `secrets.check` (H-028); Task 7b added `repo.private-untracked` (H-058); all in handoffs.md):
     - **`generated.drift`:** the deployed `/home/hapi/...` configs equal a fresh `buildAll`.
     - **`runtime.archon-env`:** `docker inspect` env contains the Global Constraints' Archon and Pi values.
     - **`runtime.hermes-no-yolo`:** no yolo flag, and `approvals.mode != off` in the effective config.
     - **`pins.versions`:** every `mise.toml` tool and compose image is pinned by version or digest.
-    - **`tools.archon-validate`:** `archon validate workflows --json` has no errors **and** an empty `parseWarnings`.
-    - **`github.rulesets`:** for each `--repo`, `main` requires 1 approval with no App bypass.
+    - **`tools.archon-validate`:** `archon validate workflows --json` has no errors **and** an empty `parseWarnings`. (As built: no parse warning, which Archon 0.12.1 reports as a `results[].issues` entry with `field: parse_warning`, and `archon ai alias list --json` and `ai tier list --json` show every generated binding as generated (H-030 in handoffs.md): docs/audit.md#toolsarchon-validate.)
+    - **`github.rulesets`:** for each `--repo`, `main` requires 1 approval with no App bypass. (As built: it reads two rulesets on `main`, `main-protect` and `main-review` (H-023), and since H-174 it also checks `agent-branch-scope` and `tags-admin-only`, which don't apply to `main` and are read by name; in handoffs.md.)
     - **`github.app-perms`:** neither App has administration or a ruleset bypass.
     - **`repo.ai-workflows`:** for each `--repo`, fail on any workflow that runs an AI action with secrets on `issue_comment`, `issues`, `pull_request_review*` or `pull_request_target` triggers.
 
@@ -871,13 +872,15 @@ test("audit flags comment-triggered AI workflow", async () => { /* fixture = mtg
 test("audit passes a clean fixture", async () => { /* all pass/skip */ });
 ```
 
+(As built: that fake output is the plain `{errors, parseWarnings}` shape. Archon 0.12.1 itself prints `{results: [{workflowName, valid, issues: [{level, field, message}]}], summary}`, a parse warning being an issue with `field: parse_warning`, and the audit reads both: `src/audit/checks/tools.ts`, with 0.12.1's own output in `tests/audit/fixtures/archon-validate-parse-warning-v0.12.1.json`; H-081 in handoffs.md.)
+
 - [ ] **Step 2: Run** `bun test tests/audit`. Expected: FAIL.
 
 - [ ] **Step 3: Implement the checks.** Command runners and HTTP are injected (`ctx.exec`, `ctx.fetch`) so the tests use fakes.
 
 - [ ] **Step 4: Run** `bun test tests/audit`. Expected: PASS.
 
-- [ ] **Step 5: Run live** `mise run audit`. Expected: exit 0, with every check `pass`, except `skip` for the `github.*` and `repo.*` checks when no `--repo` is given.
+- [ ] **Step 5: Run live** `mise run audit`. Expected: exit 0, with every check `pass`, except `skip` for the `github.*` and `repo.*` checks when no `--repo` is given. (As built: `mcp.tool-hashes` also skips until H-101 (H-026; ruled: no "expected skip" flag, docs/security/threat-model.md MO-2), `repo.private-untracked` checks the checkout and never skips, and without the stack or the hapi user most checks skip. The live run is stage b's last step, as hapi with the stack up: `mise run audit -- --strict --repo $OWNER/hapi-factory --github-token-file <file>`, which exits 1 with that one expected fail and `13 pass, 1 fail, 0 skip` (docs/runbooks/stack.md#5-the-audit); H-080 in handoffs.md.)
 
 - [ ] **Step 6: Commit** `git commit -am "feat(audit): drift, runtime, pins, tool validation, GitHub and AI-workflow checks"`
 
@@ -886,7 +889,7 @@ test("audit passes a clean fixture", async () => { /* all pass/skip */ });
 ### Task 7: Threat model v0 and kill-switch runbook
 
 **Files:**
-- Create: `docs/security/threat-model.md`, `docs/runbooks/kill-switches.md`
+- Create: `docs/security/threat-model.md`, `docs/runbooks/kill-switches.md` (as built, also `tests/docs/threat-model.test.ts`, and docs/runbooks/stack.md's kill-switch section became a pointer to the runbook; handoffs.md § Plan 01 Task 7)
 
 - [ ] **Step 1: Write `threat-model.md`** using CSA MAESTRO's 7 layers and 6 steps, scoped to the Phase 0 stack plus the planned Phase 1 flow (spec §4 and §11).
   - For each layer, list threats with **OWASP ASI01–ASI10** IDs, LLM Top 10 IDs and **MITRE ATLAS** technique IDs (e.g. AML.T0080, AML.T0086, AML.T0110), then the control (spec section plus the policy file that enforces it).
@@ -896,10 +899,10 @@ test("audit passes a clean fixture", async () => { /* all pass/skip */ });
 - [ ] **Step 2: Write `kill-switches.md`** with exact commands or UI paths, fastest first:
   1. zero or revoke the provider keys;
   2. suspend the GitHub App installations;
-  3. `sudo -iu hapi mise run down`;
-  4. `sudo nft` / `ufw` drop for uid `hapi`.
+  3. `sudo -iu hapi mise run down` (as built: `mise run down` from the operator's own checkout, which re-execs as hapi, plus a fallback without a checkout or mise and a hard stop of hapi's Docker: docs/runbooks/kill-switches.md#3-stop-the-stack);
+  4. `sudo nft` / `ufw` drop for uid `hapi` (as built: an nft `inet hapi_kill` table that rejects hapi's uid, undone with `sudo nft delete table inet hapi_kill`, or iptables `-m owner`; ufw's rules can't match a user: docs/runbooks/kill-switches.md#4-firewall-drop-the-hapi-user).
 
-- [ ] **Step 3: Verify** by having one fresh reader (a subagent) check every residual risk in spec §11.9 against the threat model. Expected: each appears with an owner control and a "next level" item.
+- [ ] **Step 3: Verify** by having one fresh reader (a subagent) check every residual risk in spec §11.9 against the threat model. Expected: each appears with an owner control and a "next level" item. (As built: the Task 7 reviewer made the check, not a subagent the implementer spawns: docs/security/threat-model.md#h-052; H-052 in handoffs.md.)
 
 - [ ] **Step 4: Commit** `git commit -am "docs(security): MAESTRO threat model v0 and kill-switch runbook"`
 
@@ -1026,7 +1029,7 @@ Spike 2 of spec §19 (Pi config skew) is **resolved by design**: Archon's Pi use
 
 - `sudo -iu hapi mise run up` brings up all five services healthy.
 - `mise run test` and `mise run test:int` pass.
-- `mise run audit` exits 0.
+- `mise run audit` exits 0 (as built: without `--strict`; stage b's strict run exits 1 with only the expected `mcp.tool-hashes` fail until H-101: docs/runbooks/stack.md#5-the-audit; H-080 in handoffs.md).
 - `docs/security/threat-model.md` exists.
 - The spike notes of Tasks 8–13 are committed, each with a decision and its consequence for the next plans. Task 14 is on hold (H-177): Plan 03's planning retargets it, and its note comes with Plan 03.
 - [handoffs.md](handoffs.md) is current: diffed against the SDD ledger before the plan's workspace is deleted, with every open item assigned to a later task, plan or the operator.

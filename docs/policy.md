@@ -273,7 +273,7 @@ The MCP catalog (spec §10.1): every MCP server any zone may load. An MCP server
 
 | Layer / zone | MCP servers | Notes |
 |---|---|---|
-| hapi-research (`research` zone, its own container) | `context7` (T2), always | Quarantined: egress `context7.com` only, always with an API key, `OTEL_SDK_DISABLED=true`, no proxy or URL overrides |
+| hapi-research (`research` zone, its own container) | `context7` (T2), always | Quarantined: catalog egress `context7.com`, though the research zone's proxy allows any public name (H-199); always with an API key, `OTEL_SDK_DISABLED=true`, no proxy or URL overrides |
 | Hermes main session (`hermes` zone) | None, unless the observability profile runs (`flags.otel.enabled`); then `phoenix` | A VIEWER-role key, `PHOENIX_DISCOVER_CONFIG=false`, an explicit `PHOENIX_ENDPOINT`, the 23 read-only tools; `phoenix-support` denied |
 | Archon Pi workers and Claude review nodes (`archon` zone) | None | The schema rejects a server that lists this zone |
 | Claude Code lane (phase 4) | Generated from the same catalog, with `--strict-mcp-config` | Context7 only under research-zone quarantine |
