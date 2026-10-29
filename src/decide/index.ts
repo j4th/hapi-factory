@@ -12,17 +12,18 @@
  * Keys are passed in by the caller from their own named variables
  * (HAPI_JEV_OPENROUTER_API_KEY, ANTHROPIC_API_KEY); nothing here reads the
  * environment. An unset key is an error in the result, never a lookup of
- * another name. The state is capped at `gates.max_state_chars` before it leaves,
- * and neither it nor any key is ever logged or put in `error`.
+ * another name; a key that isn't printable ASCII is "malformed", never echoed.
+ * A state over `gates.max_state_chars` is not classified (the unseen tail could
+ * hold the danger): the file's fallback comes back, marked `truncated`. Neither it nor any key is ever logged or put in `error`.
  *
  * It is bundled into hapi-guard (Task 5) and `hapi-decide.js` (Task 4), so
  * everything under src/decide/ must stay free of imports beyond `node:*` and
  * the two npm packages the bundle inlines.
  */
 import type { Gates } from "../policy/types";
-import { askHaiku } from "./haiku";
-import { JevClient } from "./vendor/ten-levels/client";
-import type { Answer, Questions, State } from "./vendor/ten-levels/types";
+import { askHaiku, HaikuError } from "./haiku";
+import { ContractError, JevClient } from "./vendor/ten-levels/client";
+import { QuestionValidationError, type Answer, type Questions, type State } from "./vendor/ten-levels/types";
 
 export type { Answer, Questions, State };
 export type Answers = Record<string, Answer>;
@@ -61,21 +62,39 @@ export interface DecideResult<V extends string = Verdict> {
   costUsd: number;
   latencyMs: number;
   answers?: Answers;
+  /** true when the state was over `gates.max_state_chars`: nothing was sent and the file's fallback was returned. */
+  truncated?: true;
   /** One line, no secret, no state text. */
   error?: string;
 }
 
-/** The state a classifier is shown: at most `max` characters (a structured state over the cap becomes capped text). */
-function capState(state: State, max: number): State {
-  if (typeof state === "string") return state.length > max ? state.slice(0, max) : state;
-  const text = JSON.stringify(state);
-  return text.length > max ? text.slice(0, max) : state;
+/** How many characters of state a classifier would be shown. */
+function stateLength(state: State): number {
+  return (typeof state === "string" ? state : JSON.stringify(state)).length;
 }
 
-/** One safe line from a classifier's error: the client's own messages name a status or a contract rule, never the state. */
+/** A key must be printable ASCII with no whitespace: anything else can't be a header value and must never be echoed. */
+const KEY_SHAPE = /^[\x21-\x7e]+$/;
+
+/** Why a key can't be used, naming its variable and never its value; undefined when it is usable. */
+function keyProblem(name: string, key: string | undefined): string | undefined {
+  if (!key) return `${name} is not set`;
+  return KEY_SHAPE.test(key) ? undefined : `${name} is malformed`;
+}
+
+/** The Jev client's own failure for an HTTP status, e.g. "openrouter HTTP 503.". */
+const JEV_HTTP = /^openrouter HTTP \d{3}\./;
+
+/**
+ * One safe line from a classifier's error. Only messages of the errors this code
+ * knows are passed on; anything else (a fetch or header error may quote its
+ * input) is reported by its name alone.
+ */
 function oneLine(e: unknown): string {
-  const message = e instanceof Error ? e.message : "unknown error";
-  return (message.split("\n")[0] ?? "").slice(0, 200);
+  if (!(e instanceof Error)) return "unknown error";
+  const first = (e.message.split("\n")[0] ?? "").slice(0, 200);
+  if (e instanceof HaikuError || e instanceof ContractError || e instanceof QuestionValidationError) return first;
+  return JEV_HTTP.exec(first)?.[0] ?? e.name;
 }
 
 export async function decide<V extends string>(
@@ -85,21 +104,35 @@ export async function decide<V extends string>(
 ): Promise<DecideResult<V>> {
   const started = performance.now();
   const latencyMs = () => Math.round(performance.now() - started);
-  const shown = capState(state, o.gates.max_state_chars);
+
+  if (!o.mock && !o.jev.enabled && !o.haiku.enabled) {
+    throw new Error(`decision ${file.name} has no classifier: turn the gate off in policy/gates.yaml instead`);
+  }
+  // Text past the cap would go unassessed yet could still get "allow", so an over-cap state is never classified.
+  if (stateLength(state) > o.gates.max_state_chars) {
+    return {
+      verdict: file.fallback,
+      via: "default",
+      fallback: true,
+      costUsd: 0,
+      latencyMs: latencyMs(),
+      truncated: true,
+      error: `state is over max_state_chars (${o.gates.max_state_chars}) and was not classified`,
+    };
+  }
+  const shown = state;
 
   if (o.mock) {
     const r = await new JevClient({ provider: "mock" }).systemOne(shown, file.questions);
     return { verdict: file.verdict(r.answers), via: "mock", fallback: false, costUsd: 0, latencyMs: latencyMs(), answers: r.answers };
   }
-  if (!o.jev.enabled && !o.haiku.enabled) {
-    throw new Error(`decision ${file.name} has no classifier: turn the gate off in policy/gates.yaml instead`);
-  }
 
   const notes: string[] = [];
   const jevFirst = o.jev.enabled && o.jev.public;
   if (jevFirst) {
-    if (!o.jev.apiKey) {
-      notes.push("HAPI_JEV_OPENROUTER_API_KEY is not set");
+    const problem = keyProblem("HAPI_JEV_OPENROUTER_API_KEY", o.jev.apiKey);
+    if (problem || !o.jev.apiKey) {
+      notes.push(problem ?? "HAPI_JEV_OPENROUTER_API_KEY is not set");
     } else {
       try {
         const jev = new JevClient({
@@ -127,8 +160,9 @@ export async function decide<V extends string>(
   }
 
   if (o.haiku.enabled) {
-    if (!o.haiku.apiKey) {
-      notes.push("ANTHROPIC_API_KEY is not set");
+    const problem = keyProblem("ANTHROPIC_API_KEY", o.haiku.apiKey);
+    if (problem || !o.haiku.apiKey) {
+      notes.push(problem ?? "ANTHROPIC_API_KEY is not set");
     } else {
       try {
         const h = o.gates.classifiers.haiku;

@@ -120,3 +120,35 @@ test("answers outside [0,1], probabilities not summing to 1±0.025, or an undecl
   // within tolerance is fine
   await ask(haikuReply({ ...good, effect: { choice: "read", probabilities: { read: 0.75, write: 0.26 } } })).run();
 });
+
+/** Run `fn` with env vars set, restoring them after; capture every console method's output. */
+async function withEnv(env: Record<string, string>, fn: () => Promise<void>): Promise<string[]> {
+  const logged: string[] = [];
+  const methods = ["log", "debug", "info", "warn", "error"] as const;
+  const saved = methods.map((m) => console[m]);
+  const prev = Object.fromEntries(Object.keys(env).map((k) => [k, process.env[k]]));
+  methods.forEach((m) => (console[m] = (...a: unknown[]) => void logged.push(a.map(String).join(" "))));
+  Object.assign(process.env, env);
+  try {
+    await fn();
+  } finally {
+    methods.forEach((m, i) => (console[m] = saved[i] as never));
+    for (const [k, v] of Object.entries(prev)) v === undefined ? delete process.env[k] : (process.env[k] = v);
+  }
+  return logged;
+}
+
+test("the SDK's ambient env does not log the state or replace the caller's key", async () => {
+  const { seen, run } = ask(haikuReply(good));
+  const logged = await withEnv(
+    {
+      ANTHROPIC_LOG: "debug",
+      ANTHROPIC_OPEN_TELEMETRY: "true",
+      ANTHROPIC_OPEN_TELEMETRY_TRACES_CONTENT_MODE: "content",
+      ANTHROPIC_CUSTOM_HEADERS: "Authorization: Bearer ENV-KEY\nauthorization: Bearer ENV-KEY-2\nx-api-key: ENV-KEY-3",
+    },
+    async () => void (await run()),
+  );
+  expect(logged).toEqual([]);
+  expect(seen[0]!.headers.get("authorization")).toBe(`Bearer ${FAKE_ANTHROPIC_KEY}`);
+});

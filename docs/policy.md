@@ -659,8 +659,8 @@ The result says which one answered (`via`: `jev`, `haiku`, `default`, or `mock` 
 
 ### Keys, state and cost
 
-- **Keys** come only from the caller, which reads `HAPI_JEV_OPENROUTER_API_KEY` and `ANTHROPIC_API_KEY`. Nothing reads another name: an unset key is reported in `error` and that classifier is skipped. The vendored Jev client has its environment lookup removed (`src/decide/vendor/ten-levels/SOURCE.md`).
-- **State** is cut to `max_state_chars` before it leaves; a structured state over the limit is sent as capped text.
+- **Keys** come only from the caller, which reads `HAPI_JEV_OPENROUTER_API_KEY` and `ANTHROPIC_API_KEY`. Nothing reads another name: an unset key (`... is not set`) or one that isn't printable ASCII without whitespace (`... is malformed`, never quoted) is reported in `error` and that classifier is skipped. The Anthropic SDK's own environment (`ANTHROPIC_LOG`, `ANTHROPIC_OPEN_TELEMETRY*`, `ANTHROPIC_CUSTOM_HEADERS`) is switched off or overridden. `error` repeats only messages of errors this code knows; any other error is named by its type alone. The vendored Jev client has its environment lookup removed (`src/decide/vendor/ten-levels/SOURCE.md`).
+- **State** longer than `max_state_chars` is never classified, because the part past the limit would go unassessed yet could still be allowed. `decide()` sends nothing, charges nothing and returns the file's `fallback` (`block` for the bash gate, `wrap` for the result screen) with `via: "default"`, `fallback: true` and `truncated: true`. A state of exactly `max_state_chars` is sent whole.
 - **Cost** is added to the run's spend. Haiku: input tokens at `input_per_mtok` plus output tokens at `output_per_mtok`. Jev: the cost it reports, or `classifiers.jev.unknown_call_usd` when it reports none. A classifier that fails costs nothing.
 
 ### `hapi decide <name> [--state-file file] [--public] [--mock]`

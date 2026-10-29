@@ -107,23 +107,51 @@ describe("decide", () => {
     expect(r.error).toBe("jev answers public repos only and this run is not marked public");
   });
 
-  test("state is capped at gates.max_state_chars before sending", async () => {
-    const state = "☃".repeat(10_000);
-    const count = (s: string) => [...s].filter((c) => c === "☃").length;
+  test("over-cap state takes the decision file's fallback, sends nothing, and is marked truncated", async () => {
+    const { fetch, seen } = route(jevReply({ irreversible: 0, destructive: 0 }), haikuReply(bashHaikuAnswers(0, 0)));
+    for (const state of ["a".repeat(6001), { cmd: "x".repeat(6000) }]) {
+      const r = await decide(bashGate, state, base({ fetch }));
+      expect(r.verdict).toBe(bashGate.fallback);
+      expect(r.via).toBe("default");
+      expect(r.fallback).toBe(true);
+      expect(r.truncated).toBe(true);
+      expect(r.costUsd).toBe(0);
+      expect(r.answers).toBeUndefined();
+    }
+    expect(seen).toHaveLength(0);
+    const m = await decide(bashGate, "a".repeat(6001), base({ fetch, mock: true }));
+    expect(m.truncated).toBe(true);
+  });
+
+  test("state at exactly the cap is sent whole", async () => {
+    const state = "\u2603".repeat(6000);
+    const count = (s: string) => [...s].filter((c) => c === "\u2603").length;
     const j = route(jevReply({ irreversible: 0, destructive: 0 }), null);
-    await decide(bashGate, state, base({ fetch: j.fetch }));
+    const r = await decide(bashGate, state, base({ fetch: j.fetch }));
+    expect(r.truncated).toBeUndefined();
     expect(count(j.seen[0]!.body.state)).toBe(6000);
     const h = route(null, haikuReply(bashHaikuAnswers(0, 0)));
     await decide(bashGate, state, base({ fetch: h.fetch }));
-    const anthropic = h.seen.find((s) => !isOpenrouter(s))!;
-    expect(count(anthropic.body.messages[0].content)).toBe(6000);
+    expect(count(h.seen.find((s) => !isOpenrouter(s))!.body.messages[0].content)).toBe(6000);
   });
 
-  test("a structured state over the cap is sent as capped text", async () => {
-    const j = route(jevReply({ irreversible: 0, destructive: 0 }), null);
-    await decide(bashGate, { cmd: "x".repeat(10_000) }, base({ fetch: j.fetch }));
-    expect(typeof j.seen[0]!.body.state).toBe("string");
-    expect(j.seen[0]!.body.state.length).toBe(6000);
+  test("a malformed key is reported by name and never sent or echoed", async () => {
+    const { fetch, seen } = route(jevReply({ irreversible: 0, destructive: 0 }), haikuReply(bashHaikuAnswers(0, 0)));
+    for (const bad of ["bad\nkey-VALUE", "has space", "   ", "caf\u00e9", "nul\u0000key"]) {
+      const r = await decide(bashGate, "ls", base({ fetch, jev: { enabled: true, public: true, apiKey: bad }, haiku: { enabled: true, apiKey: bad } }));
+      expect(r.via).toBe("default");
+      expect(r.error).toBe("HAPI_JEV_OPENROUTER_API_KEY is malformed; ANTHROPIC_API_KEY is malformed");
+    }
+    expect(seen).toHaveLength(0);
+  });
+
+  test("an unknown error is reported by its name only, never its message", async () => {
+    const boom = (async () => {
+      throw new TypeError('Headers.append: "Bearer QUOTED-SECRET" is an invalid header value');
+    }) as unknown as typeof fetch;
+    const r = await decide(bashGate, "ls", base({ fetch: boom }));
+    expect(r.error).not.toContain("QUOTED-SECRET");
+    expect(r.via).toBe("default");
   });
 
   test("state is never logged", async () => {

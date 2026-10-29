@@ -110,6 +110,9 @@ export async function askHaiku(
     baseURL: BASE_URL,
     maxRetries: 2,
     timeout: 30_000,
+    // The SDK reads ANTHROPIC_LOG (it can log request bodies) and ANTHROPIC_OPEN_TELEMETRY* (spans can hold message content) from the environment.
+    logLevel: "off",
+    openTelemetry: false,
     ...(o.fetch ? { fetch: o.fetch } : {}),
   });
   let res;
@@ -121,7 +124,8 @@ export async function askHaiku(
       output_config: { effort: "low", format: { type: "json_schema", schema: haikuSchema(q) as Record<string, unknown> } },
       system: SYSTEM,
       messages: [{ role: "user", content: userMessage(q, state) }],
-    });
+      // ANTHROPIC_CUSTOM_HEADERS is merged into the client's headers; the caller's key is pinned per request.
+    }, { headers: { Authorization: `Bearer ${o.apiKey}` } });
   } catch (e) {
     if (e instanceof Anthropic.APIConnectionTimeoutError) throw new HaikuError("anthropic request timed out");
     if (e instanceof Anthropic.APIConnectionError) throw new HaikuError("anthropic connection error");
