@@ -12,6 +12,7 @@
  */
 import { auditCommand } from "./audit/index";
 import { tokenMint } from "./forge/github/app-token";
+import { decideCommand } from "./decide/cli";
 import { policyBuild } from "./generate/index";
 import { mcpPin, mcpVerify } from "./mcp/lock";
 import {
@@ -142,6 +143,7 @@ register("secrets resolve", secretsResolve, "Resolve stack/secrets.yaml from the
 register("stack up", stackUp, "Build policy, resolve secrets and start the stack as the hapi user (stack/compose.yaml); see docs/runbooks/stack.md");
 register("stack down", stackDown, "Stop the stack and remove its containers and networks, keeping its volumes (kill switch 3)");
 register("token mint", tokenMint, "Mint a 1-hour GitHub App token for one repo into a 0600 file under $XDG_RUNTIME_DIR/hapi/tokens/");
+register("decide", (args) => decideCommand(args), "Run one typed decision (bash-gate, result-screen) on a state read from stdin; prints the result as JSON");
 register("audit", (args) => auditCommand(args), "Check the deployed config, pins, running stack, secrets setup and each --repo's GitHub settings against policy (docs/audit.md)");
 
 if (import.meta.main) {

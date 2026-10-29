@@ -633,6 +633,40 @@ orphaned <name> expected sha256:<locked>
 
 Exit codes are the CLI's: `0` success, `1` a failed check or a failed command (a bad policy or lock file is reported as `hapi mcp verify: <file>: <problem>`), and `2` a usage error, such as an unknown flag, a missing `--server` or an unknown server name.
 
+## `decide()` and the decision files
+
+`decide()` (`src/decide/index.ts`) is the one helper every typed decision goes through: the level-6 gates in hapi-guard (the bash gate and the result screen), and `hapi decide` on the command line.
+
+### A decision file
+
+A decision file is `policy/decisions/<name>.ts` and default-exports a `DecisionFile`: `name` (a slug equal to the file name), `questions` (Jev's typed questions: `noul`, `choice` or `score`), `fallback` (the careful verdict) and `verdict(answers)`. The thresholds live in `verdict`, in code, so changing one is a reviewed change to a protected path (`policy/**`). The three files:
+
+| File | Decides | Questions | Verdict | Fallback |
+|---|---|---|---|---|
+| `bash-gate.ts` | a worker's bash call, before it runs | `effect` (read_only, reversible, irreversible), `destructive_intent` | `block` at irreversible >= 0.6 or destructive >= 0.7; `flag` at >= 0.4 or >= 0.5; else `allow` | `block` |
+| `result-screen.ts` | what a tool returned, before the worker reads it | `injection` | `wrap` at >= 0.7; `flag` at >= 0.5; else `allow` | `wrap` |
+| `write-gate.ts` | a write whose content holds a credential | none: it exports `KEY_PATTERNS` and nothing goes to a classifier | (local pattern check) | n/a |
+
+### The order
+
+`decide(file, state, options)` tries, in order:
+
+1. **Jev**, through OpenRouter, only when `flags.jev.enabled` and the run is marked public (`options.jev.public`). Jev is a third-party service, so a private repo's state never goes there.
+2. **Haiku** (`classifiers.haiku.model`, through the Anthropic API), when `flags.jev.fallback` is `haiku`.
+3. **The file's `fallback` verdict**, when neither answers.
+
+The result says which one answered (`via`: `jev`, `haiku`, `default`, or `mock` offline), whether it was not the first choice (`fallback`), and in `error` one line on what failed, never the state or a key. If neither classifier is enabled `decide` throws: `loadPolicy` already refuses a gate that is on with no classifier, and the throw is the backstop.
+
+### Keys, state and cost
+
+- **Keys** come only from the caller, which reads `HAPI_JEV_OPENROUTER_API_KEY` and `ANTHROPIC_API_KEY`. Nothing reads another name: an unset key is reported in `error` and that classifier is skipped. The vendored Jev client has its environment lookup removed (`src/decide/vendor/ten-levels/SOURCE.md`).
+- **State** is cut to `max_state_chars` before it leaves; a structured state over the limit is sent as capped text.
+- **Cost** is added to the run's spend. Haiku: input tokens at `input_per_mtok` plus output tokens at `output_per_mtok`. Jev: the cost it reports, or `classifiers.jev.unknown_call_usd` when it reports none. A classifier that fails costs nothing.
+
+### `hapi decide <name> [--state-file file] [--public] [--mock]`
+
+Runs one decision on a state and prints the result as one JSON line. The state comes from `--state-file` or stdin, never from argv. `--public` marks the run public; `--mock` answers offline with the vendored mock and needs no policy directory. Without `--mock` it reads the gates and flags from `$HAPI_POLICY_DIR` (default `policy`). Exit 0: a result was printed (a fallback verdict counts); 1: the decision could not run; 2: a usage error or an unknown name.
+
 ## TypeScript API
 
 Later plans build on these functions:
@@ -658,6 +692,7 @@ Later plans build on these functions:
 | `hashToolSurface(surface): string` | `src/mcp/lock.ts` | `sha256:<hex>` of a surface's canonical JSON, order-independent ([the lock](#mcplockjson)) |
 | `verifyLock(p, lock, fetchSurface): Promise<{name, status, expected?, actual?}[]>` | `src/mcp/lock.ts` | Every catalog server's live surface against the lock: `ok`, `changed` or `unpinned`; and `orphaned` (no `actual`; never fetched) for a lock entry whose server isn't in the catalog. It rejects, fetching nothing, if any server lists a zone outside `MCP_ZONES`, as a policy built in code could |
 | `loadLock(file): McpLock` | `src/mcp/lock.ts` | Reads and checks a lock file. Throws `PolicyError`. |
+| `decide(file, state, options): Promise<DecideResult>` | `src/decide/index.ts` | Asks a classifier and applies a decision file's verdict ([the order](#decide-and-the-decision-files)). Throws only when no classifier is enabled. |
 | `pinOf(server)`, `canonicalJson(value)`, `lockJson(lock)` | `src/mcp/lock.ts` | A server's pin fields as a lock entry records them; the canonical JSON the hash uses; the lock as written to disk |
 | `validateWorkOrder(obj): WorkOrder` | `src/workorder/validate.ts` | Validates a parsed work order. Throws `WorkOrderError { path, message, issues }`. |
 | `loadWorkOrder(file): WorkOrder` | `src/workorder/validate.ts` | Reads, parses and validates a work-order file |
