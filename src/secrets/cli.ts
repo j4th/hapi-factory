@@ -256,7 +256,9 @@ export async function secretsResolve(args: string[], deps: SecretsDeps = {}): Pr
  * tmpfs): the plaintext never lands on a disk. The editor gets the caller's
  * env minus every SOPS_* variable, plus SOPS_AGE_KEY_FILE,
  * SOPS_DISABLE_VERSION_CHECK=1, GPG_AGENT_INFO= and the pinned age first on
- * PATH. sops's exit 200 (file unchanged) counts as success.
+ * PATH. sops's exit 200 (file unchanged) counts as success. When sops ends,
+ * the store checks run again, and a store that now fails them (a value left
+ * in plaintext, say) is an error that says not to commit it.
  */
 export async function secretsEdit(args: string[], deps: SecretsDeps = {}): Promise<number> {
   const f = flagsOr(USAGE.edit, args, ["--config"]);
@@ -281,6 +283,15 @@ export async function secretsEdit(args: string[], deps: SecretsDeps = {}): Promi
       // Ctrl-C in the editor is the editor's (it reaches hapi too, in the same foreground group), so hapi ignores it
       // until sops ends, as system(3) does; a SIGTERM or SIGHUP waits until then, so the lock outlives no edit.
       const code = await shielded(() => (deps.interactive ?? runInteractive)("sops", inv.args, { env: inv.env }), { ignoreInterrupt: true, done: "stopped after sops edit ended" });
+      // sops wrote what its metadata told it to: check the result too, so a value it left in plaintext is never committed.
+      try {
+        await loadStore(file);
+      } catch (e) {
+        if (!(e instanceof SecretError)) throw e;
+        throw new SecretError(
+          `sops edit left ${file} failing hapi's store check: ${e.message}. Don't commit or push it: put back its last committed version, and treat any value you entered as exposed if the file has left this machine (docs/secrets.md#hapi-secrets-edit)`,
+        );
+      }
       if (code === 0 || code === 200) return 0;
       console.error(`hapi secrets edit: sops exited with status ${code}; the file is unchanged unless sops said otherwise`);
       return 1;

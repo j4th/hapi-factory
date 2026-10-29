@@ -9,6 +9,7 @@ import { secretsAddMachine, secretsCheck, secretsDrill, secretsEdit, secretsInit
 import { DRIFT_FIX, loadStore, recipientReport } from "../../src/secrets/lifecycle";
 import { lockPath } from "../../src/secrets/store-files";
 import { loadManifest, manifestNames } from "../../src/secrets/manifest";
+import { SecretError } from "../../src/secrets/provider";
 import { passphraseOf } from "../../src/secrets/recovery";
 import { shortRecipient } from "../../src/secrets/recipients";
 import {
@@ -574,6 +575,35 @@ describe("hapi secrets edit runs the store checks first", () => {
     await expect(secretsEdit([], deps)).rejects.toThrow(/no recipients file at .*secrets\.recipients\.yaml/);
     expect(ed.runs).toEqual([]);
     expect(existsSync(join(dir, ".secrets.enc.yaml.lock"))).toBe(false);
+  });
+
+  test("edit checks the store again after sops: one it left failing the checks exits non-zero and says not to commit it", async () => {
+    const { err } = capture();
+    const { tools, a } = await initialised();
+    await fill(tools, a.store);
+    const good = readFileSync(a.store, "utf8");
+    const value = "fake-plaintext-value-123";
+    // A sops that leaves a value in plaintext (a name ending in _unencrypted, say, which sops's default suffix keeps out of the encryption).
+    for (const code of [0, 200, 1]) {
+      writeFileSync(a.store, good);
+      const runs: string[][] = [];
+      const interactive = async (_cmd: string, args: string[]) => {
+        runs.push(args);
+        writeFileSync(a.store, good.replace(/^sops:/m, `hapi-new_unencrypted: ${value}\nsops:`));
+        return code;
+      };
+      const e = await caught(secretsEdit([], { ...a.deps, interactive }));
+      expect(runs.length).toBe(1);
+      expect(e).toBeInstanceOf(SecretError);
+      expect(e.message).toMatch(/^sops edit left .*secrets\.enc\.yaml failing hapi's store check: .*secrets\.enc\.yaml \(a name that is not a logical name, not shown\) is not encrypted/);
+      expect(e.message).toMatch(/Don't commit or push it/);
+      expect(e.message).not.toContain(value);
+      expect(existsSync(await lockPath(a.store, a.env))).toBe(false);
+    }
+    // A store sops left passing the checks is fine, as before.
+    writeFileSync(a.store, good);
+    expect(await secretsEdit([], { ...a.deps, interactive: editor().interactive })).toBe(0);
+    expect(err.join("\n")).not.toContain(value);
   });
 
   test("a config whose age_key_file is the store's recovery.age is refused before sops ever sees it", async () => {
