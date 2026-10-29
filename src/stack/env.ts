@@ -128,7 +128,8 @@ export const CONTROL_ENV_NAMES: readonly string[] = [
   "RUBYOPT",
   "VIRTUAL_ENV",
   "_JAVA_OPTIONS",
-  // Where tools read their config and data.
+  // Where tools read their config and data. Claude Code (Archon's claude nodes) loads settings.json hooks and env, and credentials, from CLAUDE_CONFIG_DIR.
+  "CLAUDE_CONFIG_DIR",
   "XDG_CACHE_HOME",
   "XDG_CONFIG_DIRS",
   "XDG_CONFIG_HOME",
@@ -145,9 +146,11 @@ export const CONTROL_ENV_NAMES: readonly string[] = [
  * and tools in the containers, each of which reads its own settings from its
  * prefix (NODE_OPTIONS, NODE_EXTRA_CA_CERTS, PYTHONPATH, BUN_OPTIONS,
  * UV_INDEX_URL, PIP_INDEX_URL, NPM_CONFIG_REGISTRY, HERMES_HOME, ARCHON_*,
- * PI_*, CLAUDE_CODE_*). No entry of the committed stack/secrets.yaml starts
- * with one (a unit test checks). `PYTHON` has no underscore: Python's own
- * variables are PYTHONPATH, PYTHONHOME, PYTHONSTARTUP and the rest.
+ * PI_*, CLAUDE_CODE_*, and s6-overlay's S6_*, the Hermes image's init:
+ * S6_CMD_ARG0 runs a program in front of its command). No entry of the
+ * committed stack/secrets.yaml starts with one (a unit test checks). `PYTHON`
+ * has no underscore: Python's own variables are PYTHONPATH, PYTHONHOME,
+ * PYTHONSTARTUP and the rest.
  * CLAUDE_CODE_ also keeps CLAUDE_CODE_OAUTH_TOKEN out: the factory bills by
  * API key and never runs on subscription OAuth (spec §11.5).
  */
@@ -165,6 +168,7 @@ export const CONTROL_ENV_PREFIXES: readonly string[] = [
   "PIP_",
   "PI_",
   "PYTHON",
+  "S6_",
   "UV_",
 ];
 
