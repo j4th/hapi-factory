@@ -1,12 +1,13 @@
 /**
- * .github/workflows/ci.yml: where its checks sit among the steps, and two of
+ * .github/workflows/ci.yml: where its checks sit among the steps, and three of
  * them run for real, as CI runs them (`bash -e`), on throwaway checkouts: the
- * mise-config check with the pinned mise, offline, and the history scan with the
- * gitleaks mise.toml pins (a stub `mise` on PATH runs it).
+ * mise-file scan, which needs only bash and find; the mise-config check with the
+ * pinned mise, offline; and the history scan with the gitleaks mise.toml pins (a
+ * stub `mise` on PATH runs it).
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { randomBytes } from "node:crypto";
-import { chmodSync, cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import YAML from "yaml";
@@ -18,7 +19,8 @@ interface Step {
   run?: string;
 }
 const steps: Step[] = YAML.parse(await Bun.file(join(REPO, ".github", "workflows", "ci.yml")).text()).jobs.ci.steps;
-const MISE_CHECK = "Only the root mise.toml configures mise";
+const MISE_SCAN = "Only the root mise.toml configures mise";
+const MISE_CHECK = "mise loads no config or tasks but the root mise.toml";
 const at = (pred: (s: Step) => boolean) => steps.findIndex(pred);
 
 const temps: string[] = [];
@@ -26,11 +28,78 @@ afterAll(() => {
   for (const d of temps) rmSync(d, { recursive: true, force: true });
 });
 
+test("the mise-file scan runs right after checkout, before mise-action reads, installs from or exports the env of any mise file", () => {
+  const scan = at((s) => s.name === MISE_SCAN);
+  expect(scan).toBeGreaterThan(at((s) => s.uses?.startsWith("actions/checkout@") === true));
+  expect(scan).toBeLessThan(at((s) => s.uses?.startsWith("jdx/mise-action@") === true));
+});
+
 test("the mise-config check runs once mise is installed, before any step that installs tools or runs a task", () => {
   const check = at((s) => s.name === MISE_CHECK);
   expect(check).toBeGreaterThan(at((s) => s.uses?.startsWith("jdx/mise-action@") === true));
   const first = at((s) => /\bmise (install|run)\b/.test(s.run ?? ""));
   expect(first).toBeGreaterThan(check);
+});
+
+describe("the mise-file scan, run on a throwaway checkout", () => {
+  const script = steps.find((s) => s.name === MISE_SCAN)?.run ?? "exit 99";
+  /** A checkout holding mise.toml, a .git dir and `files`; the step's exit code and output. */
+  const scan = (files: Record<string, string> = {}) => {
+    const root = mkdtempSync(join(tmpdir(), "hapi-ci-scan-mise-"));
+    temps.push(root);
+    const all = { "mise.toml": '[tasks.test]\nrun = "true"\n', ".git/HEAD": "ref: refs/heads/main\n", ".git/mise.toml": "", ...files };
+    for (const [path, text] of Object.entries(all)) {
+      mkdirSync(join(root, path, ".."), { recursive: true });
+      writeFileSync(join(root, path), text);
+    }
+    // Only find on PATH: the scan runs before mise-action, so it must not need mise, jq or anything else.
+    const bin = mkdtempSync(join(tmpdir(), "hapi-ci-scan-bin-"));
+    temps.push(bin);
+    symlinkSync(Bun.which("find")!, join(bin, "find"));
+    const r = Bun.spawnSync([Bun.which("bash")!, "-e", "-c", script], { cwd: root, env: { PATH: bin }, stdout: "pipe", stderr: "pipe" });
+    return { code: r.exitCode, out: r.stdout.toString() + r.stderr.toString() };
+  };
+
+  test("passes with only the root mise.toml, whatever else is named like mise", () => {
+    const r = scan({ "src/mise.ts": "", "docs/mise.md": "", "misery.toml": "", "mise-notes/a.md": "", "docs/mise.lockfile.md": "", ".config/other.toml": "" });
+    expect([r.code, r.out]).toEqual([0, ""]);
+  });
+
+  for (const path of [
+    ".mise.toml",
+    "mise.local.toml",
+    ".mise.local.toml",
+    "mise.ci.toml",
+    ".mise.ci.toml",
+    "mise/config.toml",
+    "mise/conf.d/extra.toml",
+    "mise/tasks/extra",
+    ".mise/config.toml",
+    ".mise/tasks/extra",
+    ".config/mise.toml",
+    ".config/mise.local.toml",
+    ".config/mise/config.toml",
+    ".config/mise/conf.d/extra.toml",
+    ".config/mise/tasks/extra",
+    "mise-tasks/extra",
+    ".mise-tasks/extra",
+    ".tool-versions",
+    "mise.lock",
+    "mise.ci.lock",
+    "mise.local.lock",
+    "src/mise.toml",
+    "pkg/.mise.toml",
+    "pkg/.tool-versions",
+    "MISE.TOML",
+    ".Mise.Toml",
+  ]) {
+    test(`fails on ${path}, naming it`, () => {
+      const r = scan({ [path]: "" });
+      expect(r.code).not.toBe(0);
+      expect(r.out).toContain(path.split("/")[0]!);
+      expect(r.out).not.toContain(".git/");
+    });
+  }
 });
 
 /** mise and jq that run (a mise shim with no version set doesn't); the step needs both. */
