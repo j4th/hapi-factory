@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { parse } from "yaml";
+import { effectiveModes } from "../../src/policy/paths";
 import { loadWorkOrder, validateWorkOrder, WorkOrderError } from "../../src/workorder/validate";
 
 const load = (file: string): unknown => parse(readFileSync(file, "utf8"));
@@ -73,6 +74,16 @@ describe("rejects", () => {
     ["a duplicate piece id", (o) => o.pieces.push({ ...o.pieces[0] }), "/pieces/1/id"],
     ["an egress_extra entry with a scheme", (o) => (o.egress_extra = ["https://odoo.internal"]), "/egress_extra/0"],
     ["a source outside the repo", (o) => (o.sources = ["../secrets.md"]), "/sources/0"],
+    // Control characters as src/policy/paths.ts defines them: U+0000-U+001F and U+007F-U+009F.
+    ["a file path with a DEL", (o) => (o.pieces[0].files[0] = "src/a\u007fb.ts"), "/pieces/0/files/0"],
+    ["a file path with a C1 control (NEL)", (o) => (o.pieces[0].files[0] = "src/a\u0085b.ts"), "/pieces/0/files/0"],
+    ["a source with a C1 control", (o) => (o.sources = ["docs/a\u009fb.md"]), "/sources/0"],
+    // The repo root itself, which effectiveModes refuses as not a file path.
+    ["the repo root as a file path", (o) => (o.pieces[0].files[0] = "."), "/pieces/0/files/0"],
+    ["the repo root as a file path, with a slash", (o) => (o.pieces[0].files[0] = "./"), "/pieces/0/files/0"],
+    ["the repo root, spelled ././", (o) => (o.sources = ["././"]), "/sources/0"],
+    // A line separator before the '..' segment still leaves a '..' segment.
+    ["a '..' segment after a line separator", (o) => (o.pieces[0].files[0] = "a /../../x.py"), "/pieces/0/files/0"],
     ["a non-boolean smoke flag", (o) => (o.verify.smoke = "yes"), "/verify/smoke"],
   ];
   for (const [name, breakIt, path] of cases) {
@@ -87,6 +98,29 @@ describe("rejects", () => {
     expect(workOrderError(null).path).toBe("");
     expect(workOrderError("id: x").path).toBe("");
   });
+});
+
+test("a piece path the schema accepts is one the guard's effectiveModes accepts, and the other way round", () => {
+  // So an order's declared scope never validates in Hermes, CI and prepare, then fails at run time.
+  const policy = { protectedPaths: {} };
+  for (const path of ["src/a.ts", "./src/a.ts", "src/./a.ts", "src/a/", "...", ".github/workflows/ci.yml", "a b.ts", ".", "./", "././", "src/a\u007fb.ts", "src/a\u0085b.ts", "src/a\u009fb.ts", "src/a b.ts", "src/../../x", "a /../../x"]) {
+    const o = example();
+    o.pieces[0].files = [path];
+    let schema = true;
+    try {
+      validateWorkOrder(o);
+    } catch (e) {
+      if (!(e instanceof WorkOrderError)) throw e;
+      schema = false;
+    }
+    let guard = true;
+    try {
+      effectiveModes(policy, path);
+    } catch {
+      guard = false;
+    }
+    expect([JSON.stringify(path), schema]).toEqual([JSON.stringify(path), guard]);
+  }
 });
 
 describe("egress_extra may not name a forge host (spec §4.3, §10)", () => {
