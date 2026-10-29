@@ -51,3 +51,10 @@ protected_paths:
   ".coderabbit.yaml":      { interactive: ask, unattended: deny, workers: deny }
   ".coderabbit.yml":       { interactive: ask, unattended: deny, workers: deny }
   ".coderabbit.config.ts": { interactive: ask, unattended: deny, workers: deny }
+  # git's own files, at any depth: a .git directory and all of it, and a linked
+  # worktree's .git file ("/**" covers ".git" itself). git runs the commands
+  # .git/config names (core.fsmonitor, diff.external, credential.helper) from
+  # the argv commands.yaml allows (git status, git diff), and a .git file names
+  # the git dir git uses. No agent edits these files directly. H-191 hardens the
+  # argv side.
+  "**/.git/**": { interactive: deny, unattended: deny, workers: deny }

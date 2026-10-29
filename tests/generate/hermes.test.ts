@@ -105,7 +105,7 @@ describe("protected instruction files", () => {
       .split("\n")
       .filter((l) => l.trimStart().startsWith("#"))
       .join("\n");
-    for (const glob of [".agents/**", ".archon/**", ".factory/**", ".github/**", ".pi/**"]) expect(comment).toContain(glob);
+    for (const glob of ["**/.git/**", ".agents/**", ".archon/**", ".factory/**", ".github/**", ".pi/**"]) expect(comment).toContain(glob);
     expect(comment).toContain("hapi-path-guard");
   });
 

@@ -74,6 +74,16 @@ describe("effectiveModes", () => {
     expect(effectiveModes(p, "src/cli.ts")).toEqual(ALLOW);
   });
 
+  test("git's own files are deny in every session: a .git dir at any depth, all of it, and a worktree's .git file", () => {
+    // git runs commands that .git/config names (core.fsmonitor, diff.external) from argv commands.yaml allows.
+    for (const path of [".git", ".git/config", ".git/hooks/pre-commit", "sub/.git/config", "sub/.git", ".GIT/Config", "a/b/.git/worktrees/x/gitdir"]) {
+      expect([path, effectiveModes(p, path)]).toEqual([path, DENY]);
+    }
+    // Names that only start with ".git" are not git's own.
+    for (const path of [".gitignore", ".gitattributes", "docs/.gitkeep", "src/.github/x.yml"]) expect([path, effectiveModes(p, path)]).toEqual([path, ALLOW]);
+    expect(effectiveModes(p, ".github/workflows/ci.yml")).toEqual(ASK);
+  });
+
   test("the strictest mode across every matching glob wins, per session, whatever the order", () => {
     const broad: PathModes = { interactive: "allow", unattended: "deny", workers: "ask" };
     const narrow: PathModes = { interactive: "ask", unattended: "allow", workers: "allow" };
