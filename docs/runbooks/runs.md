@@ -81,7 +81,7 @@ Expected: it prints the run id (twelve hex digits) and returns. The run is going
 - **`--public`** is [the public flag](#the-public-flag).
 - **`--retry-of <run-id>`** names the last run of the same work order and commit, which ended without succeeding. A run is keyed by the work order's id and the source commit: a key with a live or a succeeded run is refused, and one whose last run ended another way is refused unless `--retry-of` names that run. So a re-fire is safe.
 
-**What it refuses**, in this order, with an error that names the fix: a work order that fails validation or names `egress_extra`; no archon env file (run `mise run up` first); a source that isn't a git repo or has no commit; a key already run; a second live run for the same repo (one per repo, H-090); more live runs than `max_live` in `policy/runs.yaml` (1 by default). A step that fails after that removes everything `start` made. A supervisor that starts and then dies is reaped by the next `hapi run` command.
+**What it refuses**, in this order, with an error that names the fix: a work order that fails validation or names `egress_extra`; no archon env file (run `mise run up` first); a source that isn't a git repo or has no commit; a key already run; a second live run for the same repo (one per repo, H-090); more live runs than `max_live` in `policy/runs.yaml` (1 by default). A step that fails after that removes everything `start` made. A supervisor that starts and then dies is reaped by the next `hapi run start` or `hapi run stop`; `hapi run stop <id>` is the direct fix. `list` and `watch` never reap.
 
 **The deadline** is the work order's `budget.minutes`. A detached `hapi run supervise <id>` waits for the container to end or the deadline, stops it at the deadline, then finalizes the run: copy-out, checks, removal and the record. You never run `supervise` yourself.
 
@@ -153,7 +153,7 @@ In Plan 02 the flag is an assertion, not a check: nothing on the host verifies i
 
 ## Rollout on hapi's checkout
 
-Once this branch has landed on `main`, and before the first run. Each step runs on the host, as hapi, in hapi's checkout; the first two are `mise` tasks, so they use hapi's `PATH` and runtime directory as above. Stop first if a run is live (`hapi run list`): `up` refuses while one is.
+Once this branch has landed on `main`, and before the first run. Each step runs on the host, as hapi, in hapi's checkout; steps 1 to 3 are `mise` tasks, so they use hapi's `PATH` and runtime directory as above. Stop first if a run is live (`hapi run list`): `up` refuses while one is.
 
 1. **Update hapi's checkout and install its dependencies.** `mise run setup` runs `bun install --frozen-lockfile`, which brings in `@anthropic-ai/sdk`, the package `hapi policy build` bundles into the guard and `hapi decide`. Without it `up` stops at its policy build.
 
@@ -171,9 +171,20 @@ Once this branch has landed on `main`, and before the first run. Each step runs 
    mise run up
    ```
 
-   Expected: the three proxies and Hermes healthy, no `archon` container, and `docker compose build archon` having built `hapi-factory/archon:0.12.1`. Then `mise run audit -- --strict --repo <owner>/<name> --github-token-file <file>` as in [the stack runbook](stack.md#5-the-audit): `14 pass, 1 fail, 0 skip`, the one fail the expected `mcp.tool-hashes` (not yet run live on the real host).
+   Expected: the three proxies and Hermes healthy, no `archon` container, and `docker compose build archon` having built `hapi-factory/archon:0.12.1`.
 
-3. **Remove the old Archon volumes, once.** The long-lived Archon container is gone, and its two volumes are left over, holding the old Archon's run database and Claude Code state. Nothing reads them, and the factory keeps nothing in them. The operator removes them, with the stack down (`mise run down`):
+3. **Audit.** As hapi, in hapi's checkout, with the stack up ([the stack runbook](stack.md#5-the-audit)); `<owner>/<name>` and `<file>` are yours:
+
+   ```bash
+   sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
+     export XDG_RUNTIME_DIR PATH="$HOME/.local/bin:$PATH"; \
+     cd "$HOME/hapi-factory" && exec mise run audit -- \
+     --repo <owner>/<name> --strict --github-token-file <file>' | grep -v '^pass'
+   ```
+
+   Expected: two lines, the `mcp.tool-hashes` fail and `hapi audit: 14 pass, 1 fail, 0 skip` (not yet run live on the real host).
+
+4. **Remove the old Archon volumes, once.** The long-lived Archon container is gone, and its two volumes are left over, holding the old Archon's run database and Claude Code state. Nothing reads them, and the factory keeps nothing in them. The operator removes them. No container uses them after step 2, so the stack can stay up:
 
    ```bash
    sudo -u hapi -H -- sh -c 'export XDG_RUNTIME_DIR="/run/user/$(id -u)" \
@@ -181,7 +192,7 @@ Once this branch has landed on `main`, and before the first run. Each step runs 
      exec docker volume rm hapi_archon-data hapi_archon-home'
    ```
 
-   Expected: each name echoed, or `No such volume` for one already gone. Then `mise run up` again.
+   Expected: each name echoed, or `No such volume` for one already gone.
 
 ## The tests
 
@@ -220,7 +231,7 @@ Once this branch has landed on `main`, and before the first run. Each step runs 
 | `reason` says `the run's container was removed before the run was finalized` | `mise run down` or a cleanup removed the container while the run was live. Nothing was copied out. Start the run again with `--retry-of`. |
 | `reason` says `cleanup left run objects behind` | Docker couldn't remove one of the run's objects. `mise run down` removes everything labelled `org.hapi.run`. |
 | `timed-out` | The run passed the work order's `budget.minutes` and was stopped. Raise the budget in the work order, or fix what is slow. |
-| `hapi run watch` prints `the container has exited, but the run was not finalized within 120 s` | The supervisor died. Run `hapi run list`: the next `hapi run` command reaps the run, then `watch` shows it. |
+| `hapi run watch` prints `run <id>'s container has exited, but the run was not finalized within 120 s: ...` | The supervisor died. `list` and `watch` don't reap: run `hapi run stop <id>` (or the next `hapi run start`), which finalizes the run, then `watch <id>` shows how it ended. |
 | `stop` or `start` says a lock is held | Another `hapi run` command holds the launcher's lock. It fails at once and names the holder; run it again when that one ends. |
 | A tool in the run fails with `Permission denied` for a script under `/tmp` or `~` | Docker's tmpfs mounts are `noexec` (H-208). Run the tool through its interpreter (`sh script`, `python script.py`), or ask for it to be in the image. |
 | `docker: Error response from daemon: ... volume is in use` during `mise run down` while a run is finalizing | The copy-out helper and `down` raced for the run's volume. Run `mise run down` again once `hapi run list` shows no `live` run (H-210). |
