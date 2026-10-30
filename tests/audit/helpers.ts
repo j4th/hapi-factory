@@ -89,9 +89,9 @@ export interface Container {
   State: { Running: boolean };
   Path: string;
   Args: string[];
-  Config: { Labels: Record<string, string>; Env: string[]; Cmd: string[] | null; Entrypoint: string[] | null };
+  Config: { Labels: Record<string, string>; Env: string[]; Cmd: string[] | null; Entrypoint: string[] | null; User?: string };
   Mounts: { Type: string; Source: string; Destination: string; RW: boolean }[];
-  HostConfig?: { PortBindings: Record<string, unknown>; Tmpfs?: Record<string, string> };
+  HostConfig?: { PortBindings: Record<string, unknown>; Tmpfs?: Record<string, string>; CapDrop?: string[]; ReadonlyRootfs?: boolean; SecurityOpt?: string[]; PidsLimit?: number; Memory?: number };
 }
 
 export interface Reply {
@@ -397,9 +397,10 @@ export function runContainer(w: World, id = "ab12cd34ef56", over: { labels?: Rec
       Env: [...Object.entries(serviceEnvironment("archon")).map(([k, v]) => `${k}=${v}`), "PATH=/usr/local/bin:/usr/bin:/bin"],
       Cmd: null,
       Entrypoint: ["sh"],
+      User: "1001:1001",
     },
     Mounts: [
-      ...["/tmp", "/home/appuser", "/.archon", "/opt/hapi/pi-agent"].map((Destination) => ({ Type: "tmpfs", Source: "", Destination, RW: true })),
+      // Docker 29.9.2 lists a --tmpfs only in HostConfig.Tmpfs, never here (probed by the task 9 review).
       ...["models.json", "models-store.json", "hapi-guard.json", "settings.json", "extensions"].map((f) => bind(join(w.build, "pi", f), `/opt/hapi/pi-agent/${f}`)),
       bind(join(w.build, "archon", "config.yaml"), "/.archon/config.yaml"),
       bind(join(w.build, "archon", "empty.env"), "/.archon/.env"),
@@ -412,7 +413,20 @@ export function runContainer(w: World, id = "ab12cd34ef56", over: { labels?: Rec
       { Type: "volume", Source: `/var/lib/docker/volumes/${name}-work/_data`, Destination: "/work", RW: true },
       { Type: "volume", Source: `/var/lib/docker/volumes/${name}-out/_data`, Destination: "/out", RW: true },
     ],
-    HostConfig: { PortBindings: {}, Tmpfs: { "/opt/hapi/pi-agent": "size=64m,uid=1001,gid=1001,mode=0700" } },
+    HostConfig: {
+      PortBindings: {},
+      Tmpfs: {
+        "/tmp": "size=1g,uid=1001,gid=1001,mode=1777",
+        "/home/appuser": "size=256m,uid=1001,gid=1001,mode=0700",
+        "/.archon": "size=512m,uid=1001,gid=1001,mode=0700",
+        "/opt/hapi/pi-agent": "size=64m,uid=1001,gid=1001,mode=0700",
+      },
+      CapDrop: ["ALL"],
+      ReadonlyRootfs: true,
+      SecurityOpt: ["no-new-privileges:true"],
+      PidsLimit: 2048,
+      Memory: 4 * 1024 ** 3,
+    },
   };
 }
 

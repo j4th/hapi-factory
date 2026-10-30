@@ -48,6 +48,11 @@ describe("tools.archon-validate", () => {
     const script = runOf(w, ARCHON_IMAGE)!.at(-1)!;
     expect(script).toContain("/app/packages/core/src/config/config-loader.ts");
     expect(script).toContain("loadConfig");
+    // Without the platform policies set first, loadConfig throws on the real image (task 9 review).
+    expect(script.indexOf("setPlatformPolicies([])")).toBeGreaterThan(-1);
+    expect(script.indexOf("setPlatformPolicies([])")).toBeLessThan(script.indexOf("await loadConfig"));
+    expect(script).toContain("/app/packages/core/src/platforms/registry.ts");
+    expect(runOf(w, ARCHON_IMAGE)).toContain("ARCHON_DOCKER=true");
     expect(script).toContain("enableExtensions");
   });
 

@@ -103,7 +103,8 @@ describe("runtime.run-container", () => {
     const w = await cleanWorld();
     const live = runContainer(w);
     live.Mounts.find((m) => m.Destination === "/opt/hapi/pi-agent/models.json")!.RW = true;
-    live.Mounts = live.Mounts.filter((m) => m.Destination !== "/.archon/.env" && !(m.Type === "tmpfs" && m.Destination === "/opt/hapi/pi-agent"));
+    live.Mounts = live.Mounts.filter((m) => m.Destination !== "/.archon/.env");
+    delete live.HostConfig!.Tmpfs!["/opt/hapi/pi-agent"];
     w.containers.push(live, runContainer(w, "0123456789ab"));
     const r = await check(w, "runtime.run-container");
     expect(r.status).toBe("fail");
@@ -127,6 +128,42 @@ describe("runtime.run-container", () => {
     expect(r.detail).toContain("PI_OFFLINE is not set");
     expect(r.detail).toContain("publishes a port");
     expect(r.detail).not.toContain("PI_TELEMETRY=1");
+  });
+
+  test("a live run container is held to every bind of the run definition, not a short list", async () => {
+    const w = await cleanWorld();
+    const live = runContainer(w);
+    for (const dest of ["/opt/hapi/pi-agent/settings.json", "/opt/hapi/pi-agent/extensions", "/opt/hapi/run.sh", "/home/appuser/.gitconfig", "/src/repo.git"]) live.Mounts.find((m) => m.Destination === dest)!.RW = true;
+    w.containers.push(live);
+    const r = await check(w, "runtime.run-container");
+    expect(r.status).toBe("fail");
+    for (const dest of ["/opt/hapi/pi-agent/settings.json", "/opt/hapi/pi-agent/extensions", "/opt/hapi/run.sh", "/home/appuser/.gitconfig", "/src/repo.git"]) expect(r.detail).toContain(`${dest} is not mounted read-only`);
+  });
+
+  test("an unexpected mount, a wrong pack source and a missing run volume fail", async () => {
+    const w = await cleanWorld();
+    const live = runContainer(w);
+    live.Mounts.push({ Type: "bind", Source: "/home/hapi", Destination: "/host", RW: false });
+    live.Mounts.find((m) => m.Destination === "/.archon/workflows/hapi")!.Source = "/tmp/planted-pack";
+    live.Mounts = live.Mounts.filter((m) => m.Destination !== "/out");
+    w.containers.push(live);
+    const r = await check(w, "runtime.run-container");
+    expect(r.status).toBe("fail");
+    expect(r.detail).toContain("/host is mounted but the run definition has no such mount");
+    expect(r.detail).toContain("/.archon/workflows/hapi is mounted from /tmp/planted-pack, not the default pack dir");
+    expect(r.detail).toContain("nothing is mounted at /out");
+  });
+
+  test("a live run container's hardening must be the definition's: capabilities, root fs, no-new-privileges, user, pids, memory", async () => {
+    const w = await cleanWorld();
+    const live = runContainer(w);
+    Object.assign(live.HostConfig!, { CapDrop: [], ReadonlyRootfs: false, SecurityOpt: [], PidsLimit: 0, Memory: 0 });
+    live.Config.User = "0:0";
+    delete live.HostConfig!.Tmpfs!["/tmp"];
+    w.containers.push(live);
+    const r = await check(w, "runtime.run-container");
+    expect(r.status).toBe("fail");
+    for (const part of ["does not drop ALL capabilities", "root filesystem is not read-only", "no-new-privileges:true is not set", "runs as 0:0, not 1001:1001", "pids limit is 0, not 2048", "memory limit is 0, not 4294967296", "no tmpfs at /tmp"]) expect(r.detail).toContain(part);
   });
 
   test("a stopped run container is not checked", async () => {

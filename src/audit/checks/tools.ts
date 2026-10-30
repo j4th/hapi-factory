@@ -85,7 +85,8 @@ const ARCHON_COMMANDS = ["validate workflows --json", "ai alias list --json", "a
 
 /** The fourth step: Archon's own `loadConfig` over the mounted config, printing what it makes of `assistants.pi.enableExtensions` (H-152). */
 const READ_BACK = "loadConfig: assistants.pi.enableExtensions";
-const READ_BACK_JS = 'import { loadConfig } from "/app/packages/core/src/config/config-loader.ts"; console.log(JSON.stringify((await loadConfig()).assistants?.pi?.enableExtensions))';
+// loadConfig throws on the 0.12.1 image unless the platform policies are set first, and with ARCHON_DOCKER=true (in serviceEnvironment) it reads /.archon.
+const READ_BACK_JS = 'import { setPlatformPolicies } from "/app/packages/core/src/platforms/registry.ts"; import { loadConfig } from "/app/packages/core/src/config/config-loader.ts"; setPlatformPolicies([]); console.log(JSON.stringify((await loadConfig()).assistants?.pi?.enableExtensions))';
 
 /** Runs in the Archon image: a scratch git repo (Archon needs one), then the three read-only commands and the read-back, each followed by its exit code. Fixed text. */
 const ARCHON_SCRIPT =

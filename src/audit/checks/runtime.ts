@@ -43,9 +43,17 @@ export interface Container {
   State?: { Running?: boolean };
   Path?: string;
   Args?: string[];
-  Config?: { Labels?: Record<string, string> | null; Env?: string[] | null; Cmd?: string[] | null; Entrypoint?: string[] | null };
+  Config?: { Labels?: Record<string, string> | null; Env?: string[] | null; Cmd?: string[] | null; Entrypoint?: string[] | null; User?: string | null };
   Mounts?: { Type?: string; Source?: string; Destination?: string; RW?: boolean }[] | null;
-  HostConfig?: { PortBindings?: Record<string, unknown> | null; Tmpfs?: Record<string, string> | null };
+  HostConfig?: {
+    PortBindings?: Record<string, unknown> | null;
+    Tmpfs?: Record<string, string> | null;
+    CapDrop?: string[] | null;
+    ReadonlyRootfs?: boolean;
+    SecurityOpt?: string[] | null;
+    PidsLimit?: number | null;
+    Memory?: number | null;
+  };
 }
 
 export type Stack = { containers: Container[] } | { unavailable: string };
@@ -153,42 +161,94 @@ function sampleInputs(packDir: string): RunInputs {
   };
 }
 
-/** How the run definition's `docker run` argv falls short of what a run container must be; empty if it doesn't. */
-function definitionProblems(argv: string[], packDir: string): string[] {
+/** What the run definition's argv says a run container is (the one source the live check compares against). */
+export interface RunShape {
+  tmpfs: Map<string, string>;
+  binds: Map<string, { src: string; ro: boolean }>;
+  volumes: Set<string>;
+  env: Map<string, string>;
+  capDrop: string[];
+  readOnly: boolean;
+  securityOpt: string[];
+  user: string | undefined;
+  pids: number | undefined;
+  memory: number | undefined;
+  ports: boolean;
+}
+
+const BYTES: Record<string, number> = { "": 1, b: 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3 };
+
+export function shapeOf(argv: string[]): RunShape {
   const after = (flag: string) => argv.flatMap((a, i) => (argv[i - 1] === flag ? [a] : []));
+  const mem = /^(\d+)([bkmg]?)$/i.exec(after("--memory")[0] ?? "");
+  const pids = after("--pids-limit")[0];
+  const shape: RunShape = {
+    tmpfs: new Map(after("--tmpfs").map((t) => [t.slice(0, t.indexOf(":")), t.slice(t.indexOf(":") + 1)] as [string, string])),
+    binds: new Map(),
+    volumes: new Set(),
+    env: new Map(after("-e").filter((e) => e.includes("=")).map((e) => [e.slice(0, e.indexOf("=")), e.slice(e.indexOf("=") + 1)] as [string, string])),
+    capDrop: after("--cap-drop"),
+    readOnly: argv.includes("--read-only"),
+    securityOpt: after("--security-opt"),
+    user: after("--user")[0],
+    pids: pids === undefined ? undefined : Number(pids),
+    memory: mem === null ? undefined : Number(mem[1]) * BYTES[mem[2]!.toLowerCase()]!,
+    ports: argv.some((a) => ["-p", "--publish", "-P", "--publish-all"].includes(a) || a.startsWith("--publish=")),
+  };
+  for (const v of after("-v")) {
+    const [src, dst, mode] = v.split(":") as [string, string, string?];
+    // A source that is a path is a bind of a host file; a name is a per-run volume (/work and /out), which is meant to be written.
+    if (src.startsWith("/")) shape.binds.set(dst, { src, ro: mode === "ro" });
+    else shape.volumes.add(dst);
+  }
+  return shape;
+}
+
+/** How the run definition's `docker run` argv falls short of what a run container must be; empty if it doesn't. */
+function definitionProblems(want: RunShape, packDir: string): string[] {
   const problems: string[] = [];
-  const tmpfs = after("--tmpfs").find((t) => t.startsWith(`${RUN_PATHS.piDir}:`));
+  const tmpfs = want.tmpfs.get(RUN_PATHS.piDir);
   if (tmpfs === undefined) problems.push(`no tmpfs at ${RUN_PATHS.piDir}`);
-  else if (tmpfs !== `${RUN_PATHS.piDir}:${PI_TMPFS}`) problems.push(`the tmpfs at ${RUN_PATHS.piDir} has options ${tmpfs.slice(RUN_PATHS.piDir.length + 1)}, not ${PI_TMPFS}`);
-  const binds = after("-v").map((v) => v.split(":") as [string, string, string?]);
-  // A source that is a path is a bind of a host file; a name is a per-run volume (/work and /out), which is meant to be written.
-  for (const [src, dst, mode] of binds) if (src.startsWith("/") && mode !== "ro") problems.push(`${dst} is not bound read-only`);
-  for (const dest of READ_ONLY_DESTINATIONS) if (!binds.some(([, dst]) => dst === dest)) problems.push(`nothing is bound at ${dest}`);
-  const pack = binds.find(([, dst]) => dst === RUN_PATHS.pack);
-  if (pack !== undefined && pack[0] !== packDir) problems.push(`${RUN_PATHS.pack} is bound from ${pack[0]}, not the default pack dir ${packDir}`);
-  const env = new Map(after("-e").filter((e) => e.includes("=")).map((e) => [e.slice(0, e.indexOf("=")), e.slice(e.indexOf("=") + 1)] as [string, string]));
-  problems.push(...envProblems(env));
-  if (argv.some((a) => ["-p", "--publish", "-P", "--publish-all"].includes(a) || a.startsWith("--publish="))) problems.push("it publishes a port (a run listens nowhere)");
+  else if (tmpfs !== PI_TMPFS) problems.push(`the tmpfs at ${RUN_PATHS.piDir} has options ${tmpfs}, not ${PI_TMPFS}`);
+  for (const [dst, b] of want.binds) if (!b.ro) problems.push(`${dst} is not bound read-only`);
+  for (const dest of READ_ONLY_DESTINATIONS) if (!want.binds.has(dest)) problems.push(`nothing is bound at ${dest}`);
+  const pack = want.binds.get(RUN_PATHS.pack);
+  if (pack !== undefined && pack.src !== packDir) problems.push(`${RUN_PATHS.pack} is bound from ${pack.src}, not the default pack dir ${packDir}`);
+  problems.push(...envProblems(want.env));
+  if (want.ports) problems.push("it publishes a port (a run listens nowhere)");
   return problems;
 }
 
-/** How a live run container's mounts, environment and ports fall short of the same. */
-function liveProblems(c: Container): string[] {
+/**
+ * How a live run container falls short of the definition `want`: every tmpfs (Docker lists a `--tmpfs` only in
+ * `HostConfig.Tmpfs`), every bind and volume (none missing, none unexpected, each bind read-only), the default pack
+ * dir, the environment, no published port, and the hardening flags.
+ */
+export function liveProblems(c: Container, want: RunShape, packDir: string): string[] {
   const problems: string[] = [];
-  const mounts = c.Mounts ?? [];
-  const tmpfs = mounts.find((m) => m.Destination === RUN_PATHS.piDir && m.Type === "tmpfs");
-  if (tmpfs === undefined) problems.push(`no tmpfs at ${RUN_PATHS.piDir}`);
-  else {
-    const options = c.HostConfig?.Tmpfs?.[RUN_PATHS.piDir];
-    if (options !== PI_TMPFS) problems.push(`the tmpfs at ${RUN_PATHS.piDir} has options ${options ?? "(none)"}, not ${PI_TMPFS}`);
+  const have = c.HostConfig?.Tmpfs ?? {};
+  for (const [path, options] of want.tmpfs) {
+    if (!Object.hasOwn(have, path)) problems.push(`no tmpfs at ${path}`);
+    else if (have[path] !== options) problems.push(`the tmpfs at ${path} has options ${have[path]}, not ${options}`);
   }
-  for (const dest of READ_ONLY_DESTINATIONS) {
+  for (const path of Object.keys(have)) if (!want.tmpfs.has(path)) problems.push(`${path} is a tmpfs but the run definition has no such mount`);
+  const mounts = c.Mounts ?? [];
+  for (const dest of [...want.binds.keys(), ...want.volumes]) {
     const m = mounts.find((x) => x.Destination === dest);
     if (m === undefined) problems.push(`nothing is mounted at ${dest}`);
-    else if (m.RW !== false) problems.push(`${dest} is not mounted read-only`);
+    else if (want.binds.has(dest) && m.RW !== false) problems.push(`${dest} is not mounted read-only`);
+    else if (dest === RUN_PATHS.pack && m.Source !== packDir) problems.push(`${dest} is mounted from ${m.Source}, not the default pack dir ${packDir}`);
   }
+  for (const m of mounts) if (m.Destination !== undefined && !want.binds.has(m.Destination) && !want.volumes.has(m.Destination)) problems.push(`${m.Destination} is mounted but the run definition has no such mount`);
   problems.push(...envProblems(envOf(c)));
   if (Object.keys(c.HostConfig?.PortBindings ?? {}).length > 0) problems.push("it publishes a port (a run listens nowhere)");
+  const h = c.HostConfig ?? {};
+  for (const cap of want.capDrop) if (!(h.CapDrop ?? []).includes(cap)) problems.push(`it does not drop ${cap} capabilities`);
+  if (want.readOnly && h.ReadonlyRootfs !== true) problems.push("its root filesystem is not read-only");
+  for (const opt of want.securityOpt) if (!(h.SecurityOpt ?? []).includes(opt)) problems.push(`${opt} is not set`);
+  if (want.user !== undefined && c.Config?.User !== want.user) problems.push(`it runs as ${c.Config?.User || "(the image's user)"}, not ${want.user}`);
+  if (want.pids !== undefined && h.PidsLimit !== want.pids) problems.push(`its pids limit is ${h.PidsLimit ?? 0}, not ${want.pids}`);
+  if (want.memory !== undefined && h.Memory !== want.memory) problems.push(`its memory limit is ${h.Memory ?? 0}, not ${want.memory}`);
   return problems;
 }
 
@@ -202,12 +262,13 @@ export async function runContainer(run: AuditRun): Promise<CheckResult[]> {
   const packDir = join(ctx.root, "archon", "workflows", "hapi");
   const argv = runArgs(service, sampleInputs(packDir), { project: PROJECT, image: service.image, root: ctx.root, buildDir: join(fresh.root, "build"), stateDir: "/audit/sample/state", user: ctx.user, env: ctx.env }, []);
   const fix = "the run container's definition is stack/compose.yaml's archon service, translated by src/run/spec.ts: restore them";
-  const static_ = definitionProblems(argv, packDir);
+  const want = shapeOf(argv);
+  const static_ = definitionProblems(want, packDir);
   if (static_.length > 0) return [result(id, "fail", `the run definition (runArgs, src/run/spec.ts): ${static_.join("; ")}. ${fix}`)];
 
   const runs = await runContainers(run);
   const live = "containers" in runs ? runs.containers.filter(isRunning) : [];
-  const bad = live.map((c) => [c, liveProblems(c)] as const).filter(([, p]) => p.length > 0);
+  const bad = live.map((c) => [c, liveProblems(c, want, packDir)] as const).filter(([, p]) => p.length > 0);
   if (bad.length > 0) {
     return [result(id, "fail", `${bad.map(([c, p]) => `${containerName(c)}: ${p.join("; ")}`).join("; ")}. A live run container must be as the run definition says: stop it with \`hapi run stop <id>\`, then ${fix}`)];
   }
