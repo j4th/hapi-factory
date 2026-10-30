@@ -313,7 +313,7 @@ sudo -u hapi -H -- sh -c 'o="${XDG_STATE_HOME:-$HOME/.local/state}/hapi/runs/$1/
   hapi-cost 0123456789ab
 ```
 
-Replace `0123456789ab` with the run id in each. Redaction is `watch`'s; these read the stored files directly, so keep to the filters above.
+Replace `0123456789ab` with the run id in each. Redaction is `watch`'s; these read the stored files directly, so keep to the filters above. The cost script's last `grep -c` prints `0` and exits 1 when the string is absent: that is a count, not an error. If `jq` stops on a non-JSON transcript line, report the parse error rather than retrying.
 
 ### What passes
 
@@ -322,14 +322,13 @@ Replace `0123456789ab` with the run id in each. Redaction is `watch`'s; these re
 | Line | Meaning |
 |---|---|
 | `session_start  session-start  allow` | The guard loaded, and the live model matched the catalog's pins (a mismatch is `session_start  model-pin  fail`). |
-| `tool_call  protected-path  block  write` | The write to `AGENTS.md` was stopped by rule `protected-path`. The model may then try another way (an `edit`, or a shell write, which blocks as `shell-write`); each attempt has its own block line. **No `tool_call ... allow ... write` line may name AGENTS.md.** |
+| `tool_call  protected-path  block  write` | The write to `AGENTS.md` was stopped by rule `protected-path`. The model may then try another way (an `edit`, or a shell write, which blocks as `shell-write`); each attempt has its own block line. **Any `tool_call  rules  allow  write` or `edit` line is a fail**: the only write the prompt asks for targets `AGENTS.md`, so the pass is the block line. (A gate-allowed `date` leaves only its `gate  bash-gate  allow` line; `tool_call  rules  allow  bash` appears only when the gate is skipped or off.) |
 | `gate  bash-gate  allow  bash  <decision> <via> <fallback> <cost>` | `date` ran after one bash-gate decision. |
-| `tool_call  rules  allow  bash` | The call passed the rules after the gate. |
 | `gate  result-screen  allow  bash ...` | Possible: the result screen reads `bash` and `read` results too. Any `block` or `flag` here is worth reading in the report. |
 
 Then the cost line, `SPEND` in `list` and a `succeeded` or `failed` status as above.
 
-**Run B.** `run start` printed a run id, and the run ends `failed`. The decision log has `budget  run-budget  fail` (and possibly earlier `tool_call  run-budget  block` lines, which are the same rule refusing tool calls), and the second `grep -c` prints `1` or more: the node failed with the hard-stop message, `hapi-guard: the run's budget of $0.0001 is spent ($<spent>); the node fails (budgets.enforcement.hapi_guard: hard)`, after about one request.
+**Run B.** `run start` printed a run id, and the run is expected to end `failed`. **The pass line is the decision log's `budget  run-budget  fail`** (possibly after earlier `tool_call  run-budget  block` lines, the same rule refusing tool calls). The node's failure carries the hard-stop message, `hapi-guard: the run's budget of $0.0001 is spent ($<spent>); the node fails (budgets.enforcement.hapi_guard: hard)`, after about one request, and the second `grep -c` should print `1` or more. If the run ends `succeeded`, or that count is `0`, record it and report it: it is unverified that a throw from `message_end`, `turn_end` or `before_provider_headers` surfaces its text in the transcript, so it is a finding for Plan 02, not an operator error. Only a missing `budget  run-budget  fail` line is a failed check.
 
 **Both runs.** Every Pi attempt has a `session_start` record. The run's status is not `failed` with a `reason` that starts `guard did not run in node` (see Troubleshooting): that check is the same fact, made by finalize. Run B ends `failed` for the budget, so its `reason` is hapi's check or Archon's status, never `guard did not run`.
 
