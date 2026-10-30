@@ -72,14 +72,30 @@ export function findSecret(text: string, s: Secrets): { name: string; exact: boo
 /** KEY_PATTERNS' names, which never clash with an env name (those are upper case). */
 export const PATTERN_NAMES: ReadonlySet<string> = new Set(KEY_PATTERNS.map((k) => k.name));
 
-/** A private key's whole block: its BEGIN line, its body, and its END line, or the rest of the text when it has none. */
-const PRIVATE_KEY_BLOCK = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g;
+const PEM_BEGIN = String.raw`-----BEGIN [A-Z ]*PRIVATE KEY-----`;
+const PEM_END = String.raw`-----END [A-Z ]*PRIVATE KEY-----`;
+/** What a line of a private key's body holds: base64, a `Name: value` header (an encrypted key's `Proc-Type:`), or nothing. */
+const PEM_BODY = String.raw`(?:[A-Za-z0-9+/=]+|[A-Za-z-]+: [^\r\n]*|)`;
+/** One whole line of a private key's body, without its newline (as `hapi run watch` gets a line). */
+export const PEM_BODY_LINE = new RegExp(`^${PEM_BODY}\\r?$`);
+/** One whole line that is a private key's END line. */
+export const PEM_END_LINE = new RegExp(`^${PEM_END}\\r?$`);
+/** A BEGIN line with no END line after it in the same text: the key's body is still to come. */
+export const PEM_OPEN = new RegExp(`${PEM_BEGIN}(?![\\s\\S]*${PEM_END})`);
+/**
+ * A private key's block: its BEGIN line, then each following line while it is a body line (PEM_BODY), then its END
+ * line if that comes next. It stops at the first line that is neither, so a BEGIN line alone hides no text after it,
+ * and a truncated key never runs on into the next. Each body line is matched up to a line end it looks ahead for, so
+ * a long line that isn't one costs one linear scan, never a backtracking blow-up.
+ */
+const PRIVATE_KEY_BLOCK = new RegExp(`${PEM_BEGIN}(?:\\r?\\n${PEM_BODY}(?=\\r?\\n|$))*(?:\\r?\\n${PEM_END})?`, "g");
 
 /**
  * KEY_PATTERNS as redaction patterns, global, by the same names. `private-key` matches only a key's BEGIN line,
  * which is enough to find one (`findSecret`), but redacting that line alone would leave the key's body in the text,
  * so it is redacted as PRIVATE_KEY_BLOCK (ledger 168). That form lives here, not in policy/decisions/write-gate.ts,
- * which is under policy/**. Shared with `hapi run watch` (src/run/sanitize.ts).
+ * which is under policy/**. Shared with `hapi run watch` (src/run/sanitize.ts), whose live printer uses the same
+ * line rule (PEM_BODY_LINE) across the lines it is handed one at a time.
  */
 export const REDACT_PATTERNS: readonly { name: string; re: RegExp }[] = KEY_PATTERNS.map(({ name, re }) => ({
   name,

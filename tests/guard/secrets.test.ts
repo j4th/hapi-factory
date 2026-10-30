@@ -183,7 +183,7 @@ test("a key-shaped string is redacted to [hapi: <pattern name> redacted], in too
   expect(readFileSync(join(h.out, "decisions.jsonl"), "utf8").includes(token)).toBe(false);
 });
 
-test("a private key is redacted whole, its BEGIN line to its END line, or to the end of the text with no END line (ledger 168)", async () => {
+test("a private key is redacted whole: its BEGIN line, its PEM body lines and its END line (ledger 168)", async () => {
   const h = setup({ settings: gatesOff });
   await h.start();
   const body = Array.from({ length: 4 }, () => randomBytes(48).toString("base64"));
@@ -196,7 +196,13 @@ test("a private key is redacted whole, its BEGIN line to its END line, or to the
   // Two blocks are each redacted, and the text between them stays.
   const two = await h.result("read", [{ type: "text", text: `${begin}\n${body[0]}\n${end}\nkeep this\n${begin}\n${body[1]}\n${end}\ntail` }]);
   expect(two.content).toEqual([{ type: "text", text: "[hapi: private-key redacted]\nkeep this\n[hapi: private-key redacted]\ntail" }]);
-  const shown = JSON.stringify([full, cut, two]) + readFileSync(join(h.out, "decisions.jsonl"), "utf8");
+  // The span is the key's PEM lines only (base64, a `Name: value` header, an empty line): a BEGIN line can't hide the
+  // prose after it, and a truncated key keeps the text between it and the next one.
+  const lone = await h.result("read", [{ type: "text", text: `${begin}\nthis prose is not a key, and stays.\nnor is this.` }]);
+  expect(lone.content).toEqual([{ type: "text", text: "[hapi: private-key redacted]\nthis prose is not a key, and stays.\nnor is this." }]);
+  const truncated = await h.result("read", [{ type: "text", text: `${begin}\n${body[0]}\nthe text between stays\n${begin}\nProc-Type: 4,ENCRYPTED\n\n${body[1]}\n${end}\nend` }]);
+  expect(truncated.content).toEqual([{ type: "text", text: "[hapi: private-key redacted]\nthe text between stays\n[hapi: private-key redacted]\nend" }]);
+  const shown = JSON.stringify([full, cut, two, truncated]) + readFileSync(join(h.out, "decisions.jsonl"), "utf8");
   for (const line of body) expect(shown.includes(line)).toBe(false);
   // Finding one still needs only the BEGIN line: a write that holds the block blocks.
   expect((await h.tool("write", { path: "notes.txt", content: `${begin}\n${body[0]}\n${end}\n` }))?.reason).toContain("secret: private-key");

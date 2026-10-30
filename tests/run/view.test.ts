@@ -75,7 +75,7 @@ describe("redactSecrets", () => {
     expect(redactSecrets(`${key}/${key}`, {})).toBe("[hapi: anthropic redacted]/[hapi: anthropic redacted]");
   });
 
-  test("a private key is redacted whole: its BEGIN line to its END line, or to the end of the text with no END line (ledger 168)", () => {
+  test("a private key is redacted whole: its BEGIN line, its PEM body lines and its END line (ledger 168)", () => {
     const body = Array.from({ length: 3 }, () => randomBytes(48).toString("base64"));
     const begin = "-----BEGIN " + "OPENSSH PRIVATE KEY-----";
     const end = "-----END " + "OPENSSH PRIVATE KEY-----";
@@ -87,6 +87,11 @@ describe("redactSecrets", () => {
     // Two blocks are each redacted, and the text between them stays.
     expect(redactSecrets(`${begin}\n${body[0]}\n${end}\nkeep this\n${begin}\n${body[1]}\n${end}`, {})).toBe(
       "[hapi: private-key redacted]\nkeep this\n[hapi: private-key redacted]",
+    );
+    // Only the key's PEM lines: a lone BEGIN line keeps the prose after it, and a truncated key the text before the next.
+    expect(redactSecrets(`${begin}\nprose after a BEGIN line stays\nand so does this`, {})).toBe("[hapi: private-key redacted]\nprose after a BEGIN line stays\nand so does this");
+    expect(redactSecrets(`${begin}\n${body[0]}\nthe text between stays\n${begin}\n${body[1]}\n${end}`, {})).toBe(
+      "[hapi: private-key redacted]\nthe text between stays\n[hapi: private-key redacted]",
     );
   });
 });
