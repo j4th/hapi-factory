@@ -70,8 +70,8 @@ export interface RunDeps {
   packDir: string;
   /** policy/runs.yaml: the cap on live runs and on each output file. */
   runs: Runs;
-  /** Starts `hapi run supervise <id>`, detached. */
-  spawnDetached: (argv: string[]) => void;
+  /** Starts `hapi run supervise <id>`, detached: settles once it has started, and rejects if it couldn't. */
+  spawnDetached: (argv: string[]) => Promise<void>;
 }
 
 export interface RunInputs {

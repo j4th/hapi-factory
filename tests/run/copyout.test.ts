@@ -8,20 +8,21 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { COPY_SCRIPT, copyOut, HELPER_TIMEOUT_S, LIST_SCRIPT, OUTPUT_FILES } from "../../src/run/copyout";
+import { COPY_SCRIPT, copyOut, HELPER_HOST_TIMEOUT_S, HELPER_KILL_AFTER_S, HELPER_TIMEOUT_S, LIST_SCRIPT, OUTPUT_FILES } from "../../src/run/copyout";
 import { PROJECT_LABEL, RUN_LABEL } from "../../src/stack/up";
 import { cleanup, tempDir } from "../secrets/helpers";
-import { type FakeFile, fakeRun, file } from "./helpers";
+import { type FakeFile, type FakeOptions, fakeRun, file } from "./helpers";
 
 afterEach(cleanup);
 
 const ID = "ab12cd34ef56";
 const VOL = `hapi-run-${ID}-out`;
 const LIMITS = { bundle: 256, transcript: 64, decisions: 16, result: 4 };
+const TIMED_OUT = `timed out (after ${HELPER_TIMEOUT_S} s in the helper, or ${HELPER_HOST_TIMEOUT_S} s in all)`;
 
 /** A world with one output volume holding `files`, and a fresh destination dir. */
-function withVolume(files: Record<string, FakeFile>) {
-  const f = fakeRun();
+function withVolume(files: Record<string, FakeFile>, o: FakeOptions = {}) {
+  const f = fakeRun(o);
   f.world.volumes.set(VOL, { labels: { [RUN_LABEL]: ID, [PROJECT_LABEL]: "hapi" }, owner: "1001:1001", files: new Map(Object.entries(files)) });
   const dest = join(f.tmp, "record", "out");
   return { f, dest };
@@ -115,7 +116,7 @@ describe("copyOut", () => {
     const runBytes = f.deps.runBytes;
     f.deps.runBytes = async () => ({ code: 124, stdout: new Uint8Array([1, 2]), stderr: "" });
     let r = await copyOut(VOL, dest, LIMITS, f.deps);
-    expect(r.problems).toEqual([`copying result.json out timed out after ${HELPER_TIMEOUT_S} s: not copied`]);
+    expect(r.problems).toEqual([`copying result.json out ${TIMED_OUT}: not copied`]);
     expect(existsSync(join(dest, "result.json"))).toBe(false);
     f.deps.runBytes = async () => ({ code: 125, stdout: new Uint8Array(), stderr: "daemon says no" });
     r = await copyOut(VOL, dest, LIMITS, f.deps);
@@ -145,17 +146,30 @@ describe("copyOut", () => {
     const { f, dest } = withVolume({ "result.json": file("{}") });
     await copyOut(VOL, dest, LIMITS, f.deps);
     expect(f.calls[0]!.cmd).toEqual(["docker", "volume", "inspect", "--format", "{{.Name}}", VOL]);
-    const helpers = f.calls.filter((c) => c.cmd[1] === "run");
+    const helpers = f.calls.filter((c) => c.cmd.includes("--entrypoint"));
     expect(helpers).toHaveLength(2);
     for (const { cmd } of helpers) {
       const script = cmd.includes(LIST_SCRIPT) ? LIST_SCRIPT : COPY_SCRIPT;
       expect(cmd.slice(0, cmd.indexOf("-c") + 2)).toEqual([
+        // The host's bound on the whole helper: TERM, which the docker CLI passes on, then KILL.
+        "timeout", "-k", String(HELPER_KILL_AFTER_S), String(HELPER_HOST_TIMEOUT_S),
         "docker", "run", "--rm", "--pull", "never", "--network", "none", "--read-only", "--user", "1001:1001", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
         "--label", RUN_LABEL, "--label", `${PROJECT_LABEL}=hapi`, "-v", `${VOL}:/out:ro`, "--entrypoint", "sh", "hapi-factory/archon:0.12.1", "-c", script,
       ]);
     }
-    // Every read is bounded in time inside the helper.
+    // The listing and every read are bounded in time inside the helper too, below the host's bound.
+    expect(LIST_SCRIPT).toStartWith(`exec timeout ${HELPER_TIMEOUT_S} sh -c '`);
     expect(COPY_SCRIPT).toContain(`timeout ${HELPER_TIMEOUT_S} head -c "$2" "$f"`);
+    expect(HELPER_HOST_TIMEOUT_S).toBeGreaterThan(HELPER_TIMEOUT_S);
+  });
+
+  test("a helper that never returns, as on a hung daemon, fails its step at the host's bound instead of hanging", async () => {
+    const files = { "result.json": file("{}"), "transcript.jsonl": file("{}\n") };
+    const list = withVolume(files, { hangs: (c) => c.includes(LIST_SCRIPT) });
+    expect(await copyOut(VOL, list.dest, LIMITS, list.f.deps)).toEqual({ copied: [], problems: [`listing the run's output volume ${TIMED_OUT}: nothing was copied`] });
+    const read = withVolume(files, { hangs: (c) => c.includes(COPY_SCRIPT) && c.at(-2) === "result.json" });
+    expect(await copyOut(VOL, read.dest, LIMITS, read.f.deps)).toEqual({ copied: ["transcript.jsonl"], problems: [`copying result.json out ${TIMED_OUT}: not copied`] });
+    expect(readdirSync(read.dest)).toEqual(["transcript.jsonl"]);
   });
 });
 

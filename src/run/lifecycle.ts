@@ -2,7 +2,10 @@
  * `hapi run start`, `stop` and `supervise` (design §3.1; §6a items 11, 12, 14
  * and 16), on the host, as the hapi user: as anyone else each re-execs
  * `mise run hapi -- run <sub> ...` as hapi (`reexecScript("hapi")`, as `up`
- * does), and HAPI_ALLOW_CURRENT_USER=1 is the same dev-only downgrade.
+ * does), and HAPI_ALLOW_CURRENT_USER=1 is the same dev-only downgrade. The
+ * re-exec runs in hapi's checkout, so `start` first makes `--repo` and
+ * `--work-order` absolute from the caller's working dir (a path that isn't
+ * there is a usage error).
  *
  * `start`, in order, refusing at the first failure:
  * 1. reap (`reapRuns`), then validate: the work order (`validateWorkOrder`;
@@ -17,13 +20,16 @@
  * 4. `egress-archon` joined to it under the alias the proxy variables name
  *    (spike 07 finding 13);
  * 5. the two volumes, chowned to 1001 by a one-shot helper with CAP_CHOWN
- *    alone: a fresh volume's root is root's (spike 07 finding 12);
+ *    alone: a fresh volume's root is root's (spike 07 finding 12). Like every
+ *    helper, it runs under the host's `timeout` (./copyout.ts `bounded`);
  * 6. the run container, its secrets passed by name, their values in the docker
  *    CLI's env only;
- * 7. a detached `hapi run supervise <id>`.
+ * 7. a detached `hapi run supervise <id>`, awaited until its process has
+ *    started: one that can't start is a failed step.
  * A failure in 3-7 removes what start made (egress disconnected before its
  * network goes) and the run's dir, then releases the lock. start prints the
- * run id and returns at once.
+ * run id and returns at once. A supervisor that starts and then dies is left
+ * to the reap (below): nothing in start can see it.
  *
  * `supervise` waits for the container (`docker wait` under a host `timeout`
  * to the run's deadline, the work order's budget.minutes), stops it at the
@@ -57,7 +63,7 @@ import { composeServices } from "../stack/compose";
 import { currentUserOverride, definedEnv, HAPI_USER, networkProblem, reexec, removeRuns, runCommand } from "../stack/up";
 import { loadWorkOrder } from "../workorder/validate";
 import { parseRunId, parseStart, runDeps, START_USAGE, STOP_USAGE, SUPERVISE_USAGE } from "./cli";
-import { copyOut } from "./copyout";
+import { bounded, copyOut, HELPER_HOST_TIMEOUT_S, timedOut } from "./copyout";
 import {
   capacityProblem,
   createRun,
@@ -85,7 +91,7 @@ import { APP_USER, PROXY_ALIAS, runArgs, type RunDeps, type RunInputs, runLabels
  * that leaves a stopped run without its outputs. Spike 07 saw a bash-only run's post-run steps take under a second.
  */
 export const STOP_GRACE_S = 30;
-/** How long `finalizeRun` waits for another process finalizing the same run: four copy-outs at their timeout, and the rest. */
+/** How long `finalizeRun` waits for another process finalizing the same run: the listing and four reads at their host bound and KILL, and the rest. */
 const FINALIZE_WAIT_S = 900;
 
 const firstLine = (s: string | undefined) => (s ?? "").trim().split("\n")[0]?.slice(0, 300) || "(no error output)";
@@ -184,7 +190,9 @@ async function createRunObjects(d: RunDeps, rec: RunRecord, argv: string[], secr
     if (r.code !== 0) {
       let why = firstLine(r.stderr);
       for (const v of Object.values(secrets)) if (v.length >= 4) why = why.replaceAll(v, "[a secret value]");
-      throw new Error(`${what} failed (exit ${r.code}): ${why}`);
+      // `cmd` starts with `timeout` only when it is a helper `bounded` put under the host's bound.
+      const how = cmd[0] === "timeout" && timedOut(r.code) ? `timed out after ${HELPER_HOST_TIMEOUT_S} s` : "failed";
+      throw new Error(`${what} ${how} (exit ${r.code}): ${why}`);
     }
     return r;
   };
@@ -200,22 +208,45 @@ async function createRunObjects(d: RunDeps, rec: RunRecord, argv: string[], secr
   if (problem !== undefined) throw new Error(problem);
   await must(`docker network connect ${rec.network} ${d.egress}`, ["docker", "network", "connect", "--alias", PROXY_ALIAS, rec.network, d.egress]);
   for (const v of [rec.volumes.work, rec.volumes.out]) await must(`docker volume create ${v}`, ["docker", "volume", "create", ...labels, v]);
-  await must("the volume chown helper", [
+  await must("the volume chown helper", bounded([
     "docker", "run", "--rm", "--pull", "never", "--network", "none", "--read-only", "--user", "0:0", "--cap-drop", "ALL", "--cap-add", "CHOWN", "--security-opt", "no-new-privileges:true",
     ...labels, "-v", `${rec.volumes.work}:/w`, "-v", `${rec.volumes.out}:/o`, "--entrypoint", "chown", d.image, APP_USER, "/w", "/o",
-  ]);
+  ]));
   await must(`docker run ${rec.container}`, argv, { ...definedEnv(d.env), ...secrets });
-  d.spawnDetached(["hapi", "run", "supervise", rec.runId]);
+  await d.spawnDetached(["hapi", "run", "supervise", rec.runId]);
+}
+
+/** Whether nothing is at `p` (ENOENT, or a file where a dir was named). A path that can't be looked at for another reason is left to the step that reads it. */
+async function absent(p: string): Promise<boolean> {
+  try {
+    await stat(p);
+    return false;
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    return code === "ENOENT" || code === "ENOTDIR";
+  }
 }
 
 /** `hapi run start --repo <path> --work-order <file> [--public] [--budget-usd <n>] [--retry-of <run-id>]`: see the module comment. */
 export async function runStart(args: string[], deps: Partial<RunDeps> = {}): Promise<number> {
-  const opts = parseStart(args);
-  if (opts === undefined) {
+  const parsed = parseStart(args);
+  if (parsed === undefined) {
     console.error(START_USAGE);
     return 2;
   }
-  return asHapi("start", args, deps, async (d) => {
+  // The re-exec runs in hapi's checkout (`reexecScript`), so both paths are made absolute here, from the caller's
+  // working dir, and one that isn't there is a usage error before anything runs.
+  const opts = { ...parsed, repo: resolve(parsed.repo), workOrder: resolve(parsed.workOrder) };
+  for (const [flag, p] of [["--repo", opts.repo], ["--work-order", opts.workOrder]] as const) {
+    if (await absent(p)) {
+      console.error(`hapi run start: ${flag} ${p} does not exist: name a path relative to where you run hapi, or an absolute one`);
+      console.error(START_USAGE);
+      return 2;
+    }
+  }
+  // parseStart has checked that each value follows its flag and that none starts with "-", so only the two values match.
+  const absolute = args.map((a, i) => (args[i - 1] === "--repo" ? opts.repo : args[i - 1] === "--work-order" ? opts.workOrder : a));
+  return asHapi("start", absolute, deps, async (d) => {
     await reapRuns(d);
     const order = loadWorkOrder(opts.workOrder);
     if (order.egress_extra.length > 0) throw new Error("egress_extra isn't supported yet (design §3.1, H-088); remove it or wait for the per-run proxy");

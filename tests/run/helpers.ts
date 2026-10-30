@@ -92,12 +92,21 @@ function volumeAt(cmd: string[], dest: string): string | undefined {
 const ok = (stdout = "") => ({ code: 0, stdout, stderr: "" });
 const fail = (stderr: string, code = 1) => ({ code, stdout: "", stderr });
 
+/** `cmd` without the host's `timeout -k <k> <s>` in front, which bounds every helper's `docker run`. */
+export const unbounded = (cmd: string[]) => (cmd[0] === "timeout" && cmd[1] === "-k" ? cmd.slice(4) : cmd);
+
 export interface FakeOptions {
   project?: string;
   user?: string;
   env?: Record<string, string>;
   /** Commands (prefixes of the joined argv) that exit 1. */
   failing?: string[];
+  /**
+   * Whether a helper run (its docker argv) never returns, as on a hung daemon. Under the host's
+   * `timeout -k <k> <s>` the fake answers 137, as timeout does once its KILL has ended a docker CLI that passed
+   * the TERM on and kept waiting; bare, the call never settles.
+   */
+  hangs?: (cmd: string[]) => boolean;
   /** The exit code of `timeout <s> docker wait <run>`: 0 (the run exited) or 124 (the deadline came first). */
   waitCode?: number;
   /** What `git bundle list-heads` prints. */
@@ -126,10 +135,12 @@ export function fakeRun(o: FakeOptions = {}) {
   const spawned: string[][] = [];
   const project = o.project ?? "hapi";
 
-  const run: RunDeps["run"] = async (cmd, opts) => {
-    calls.push({ cmd, env: opts.env, bytes: false });
-    o.onCall?.(cmd);
+  const run: RunDeps["run"] = async (full, opts) => {
+    calls.push({ cmd: full, env: opts.env, bytes: false });
+    o.onCall?.(full);
+    const cmd = unbounded(full);
     const joined = cmd.join(" ");
+    if (o.hangs?.(cmd)) return cmd === full ? new Promise<never>(() => {}) : fail("", 137);
     if (o.failing?.some((f) => joined.startsWith(f))) return fail("boom");
     if (cmd[0] === "sudo") return ok();
     if (cmd[0] === "timeout" && cmd[2] === "docker" && cmd[3] === "wait") {
@@ -231,9 +242,11 @@ export function fakeRun(o: FakeOptions = {}) {
     throw new Error(`fake: unexpected command ${joined}`);
   };
 
-  const runBytes: RunDeps["runBytes"] = async (cmd, env) => {
-    calls.push({ cmd, env, bytes: true });
-    o.onCall?.(cmd);
+  const runBytes: RunDeps["runBytes"] = async (full, env) => {
+    calls.push({ cmd: full, env, bytes: true });
+    o.onCall?.(full);
+    const cmd = unbounded(full);
+    if (o.hangs?.(cmd)) return cmd === full ? new Promise<never>(() => {}) : { code: 137, stdout: new Uint8Array(), stderr: "" };
     if (!cmd.includes(COPY_SCRIPT)) throw new Error(`fake: unexpected byte command ${cmd.join(" ")}`);
     const v = world.volumes.get(volumeAt(cmd, "/out") ?? "");
     if (v === undefined) return { code: 125, stdout: new Uint8Array(), stderr: "no such volume" };
@@ -257,7 +270,7 @@ export function fakeRun(o: FakeOptions = {}) {
     buildDir,
     packDir: join(REPO, "archon", "workflows", "hapi"),
     runs: { max_live: 1, retention_days: 14, ...o.runs, output_limits_mb: { bundle: 256, transcript: 64, decisions: 16, result: 4, ...o.runs?.output_limits_mb } },
-    spawnDetached: (argv) => void spawned.push(argv),
+    spawnDetached: async (argv) => void spawned.push(argv),
   };
   return { deps, calls, world, spawned, tmp, xdg };
 }

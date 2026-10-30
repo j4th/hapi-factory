@@ -88,17 +88,24 @@ export const runBytes: RunDeps["runBytes"] = async (cmd, env) => {
  * Starts `argv` in a session of its own (`detached`, so neither the caller's
  * exit nor its terminal's hangup ends it), from the checkout, with this
  * process's env. "hapi" is this CLI: the same bun and the same src/cli.ts.
- * Its output is appended to `<stateDir>/supervise.log` (0600).
+ * Its output is appended to `<stateDir>/supervise.log` (0600). Settles once
+ * the child has started (its `spawn` event), and rejects with its `error`:
+ * `spawn` reports ENOENT, EACCES or EAGAIN that way, after it has returned.
  */
 function spawnDetached(root: string, stateDir: string, env: Env): RunDeps["spawnDetached"] {
-  return (argv) => {
+  return async (argv) => {
     const cmd = argv[0] === "hapi" ? [process.execPath, join(root, "src", "cli.ts"), ...argv.slice(1)] : argv;
     mkdirSync(stateDir, { recursive: true, mode: 0o700 });
     const log = openSync(join(stateDir, "supervise.log"), "a", 0o600);
     try {
-      const child = spawn(cmd[0]!, cmd.slice(1), { cwd: root, env: definedEnv(env), detached: true, stdio: ["ignore", log, log] });
-      child.on("error", (e) => console.error(`hapi run: cannot start ${argv.join(" ")}: ${e.message}`));
-      child.unref();
+      await new Promise<void>((started, failed) => {
+        const child = spawn(cmd[0]!, cmd.slice(1), { cwd: root, env: definedEnv(env), detached: true, stdio: ["ignore", log, log] });
+        child.once("spawn", started);
+        child.once("error", failed);
+        child.unref();
+      });
+    } catch (e) {
+      throw new Error(`cannot start ${argv.join(" ")}: ${(e as Error).message}`);
     } finally {
       closeSync(log);
     }

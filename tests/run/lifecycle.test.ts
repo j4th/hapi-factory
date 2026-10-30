@@ -8,16 +8,17 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join, relative } from "node:path";
 import { main } from "../../src/cli";
-import { START_USAGE } from "../../src/run/cli";
+import { runDeps, START_USAGE } from "../../src/run/cli";
+import { COPY_SCRIPT, HELPER_HOST_TIMEOUT_S, HELPER_KILL_AFTER_S, HELPER_TIMEOUT_S, LIST_SCRIPT } from "../../src/run/copyout";
 import { bundleProblem, finalizeRun, guardProblems, reapRuns, runStart, runStop, runSupervise, STOP_GRACE_S } from "../../src/run/lifecycle";
 import { readRecord, RUN_ID, runKey } from "../../src/run/records";
 import { reexecScript, runCommand } from "../../src/stack/up";
 import { loadWorkOrder } from "../../src/workorder/validate";
 import { capture, caught, cleanup, tempDir } from "../secrets/helpers";
 import { REPO } from "../stack/helpers";
-import { type Call, completedOutputs, fakeRepo, fakeRun, fakeSecret, file, NOW, SHA, seedRun, writeArchonEnv, writeOrder } from "./helpers";
+import { type Call, completedOutputs, fakeRepo, fakeRun, fakeSecret, file, NOW, SHA, seedRun, unbounded, writeArchonEnv, writeOrder } from "./helpers";
 
 afterEach(cleanup);
 
@@ -34,8 +35,12 @@ function ready(o: Parameters<typeof fakeRun>[0] = {}) {
   return { ...f, secret, repo: fakeRepo(f.tmp), order: writeOrder(f.tmp) };
 }
 
-/** The calls that create, connect or run something (not listings, inspects or git). */
-const changes = (calls: Call[]) => calls.filter((c) => c.cmd[0] === "docker" && !["ps", "inspect", "ls"].includes(c.cmd[1] === "network" || c.cmd[1] === "volume" ? c.cmd[2]! : c.cmd[1]!));
+/** The calls that create, connect or run something (not listings, inspects or git), a helper with its host bound. */
+const changes = (calls: Call[]) =>
+  calls.filter((c) => {
+    const d = unbounded(c.cmd);
+    return d[0] === "docker" && !["ps", "inspect", "ls"].includes(d[1] === "network" || d[1] === "volume" ? d[2]! : d[1]!);
+  });
 const locksIn = (xdg: string) => (existsSync(join(xdg, "hapi", "locks")) ? readdirSync(join(xdg, "hapi", "locks")).filter((n) => n.endsWith(".lock")) : []);
 
 describe("hapi run start: refusals", () => {
@@ -144,6 +149,7 @@ describe("hapi run start: the order of steps", () => {
       ["docker", "volume", "create", ...labels, `${N}-work`],
       ["docker", "volume", "create", ...labels, `${N}-out`],
       [
+        "timeout", "-k", String(HELPER_KILL_AFTER_S), String(HELPER_HOST_TIMEOUT_S),
         "docker", "run", "--rm", "--pull", "never", "--network", "none", "--read-only", "--user", "0:0", "--cap-drop", "ALL", "--cap-add", "CHOWN", "--security-opt", "no-new-privileges:true",
         ...labels, "-v", `${N}-work:/w`, "-v", `${N}-out:/o`, "--entrypoint", "chown", "hapi-factory/archon:0.12.1", "1001:1001", "/w", "/o",
       ],
@@ -209,6 +215,33 @@ describe("hapi run start: the order of steps", () => {
     expect(err[0]).toBe("hapi run start: running as hapi (sudo -u hapi -H), not dev. For development only, HAPI_ALLOW_CURRENT_USER=1 runs it as dev instead (docs/runbooks/stack.md).");
     expect(existsSync(f.deps.stateDir)).toBe(false);
   });
+
+  test("a relative --repo or --work-order is made absolute from the caller's directory before the re-exec, which runs in hapi's checkout", async () => {
+    capture();
+    const f = ready({ user: "dev" });
+    const rel = (p: string) => relative(process.cwd(), p);
+    expect([isAbsolute(rel(f.repo)), isAbsolute(rel(f.order))]).toEqual([false, false]);
+    expect(await runStart(["--public", "--repo", rel(f.repo), "--work-order", rel(f.order), "--budget-usd", "1.50"], f.deps)).toBe(0);
+    // `reexecScript` cd's to hapi's checkout, where `--repo .` would name hapi-factory itself.
+    expect(f.calls.map((c) => c.cmd)).toEqual([
+      ["sudo", "-u", "hapi", "-H", "--", "sh", "-c", reexecScript("hapi"), "hapi-stack", "run", "start", "--public", "--repo", f.repo, "--work-order", f.order, "--budget-usd", "1.50"],
+    ]);
+  });
+
+  test("a --repo or --work-order that isn't there, from the caller's directory, is a usage error before any re-exec", async () => {
+    const { err } = capture();
+    const f = ready({ user: "dev" });
+    const missing = join(f.tmp, "no-such-repo");
+    expect(await runStart(["--repo", relative(process.cwd(), missing), "--work-order", f.order], f.deps)).toBe(2);
+    expect(await runStart(["--repo", f.repo, "--work-order", join(f.order, "x.yaml")], f.deps)).toBe(2);
+    expect(f.calls).toEqual([]);
+    expect(err).toEqual([
+      `hapi run start: --repo ${missing} does not exist: name a path relative to where you run hapi, or an absolute one`,
+      START_USAGE,
+      `hapi run start: --work-order ${join(f.order, "x.yaml")} does not exist: name a path relative to where you run hapi, or an absolute one`,
+      START_USAGE,
+    ]);
+  });
 });
 
 describe("hapi run start: rollback", () => {
@@ -219,8 +252,10 @@ describe("hapi run start: rollback", () => {
       const { err } = capture();
       const f = ready(failing === "spawn" ? {} : { failing: [failing] });
       if (failing === "spawn") {
-        f.deps.spawnDetached = () => {
-          throw new Error("cannot start the supervisor");
+        // As the real one fails: child_process.spawn reports ENOENT, EACCES or EAGAIN on its `error` event, after it has returned.
+        f.deps.spawnDetached = async () => {
+          await Bun.sleep(1);
+          throw new Error("cannot start hapi run supervise: spawn EAGAIN");
         };
       }
       expect([failing, await runStart(["--repo", f.repo, "--work-order", f.order], f.deps)]).toEqual([failing, 1]);
@@ -235,13 +270,33 @@ describe("hapi run start: rollback", () => {
     }
   });
 
+  test("a chown helper that never returns fails start at the host's bound instead of hanging, and what start made is removed", async () => {
+    const { err } = capture();
+    const f = ready({ hangs: (c) => c.includes("chown") });
+    expect(await runStart(["--repo", f.repo, "--work-order", f.order], f.deps)).toBe(1);
+    expect(err.at(-1)).toBe(`hapi run start: the volume chown helper timed out after ${HELPER_HOST_TIMEOUT_S} s (exit 137): (no error output). What start had created was removed.`);
+    expect([f.world.containers.size, f.world.networks.size, f.world.volumes.size, readdirSync(f.deps.stateDir), locksIn(f.xdg)]).toEqual([0, 0, 0, [], []]);
+    expect(f.spawned).toEqual([]);
+  });
+
+  test("the host's supervisor spawn settles once the child has started, and rejects when it can't start", async () => {
+    const dir = tempDir("hapi-run-spawn-");
+    const d = await runDeps({ root: dir, stateDir: join(dir, "state"), env: { PATH: process.env.PATH ?? "/usr/bin:/bin" }, image: "x", runs: fakeRun().deps.runs });
+    await d.spawnDetached(["true"]);
+    expect(statSync(join(dir, "state", "supervise.log")).mode & 0o777).toBe(0o600);
+    const missing = join(dir, "no-such-supervisor");
+    const e = await caught(d.spawnDetached([missing]));
+    expect(e.message).toStartWith(`cannot start ${missing}: `);
+    expect(e.message).toContain("ENOENT");
+  });
+
   test("a run network that isn't internal or isn't private stops start, and what it made is removed", async () => {
     for (const o of [{ internal: false }, { subnet: "100.64.0.0/24" }]) {
       const { err } = capture();
       const f = ready(o);
       expect(await runStart(["--repo", f.repo, "--work-order", f.order], f.deps)).toBe(1);
       expect(err.at(-1)).toMatch(/^hapi run start: network hapi-run-[0-9a-f]{12} (is not internal|has subnet 100\.64\.0\.0\/24)/);
-      expect(changes(f.calls).some((c) => c.cmd[1] === "run" || c.cmd[2] === "connect")).toBe(false);
+      expect(changes(f.calls).some((c) => unbounded(c.cmd)[1] === "run" || c.cmd[2] === "connect")).toBe(false);
       expect([f.world.networks.size, readdirSync(f.deps.stateDir)]).toEqual([0, []]);
     }
   });
@@ -253,7 +308,7 @@ describe("hapi run supervise", () => {
     const f = fakeRun();
     await seedRun(f, { id: ID, outputs: completedOutputs() });
     expect(await runSupervise([ID], f.deps)).toBe(0);
-    expect(f.calls.find((c) => c.cmd[0] === "timeout")!.cmd).toEqual(["timeout", String(29 * 60), "docker", "wait", N]);
+    expect(f.calls.find((c) => c.cmd.includes("wait"))!.cmd).toEqual(["timeout", String(29 * 60), "docker", "wait", N]);
     expect((await readRecord(f.deps.stateDir, ID))!.status).toBe("succeeded");
   });
 
@@ -275,7 +330,7 @@ describe("hapi run supervise", () => {
     const f = fakeRun();
     await seedRun(f, { id: ID, deadline: new Date(NOW.getTime() - 1000).toISOString(), outputs: completedOutputs() });
     expect(await runSupervise([ID], f.deps)).toBe(0);
-    expect(f.calls.some((c) => c.cmd[0] === "timeout")).toBe(false);
+    expect(f.calls.some((c) => c.cmd.includes("wait"))).toBe(false);
     expect((await readRecord(f.deps.stateDir, ID))!.status).toBe("timed-out");
   });
 
@@ -301,7 +356,7 @@ describe("finalizeRun", () => {
     const cmds = f.calls.map((c) => c.cmd);
     const at = (pred: (c: string[]) => boolean) => cmds.findIndex(pred);
     const order = [
-      at((c) => c[1] === "run" && c.includes("--entrypoint")), // the copy-out listing
+      at((c) => c.includes(LIST_SCRIPT)), // the copy-out listing
       at((c) => c.includes("list-heads")),
       at((c) => c[1] === "rm"),
       at((c) => c[2] === "disconnect"),
@@ -361,7 +416,19 @@ describe("finalizeRun", () => {
     const cmds = f.calls.map((c) => c.cmd.join(" "));
     const stop = cmds.indexOf(`docker stop -t ${STOP_GRACE_S} ${N}`);
     expect(stop).toBeGreaterThan(-1);
-    expect(stop).toBeLessThan(cmds.findIndex((c) => c.startsWith("docker run --rm")));
+    expect(stop).toBeLessThan(cmds.findIndex((c) => c.includes("docker run --rm")));
+  });
+
+  test("a copy-out helper that never returns fails the run at the host's bound instead of hanging finalize, which still cleans up and lets go of the run's lock", async () => {
+    capture();
+    const f = fakeRun({ hangs: (c) => c.includes(COPY_SCRIPT) && c.at(-2) === "transcript.jsonl" });
+    const done = await finalizeRun(await seedRun(f, { id: ID, running: false, outputs: completedOutputs() }), f.deps);
+    expect([done.status, done.reason]).toEqual([
+      "failed",
+      `copying transcript.jsonl out timed out (after ${HELPER_TIMEOUT_S} s in the helper, or ${HELPER_HOST_TIMEOUT_S} s in all): not copied; no transcript.jsonl was copied out, so the guard-ran check could not be made`,
+    ]);
+    expect(f.world.containers.size + f.world.networks.size + f.world.volumes.size).toBe(0);
+    expect(locksIn(f.xdg)).toEqual([]);
   });
 
   test("finalize is idempotent: a run that has ended is returned as recorded, with no docker call", async () => {
