@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { SecretError } from "../../src/secrets/provider";
 import { secretsResolve } from "../../src/secrets/cli";
 import { resolveAgeDir } from "../../src/secrets/providers/sops";
-import { buildDigest, currentUserOverride, networkProblems, PROJECT_LABEL, reexecScript, RUN_LABEL, removeRuns, type StackDeps, stackDown, stackUp } from "../../src/stack/up";
+import { buildDigest, currentUserOverride, networkProblem, networkProblems, PROJECT_LABEL, reexecScript, RUN_LABEL, removeRuns, type StackDeps, stackDown, stackUp } from "../../src/stack/up";
 import { capture, caught, cleanup, fullStore, sopsConfig, sopsStore, tempDir } from "../secrets/helpers";
 
 afterEach(cleanup);
@@ -467,6 +467,29 @@ describe("networkProblems", () => {
   });
 });
 
+describe("networkProblem (one network: a run's own, and each zone network)", () => {
+  test("none for an internal network inside the proxies' zone_clients ranges", () => {
+    expect(networkProblem(net("hapi-run-ab12cd34ef56", "172.30.0.0/16"))).toBeUndefined();
+    expect(networkProblem(net("hapi-run-ab12cd34ef56", "fd00:2::/64"))).toBeUndefined();
+  });
+
+  test("names a network that isn't internal or has a subnet outside the ranges, each problem once", () => {
+    expect(networkProblem(net("hapi-run-ab12cd34ef56", "172.30.0.0/16", false))).toBe("network hapi-run-ab12cd34ef56 is not internal: it would have a route out around the proxy");
+    expect(networkProblem(net("hapi-run-ab12cd34ef56", "100.64.0.0/24"))).toBe(
+      "network hapi-run-ab12cd34ef56 has subnet 100.64.0.0/24, outside the proxies' zone_clients ranges, so its requests would all be refused: set Docker's default-address-pools to private ranges",
+    );
+    expect(networkProblem(net("n", "100.64.0.0/24", false))).toBe(
+      "network n is not internal: it would have a route out around the proxy; network n has subnet 100.64.0.0/24, outside the proxies' zone_clients ranges, so its requests would all be refused: set Docker's default-address-pools to private ranges",
+    );
+  });
+
+  test("anything that isn't a network as docker network inspect prints one is a problem, not a pass", () => {
+    for (const x of [undefined, null, "net", [], {}, { Name: 7, Internal: true }]) {
+      expect(networkProblem(x)).toBe("docker network inspect printed something that is not a network");
+    }
+  });
+});
+
 /** The `docker` calls removeRuns makes for `project`, with `ids`/`nets`/`vols` found labelled. */
 const LABELS = (project: string) => ["--filter", `label=${RUN_LABEL}`, "--filter", `label=${PROJECT_LABEL}=${project}`];
 
@@ -500,6 +523,25 @@ describe("removeRuns", () => {
       ["docker", "volume", "rm", "hapi-int-ab12cd34-run-9-out"],
     ]);
     expect(JSON.stringify(calls)).not.toContain('"hapi-egress-archon-1"');
+  });
+
+  test("with a run id and an egress container, it selects that one run's objects and disconnects that container", async () => {
+    const f = fakes({ runs: { containers: ["c1"], networks: ["hapi-run-ab12cd34ef56"], volumes: ["hapi-run-ab12cd34ef56-work", "hapi-run-ab12cd34ef56-out"] } });
+    await removeRuns("hapi", f.deps.run!, f.deps.env!, { runId: "ab12cd34ef56", egress: "hapi-egress-archon-1" });
+    const one = ["--filter", `label=${RUN_LABEL}=ab12cd34ef56`, "--filter", `label=${PROJECT_LABEL}=hapi`];
+    expect(f.calls.map((c) => c.cmd)).toEqual([
+      ["docker", "ps", "-aq", ...one],
+      ["docker", "rm", "-f", "c1"],
+      ["docker", "network", "ls", "--format", "{{.Name}}", ...one],
+      ["docker", "network", "disconnect", "-f", "hapi-run-ab12cd34ef56", "hapi-egress-archon-1"],
+      ["docker", "network", "rm", "hapi-run-ab12cd34ef56"],
+      ["docker", "volume", "ls", "-q", ...one],
+      ["docker", "volume", "rm", "hapi-run-ab12cd34ef56-work", "hapi-run-ab12cd34ef56-out"],
+    ]);
+    // A test project's egress container is the one given.
+    const g = fakes({ runs: { networks: ["p-run-ab12cd34ef56"] } });
+    await removeRuns("p", g.deps.run!, g.deps.env!, { runId: "ab12cd34ef56", egress: "p-egress-archon-1" });
+    expect(g.calls.find((c) => c.cmd[2] === "disconnect")!.cmd).toEqual(["docker", "network", "disconnect", "-f", "p-run-ab12cd34ef56", "p-egress-archon-1"]);
   });
 
   test("with no runs it lists and removes nothing", async () => {

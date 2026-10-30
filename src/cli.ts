@@ -15,6 +15,7 @@ import { tokenMint } from "./forge/github/app-token";
 import { decideCommand } from "./decide/cli";
 import { policyBuild } from "./generate/index";
 import { mcpPin, mcpVerify } from "./mcp/lock";
+import { runStart, runStop, runSupervise } from "./run/lifecycle";
 import {
   secretsAddMachine,
   secretsCheck,
@@ -142,6 +143,9 @@ register("secrets check", secretsCheck, "List every secret in stack/secrets.yaml
 register("secrets resolve", secretsResolve, "Resolve stack/secrets.yaml from the configured provider into $XDG_RUNTIME_DIR/hapi/env/<zone>.env (--dry-run: check)");
 register("stack up", stackUp, "Build policy, resolve secrets and start the stack as the hapi user (stack/compose.yaml); see docs/runbooks/stack.md");
 register("stack down", stackDown, "Stop the stack and remove its containers and networks, keeping its volumes (kill switch 3)");
+register("run start", (args) => runStart(args), "Start one run of a work order in a hardened one-shot Archon container, on its own network, and print its id (as hapi)");
+register("run stop", (args) => runStop(args), "Stop one run (docker stop, 30 s grace), copy its outputs out and remove its container, network and volumes");
+register("run supervise", (args) => runSupervise(args), "Internal: wait for one run until its deadline, then finalize it (run start spawns it, detached)");
 register("token mint", tokenMint, "Mint a 1-hour GitHub App token for one repo into a 0600 file under $XDG_RUNTIME_DIR/hapi/tokens/");
 register("decide", (args) => decideCommand(args), "Run one typed decision (bash-gate, result-screen) on a state read from stdin; prints the result as JSON");
 register("audit", (args) => auditCommand(args), "Check the deployed config, pins, running stack, secrets setup and each --repo's GitHub settings against policy (docs/audit.md)");

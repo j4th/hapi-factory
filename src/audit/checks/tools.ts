@@ -28,10 +28,11 @@ import { join } from "node:path";
 import YAML from "yaml";
 import { PI_AGENT_DIR } from "../../generate/archon";
 import { canonicalJson as canonical } from "../../mcp/lock";
+import { composeServices } from "../../stack/compose";
 import { HERMES_HOME, proxyEnv, serviceEnvironment } from "../../stack/env";
 import { type AuditRun, type CheckResult, result } from "../types";
 import { deployedBuild } from "./generated";
-import { composeServices, dockerfileImages, dockerfileOf } from "./pins";
+import { dockerfileImages, dockerfileOf } from "./pins";
 
 const firstLine = (s: string) => (s.trim().split("\n")[0] ?? "").slice(0, 300);
 
@@ -68,9 +69,9 @@ const exists = async (p: string) => {
   }
 };
 
-/** A path a `-v src:dst` mount can hold. */
-function mountable(path: string): string {
-  if (path.includes(":") || path.includes(",")) throw new Error(`cannot mount ${path} into the validation container: its path holds ":" or ","`);
+/** A path a `-v src:dst` mount can hold, else throws naming `into` (the run launcher reuses it, src/run/spec.ts). */
+export function mountable(path: string, into = "the validation container"): string {
+  if (path.includes(":") || path.includes(",")) throw new Error(`cannot mount ${path} into ${into}: its path holds ":" or ","`);
   return path;
 }
 

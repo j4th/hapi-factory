@@ -115,11 +115,32 @@ interface NetworkInfo {
 }
 
 /**
+ * What is wrong with one network as `docker network inspect` prints it, or
+ * undefined: it isn't internal (it would have a route out around its proxy),
+ * or a subnet is outside the proxies' `zone_clients` ranges (every request
+ * from it would be refused; Docker's default pools are private, a host's
+ * default-address-pools may not be). Anything that isn't a network is a
+ * problem too, never a pass. `up` checks each zone network with it, and
+ * `hapi run start` each run's own (src/run/lifecycle.ts).
+ */
+export function networkProblem(inspect: unknown): string | undefined {
+  const n = inspect as Partial<NetworkInfo> | null | undefined;
+  if (n === null || typeof n !== "object" || Array.isArray(n) || typeof n.Name !== "string") return "docker network inspect printed something that is not a network";
+  const problems: string[] = [];
+  if (n.Internal !== true) problems.push(`network ${n.Name} is not internal: it would have a route out around the proxy`);
+  for (const { Subnet } of n.IPAM?.Config ?? []) {
+    if (Subnet !== undefined && !CLIENT_RANGES.some((r) => cidrContains(r, Subnet))) {
+      problems.push(
+        `network ${n.Name} has subnet ${Subnet}, outside the proxies' zone_clients ranges, so its requests would all be refused: set Docker's default-address-pools to private ranges`,
+      );
+    }
+  }
+  return problems.length === 0 ? undefined : problems.join("; ");
+}
+
+/**
  * Problems with the zone networks Docker made for `project`: one that is
- * missing, isn't internal (it would have a route out around its proxy), or
- * has a subnet outside the proxies' `zone_clients` ranges (every request from
- * it would be refused; Docker's default pools are private, a host's
- * default-address-pools may not be). Empty when all is well.
+ * missing, or that `networkProblem` finds fault with. Empty when all is well.
  */
 export function networkProblems(networks: unknown[], project: string): string[] {
   const byName = new Map((networks as NetworkInfo[]).map((n) => [n.Name, n]));
@@ -127,18 +148,8 @@ export function networkProblems(networks: unknown[], project: string): string[] 
   for (const zone of ZONE_NETWORKS) {
     const name = `${project}_${zone}`;
     const n = byName.get(name);
-    if (n === undefined) {
-      problems.push(`zone network ${name} does not exist`);
-      continue;
-    }
-    if (n.Internal !== true) problems.push(`zone network ${name} is not internal: it would have a route out around the proxy`);
-    for (const { Subnet } of n.IPAM?.Config ?? []) {
-      if (Subnet !== undefined && !CLIENT_RANGES.some((r) => cidrContains(r, Subnet))) {
-        problems.push(
-          `zone network ${name} has subnet ${Subnet}, outside the proxies' zone_clients ranges, so its requests would all be refused: set Docker's default-address-pools to private ranges`,
-        );
-      }
-    }
+    const problem = n === undefined ? `network ${name} does not exist` : networkProblem(n);
+    if (problem !== undefined) problems.push(`zone ${problem}`);
   }
   return problems;
 }
@@ -189,7 +200,8 @@ export interface StackDeps {
   resolve?: (args: string[]) => Promise<number>;
 }
 
-const runCommand: Runner = async (cmd, o) => {
+/** The real `Runner`: `Bun.spawn`, stdin closed. `hapi run` uses it too (src/run/cli.ts). */
+export const runCommand: Runner = async (cmd, o) => {
   let proc: Bun.Subprocess<"ignore", "pipe" | "inherit", "pipe" | "inherit">;
   const out = o.inherit ? "inherit" : "pipe";
   try {
@@ -202,7 +214,7 @@ const runCommand: Runner = async (cmd, o) => {
   return { code: await proc.exited, stdout, stderr };
 };
 
-const definedEnv = (env: Env): Record<string, string> => Object.fromEntries(Object.entries(env).filter((e): e is [string, string] => e[1] !== undefined));
+export const definedEnv = (env: Env): Record<string, string> => Object.fromEntries(Object.entries(env).filter((e): e is [string, string] => e[1] !== undefined));
 
 /**
  * The script `sh -c` runs as hapi to re-exec `mise run <task>`. It is fixed text: nothing the caller passes is
@@ -226,23 +238,24 @@ export function reexecScript(task: "up" | "down" | "hapi"): string {
 /**
  * Re-run `mise run <task> -- <args>` as hapi: `sudo -u hapi -H` (HOME is hapi's), never `sudo -i`, whose login
  * shell re-parses the command's words and leaves `$` unescaped (sudo(8)). `reexecScript` is the whole script,
- * and the arguments are its "$@".
+ * and the arguments are its "$@". `name` is the command the message names: `hapi run` passes `run <sub>`, with
+ * task `hapi` and args `run <sub> ...`.
  */
-async function reexec(task: "up" | "down" | "hapi", args: string[], run: Runner, env: Env, user: string): Promise<number> {
+export async function reexec(task: "up" | "down" | "hapi", args: string[], run: Runner, env: Env, user: string, name = `stack ${task}`): Promise<number> {
   console.error(
-    `hapi stack ${task}: running as ${HAPI_USER} (sudo -u ${HAPI_USER} -H), not ${user}. For development only, HAPI_ALLOW_CURRENT_USER=1 runs it as ${user} instead (docs/runbooks/stack.md).`,
+    `hapi ${name}: running as ${HAPI_USER} (sudo -u ${HAPI_USER} -H), not ${user}. For development only, HAPI_ALLOW_CURRENT_USER=1 runs it as ${user} instead (docs/runbooks/stack.md).`,
   );
   const r = await run(["sudo", "-u", HAPI_USER, "-H", "--", "sh", "-c", reexecScript(task), "hapi-stack", ...args], { env: definedEnv(env), inherit: true });
   return r.code;
 }
 
-/** The `--filter` arguments that select the run objects of `project`. */
-const runFilters = (project: string): string[] => ["--filter", `label=${RUN_LABEL}`, "--filter", `label=${PROJECT_LABEL}=${project}`];
+/** The `--filter` arguments that select the run objects of `project`, or of its one run `runId`. */
+export const runFilters = (project: string, runId?: string): string[] => ["--filter", `label=${RUN_LABEL}${runId === undefined ? "" : `=${runId}`}`, "--filter", `label=${PROJECT_LABEL}=${project}`];
 
 const lines = (out: string): string[] => out.split("\n").map((l) => l.trim()).filter((l) => l !== "");
 
 /** The ids (or names) a listing printed, one per line. Throws, naming the command, when it fails. */
-async function listed(run: Runner, env: Env, cmd: string[]): Promise<string[]> {
+export async function listed(run: Runner, env: Env, cmd: string[]): Promise<string[]> {
   const r = await run(cmd, { env: definedEnv(env), inherit: false });
   if (r.code !== 0) throw new Error(`${cmd.join(" ")} failed (exit ${r.code}): ${r.stderr?.trim() || "(no error output)"}`);
   return lines(r.stdout);
@@ -262,18 +275,22 @@ async function liveRuns(run: Runner, env: Env, project: string): Promise<string[
  * It tries every step and throws at the end naming the ones that failed: `down` is kill switch 3 and goes on to
  * `compose down` regardless. A disconnect that fails is not an error by itself (the proxy may be gone, or not
  * attached); the network removal after it says whether anything is left.
+ *
+ * With `o.runId`, only that run's objects (`org.hapi.run=<id>`): `hapi run` finalizes one run, or rolls back a
+ * start, this way, disconnecting `o.egress` (its `RunDeps.egress`) when given.
  */
-export async function removeRuns(project: string, run: Runner, env: Env): Promise<void> {
+export async function removeRuns(project: string, run: Runner, env: Env, o: { runId?: string; egress?: string } = {}): Promise<void> {
   const failures: string[] = [];
   const attempt = async (cmd: string[]) => {
     const r = await run(cmd, { env: definedEnv(env), inherit: false });
     if (r.code !== 0) failures.push(`${cmd.join(" ")} failed (exit ${r.code}): ${r.stderr?.trim() || "(no error output)"}`);
   };
-  const filters = runFilters(project);
+  const filters = runFilters(project, o.runId);
+  const egress = o.egress ?? `${project}-egress-archon-1`;
   const containers = await listed(run, env, ["docker", "ps", "-aq", ...filters]);
   if (containers.length > 0) await attempt(["docker", "rm", "-f", ...containers]);
   const networks = await listed(run, env, ["docker", "network", "ls", "--format", "{{.Name}}", ...filters]);
-  for (const n of networks) await run(["docker", "network", "disconnect", "-f", n, `${project}-egress-archon-1`], { env: definedEnv(env), inherit: false });
+  for (const n of networks) await run(["docker", "network", "disconnect", "-f", n, egress], { env: definedEnv(env), inherit: false });
   if (networks.length > 0) await attempt(["docker", "network", "rm", ...networks]);
   const volumes = await listed(run, env, ["docker", "volume", "ls", "-q", ...filters]);
   if (volumes.length > 0) await attempt(["docker", "volume", "rm", ...volumes]);
