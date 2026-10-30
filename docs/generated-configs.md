@@ -237,7 +237,7 @@ Both are `Bun.build` bundles (`bundleEntry` in `src/generate/index.ts`): `target
 
 ### What hapi-guard enforces
 
-hapi-guard is Pi's only extension in a run container (spec §9.3; design §3.3 and §6a). Each Pi node attempt is a fresh process that imports the bundle and runs its factory once. The factory never throws, because Pi records a load error and Archon never reads it, so a throw would leave the node unguarded. Instead, bad settings register only a `session_start` that throws `hapi-guard: <problem>; the node fails closed`. Bad settings are a missing or malformed `hapi-guard.json` or run file, or no `WORKFLOW_ID` or `ARCHON_NODE_EXECUTION`, and the message names the file and the field, never a value. The guard registers no tools and no flags.
+hapi-guard is Pi's only extension in a run container (spec §9.3; design §3.3 and §6a; [the runs runbook](runbooks/runs.md#the-containers-layout) has the container's layout and where the decision log goes). Each Pi node attempt is a fresh process that imports the bundle and runs its factory once. The factory never throws, because Pi records a load error and Archon never reads it, so a throw would leave the node unguarded. Instead, bad settings register only a `session_start` that throws `hapi-guard: <problem>; the node fails closed`. Bad settings are a missing or malformed `hapi-guard.json` or run file, or no `WORKFLOW_ID` or `ARCHON_NODE_EXECUTION`, and the message names the file and the field, never a value. The guard registers no tools and no flags.
 
 | Hook | Rule | What it does |
 |---|---|---|

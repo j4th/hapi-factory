@@ -199,6 +199,7 @@ Read-only research for the plan, in the pinned image and upstream sources at the
 14. **A paused run exits 0,** so the launcher reads the run's status from Archon, never the exit code alone.
 15. **Claude Code's settings move to Plan 03** [call]. Plan 02 runs no Claude-provider node, so settings for one couldn't be tested here, and the tmpfs `$HOME` already gives the property H-182 asks for: nothing a run writes there persists. Plan 03 generates them, read-only, with the review node that uses them.
 16. **Fresh volumes need chowning.** A named volume mounted at a path the image lacks has a root-owned root, so the launcher chowns each run volume to uid 1001 with a one-shot helper before the run starts.
+17. **The live view is `docker logs`, then the stored transcript** (spike 07, finding 15). §3.2's "follows a run's transcript from the host" became `docker logs --follow` of the run container while it is live, because the transcript is in the run's `/.archon` tmpfs, out of the host's reach until copy-out; once the run is finalized, `hapi run watch` prints the transcript copied to the host.
 
 ## 7. Verify early
 

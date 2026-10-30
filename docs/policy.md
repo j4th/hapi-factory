@@ -228,7 +228,7 @@ The monthly caps are enforced at the provider. The operator sets them on the Con
 
 ### `runs.yaml`
 
-The run launcher's limits (Plan 02 Task 7). Every key is required. An overlay may lower any of them, never raise one.
+The run launcher's limits (Plan 02 Task 7; [the runs runbook](runbooks/runs.md) covers the launcher, the outputs and retention). Every key is required. An overlay may lower any of them, never raise one.
 
 | Key | Value | Meaning |
 |---|---|---|
