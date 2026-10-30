@@ -97,8 +97,12 @@ const ARCHON_SCRIPT =
 const asRecord = (v: unknown) => (v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined);
 const text = (v: unknown) => (typeof v === "string" ? v : typeof asRecord(v)?.message === "string" ? (asRecord(v)!.message as string) : JSON.stringify(v));
 
-/** Errors and parse warnings from `archon validate workflows --json`, in v0.12.1's shape ({results[].issues}) or the plain {errors, parseWarnings}. */
-export function readValidate(out: string): { errors: string[]; warnings: string[]; notes: string[]; workflows: number } | { unreadable: string } {
+/**
+ * Errors and parse warnings from `archon validate workflows --json`, in v0.12.1's shape ({results[].issues}) or the
+ * plain {errors, parseWarnings}, and the names of the workflows it validated (`results[].workflowName`; none in the
+ * plain shape).
+ */
+export function readValidate(out: string): { errors: string[]; warnings: string[]; notes: string[]; workflows: number; names: string[] } | { unreadable: string } {
   let doc: Record<string, unknown> | undefined;
   try {
     doc = asRecord(JSON.parse(out));
@@ -106,7 +110,7 @@ export function readValidate(out: string): { errors: string[]; warnings: string[
     doc = undefined;
   }
   if (doc === undefined) return { unreadable: "could not read the output of archon validate workflows --json (not a JSON object)" };
-  if (doc.ok === false && doc.error !== undefined) return { errors: [firstLine(text(doc.error))], warnings: [], notes: [], workflows: 0 };
+  if (doc.ok === false && doc.error !== undefined) return { errors: [firstLine(text(doc.error))], warnings: [], notes: [], workflows: 0, names: [] };
   const errors: string[] = [];
   const warnings: string[] = [];
   const notes: string[] = [];
@@ -130,7 +134,8 @@ export function readValidate(out: string): { errors: string[]; warnings: string[
     }
   }
   if (!known) return { unreadable: "could not read the output of archon validate workflows --json (no results, errors or parseWarnings)" };
-  return { errors, warnings, notes, workflows: results?.length ?? 0 };
+  const names = (results ?? []).flatMap((r) => (typeof r?.workflowName === "string" ? [r.workflowName] : []));
+  return { errors, warnings, notes, workflows: results?.length ?? 0, names };
 }
 
 /** Whether Archon read every generated binding as generated: the `effective` entries of `ai alias list` / `ai tier list`. */
@@ -150,8 +155,11 @@ function bindingProblems(kind: "alias" | "tier", generated: Record<string, unkno
 /** The workflow pack a run binds at /.archon/workflows/hapi (the default `hapi run` uses). */
 const packOf = (root: string) => join(root, "archon", "workflows", "hapi");
 
-/** The pack's workflow files and every node of them that sets `pi.enableExtensions: false`, which would drop hapi-guard from that step. */
-async function packNodes(pack: string): Promise<{ workflows: number; problems: string[] } | { missing: string }> {
+/**
+ * The pack's workflows (each file and its `name`, the file's stem if it has none) and every node of them that sets
+ * `pi.enableExtensions: false`, which would drop hapi-guard from that step.
+ */
+async function packNodes(pack: string): Promise<{ workflows: { file: string; name: string }[]; problems: string[] } | { missing: string }> {
   let names: string[];
   try {
     names = (await readdir(pack)).filter((n) => /\.ya?ml$/.test(n)).sort();
@@ -159,6 +167,7 @@ async function packNodes(pack: string): Promise<{ workflows: number; problems: s
     return { missing: `no workflow pack at ${pack} (${(e as NodeJS.ErrnoException).code ?? "error"}): a run binds it at ${RUN_PATHS.pack}` };
   }
   const problems: string[] = [];
+  const workflows: { file: string; name: string }[] = [];
   for (const name of names) {
     let doc: unknown;
     try {
@@ -167,12 +176,14 @@ async function packNodes(pack: string): Promise<{ workflows: number; problems: s
       problems.push(`${name}: does not parse as YAML`);
       continue;
     }
+    const named = asRecord(doc)?.name;
+    workflows.push({ file: name, name: typeof named === "string" ? named : name.replace(/\.ya?ml$/, "") });
     for (const node of Array.isArray(asRecord(doc)?.nodes) ? (asRecord(doc)!.nodes as unknown[]) : []) {
       const n = asRecord(node);
       if (asRecord(n?.pi)?.enableExtensions === false) problems.push(`${name}: node ${String(n?.id ?? "(no id)")} sets pi.enableExtensions: false, so hapi-guard would not load in it`);
     }
   }
-  return { workflows: names.length, problems };
+  return { workflows, problems };
 }
 
 /** tools.archon-validate */
@@ -220,6 +231,12 @@ export async function archonValidate(run: AuditRun): Promise<CheckResult[]> {
     ...(readBack === "true" ? [] : [`assistants.pi.enableExtensions reads back as ${readBack === "" ? "nothing" : readBack} in Archon's loadConfig, not true (hapi-guard is a Pi extension; H-152)`]),
     ...nodes.problems,
     ...("unreadable" in v ? [v.unreadable] : [...v.errors.map((e) => `error: ${e}`), ...v.warnings.map((w) => `parse warning: ${w}`)]),
+    // An image that stopped scanning the pack's directory would validate nothing of it and still pass (final review B-7).
+    ...("unreadable" in v
+      ? []
+      : nodes.workflows
+          .filter((wf) => !v.names.includes(wf.name))
+          .map((wf) => `the pack's workflow ${wf.name} (${wf.file}) is not among archon validate workflows' results, so it was not validated (does the image read ${RUN_PATHS.pack}?)`)),
     ...bindingProblems("alias", generated.aliases ?? {}, json(parts[2]!)),
     ...bindingProblems("tier", generated.tiers ?? {}, json(parts[4]!)),
   ];
@@ -234,7 +251,7 @@ export async function archonValidate(run: AuditRun): Promise<CheckResult[]> {
     result(
       id,
       "pass",
-      `archon validate workflows (${img.image}): ${v.workflows} workflows, no errors, no parse warnings; Archon reads all ${aliases} aliases and ${tiers} tiers as generated (ai alias list, ai tier list), and assistants.pi.enableExtensions is true (loadConfig); the pack ${RUN_PATHS.pack} has ${nodes.workflows} workflows and no node that turns Pi's extensions off${notes}`,
+      `archon validate workflows (${img.image}): ${v.workflows} workflows, no errors, no parse warnings; Archon reads all ${aliases} aliases and ${tiers} tiers as generated (ai alias list, ai tier list), and assistants.pi.enableExtensions is true (loadConfig); the pack ${RUN_PATHS.pack} has ${nodes.workflows.length} workflows, each among the validated, and no node that turns Pi's extensions off${notes}`,
     ),
   ];
 }

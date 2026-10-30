@@ -142,7 +142,7 @@ export async function runWatch(args: string[], deps: Partial<RunDeps> = {}): Pro
         if (rec.status !== "live") break;
         if (d.now().getTime() - since >= WATCH_WAIT_S * 1000) {
           throw new Error(
-            `run ${id}'s container has exited, but the run was not finalized within ${WATCH_WAIT_S} s: \`hapi run watch ${id}\` shows it once it is (the next \`hapi run start\` or \`hapi run stop\` reaps a run whose supervisor died)`,
+            `run ${id}'s container has exited, but the run was not finalized within ${WATCH_WAIT_S} s: it is still being finalized, or its supervisor died. \`hapi run list\` shows its status; \`hapi run stop ${id}\` finalizes it if the supervisor is gone`,
           );
         }
         await Bun.sleep(1000);

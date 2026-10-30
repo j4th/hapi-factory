@@ -220,7 +220,7 @@ describe("hapi run watch", () => {
     await seedRun(f, { id: ID });
     expect(await runWatch([ID], f.deps)).toBe(1);
     expect(err.at(-1)).toBe(
-      `hapi run watch: run ${ID}'s container has exited, but the run was not finalized within 120 s: \`hapi run watch ${ID}\` shows it once it is (the next \`hapi run start\` or \`hapi run stop\` reaps a run whose supervisor died)`,
+      `hapi run watch: run ${ID}'s container has exited, but the run was not finalized within 120 s: it is still being finalized, or its supervisor died. \`hapi run list\` shows its status; \`hapi run stop ${ID}\` finalizes it if the supervisor is gone`,
     );
     expect((await readRecord(f.deps.stateDir, ID))!.status).toBe("live");
   });

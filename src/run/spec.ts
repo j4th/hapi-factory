@@ -30,6 +30,8 @@
  *   which the launcher makes and chowns first (design §6a item 16);
  * - each secret of the archon zone as `-e NAME`, never its value: the docker
  *   CLI takes the value from its own environment (spike 07 finding 16);
+ * - `--stop-timeout STOP_GRACE_S`, so a daemon stop gives the prelude the same
+ *   grace `hapi run stop` does;
  * - the prelude as the entrypoint, from `/app`, never the clone (design §6a
  *   items 2 and 4).
  *
@@ -112,6 +114,13 @@ export const TRANSLATED_KEYS: readonly string[] = [
 
 /** The image's appuser (stack/archon/Dockerfile): the tmpfs mounts, the volume chown and the copy-out helper assume it. */
 export const APP_USER = "1001:1001";
+/**
+ * Seconds between TERM and KILL, for `hapi run stop` (`docker stop -t`) and for any other stop (`--stop-timeout`:
+ * a daemon restart or a host reboot). Not Docker's 10: after the workflow ends, run.sh starts the Archon CLI (bun)
+ * up to three more times for its read-back (result.json, the transcript), and a KILL inside that leaves a stopped
+ * run without its outputs. Spike 07 saw a bash-only run's post-run steps take under a second.
+ */
+export const STOP_GRACE_S = 30;
 /** The appuser's home in the image: a tmpfs per run, with the generated gitconfig bound into it. */
 export const APP_HOME = "/home/appuser";
 /** The name the run reaches its proxy by: the host of the archon zone's proxy variables (`http://egress-archon:3128`). */
@@ -182,16 +191,27 @@ const scalar = (v: unknown, what: string): string => {
   return v;
 };
 
-/** The service's hardening and limits, as `docker run` flags, in a fixed order. */
+/** The no-new-privileges setting every service has (the stack's hardening anchor). */
+export const NO_NEW_PRIVILEGES = "no-new-privileges:true";
+
+/**
+ * The service's hardening and limits, as `docker run` flags, in a fixed order. Each hardening key is required: a
+ * service that lost one (a drifted compose.yaml on the host) is refused, never run without it (final review B-2).
+ */
 function hardening(s: Record<string, unknown>): string[] {
   if (s.restart !== undefined && s.restart !== "no") throw new Error(`${SERVICE} restart is ${JSON.stringify(s.restart)}: a run container is one-shot, so it must be "no"`);
   if (s.user !== APP_USER) throw new Error(`${SERVICE} user is ${JSON.stringify(s.user)}: the run container runs as ${APP_USER}, the image's appuser, which its tmpfs mounts, volumes and copy-out assume`);
-  const out = ["--user", APP_USER];
-  if (s.read_only === true) out.push("--read-only");
-  for (const cap of strings(s.cap_drop ?? [], "cap_drop")) out.push("--cap-drop", cap);
-  for (const opt of strings(s.security_opt ?? [], "security_opt")) out.push("--security-opt", opt);
-  if (s.pids_limit !== undefined) out.push("--pids-limit", scalar(s.pids_limit, "pids_limit"));
-  if (s.mem_limit !== undefined) out.push("--memory", scalar(s.mem_limit, "mem_limit"));
+  if (s.read_only !== true) throw new Error(`${SERVICE} read_only is ${JSON.stringify(s.read_only) ?? "undefined"}: the run container's root filesystem must be read-only (read_only: true)`);
+  const caps = strings(s.cap_drop ?? [], "cap_drop");
+  if (!caps.includes("ALL")) throw new Error(`${SERVICE} cap_drop does not include ALL: the run container drops every capability`);
+  const opts = strings(s.security_opt ?? [], "security_opt");
+  if (!opts.includes(NO_NEW_PRIVILEGES)) throw new Error(`${SERVICE} security_opt does not include ${NO_NEW_PRIVILEGES}: the run container gains no privileges`);
+  if (s.pids_limit === undefined) throw new Error(`${SERVICE} pids_limit is not set: the run container has a pid limit`);
+  if (s.mem_limit === undefined) throw new Error(`${SERVICE} mem_limit is not set: the run container has a memory limit`);
+  const out = ["--user", APP_USER, "--read-only"];
+  for (const cap of caps) out.push("--cap-drop", cap);
+  for (const opt of opts) out.push("--security-opt", opt);
+  out.push("--pids-limit", scalar(s.pids_limit, "pids_limit"), "--memory", scalar(s.mem_limit, "mem_limit"));
   if (s.logging !== undefined) {
     if (!isMap(s.logging)) throw new Error(`${SERVICE} logging must be a mapping`);
     for (const k of Object.keys(s.logging)) if (k !== "driver" && k !== "options") throw untranslated(`logging key "${k}"`);
@@ -269,6 +289,7 @@ export function runArgs(
     ...labels(service, { user: who.user, override: who.override, digest: buildInUse(d.buildDir) }),
     ...COMPOSE_LABELS.flatMap((k) => ["--label", `${k}=`]),
     ...hardening(service),
+    "--stop-timeout", String(STOP_GRACE_S),
     "--network", name,
     ...strings(service.tmpfs ?? [], "tmpfs").flatMap((t) => ["--tmpfs", t]),
     ...[tmpfs(APP_HOME, "256m"), tmpfs("/.archon", "512m"), tmpfs(RUN_PATHS.piDir, "64m")].flatMap((t) => ["--tmpfs", t]),

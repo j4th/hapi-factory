@@ -246,6 +246,13 @@ describe("loadManifest", () => {
     );
   });
 
+  test("a DOCKER_* secret is refused: the launcher spreads the archon zone's secrets over its `docker run` env, where one would point that call at another daemon", () => {
+    const e = policyError(() => loadManifest(manifestFile(full().replace("  B: hapi-b", "  B: hapi-b\n  DOCKER_HOST: hapi-b\n  DOCKER_CONFIG: hapi-b"))));
+    expect(e.issues.map((i) => i.path)).toEqual(["/archon/DOCKER_HOST", "/archon/DOCKER_CONFIG"]);
+    expect(e.message).toContain("/archon/DOCKER_HOST: DOCKER_HOST is reserved: env names starting DOCKER_ configure a runtime, the loader or a tool");
+    for (const name of ["DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "DOCKER_CERT_PATH", "DOCKER_TLS_VERIFY"]) expect([name, reservedEnvRule(name)?.includes("starting DOCKER_")]).toEqual([name, true]);
+  });
+
   test("every name the ruling lists is refused, each exact name and each prefix too, and a name hapi sets keeps its own reason", () => {
     const ruling = [
       ...["PATH", "HOME", "SHELL", "ENV", "BASH_ENV", "IFS", "PS4", "NODE_OPTIONS", "NODE_PATH", "NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED"],
@@ -299,7 +306,7 @@ describe("loadManifest", () => {
     for (const name of [...CONTROL_ENV_NAMES, ...CONTROL_ENV_PREFIXES, ...CONTROL_ENV_SUFFIXES]) expect(name).toMatch(/^[A-Z_][A-Z0-9_]*$/);
     for (const name of CONTROL_ENV_NAMES) expect([name, CONTROL_ENV_SUFFIXES.filter((s) => name.endsWith(s))]).toEqual([name, []]);
     for (const name of CONTROL_ENV_NAMES) expect([name, CONTROL_ENV_PREFIXES.filter((p) => name.startsWith(p))]).toEqual([name, []]);
-    expect(CONTROL_ENV_PREFIXES).toEqual(["ARCHON_", "BUN_", "CLAUDE_CODE_", "DYLD_", "GIT_CONFIG_", "HERMES_", "LD_", "MISE_", "NODE_", "NPM_CONFIG_", "PIP_", "PI_", "PYTHON", "S6_", "UV_"]);
+    expect(CONTROL_ENV_PREFIXES).toEqual(["ARCHON_", "BUN_", "CLAUDE_CODE_", "DOCKER_", "DYLD_", "GIT_CONFIG_", "HERMES_", "LD_", "MISE_", "NODE_", "NPM_CONFIG_", "PIP_", "PI_", "PYTHON", "S6_", "UV_"]);
   });
 
   test("the logical-name pattern", () => {

@@ -261,22 +261,31 @@ export async function listed(run: Runner, env: Env, cmd: string[]): Promise<stri
   return lines(r.stdout);
 }
 
-/** The running containers `hapi run` made for `project`. Throws when Docker can't say: `up` must not assume none. */
+/**
+ * The ids of `project`'s live runs: a running container with both run labels and the run's own name,
+ * `<project>-run-<id>`. A helper (the volume chown, a copy-out) carries the labels but no run's name, so a run that
+ * is finalizing doesn't count (final review B-5). The same test as src/run/records.ts `liveRuns`, which can't be
+ * imported here: records.ts imports this module. Throws when Docker can't say: `up` must not assume none.
+ */
 async function liveRuns(run: Runner, env: Env, project: string): Promise<string[]> {
-  const r = await run(["docker", "ps", "-q", ...runFilters(project)], { env: definedEnv(env), inherit: false });
+  const r = await run(["docker", "ps", ...runFilters(project), "--format", '{{.Label "org.hapi.run"}}\t{{.Names}}'], { env: definedEnv(env), inherit: false });
   if (r.code !== 0) throw new Error(`hapi stack up: cannot tell whether runs are live (docker ps exited ${r.code}: ${r.stderr?.trim() || "(no error output)"}); nothing was started`);
-  return lines(r.stdout);
+  return lines(r.stdout)
+    .map((row) => row.split("\t"))
+    .filter(([id, name]) => id !== undefined && id !== "" && name === `${project}-run-${id}`)
+    .map(([id]) => id!);
 }
 
 /**
  * Removes every run object of `project`: the labelled containers (`rm -f`), then `<project>-egress-archon-1`'s
  * attachment to each labelled network (Docker refuses to remove a network with an endpoint attached, spike 07
  * finding 13), then the networks, then the volumes. Only what the two labels select, never by name or prefix.
- * It tries every step and throws at the end naming the ones that failed: `down` is kill switch 3 and goes on to
- * `compose down` regardless. A disconnect that fails is not an error by itself (the proxy may be gone, or not
- * attached); the network removal after it says whether anything is left. Nor is a removal that fails while
- * nothing it named is still listed: a supervisor finalizing its run removes the same objects, and may have got
- * there first (`not found`).
+ * It tries every removal and throws at the end naming the ones that failed. A listing that fails (`docker ps`,
+ * `network ls`, `volume ls`) throws at once and skips the steps after it: that almost always means the daemon is
+ * down, when they would fail too. Either way `down`, kill switch 3, goes on to `compose down`. A disconnect that
+ * fails is not an error by itself (the proxy may be gone, or not attached); the network removal after it says
+ * whether anything is left. Nor is a removal that fails while nothing it named is still listed: a supervisor
+ * finalizing its run removes the same objects, and may have got there first (`not found`).
  *
  * With `o.runId`, only that run's objects (`org.hapi.run=<id>`): `hapi run` finalizes one run, or rolls back a
  * start, this way, disconnecting `o.egress` (its `RunDeps.egress`) when given.

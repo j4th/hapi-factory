@@ -145,7 +145,10 @@ export const CONTROL_ENV_NAMES: readonly string[] = [
  * prefix (NODE_OPTIONS, NODE_EXTRA_CA_CERTS, PYTHONPATH, BUN_OPTIONS,
  * UV_INDEX_URL, PIP_INDEX_URL, NPM_CONFIG_REGISTRY, HERMES_HOME, ARCHON_*,
  * PI_*, CLAUDE_CODE_*, and s6-overlay's S6_*, the Hermes image's init:
- * S6_CMD_ARG0 runs a program in front of its command). No entry of the
+ * S6_CMD_ARG0 runs a program in front of its command), and the docker CLI's
+ * own (DOCKER_HOST, DOCKER_CONTEXT, DOCKER_CONFIG, DOCKER_CERT_PATH): the
+ * launcher gives the archon zone's secrets to its `docker run` call's env, so
+ * one would send that call to another daemon. No entry of the
  * committed stack/secrets.yaml starts with one (a unit test checks). `PYTHON`
  * has no underscore: Python's own variables are PYTHONPATH, PYTHONHOME,
  * PYTHONSTARTUP and the rest.
@@ -156,6 +159,7 @@ export const CONTROL_ENV_PREFIXES: readonly string[] = [
   "ARCHON_",
   "BUN_",
   "CLAUDE_CODE_",
+  "DOCKER_",
   "DYLD_",
   "GIT_CONFIG_",
   "HERMES_",

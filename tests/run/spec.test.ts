@@ -6,7 +6,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { runDeps } from "../../src/run/cli";
-import { runArgs, type RunInputs, runName, TRANSLATED_KEYS } from "../../src/run/spec";
+import { runArgs, type RunInputs, runName, STOP_GRACE_S, TRANSLATED_KEYS } from "../../src/run/spec";
 import { type ComposeService, composeServices } from "../../src/stack/compose";
 import { serviceEnvironment } from "../../src/stack/env";
 import { buildDigest, PROJECT_LABEL, RUN_LABEL } from "../../src/stack/up";
@@ -40,7 +40,7 @@ describe("runArgs", () => {
       "--label", "org.hapi.stack=hapi-factory", "--label", "org.hapi.started-by=hapi", "--label", "org.hapi.dev-override=0", "--label", `org.hapi.build-sha256=${digest}`,
       "--label", "com.docker.compose.project=", "--label", "com.docker.compose.service=", "--label", "com.docker.compose.version=",
       "--user", "1001:1001", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", "--pids-limit", "2048", "--memory", "4g",
-      "--log-driver", "json-file", "--log-opt", "max-size=10m", "--log-opt", "max-file=3", "--network", N,
+      "--log-driver", "json-file", "--log-opt", "max-size=10m", "--log-opt", "max-file=3", "--stop-timeout", "30", "--network", N,
       "--tmpfs", "/tmp:size=1g,uid=1001,gid=1001,mode=1777",
       "--tmpfs", "/home/appuser:size=256m,uid=1001,gid=1001,mode=0700",
       "--tmpfs", "/.archon:size=512m,uid=1001,gid=1001,mode=0700",
@@ -138,6 +138,31 @@ describe("runArgs", () => {
       [{ ...s, logging: { driver: "json-file", options: { "max-size": "10m" }, extra: 1 } }, /archon: logging key "extra" isn't translated/],
     ];
     for (const [service, error] of cases) expect(() => runArgs(service, inputs(), f.deps, [])).toThrow(error);
+  });
+
+  describe("a service without one of the hardening keys is refused, naming it (final review B-2)", () => {
+    const cases: [string, (s: ComposeService) => ComposeService, string][] = [
+      ["read_only", ({ read_only: _, ...s }) => s, "read_only is undefined: the run container's root filesystem must be read-only (read_only: true)"],
+      ["read_only false", (s) => ({ ...s, read_only: false }), "read_only is false: the run container's root filesystem must be read-only (read_only: true)"],
+      ["cap_drop", ({ cap_drop: _, ...s }) => s, "cap_drop does not include ALL: the run container drops every capability"],
+      ["cap_drop without ALL", (s) => ({ ...s, cap_drop: ["NET_RAW"] }), "cap_drop does not include ALL: the run container drops every capability"],
+      ["security_opt", ({ security_opt: _, ...s }) => s, "security_opt does not include no-new-privileges:true: the run container gains no privileges"],
+      ["security_opt without no-new-privileges", (s) => ({ ...s, security_opt: ["seccomp=unconfined"] }), "security_opt does not include no-new-privileges:true"],
+      ["pids_limit", ({ pids_limit: _, ...s }) => s, "pids_limit is not set: the run container has a pid limit"],
+      ["mem_limit", ({ mem_limit: _, ...s }) => s, "mem_limit is not set: the run container has a memory limit"],
+    ];
+    for (const [what, change, error] of cases) {
+      test(what, async () => {
+        const service = change(await archon());
+        expect(() => runArgs(service, inputs(), fakeRun().deps, [])).toThrow(`stack/compose.yaml: archon: ${error}`);
+      });
+    }
+  });
+
+  test("the stop timeout is STOP_GRACE_S, the same as `hapi run stop`'s, so a daemon stop gives the prelude its grace too", async () => {
+    const argv = runArgs(await archon(), inputs(), fakeRun().deps, []);
+    expect(argv[argv.indexOf("--stop-timeout") + 1]).toBe(String(STOP_GRACE_S));
+    expect(STOP_GRACE_S).toBe(30);
   });
 
   test("a build dir that isn't there is named, with the fix", async () => {

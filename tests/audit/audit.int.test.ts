@@ -6,7 +6,7 @@
  * - tools.archon-validate's `loadConfig` read-back, in a throwaway container of
  *   the local image (no network, read-only, no secret).
  * - runtime.run-container's reading of a live container: a throwaway container
- *   made with the run definition's kinds of flags, inspected, and compared with
+ *   made with the run definition's kinds of flags (the stop timeout among them), inspected, and compared with
  *   the same flags through the parser the audit uses (`shapeOf`, `liveProblems`).
  * It creates and removes only its own objects: one container and one volume named
  * hapi-int-audit-<id>, labelled org.hapi.int=hapi-int-audit-<id>.
@@ -60,6 +60,7 @@ describe.skipIf(!READY)("the audit against real Docker", () => {
     const argv = [
       "docker", "run", "-d", "--pull", "never", "--name", id, "--label", `org.hapi.int=${id}`,
       "--user", "1001:1001", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", "--pids-limit", "2048", "--memory", "4g",
+      "--stop-timeout", "30",
       "--tmpfs", "/tmp:size=1g,uid=1001,gid=1001,mode=1777",
       "--tmpfs", "/opt/hapi/pi-agent:size=64m,uid=1001,gid=1001,mode=0700",
       "-v", `${models}:/opt/hapi/pi-agent/models.json:ro`, "-v", `${pack}:/.archon/workflows/hapi:ro`, "-v", `${id}-work:/work`,
@@ -75,8 +76,10 @@ describe.skipIf(!READY)("the audit against real Docker", () => {
     expect((c!.Mounts ?? []).some((m) => m.Destination === "/opt/hapi/pi-agent")).toBe(false);
     expect(c!.HostConfig!.Tmpfs!["/opt/hapi/pi-agent"]).toBe("size=64m,uid=1001,gid=1001,mode=0700");
     expect(liveProblems(c!, shapeOf(argv), pack)).toEqual([]);
+    // Docker keeps --stop-timeout in Config, not HostConfig.
+    expect(c!.Config!.StopTimeout).toBe(30);
     // And a flag the container wasn't made with is found.
-    const other = shapeOf(argv.map((a) => (a === "2048" ? "4096" : a)));
-    expect(liveProblems(c!, other, pack)).toEqual(["its pids limit is 2048, not 4096"]);
+    const other = shapeOf(argv.map((a) => (a === "2048" ? "4096" : a === "30" ? "10" : a)));
+    expect(liveProblems(c!, other, pack)).toEqual(["its pids limit is 2048, not 4096", "its stop timeout is 30, not 10"]);
   }, 120_000);
 });

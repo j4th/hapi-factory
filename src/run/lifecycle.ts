@@ -90,14 +90,8 @@ import {
   withStartLock,
   writeRecord,
 } from "./records";
-import { APP_USER, PROXY_ALIAS, runArgs, type RunDeps, type RunInputs, runLabels, runName } from "./spec";
+import { APP_USER, PROXY_ALIAS, runArgs, type RunDeps, type RunInputs, runLabels, runName, STOP_GRACE_S } from "./spec";
 
-/**
- * `docker stop -t`: seconds between TERM and KILL. Not Docker's 10: after the workflow ends, run.sh starts the
- * Archon CLI (bun) up to three more times for its read-back (result.json, the transcript), and a KILL inside
- * that leaves a stopped run without its outputs. Spike 07 saw a bash-only run's post-run steps take under a second.
- */
-export const STOP_GRACE_S = 30;
 /** How long `finalizeRun` waits for another process finalizing the same run: the listing and four reads at their host bound and KILL, and the rest. */
 const FINALIZE_WAIT_S = 900;
 
@@ -175,7 +169,10 @@ function hardenedGit(d: Pick<RunDeps, "env">, o: { env?: string[]; git?: string[
   };
 }
 
-/** The commit the source's HEAD names. The repo is the operator's (Plan 03: the mirror), read with no config of its own. */
+/**
+ * The commit the source's HEAD names. The repo is the operator's (Plan 03: the mirror), read with no system or global
+ * config, hooks or fsmonitor; the source's own .git/config is read, which is why the runbook asks for a bare clone.
+ */
 async function headOf(gitDir: string, d: RunDeps): Promise<string> {
   const git = hardenedGit(d);
   const r = await d.run([...git.cmd, "-c", `safe.directory=${gitDir}`, "--git-dir", gitDir, "rev-parse", "--verify", "HEAD^{commit}"], { env: git.env, inherit: false });

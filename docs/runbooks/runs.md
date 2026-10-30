@@ -24,7 +24,7 @@ Plan 03's poller calls the same launcher, from merged work orders. Until then th
 
 ### The container's layout
 
-Everything below is made by the launcher (`src/run/spec.ts`), from the `archon` service's user (`1001:1001`), limits (2048 pids, 4 GB), hardening and environment. The root filesystem is read-only, with all capabilities dropped and `no-new-privileges`.
+Everything below is made by the launcher (`src/run/spec.ts`), from the `archon` service's user (`1001:1001`), limits (2048 pids, 4 GB), hardening and environment. The root filesystem is read-only, with all capabilities dropped and `no-new-privileges`. The launcher refuses a service that lacks any of them (`read_only: true`, `cap_drop` with `ALL`, `security_opt` with `no-new-privileges:true`, `pids_limit`, `mem_limit`), naming the key, so a drifted `compose.yaml` never runs a run unhardened. The container's stop timeout is 30 seconds (`--stop-timeout`), the same as `hapi run stop`'s, so a daemon restart or a reboot gives the prelude the same grace.
 
 | Path in the container | What it is | Writable |
 |---|---|---|
@@ -391,7 +391,7 @@ sudo -u hapi -H -- sh -c 'rm -rf "$HOME/hapi-check-work" "$HOME/hapi-check-repo.
 | `reason` says `the run's container was removed before the run was finalized` | `mise run down` or a cleanup removed the container while the run was live. Nothing was copied out. Start the run again with `--retry-of`. |
 | `reason` says `cleanup left run objects behind` | Docker couldn't remove one of the run's objects. `mise run down` removes everything labelled `org.hapi.run`. |
 | `timed-out` | The run passed the work order's `budget.minutes` and was stopped. Raise the budget in the work order, or fix what is slow. |
-| `hapi run watch` prints `run <id>'s container has exited, but the run was not finalized within 120 s: ...` | The supervisor died. `list` and `watch` don't reap: run `hapi run stop <id>` (or the next `hapi run start`), which finalizes the run, then `watch <id>` shows how it ended. |
+| `hapi run watch` prints `run <id>'s container has exited, but the run was not finalized within 120 s: ...` | The supervisor is still finalizing (a copy-out of a large bundle can take up to 150 s per helper), or it died. `hapi run list` shows the status. If it is still `live` a few minutes on, the supervisor died: `list` and `watch` don't reap, so run `hapi run stop <id>` (or the next `hapi run start`), which finalizes the run, then `watch <id>` shows how it ended. |
 | `stop` or `start` says a lock is held | Another `hapi run` command holds the launcher's lock. It fails at once and names the holder; run it again when that one ends. |
 | A tool in the run fails with `Permission denied` for a script under `/tmp` or `~` | Docker's tmpfs mounts are `noexec` (H-208). Run the tool through its interpreter (`sh script`, `python script.py`), or ask for it to be in the image. |
 | `docker: Error response from daemon: ... volume is in use` during `mise run down` while a run is finalizing | The copy-out helper and `down` raced for the run's volume. Run `mise run down` again once `hapi run list` shows no `live` run (H-210). |

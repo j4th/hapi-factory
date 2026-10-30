@@ -166,6 +166,36 @@ describe("runtime.run-container", () => {
     for (const part of ["does not drop ALL capabilities", "root filesystem is not read-only", "no-new-privileges:true is not set", "runs as 0:0, not 1001:1001", "pids limit is 0, not 2048", "memory limit is 0, not 4294967296", "no tmpfs at /tmp"]) expect(r.detail).toContain(part);
   });
 
+  test("a run definition without the hardening flags or the stop timeout fails, naming each (final review B-2)", async () => {
+    const drop = (flag: string) => without(flag, () => true);
+    const r = await withSpec((argv) =>
+      [drop("--cap-drop"), drop("--security-opt"), drop("--pids-limit"), drop("--memory"), drop("--stop-timeout")].reduce((a, f) => f(a), argv).filter((a) => a !== "--read-only").map((a, i, all) => (all[i - 1] === "--user" ? "0:0" : a)),
+    );
+    expect(r.status).toBe("fail");
+    for (const part of [
+      "it does not drop ALL capabilities",
+      "its root filesystem is not read-only",
+      "it does not set no-new-privileges:true",
+      "it has no pids limit",
+      "it has no memory limit",
+      "it runs as 0:0, not 1001:1001",
+      "its stop timeout is Docker's default, not 30",
+    ]) expect(r.detail).toContain(part);
+  });
+
+  test("a live run container's stop timeout must be the definition's", async () => {
+    const w = await cleanWorld();
+    const live = runContainer(w);
+    delete live.Config.StopTimeout;
+    const other = runContainer(w, "0123456789ab");
+    other.Config.StopTimeout = 10;
+    w.containers.push(live, other);
+    const r = await check(w, "runtime.run-container");
+    expect(r.status).toBe("fail");
+    expect(r.detail).toContain("hapi-run-ab12cd34ef56: its stop timeout is Docker's default, not 30");
+    expect(r.detail).toContain("hapi-run-0123456789ab: its stop timeout is 10, not 30");
+  });
+
   test("a stopped run container is not checked", async () => {
     const w = await cleanWorld();
     const live = runContainer(w);

@@ -119,11 +119,21 @@
    "workflowName": "archon-worktree-cleanup",
    "valid": true,
    "issues": []
+  },
+  {
+   "workflowName": "hapi-check-guard",
+   "valid": true,
+   "issues": []
+  },
+  {
+   "workflowName": "hapi-check-run",
+   "valid": true,
+   "issues": []
   }
  ],
  "summary": {
-  "total": 24,
-  "valid": 24,
+  "total": 26,
+  "valid": 26,
   "errors": 0,
   "warnings": 0
  }

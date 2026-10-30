@@ -31,9 +31,11 @@ function fakes(
     inspect?: { code: number; stdout: string; stderr?: string };
     downCode?: number;
     upCode?: number;
-    /** Ids `docker ps -q` lists as live runs (what `up` checks first). */
+    /** Ids of live runs: their containers, named hapi-run-<id>, are what `up` checks for first. */
     live?: string[];
-    /** Exit code of `docker ps -q` (the live-run check). */
+    /** Ids of runs with a live helper container (the chown, a copy-out): the run's labels, Docker's own name. */
+    liveHelpers?: string[];
+    /** Exit code of `docker ps` (the live-run check). */
     liveCode?: number;
     /** Exit code of `compose build archon`. */
     buildCode?: number;
@@ -59,7 +61,8 @@ function fakes(
       steps.push(cmd.slice(0, 3).join(" ") === "docker network inspect" ? "docker network inspect" : cmd.join(" "));
       if (o.failing?.includes(cmd.join(" "))) return { code: 1, stdout: "", stderr: "boom" };
       const lines = (ids: string[] | undefined) => ({ code: 0, stdout: (ids ?? []).map((i) => `${i}\n`).join(""), stderr: "" });
-      if (cmd[1] === "ps") return cmd.includes("-aq") ? lines(o.runs?.containers) : o.liveCode ? { code: o.liveCode, stdout: "", stderr: "daemon down" } : lines(o.live);
+      const rows = [...(o.live ?? []).map((id) => `${id}\thapi-run-${id}`), ...(o.liveHelpers ?? []).map((id) => `${id}\tfervent_turing`)];
+      if (cmd[1] === "ps") return cmd.includes("-aq") ? lines(o.runs?.containers) : o.liveCode ? { code: o.liveCode, stdout: "", stderr: "daemon down" } : lines(rows);
       if (cmd[1] === "network" && cmd[2] === "ls") return lines(o.runs?.networks);
       if (cmd[1] === "volume" && cmd[2] === "ls") return lines(o.runs?.volumes);
       if (cmd[1] === "network" && cmd[2] === "inspect") return o.inspect ?? { code: 0, stdout: JSON.stringify(o.networks ?? GOOD), stderr: "" };
@@ -76,7 +79,7 @@ const COMPOSE = ["docker", "compose", "-f", "stack/compose.yaml", "-p", "hapi"];
 /** The docker compose calls a fake runner saw: none means nothing was created, built or started. */
 const composeCalls = (f: { calls: Call[] }) => f.calls.filter((c) => c.cmd[1] === "compose");
 /** `up`'s first docker call: are any runs live? */
-const LIVE_CHECK = "docker ps -q --filter label=org.hapi.run --filter label=org.hapi.project=hapi";
+const LIVE_CHECK = 'docker ps --filter label=org.hapi.run --filter label=org.hapi.project=hapi --format {{.Label "org.hapi.run"}}\t{{.Names}}';
 
 /** The whole script the re-exec hands `sh -c` as hapi, for `up`: fixed text, no argument in it. */
 const UP_SCRIPT = `: "\${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; export XDG_RUNTIME_DIR; export PATH="$HOME/.local/bin:$PATH"; cd "$HOME/hapi-factory" && exec "$HOME/.local/bin/mise" run up -- "$@"`;
@@ -417,14 +420,21 @@ describe("hapi stack up", () => {
 
   test("up refuses while a run is live: it checks first, names the count and the way out, and builds, resolves and creates nothing", async () => {
     capture();
-    const f = fakes({ live: ["aaa", "bbb"] });
+    const f = fakes({ live: ["aaaaaaaaaaaa", "bbbbbbbbbbbb"], liveHelpers: ["cccccccccccc"] });
     const e = await caught(stackUp([], f.deps));
     expect(e.message).toBe(
       "hapi stack up: 2 runs are live (docker ps --filter label=org.hapi.run): stop them with `hapi run stop <id>` or wait; recreating egress-archon would cut their egress",
     );
     // Only the live-run check ran: no policy build, no secrets, no compose.
     expect(f.steps).toEqual([LIVE_CHECK]);
-    expect(f.calls[0]!.cmd).toEqual(["docker", "ps", "-q", "--filter", `label=${RUN_LABEL}`, "--filter", `label=${PROJECT_LABEL}=hapi`]);
+    expect(f.calls[0]!.cmd).toEqual(["docker", "ps", "--filter", `label=${RUN_LABEL}`, "--filter", `label=${PROJECT_LABEL}=hapi`, "--format", '{{.Label "org.hapi.run"}}\t{{.Names}}']);
+  });
+
+  test("a live helper container (the chown, a copy-out) is not a live run: it carries the labels, not the run's name (final review B-5)", async () => {
+    capture();
+    const f = fakes({ liveHelpers: ["aaaaaaaaaaaa"] });
+    expect(await stackUp([], f.deps)).toBe(0);
+    expect(f.steps.slice(0, 2)).toEqual([LIVE_CHECK, "build anthropic"]);
   });
 
   test("when it cannot tell whether runs are live, up stops rather than assuming none", async () => {

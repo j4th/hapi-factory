@@ -22,8 +22,20 @@ describe("tools.archon-validate", () => {
   test("no errors, no parse warnings and every alias and tier read as generated passes (H-030)", async () => {
     const r = await check(await cleanWorld(), "tools.archon-validate");
     expect(r.status).toBe("pass");
-    expect(r.detail).toContain("24 workflows");
+    // Archon's 24 and the shipped pack's 2, as 0.12.1 printed them with the pack bound (re-captured 2026-10-30).
+    expect(r.detail).toContain("26 workflows");
     expect(r.detail).toContain("8 aliases and 3 tiers");
+  });
+
+  test("a pack workflow that Archon's validate results don't name fails: an image that stopped scanning the pack must not pass it unvalidated (final review B-7)", async () => {
+    const w = await cleanWorld();
+    const out = readJson("archon-validate-v0.12.1.json") as { results: { workflowName: string }[] };
+    out.results = out.results.filter((x) => x.workflowName !== "hapi-check-guard");
+    w.archonValidate = { code: 0, out };
+    const r = await check(w, "tools.archon-validate");
+    expect(r.status).toBe("fail");
+    expect(r.detail).toContain("the pack's workflow hapi-check-guard (hapi-check-guard.yaml) is not among archon validate workflows' results, so it was not validated");
+    expect(r.detail).not.toContain("hapi-check-run (");
   });
 
   test("runs the stack's Archon image offline, read-only, with no secret: only the deployed config and Pi dir, read-only", async () => {
@@ -74,6 +86,7 @@ describe("tools.archon-validate", () => {
     writeFileSync(join(pack, "ok.yaml"), "name: ok\ndescription: x\nnodes:\n  - id: a\n    bash: 'true'\n    pi:\n      enableExtensions: true\n");
     writeFileSync(join(pack, "bad.yaml"), "name: bad\ndescription: x\nnodes:\n  - id: a\n    bash: 'true'\n  - id: off\n    prompt: hi\n    pi:\n      enableExtensions: false\n");
     w.ctx.root = root;
+    w.archonValidate = { code: 0, out: { results: ["ok", "bad"].map((workflowName) => ({ workflowName, valid: true, issues: [] })) } };
     const r = await check(w, "tools.archon-validate");
     expect(r.status).toBe("fail");
     expect(r.detail).toContain("bad.yaml: node off sets pi.enableExtensions: false");

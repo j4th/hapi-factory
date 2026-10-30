@@ -89,7 +89,7 @@ export interface Container {
   State: { Running: boolean };
   Path: string;
   Args: string[];
-  Config: { Labels: Record<string, string>; Env: string[]; Cmd: string[] | null; Entrypoint: string[] | null; User?: string };
+  Config: { Labels: Record<string, string>; Env: string[]; Cmd: string[] | null; Entrypoint: string[] | null; User?: string; StopTimeout?: number };
   Mounts: { Type: string; Source: string; Destination: string; RW: boolean }[];
   HostConfig?: { PortBindings: Record<string, unknown>; Tmpfs?: Record<string, string>; CapDrop?: string[]; ReadonlyRootfs?: boolean; SecurityOpt?: string[]; PidsLimit?: number; Memory?: number };
 }
@@ -398,6 +398,8 @@ export function runContainer(w: World, id = "ab12cd34ef56", over: { labels?: Rec
       Cmd: null,
       Entrypoint: ["sh"],
       User: "1001:1001",
+      // `--stop-timeout` is in Config, not HostConfig (Docker 29.9.2).
+      StopTimeout: 30,
     },
     Mounts: [
       // Docker 29.9.2 lists a --tmpfs only in HostConfig.Tmpfs, never here (probed by the task 9 review).

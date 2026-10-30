@@ -6,10 +6,11 @@
  *   fresh container the launcher makes, src/run/spec.ts), so the check's subject
  *   is the run definition: `runArgs` for a sample run must give Pi's agent dir
  *   a tmpfs, bind every generated file (and /.archon/.env, empty, and the
- *   workflow pack) read-only, carry every value of `serviceEnvironment("archon")`
- *   and publish no port (H-197). Each live run container, found by its
- *   `org.hapi.run` and `org.hapi.project` labels (never by Compose's), is held to
- *   the same through `docker inspect`.
+ *   workflow pack) read-only, carry every value of `serviceEnvironment("archon")`,
+ *   publish no port (H-197), and carry every hardening flag and the stop
+ *   timeout. Each live run container, found by its `org.hapi.run` and
+ *   `org.hapi.project` labels (never by Compose's), is held to that argv through
+ *   `docker inspect` (`liveProblems`).
  * - runtime.hermes-no-yolo: Hermes's effective approval settings: no `--yolo`
  *   in its argv, no HERMES_YOLO_MODE or HERMES_YOLO in its env, HERMES_HOME
  *   where hapi puts it, and in the config mounted read-only at
@@ -29,7 +30,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import YAML from "yaml";
 import { RUN_PATHS } from "../../generate/archon";
-import { runArgs, type RunInputs } from "../../run/spec";
+import { APP_USER, NO_NEW_PRIVILEGES, runArgs, type RunInputs, STOP_GRACE_S } from "../../run/spec";
 import { composeServices } from "../../stack/compose";
 import { HERMES_HOME, serviceEnvironment } from "../../stack/env";
 import { currentUserOverride, HAPI_USER, PROJECT, runFilters } from "../../stack/up";
@@ -43,7 +44,7 @@ export interface Container {
   State?: { Running?: boolean };
   Path?: string;
   Args?: string[];
-  Config?: { Labels?: Record<string, string> | null; Env?: string[] | null; Cmd?: string[] | null; Entrypoint?: string[] | null; User?: string | null };
+  Config?: { Labels?: Record<string, string> | null; Env?: string[] | null; Cmd?: string[] | null; Entrypoint?: string[] | null; User?: string | null; StopTimeout?: number | null };
   Mounts?: { Type?: string; Source?: string; Destination?: string; RW?: boolean }[] | null;
   HostConfig?: {
     PortBindings?: Record<string, unknown> | null;
@@ -173,6 +174,8 @@ export interface RunShape {
   user: string | undefined;
   pids: number | undefined;
   memory: number | undefined;
+  /** `--stop-timeout`, in seconds; Docker keeps it in `Config.StopTimeout`. */
+  stopTimeout: number | undefined;
   ports: boolean;
 }
 
@@ -182,6 +185,7 @@ export function shapeOf(argv: string[]): RunShape {
   const after = (flag: string) => argv.flatMap((a, i) => (argv[i - 1] === flag ? [a] : []));
   const mem = /^(\d+)([bkmg]?)$/i.exec(after("--memory")[0] ?? "");
   const pids = after("--pids-limit")[0];
+  const stop = after("--stop-timeout")[0];
   const shape: RunShape = {
     tmpfs: new Map(after("--tmpfs").map((t) => [t.slice(0, t.indexOf(":")), t.slice(t.indexOf(":") + 1)] as [string, string])),
     binds: new Map(),
@@ -193,6 +197,7 @@ export function shapeOf(argv: string[]): RunShape {
     user: after("--user")[0],
     pids: pids === undefined ? undefined : Number(pids),
     memory: mem === null ? undefined : Number(mem[1]) * BYTES[mem[2]!.toLowerCase()]!,
+    stopTimeout: stop === undefined ? undefined : Number(stop),
     ports: argv.some((a) => ["-p", "--publish", "-P", "--publish-all"].includes(a) || a.startsWith("--publish=")),
   };
   for (const v of after("-v")) {
@@ -204,7 +209,11 @@ export function shapeOf(argv: string[]): RunShape {
   return shape;
 }
 
-/** How the run definition's `docker run` argv falls short of what a run container must be; empty if it doesn't. */
+/**
+ * How the run definition's `docker run` argv falls short of what a run container must be; empty if it doesn't: Pi's
+ * tmpfs, every bind read-only, the default pack dir, the environment, no published port, every hardening flag
+ * (`--cap-drop ALL`, `--read-only`, no-new-privileges, user 1001:1001, a pids and a memory limit) and the stop timeout.
+ */
 function definitionProblems(want: RunShape, packDir: string): string[] {
   const problems: string[] = [];
   const tmpfs = want.tmpfs.get(RUN_PATHS.piDir);
@@ -216,13 +225,21 @@ function definitionProblems(want: RunShape, packDir: string): string[] {
   if (pack !== undefined && pack.src !== packDir) problems.push(`${RUN_PATHS.pack} is bound from ${pack.src}, not the default pack dir ${packDir}`);
   problems.push(...envProblems(want.env));
   if (want.ports) problems.push("it publishes a port (a run listens nowhere)");
+  if (!want.capDrop.includes("ALL")) problems.push("it does not drop ALL capabilities");
+  if (!want.readOnly) problems.push("its root filesystem is not read-only");
+  if (!want.securityOpt.includes(NO_NEW_PRIVILEGES)) problems.push(`it does not set ${NO_NEW_PRIVILEGES}`);
+  if (want.user !== APP_USER) problems.push(`it runs as ${want.user ?? "(the image's user)"}, not ${APP_USER}`);
+  if (want.pids === undefined) problems.push("it has no pids limit");
+  if (want.memory === undefined) problems.push("it has no memory limit");
+  if (want.stopTimeout !== STOP_GRACE_S) problems.push(`its stop timeout is ${want.stopTimeout ?? "Docker's default"}, not ${STOP_GRACE_S}`);
   return problems;
 }
 
 /**
  * How a live run container falls short of the definition `want`: every tmpfs (Docker lists a `--tmpfs` only in
  * `HostConfig.Tmpfs`), every bind and volume (none missing, none unexpected, each bind read-only), the default pack
- * dir, the environment, no published port, and the hardening flags.
+ * dir, the environment, no published port, the hardening flags (capabilities dropped, a read-only root,
+ * no-new-privileges, the user, the pids and memory limits) and the stop timeout (in `Config.StopTimeout`).
  */
 export function liveProblems(c: Container, want: RunShape, packDir: string): string[] {
   const problems: string[] = [];
@@ -249,6 +266,8 @@ export function liveProblems(c: Container, want: RunShape, packDir: string): str
   if (want.user !== undefined && c.Config?.User !== want.user) problems.push(`it runs as ${c.Config?.User || "(the image's user)"}, not ${want.user}`);
   if (want.pids !== undefined && h.PidsLimit !== want.pids) problems.push(`its pids limit is ${h.PidsLimit ?? 0}, not ${want.pids}`);
   if (want.memory !== undefined && h.Memory !== want.memory) problems.push(`its memory limit is ${h.Memory ?? 0}, not ${want.memory}`);
+  const stop = c.Config?.StopTimeout ?? undefined;
+  if (want.stopTimeout !== undefined && stop !== want.stopTimeout) problems.push(`its stop timeout is ${stop ?? "Docker's default"}, not ${want.stopTimeout}`);
   return problems;
 }
 
@@ -278,7 +297,7 @@ export async function runContainer(run: AuditRun): Promise<CheckResult[]> {
     result(
       id,
       "pass",
-      `the run definition (runArgs, src/run/spec.ts) gives ${RUN_PATHS.piDir} a tmpfs (${PI_TMPFS}), binds ${READ_ONLY_DESTINATIONS.length} files (the generated ones, /.archon/.env and the pack ${packDir}) read-only, sets all ${Object.keys(serviceEnvironment("archon")).length} values of serviceEnvironment("archon") (${nonProxy} besides the proxy's) and publishes no port; ${checked}`,
+      `the run definition (runArgs, src/run/spec.ts) gives ${RUN_PATHS.piDir} a tmpfs (${PI_TMPFS}), binds ${READ_ONLY_DESTINATIONS.length} files (the generated ones, /.archon/.env and the pack ${packDir}) read-only, sets all ${Object.keys(serviceEnvironment("archon")).length} values of serviceEnvironment("archon") (${nonProxy} besides the proxy's), publishes no port, and has every hardening flag and a ${STOP_GRACE_S} s stop timeout; ${checked}`,
     ),
   ];
 }
