@@ -16,10 +16,14 @@ git -C /work/repo remote remove origin
 # Archon starts from /app, never from inside the clone: started there it would load the repo's .archon/.env
 # over the container's settings, and Bun would run the repo's bunfig.toml preload inside Archon itself.
 cd /app
+# `docker stop` sends TERM to this shell, which passes it on: Archon marks the run failed and exits. The trap is
+# in place before bun starts. A TERM that arrives before then is a no-op (pid is still empty): Docker's stop
+# timeout then ends the container, and the launcher records the run. `|| true`, because a trap body that fails
+# under set -e ends the script (bun already gone), before the read-back below.
+pid=
+trap 'kill -TERM "$pid" 2>/dev/null || true' TERM INT
 bun --no-env-file /app/packages/cli/src/cli.ts workflow run "$1" --cwd /work/repo --no-worktree --config /opt/hapi/run-config.yaml --input work_order_id="$3" --input traceparent="$4" &
 pid=$!
-# `docker stop` sends TERM to this shell, which passes it on: Archon marks the run failed and exits.
-trap 'kill -TERM "$pid" 2>/dev/null' TERM INT
 # The workflow's exit code is data, so it is captured, never allowed to end the script. A trapped signal ends
 # `wait` early (and with a code above 128), so wait again until the process is gone.
 rc=0; wait "$pid" || rc=$?

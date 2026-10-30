@@ -53,8 +53,12 @@ describe("the text of run.sh", () => {
     expect(text).toContain('--input traceparent="$4"');
   });
 
-  test("it traps TERM and INT and forwards TERM to the workflow's process", () => {
-    expect(text).toContain(`trap 'kill -TERM "$pid" 2>/dev/null' TERM INT`);
+  test("it traps TERM and INT and forwards TERM to the workflow's process, set before bun starts, with a body that can't fail under set -e", () => {
+    const trap = `trap 'kill -TERM "$pid" 2>/dev/null || true' TERM INT`;
+    expect(text).toContain(trap);
+    // pid is set (empty) first, for set -u; the trap is in place before the `&`; pid=$! comes right after it.
+    const bun = code.findIndex((l) => l.startsWith("bun ") && l.endsWith(" &"));
+    expect(code.slice(bun - 2, bun + 2)).toEqual(["pid=", trap, code[bun]!, "pid=$!"]);
   });
 
   test('the workflow\'s code is captured with wait "$pid" || rc=$?, never under set -e, and a trapped signal that ends wait early is waited out', () => {
