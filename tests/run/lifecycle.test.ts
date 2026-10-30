@@ -12,7 +12,7 @@ import { isAbsolute, join, relative } from "node:path";
 import { main } from "../../src/cli";
 import { runDeps, START_USAGE } from "../../src/run/cli";
 import { COPY_SCRIPT, HELPER_HOST_TIMEOUT_S, HELPER_KILL_AFTER_S, HELPER_TIMEOUT_S, LIST_SCRIPT } from "../../src/run/copyout";
-import { bundleProblem, finalizeRun, guardProblems, LOGS_SCRIPT, reapRuns, runStart, runStop, runSupervise } from "../../src/run/lifecycle";
+import { bundleProblem, FINALIZE_WAIT_S, finalizeRun, guardProblems, LOGS_SCRIPT, reapRuns, runStart, runStop, runSupervise } from "../../src/run/lifecycle";
 import { readRecord, RUN_ID, runKey } from "../../src/run/records";
 import { STOP_GRACE_S } from "../../src/run/spec";
 import { reexecScript, runCommand } from "../../src/stack/up";
@@ -471,6 +471,12 @@ describe("finalizeRun", () => {
     expect(done.status).toBe("succeeded");
     expect(done.reason).toMatch(new RegExp(`^cleanup left run objects behind: removing the runs of hapi left something behind: docker volume rm ${N}-work ${N}-out failed \\(exit 1\\): boom; \`mise run down\` removes them$`));
   });
+});
+
+test("a finalize waits on another long enough for that one's stop and every bounded call, the container's log among them", () => {
+  // The stop's grace, then the listing, four reads and the log, each at its host bound and KILL.
+  expect(FINALIZE_WAIT_S).toBeGreaterThanOrEqual(STOP_GRACE_S + 6 * (HELPER_HOST_TIMEOUT_S + HELPER_KILL_AFTER_S));
+  expect(FINALIZE_WAIT_S).toBe(1090);
 });
 
 describe("the container's log, when no result.json came out (final review C-1)", () => {

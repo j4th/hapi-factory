@@ -71,7 +71,7 @@ import { composeServices } from "../stack/compose";
 import { currentUserOverride, definedEnv, HAPI_USER, networkProblem, reexec, removeRuns, runCommand } from "../stack/up";
 import { loadWorkOrder } from "../workorder/validate";
 import { parseRunId, parseStart, runDeps, START_USAGE, STOP_USAGE, SUPERVISE_USAGE } from "./cli";
-import { bounded, copyOut, HELPER_HOST_TIMEOUT_S, timedOut } from "./copyout";
+import { bounded, copyOut, HELPER_HOST_TIMEOUT_S, HELPER_KILL_AFTER_S, timedOut } from "./copyout";
 import {
   capacityProblem,
   containerExists,
@@ -95,8 +95,12 @@ import {
 import { redactSecrets, sanitizeTerminal } from "./sanitize";
 import { APP_USER, PROXY_ALIAS, runArgs, type RunDeps, type RunInputs, runLabels, runName, STOP_GRACE_S } from "./spec";
 
-/** How long `finalizeRun` waits for another process finalizing the same run: the listing and four reads at their host bound and KILL, and the rest. */
-const FINALIZE_WAIT_S = 900;
+/**
+ * How long `finalizeRun` waits for another process finalizing the same run: its stop's grace (STOP_GRACE_S, 30 s),
+ * its six bounded helper calls each at its host bound and KILL (the listing, four reads and the container's log:
+ * 6 × (150 + 10) = 960 s), and 100 s for the rest: 1090 s in all.
+ */
+export const FINALIZE_WAIT_S = STOP_GRACE_S + 6 * (HELPER_HOST_TIMEOUT_S + HELPER_KILL_AFTER_S) + 100;
 
 const firstLine = (s: string | undefined) => (s ?? "").trim().split("\n")[0]?.slice(0, 300) || "(no error output)";
 /** Printable ASCII only, and short: for a name a run made (a node path, an attempt id, a ref). */
