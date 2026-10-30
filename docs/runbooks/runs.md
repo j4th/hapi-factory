@@ -32,8 +32,8 @@ Everything below is made by the launcher (`src/run/spec.ts`), from the `archon` 
 | `$HOME` (`/home/appuser`) | tmpfs, 256 MB. The generated `.gitconfig` is bound into it. | yes, but `noexec` |
 | `/.archon` | tmpfs, 512 MB: Archon's run database, workspaces and logs. `config.yaml`, an empty `.env` and the workflow pack (`/.archon/workflows/hapi`) are bound into it. | yes, but `noexec`; the bound files are not |
 | `/opt/hapi/pi-agent` | Pi's directory: tmpfs, 64 MB. Bound into it: `models.json`, `models-store.json` (`{}`), `hapi-guard.json`, `settings.json` and `extensions/`. | yes (Pi's cache and sessions); the bound files are not |
-| `/work` | volume: the clone, `/work/repo`, which a worker edits | yes |
-| `/out` | volume: `run.bundle`, `result.json`, `transcript.jsonl`, `decisions.jsonl` | yes |
+| `/work` | volume: the clone, `/work/repo`, which a worker edits. No size cap. | yes |
+| `/out` | volume: `run.bundle`, `result.json`, `transcript.jsonl`, `decisions.jsonl`. No size cap. | yes |
 | `/src/repo.git` | the source repository's git dir | no |
 | `/run/hapi/run.json` | the run's input: its id, the work order's id, `traceparent`, the budget, the public flag, the workflow | no |
 | `/opt/hapi/run.sh` | the fixed prelude that clones, runs the workflow and reads the results back | no |
@@ -75,7 +75,7 @@ sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
 
 Expected: it prints the run id (twelve hex digits) and returns. The run is going; `watch` follows it.
 
-- **`--repo`** is where the run's clone comes from. Pass a **bare clone**, not a working checkout. The launcher binds the source's git dir into the container read-only, and a working checkout's `.git/config` is then readable by the run: an `http.extraheader`, or a token in a remote URL, would be visible to a worker. A bare clone of the repo has none. Make one as hapi: `git clone --bare <url> "$HOME/repos/example.git"`, with a URL that needs no credential. The run starts from the source's `HEAD`, so that is the commit the work is cut from (H-211 tracks the mirror that replaces this in Plan 03).
+- **`--repo`** is where the run's clone comes from. Pass a **bare clone**, not a working checkout. The launcher binds the source's git dir into the container read-only, and a working checkout's `.git/config` is then readable by the run: an `http.extraheader`, or a token in a remote URL, would be visible to a worker. A bare clone of the repo has none. Make one as hapi: `git clone --bare <url> "$HOME/repos/example.git"`, with a URL that needs no credential. The run starts from the source's `HEAD`, so that is the commit the work is cut from (H-211 tracks the mirror that replaces this in Plan 03). The source must be world-readable (made under `umask 022`), because the container reads it as another uid.
 - **`--work-order`** is a work order file (`order.yaml`), validated on the host before anything starts ([docs/policy.md](../policy.md#work-orders)). A work order with a non-empty `egress_extra` is refused: a per-run proxy for it doesn't exist yet (H-088, H-207).
 - **`--budget-usd`** only lowers the work order's `budget.usd`. A value above it is a usage error.
 - **`--public`** is [the public flag](#the-public-flag).
@@ -154,7 +154,7 @@ In Plan 02 the flag is an assertion, not a check: nothing on the host verifies i
 
 ## Rollout on hapi's checkout
 
-Once this branch has landed on `main`, and before the first run. Each step runs on the host, started from your own terminal, as hapi in hapi's checkout, in the form above (hapi's `PATH` and runtime directory set). Stop first if a run is live (`hapi run list`): `up` refuses while one is.
+Once this branch has landed on `main`, and before the first run. Each step runs on the host, started from your own terminal, as hapi in hapi's checkout, in the form above (hapi's `PATH` and runtime directory set). Wait for or stop any live run first (`hapi run list`, `hapi run stop <id>`): step 2's `down` removes a live run, which is then recorded `failed` with nothing copied out.
 
 1. **Update hapi's checkout and install its dependencies.** `mise run setup` runs `bun install --frozen-lockfile`, which brings in `@anthropic-ai/sdk`, the package `hapi policy build` bundles into the guard and `hapi decide`. Without it `up` stops at its policy build.
 
@@ -220,7 +220,7 @@ The first run that spends real money, and the one that shows hapi-guard, the egr
 The work order's workflow overwrites `AGENTS.md`, so the repo needs one. Make a bare clone, as [`--repo`](#hapi-run-start) advises, so the run can't read a working checkout's `.git/config`. It holds one commit with `AGENTS.md` and `README.md`, made with a fixed identity so nothing of yours is in it:
 
 ```bash
-sudo -u hapi -H -- sh -c 'set -e; \
+sudo -u hapi -H -- sh -c 'set -e; umask 022; \
   rm -rf "$HOME/hapi-check-work" "$HOME/hapi-check-repo.git"; \
   git init -q -b main "$HOME/hapi-check-work"; cd "$HOME/hapi-check-work"; \
   printf "# Agent rules\n\nDo not edit this file.\n" > AGENTS.md; \

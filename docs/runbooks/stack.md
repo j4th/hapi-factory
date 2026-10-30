@@ -46,16 +46,7 @@ The research zone's own container, hapi-research, arrives in Plan 04. Task 5 shi
 - **hapi's own settings are in `environment:`**, which Compose puts above `env_file`: the proxy variables, Hermes's `HERMES_HOME`, and for Archon every setting of `build/archon/archon.env` (`ARCHON_ENV` in `src/generate/archon.ts`: telemetry off, Pi offline and its agent dir, Bun's `--no-install`, the git hardening, the Claude binary and `ARCHON_DOCKER`; [docs/generated-configs.md](../generated-configs.md#buildarchonarchonenv)). So no secret can override one, and the secrets manifest may not name one at all ([docs/secrets.md](../secrets.md#the-manifest-stacksecretsyaml)). `src/stack/env.ts` is the list; a unit test checks `stack/compose.yaml` against it.
 - **State** lives in one named volume, `hermes-data`: Hermes's home (sessions, memories, skills). `mise run down` keeps it. A run's state (its clone, its output, Archon's home, Pi's sessions) lives in the run's own tmpfs and labelled volumes, which `hapi run` removes when it is done and `down` removes if it wasn't.
 
-  **Once, when you first start the stack with Plan 02** (as hapi, after `mise run down`): the long-lived Archon's two volumes are left over, and nothing reads them. Remove them:
-
-  ```bash
-  # in a shell of the hapi user (sudo -iu hapi), with the stack down
-  docker volume rm \
-    hapi_archon-data \
-    hapi_archon-home
-  ```
-
-  They hold the old Archon's run DB and Claude Code state, nothing the factory keeps. `docker volume rm` removes the ones it can and says `No such volume` for any that is already gone.
+  **Once, when you first start the stack with Plan 02**, the long-lived Archon's two volumes, `hapi_archon-data` and `hapi_archon-home`, are left over. They hold the old Archon's run DB and Claude Code state, nothing the factory keeps, and nothing reads them. Remove them once, as [the runs runbook's rollout step 5](runs.md#rollout-on-hapis-checkout) says (any time after the first `mise run down` of Plan 02; the stack may be up).
 
 ## 1. Host setup
 

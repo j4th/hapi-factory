@@ -222,7 +222,7 @@ All amounts are in USD.
 | `enforcement.hapi_guard` | `hard` | What Pi's hapi-guard does when the run crosses `run_usd` (Plan 02 Task 5) |
 | `enforcement.archon` | `hard` | The same for Archon's `factory-task` budget (Plan 03) |
 
-`enforcement` is a setting per enforcement point: `hard` stops the run at `run_usd`; `soft` lets it finish and flags it (`hapi:flagged`, spec §13.3). Both default to `hard`. An overlay may harden a mode but never soften it (soft < hard).
+`enforcement` is a setting per enforcement point: `hard` stops the run at `run_usd`; `soft` lets it finish and flags it (`hapi:flagged`, spec §13.3). Both ship as `hard` and are required: the loader fills no defaults, so the fail-closed value lives in the YAML. An overlay may harden a mode but never soften it (soft < hard).
 
 The monthly caps are enforced at the provider. The operator sets them on the Console workspaces and OpenRouter keys; the [provider-keys runbook](runbooks/provider-keys.md) covers it. An OpenRouter key's cap is set as a limit that resets daily, the monthly cap divided by 31 (the runbook's rule), so a leaked key can spend only one day's share. The workspaces add up to the $200/month credit, and the default workspace is unused.
 
@@ -232,14 +232,14 @@ The run launcher's limits (Plan 02 Task 7; [the runs runbook](runbooks/runs.md) 
 
 | Key | Value | Meaning |
 |---|---|---|
-| `max_live` | 1 | Runs live (queued or running) at once; the launcher refuses the next |
-| `retention_days` | 14 | Days a finished run's files are kept before they are pruned |
-| `output_limits_mb.bundle` | 256 | The largest the result bundle may be, in MB |
-| `output_limits_mb.transcript` | 64 | The largest the run transcript may be |
-| `output_limits_mb.decisions` | 16 | The largest the decisions log may be |
-| `output_limits_mb.result` | 4 | The largest the result summary may be |
+| `max_live` | 1 | Live runs at once; the launcher refuses the next (no queue until Plan 03's poller) |
+| `retention_days` | 14 | A run's files are removed this many days after its `harvestedAt`. Plan 02 sets none, so nothing is removed yet (H-206) |
+| `output_limits_mb.bundle` | 256 | The most the result bundle may be, in MB |
+| `output_limits_mb.transcript` | 64 | The most the run transcript may be |
+| `output_limits_mb.decisions` | 16 | The most the decisions log may be |
+| `output_limits_mb.result` | 4 | The most the result summary may be |
 
-All counts are whole numbers, at least 1 (`max_live: 0` is rejected).
+An output file over its `output_limits_mb` cap is not copied out, and the run is recorded `failed`; the run itself is never stopped for it. All counts are whole numbers, at least 1 (`max_live: 0` is rejected).
 
 ### `gates.yaml`
 
@@ -251,7 +251,7 @@ The level-6 gate settings (Plan 02 Tasks 3 and 5). Every key is required. The fi
 | `bash_gate.skip_commands` | `[]` | Argv prefixes (such as `git status`) that skip the screen. The design screens every call, so the list starts empty; adding a prefix is the operator's choice. |
 | `result_screen.enabled` | true | Screen what a tool returns before the worker reads it |
 | `result_screen.tools` | `[bash, read]` | The tools whose results are screened (`bash`, `read`) |
-| `max_state_chars` | 6000 | The most characters of run state a classifier is shown |
+| `max_state_chars` | 6000 | The most characters of run state a classifier is shown. A result over it is never classified: it gets the decision file's fallback with `truncated: true`, so the result screen wraps it. With 6000, that covers most `read`s of a real source file and long bash output. |
 | `classifiers.jev.model` | `~typesafe/jev-latest` | Jev's OpenRouter model id (Task 11 confirms it passes the `hapi-jev` guardrail) |
 | `classifiers.jev.unknown_call_usd` | 0.001 | Cost charged to the run for a Jev call with unknown usage |
 | `classifiers.haiku.model` | `claude-haiku-5-5` | The fallback classifier, used when `flags.jev.fallback` is `haiku` |
