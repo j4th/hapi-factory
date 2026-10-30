@@ -96,7 +96,7 @@ sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
 
 Replace `0123456789ab` with the run id. For a live run it follows `docker logs --follow` of the run container, the only live view: the transcript is in the run's own `/.archon` tmpfs, out of the host's reach until copy-out. When the container exits, it waits up to two minutes for the run to be finalized, then prints the stored transcript, a line per row, and how the run ended. For a run that has ended it prints the stored transcript and the ending at once.
 
-It reads and never writes: it doesn't answer a pause, call Archon or publish a port. Everything a run wrote is untrusted text, so each line has its terminal escape and control sequences removed, then the archon zone's secret values (read from the env file `hapi secrets resolve` wrote) and key-shaped strings replaced by `[hapi: <NAME> redacted]`. Redaction sees an exact value or a key format, never an encoded or split one: it keeps keys off the screen and is no boundary. Without the env file, `watch` fails and prints nothing of the run.
+It reads and never writes: it doesn't answer a pause, call Archon or publish a port. Everything a run wrote is untrusted text, so each line has its terminal escape and control sequences removed, then the archon zone's secret values (read from the env file `hapi secrets resolve` wrote) and key-shaped strings (a private key whole, body and all) replaced by `[hapi: <NAME> redacted]`. Redaction sees an exact value or a key format, never an encoded or split one: it keeps keys off the screen and is no boundary. Without the env file, `watch` fails and prints nothing of the run.
 
 ## `hapi run list`
 

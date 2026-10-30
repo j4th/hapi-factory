@@ -183,6 +183,26 @@ test("a key-shaped string is redacted to [hapi: <pattern name> redacted], in too
   expect(readFileSync(join(h.out, "decisions.jsonl"), "utf8").includes(token)).toBe(false);
 });
 
+test("a private key is redacted whole, its BEGIN line to its END line, or to the end of the text with no END line (ledger 168)", async () => {
+  const h = setup({ settings: gatesOff });
+  await h.start();
+  const body = Array.from({ length: 4 }, () => randomBytes(48).toString("base64"));
+  const begin = "-----BEGIN " + "RSA PRIVATE KEY-----";
+  const end = "-----END " + "RSA PRIVATE KEY-----";
+  const full = await h.result("read", [{ type: "text", text: `before\n${begin}\n${body.join("\n")}\n${end}\nafter` }]);
+  expect(full.content).toEqual([{ type: "text", text: "before\n[hapi: private-key redacted]\nafter" }]);
+  const cut = await h.result("bash", [{ type: "text", text: `x ${begin}\n${body.slice(0, 2).join("\n")}` }]);
+  expect(cut.content).toEqual([{ type: "text", text: "x [hapi: private-key redacted]" }]);
+  // Two blocks are each redacted, and the text between them stays.
+  const two = await h.result("read", [{ type: "text", text: `${begin}\n${body[0]}\n${end}\nkeep this\n${begin}\n${body[1]}\n${end}\ntail` }]);
+  expect(two.content).toEqual([{ type: "text", text: "[hapi: private-key redacted]\nkeep this\n[hapi: private-key redacted]\ntail" }]);
+  const shown = JSON.stringify([full, cut, two]) + readFileSync(join(h.out, "decisions.jsonl"), "utf8");
+  for (const line of body) expect(shown.includes(line)).toBe(false);
+  // Finding one still needs only the BEGIN line: a write that holds the block blocks.
+  expect((await h.tool("write", { path: "notes.txt", content: `${begin}\n${body[0]}\n${end}\n` }))?.reason).toContain("secret: private-key");
+  expect((await h.tool("bash", { command: `printf '%s' '${begin}'` }))?.reason).toContain("secret: private-key");
+});
+
 describe("a tool_result whose bookkeeping throws still returns its redaction (final review A-1)", () => {
   test("an unwritable ledger: the result is redacted, and the next tool call, send and turn end fail", async () => {
     const h = setup({ settings: gatesOff });

@@ -71,12 +71,26 @@ export function findSecret(text: string, s: Secrets): { name: string; exact: boo
 
 /** KEY_PATTERNS' names, which never clash with an env name (those are upper case). */
 export const PATTERN_NAMES: ReadonlySet<string> = new Set(KEY_PATTERNS.map((k) => k.name));
-const GLOBAL_PATTERNS = KEY_PATTERNS.map(({ name, re }) => ({ name, re: new RegExp(re.source, `${re.flags.replace("g", "")}g`) }));
+
+/** A private key's whole block: its BEGIN line, its body, and its END line, or the rest of the text when it has none. */
+const PRIVATE_KEY_BLOCK = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g;
+
+/**
+ * KEY_PATTERNS as redaction patterns, global, by the same names. `private-key` matches only a key's BEGIN line,
+ * which is enough to find one (`findSecret`), but redacting that line alone would leave the key's body in the text,
+ * so it is redacted as PRIVATE_KEY_BLOCK (ledger 168). That form lives here, not in policy/decisions/write-gate.ts,
+ * which is under policy/**. Shared with `hapi run watch` (src/run/sanitize.ts).
+ */
+export const REDACT_PATTERNS: readonly { name: string; re: RegExp }[] = KEY_PATTERNS.map(({ name, re }) => ({
+  name,
+  re: name === "private-key" ? PRIVATE_KEY_BLOCK : new RegExp(re.source, `${re.flags.replace("g", "")}g`),
+}));
 
 /**
  * The text with every exact value replaced by `[hapi: <NAME> redacted]`, then
- * every KEY_PATTERNS match by `[hapi: <pattern name> redacted]`, and the names
- * found: a key in a repo file the worker reads is not sent on to a classifier.
+ * every REDACT_PATTERNS match by `[hapi: <pattern name> redacted]` (a private
+ * key's whole block), and the names found: a key in a repo file the worker
+ * reads is not sent on to a classifier.
  */
 export function redact(text: string, s: Secrets): { text: string; names: string[] } {
   const names: string[] = [];
@@ -86,7 +100,7 @@ export function redact(text: string, s: Secrets): { text: string; names: string[
     names.push(name);
     out = out.split(value).join(`[hapi: ${name} redacted]`);
   }
-  for (const { name, re } of GLOBAL_PATTERNS) {
+  for (const { name, re } of REDACT_PATTERNS) {
     const next = out.replace(re, `[hapi: ${name} redacted]`);
     if (next === out) continue;
     names.push(name);

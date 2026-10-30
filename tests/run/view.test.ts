@@ -74,6 +74,21 @@ describe("redactSecrets", () => {
     // Every occurrence, not the first.
     expect(redactSecrets(`${key}/${key}`, {})).toBe("[hapi: anthropic redacted]/[hapi: anthropic redacted]");
   });
+
+  test("a private key is redacted whole: its BEGIN line to its END line, or to the end of the text with no END line (ledger 168)", () => {
+    const body = Array.from({ length: 3 }, () => randomBytes(48).toString("base64"));
+    const begin = "-----BEGIN " + "OPENSSH PRIVATE KEY-----";
+    const end = "-----END " + "OPENSSH PRIVATE KEY-----";
+    const full = redactSecrets(`a\n${begin}\n${body.join("\n")}\n${end}\nb`, {});
+    expect(full).toBe("a\n[hapi: private-key redacted]\nb");
+    const cut = redactSecrets(`a ${begin}\n${body.join("\n")}`, {});
+    expect(cut).toBe("a [hapi: private-key redacted]");
+    for (const line of body) expect(full.includes(line) || cut.includes(line)).toBe(false);
+    // Two blocks are each redacted, and the text between them stays.
+    expect(redactSecrets(`${begin}\n${body[0]}\n${end}\nkeep this\n${begin}\n${body[1]}\n${end}`, {})).toBe(
+      "[hapi: private-key redacted]\nkeep this\n[hapi: private-key redacted]",
+    );
+  });
 });
 
 describe("transcriptLines", () => {
