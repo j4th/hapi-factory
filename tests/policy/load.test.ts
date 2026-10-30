@@ -169,23 +169,39 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
     expect(e.path).toBe("/max_live");
   });
 
-  test("a gate left on with no classifier fails to load", () => {
-    const noJev = readFileSync("policy/flags.yaml", "utf8").replace(/^jev:.*$/m, "jev:          { enabled: false, fallback: none, via: openrouter }");
+  describe("a gate that is on needs Haiku as the fallback (Plan 02 has no other classifier for a repo that isn't public)", () => {
+    const jev = (enabled: boolean, fallback: string) =>
+      readFileSync("policy/flags.yaml", "utf8").replace(/^jev:.*$/m, `jev:          { enabled: ${enabled}, fallback: ${fallback}, via: openrouter }`);
     const gates = readFileSync("policy/gates.yaml", "utf8");
-    const message = "on, but flags.jev has no classifier (enabled: false, fallback: none): turn the gate off here instead";
-    const off = (gate: string) => gates.replace(new RegExp(`(${gate}:\\s*enabled:) true`), "$1 false");
-    for (const gate of ["bash_gate", "result_screen"]) {
-      const dir = policyWith("flags.yaml", noJev);
-      // Leave only this gate on.
-      writeFileSync(join(dir, "gates.yaml"), off(gate === "bash_gate" ? "result_screen" : "bash_gate"));
-      const e = policyError(dir);
-      expect(e.file).toEndWith("gates.yaml");
-      expect(e.issues).toEqual([{ path: `/${gate}/enabled`, message }]);
+    const off = (text: string, gate: string) => text.replace(new RegExp(`(${gate}:\\s*enabled:) true`), "$1 false");
+    const message =
+      "on, but flags.jev.fallback is none, so a run that isn't public has no classifier whatever flags.jev.enabled says: set fallback to haiku, or turn the gate off here";
+
+    test("jev off with fallback haiku loads", () => {
+      expect(loadPolicy(policyWith("flags.yaml", jev(false, "haiku"))).flags.jev).toEqual({ enabled: false, fallback: "haiku", via: "openrouter" });
+    });
+
+    for (const enabled of [true, false]) {
+      test(`jev ${enabled ? "on" : "off"} with fallback none is refused, naming each gate that is on`, () => {
+        for (const gate of ["bash_gate", "result_screen"]) {
+          const dir = policyWith("flags.yaml", jev(enabled, "none"));
+          // Leave only this gate on.
+          writeFileSync(join(dir, "gates.yaml"), off(gates, gate === "bash_gate" ? "result_screen" : "bash_gate"));
+          const e = policyError(dir);
+          expect(e.file).toEndWith("gates.yaml");
+          expect(e.issues).toEqual([{ path: `/${gate}/enabled`, message }]);
+        }
+      });
     }
-    // Turning both gates off makes the policy load again.
-    const dir = policyWith("flags.yaml", noJev);
-    writeFileSync(join(dir, "gates.yaml"), off("result_screen").replace(/(bash_gate:\s*enabled:) true/, "$1 false"));
-    expect(loadPolicy(dir).gates.bash_gate.enabled).toBe(false);
+
+    test("both gates off with fallback none loads", () => {
+      for (const enabled of [true, false]) {
+        const dir = policyWith("flags.yaml", jev(enabled, "none"));
+        writeFileSync(join(dir, "gates.yaml"), off(off(gates, "result_screen"), "bash_gate"));
+        const p = loadPolicy(dir);
+        expect([p.flags.jev.enabled, p.gates.bash_gate.enabled, p.gates.result_screen.enabled]).toEqual([enabled, false, false]);
+      }
+    });
   });
 
   test("roles map every role to a tier", () => {

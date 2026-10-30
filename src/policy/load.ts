@@ -42,18 +42,22 @@ export function loadChecked(file: string, schema: SchemaName): unknown {
 }
 
 /**
- * A gate that is on needs a classifier to run: Jev, or Haiku as its fallback
- * (flags.yaml). Flags with neither leave nothing to screen with, and the gate would
- * fail every call, so refuse it here rather than at the first run.
+ * A gate that is on needs a classifier to run. Jev answers only for a public
+ * repo (design §3.4), so Haiku, Jev's fallback (flags.yaml), is the only one a
+ * run that isn't public has, whether or not Jev is enabled. With `fallback: none`
+ * such a run would take the gate's fallback on every call, blocking every bash
+ * command and wrapping every result while it spends its budget, so refuse it here
+ * rather than at the first run (final review A-6).
  */
 function gateIssues(flags: Flags, gates: Gates): Issue[] {
-  if (flags.jev.enabled || flags.jev.fallback !== "none") return [];
+  if (flags.jev.fallback !== "none") return [];
   const issues: Issue[] = [];
   for (const gate of ["bash_gate", "result_screen"] as const) {
     if (!gates[gate].enabled) continue;
     issues.push({
       path: `/${gate}/enabled`,
-      message: "on, but flags.jev has no classifier (enabled: false, fallback: none): turn the gate off here instead",
+      message:
+        "on, but flags.jev.fallback is none, so a run that isn't public has no classifier whatever flags.jev.enabled says: set fallback to haiku, or turn the gate off here",
     });
   }
   return issues;

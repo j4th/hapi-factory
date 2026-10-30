@@ -243,7 +243,7 @@ All counts are whole numbers, at least 1 (`max_live: 0` is rejected).
 
 ### `gates.yaml`
 
-The level-6 gate settings (Plan 02 Tasks 3 and 5). Every key is required. The file is central only: an overlay naming `gates` is an unknown key. A gate that is on needs a classifier, so `loadPolicy` refuses `enabled: true` while `flags.yaml` has `jev: { enabled: false, fallback: none }`; turn the gate off in `gates.yaml` instead.
+The level-6 gate settings (Plan 02 Tasks 3 and 5). Every key is required. The file is central only: an overlay naming `gates` is an unknown key. A gate that is on needs a classifier, so `loadPolicy` refuses `enabled: true` while `flags.jev.fallback` is `none`, whatever `flags.jev.enabled` says. Jev answers only for a public repo, so Haiku is the only classifier a run that isn't public has. Set `fallback: haiku`, or turn the gate off in `gates.yaml`.
 
 | Key | Value | Meaning |
 |---|---|---|
