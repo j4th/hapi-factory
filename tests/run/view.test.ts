@@ -161,6 +161,31 @@ describe("hapi run watch", () => {
     expect(out.join("\n")).not.toContain(key);
   });
 
+  test("live watch drops a private key's later lines, which docker logs hands on one at a time; the line after the key prints (ledger 168)", async () => {
+    const { out } = capture();
+    const f = ready();
+    const body = Array.from({ length: 3 }, () => randomBytes(48).toString("base64"));
+    const begin = "-----BEGIN " + "RSA PRIVATE KEY-----";
+    const end = "-----END " + "RSA PRIVATE KEY-----";
+    f.logs.push("[probe] Started", `key: ${begin}`, "Proc-Type: 4,ENCRYPTED", "", ...body, end, "after the key", begin, body[0]!, "a truncated key ends here");
+    await seedRun(f, { id: ID });
+    f.live.afterLogs = async () => {
+      const rec = (await readRecord(f.deps.stateDir, ID))!;
+      await writeRecord(f.deps.stateDir, { ...rec, status: "succeeded" });
+    };
+    expect(await runWatch([ID], f.deps)).toBe(0);
+    expect(out).toEqual([
+      "[probe] Started",
+      "key: [hapi: private-key redacted]",
+      "after the key",
+      "[hapi: private-key redacted]",
+      "a truncated key ends here",
+      "(no transcript.jsonl was copied out)",
+      `run ${ID}: succeeded`,
+    ]);
+    for (const line of body) expect(out.join("\n")).not.toContain(line);
+  });
+
   test("a finished run's transcript rows are sanitized and redacted too, then its status and reason", async () => {
     const { out } = capture();
     const f = ready();

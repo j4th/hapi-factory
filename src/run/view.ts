@@ -17,16 +17,19 @@
  * Everything a run wrote is untrusted text, so every line, live or stored,
  * goes through `sanitizeTerminal` (no escape sequence or control character
  * reaches the terminal), then `redactSecrets` with the archon zone's values,
- * read on the host from the env file `hapi secrets resolve` wrote. Without
- * that file, watch fails closed and prints nothing of the run. Redaction sees
- * an exact value or a key format, never an encoded or split one: it keeps keys
- * off the screen, and is no boundary.
+ * read on the host from the env file `hapi secrets resolve` wrote; a live
+ * run's lines come one at a time, so a private key's later lines are dropped
+ * as they come (`livePrinter`). Without that file, watch fails closed and
+ * prints nothing of the run. Redaction sees an exact value or a key format,
+ * never an encoded or split one: it keeps keys off the screen, and is no
+ * boundary.
  *
  * `list`: every run's record, newest first, with the spend Archon recorded in
  * the run's copied out/result.json, if any.
  */
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { PEM_BODY_LINE, PEM_END_LINE, PEM_OPEN } from "../guard/secrets";
 import { definedEnv } from "../stack/up";
 import { LIST_USAGE, parseRunId, WATCH_USAGE } from "./cli";
 import { archonSecrets, asHapi, ended } from "./lifecycle";
@@ -81,6 +84,32 @@ const printer = (values: Record<string, string>) => (text: string) => {
   for (const line of redactSecrets(sanitizeTerminal(text), values).split("\n")) console.log(line);
 };
 
+/**
+ * The printer for a live run's `docker logs --follow`, which hands it one line at a time, so `redactSecrets` never
+ * sees a private key's body beside its BEGIN line. After a line whose BEGIN line has no END line after it
+ * (PEM_OPEN), each following body line (PEM_BODY_LINE, the guard's own rule) and the END line are dropped; the
+ * first line that is neither ends the key and prints as usual. Stdout and stderr reach it through one callback, so
+ * a line of the other stream inside a key ends it early: like all of watch's redaction, it keeps keys off the screen
+ * and is no boundary.
+ */
+const livePrinter = (values: Record<string, string>) => {
+  const print = printer(values);
+  let open = false;
+  return (line: string) => {
+    const clean = sanitizeTerminal(line);
+    if (open) {
+      if (PEM_END_LINE.test(clean)) {
+        open = false;
+        return;
+      }
+      if (PEM_BODY_LINE.test(clean)) return;
+      open = false;
+    }
+    print(line);
+    open = PEM_OPEN.test(clean);
+  };
+};
+
 /** Print the run's copied transcript, then how it ended. */
 async function printEnded(d: RunDeps, rec: RunRecord, print: (text: string) => void): Promise<void> {
   let text: string | undefined;
@@ -102,12 +131,13 @@ export async function runWatch(args: string[], deps: Partial<RunDeps> = {}): Pro
     return 2;
   }
   return asHapi("watch", args, deps, async (d) => {
-    const print = printer(await archonSecrets(d.env));
+    const values = await archonSecrets(d.env);
+    const print = printer(values);
     let rec = await readRecord(d.stateDir, id);
     if (rec === undefined) throw new Error(`there is no run ${id} in ${d.stateDir}`);
     if (rec.status === "live") {
       // Its exit code says nothing about the run: 0 once the container exits, 1 if it is already gone.
-      await d.stream(["docker", "logs", "--follow", rec.container], definedEnv(d.env), print);
+      await d.stream(["docker", "logs", "--follow", rec.container], definedEnv(d.env), livePrinter(values));
       const since = d.now().getTime();
       for (;;) {
         rec = (await readRecord(d.stateDir, id)) ?? rec;
