@@ -8,6 +8,7 @@ import { randomBytes } from "node:crypto";
 import { chmodSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { KEY_PATTERNS } from "../../policy/decisions/write-gate";
+import { wrapText } from "../../src/guard/gates";
 import hapiGuard from "../../src/guard/index";
 import { assistant, cleanupAll, FAKE_ENV, FakePi, gatesOff, RUN_ID, setup } from "./harness";
 
@@ -226,13 +227,33 @@ describe("a tool_result whose bookkeeping throws still returns its redaction (fi
     }
   });
 
-  test("a spent hard budget: the result is redacted (and not screened), and the next send fails", async () => {
+  const HELD = "an error is held, so the node fails at its next send: the result screen was not asked, and the result takes its fallback, wrap";
+  const gates = (h: ReturnType<typeof setup>) => h.log().filter((x) => x.event === "gate").map((x) => [x.decision, x.rule, x.reason, "classifier" in x]);
+
+  test("an unwritable ledger with the result screen on: each result is redacted and wrapped, with no classifier call", async () => {
+    const h = setup({ settings: (s) => (s.gates.bash_gate.enabled = false) });
+    await h.start();
+    const dir = join(h.ledgerDir, RUN_ID);
+    chmodSync(dir, 0o500);
+    try {
+      const r = await h.result("bash", [{ type: "text", text: `ANTHROPIC_API_KEY=${FAKE_ENV.ANTHROPIC_API_KEY}` }], { structuredContent: { output: "x" } });
+      expect(r).toEqual({ content: [{ type: "text", text: wrapText("ANTHROPIC_API_KEY=[hapi: ANTHROPIC_API_KEY redacted]") }] });
+      // One with nothing to redact is wrapped too, never passed on unscreened.
+      expect(await h.result("read", [{ type: "text", text: "plain text" }])).toEqual({ content: [{ type: "text", text: wrapText("plain text") }] });
+      expect(gates(h)).toEqual([["wrap", "result-screen", HELD, false], ["wrap", "result-screen", HELD, false]]);
+      await expect(h.fire("before_provider_headers", { headers: {} })).rejects.toThrow("EACCES");
+    } finally {
+      chmodSync(dir, 0o700);
+    }
+  });
+
+  test("a spent hard budget: the result is redacted and wrapped (not screened), and the next send fails", async () => {
     const h = setup({ run: (r) => (r.budget_usd = 0.01) });
     await h.start();
     h.entries.push(assistant(0.02));
     const r = await h.result("read", [{ type: "text", text: `key ${FAKE_ENV.OPENCODE_API_KEY}` }]);
-    expect(r).toEqual({ content: [{ type: "text", text: "key [hapi: OPENCODE_API_KEY redacted]" }] });
-    expect(h.log().filter((x) => x.event === "gate")).toEqual([]);
+    expect(r).toEqual({ content: [{ type: "text", text: wrapText("key [hapi: OPENCODE_API_KEY redacted]") }] });
+    expect(gates(h)).toEqual([["wrap", "result-screen", HELD, false]]);
     await expect(h.fire("before_provider_headers", { headers: {} })).rejects.toThrow("the run's budget of $0.01 is spent ($0.02)");
   });
 });

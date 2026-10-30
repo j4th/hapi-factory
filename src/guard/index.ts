@@ -33,7 +33,8 @@
  *
  * Every hook but tool_call fails the node by throwing (brief §2.9). tool_result
  * never throws, since a throw there would drop its redaction: it holds the error,
- * and the next before_provider_headers or turn_end throws it.
+ * and the next before_provider_headers or turn_end throws it. While an error is
+ * held, a screened tool's result is wrapped without asking the screen.
  */
 import { lstatSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
@@ -145,8 +146,8 @@ function register(pi: ExtensionAPI, r: Ready, deps: GuardDeps): void {
    * The first error a tool_result caught. Pi keeps a result's original content
    * when tool_result throws, so a throw there (a full /tmp failing the ledger
    * save, say) would undo rule 6's redaction (final review A-1). The error is
-   * held instead: every later tool call blocks, and the next send or turn end
-   * throws it, which fails the node.
+   * held instead: every later tool call blocks, every screened result is wrapped
+   * unasked, and the next send or turn end throws it, which fails the node.
    */
   let deferred: { error: unknown } | undefined;
   /** Run `f`, holding a throw in `deferred`. False if it threw. */
@@ -354,11 +355,21 @@ function register(pi: ExtensionAPI, r: Ready, deps: GuardDeps): void {
       const held = PATTERN_NAMES.has(name) ? `a key shaped like ${name}` : `the value of ${name}`;
       defer(() => record({ event: "tool_result", decision: "flag", rule: "secret-redacted", reason: `the result held ${held}; the model sees it redacted`, tool, secret: name }));
     }
-    // Over a hard budget `account` throws: the result is then not screened, which would spend more.
-    if (!ledger || !defer(() => account(ctx))) return changes;
+    if (!ledger) return changes;
+    defer(() => account(ctx));
     if (!s.gates.result_screen.enabled || !(s.gates.result_screen.tools as string[]).includes(tool)) return changes;
     const text = content.flatMap((p) => (p.type === "text" && typeof p.text === "string" ? [p.text] : [])).join("\n");
     if (text.trim() === "") return changes;
+    // structuredContent is left out of a wrapped result, so Pi drops it: it would carry the unwrapped text.
+    const wrapped: ToolResultEventResult = { content: [{ type: "text", text: wrapText(text) }, ...content.filter((p) => p.type !== "text")] };
+    // With an error held (a spent hard budget, or bookkeeping that failed), the node fails at its next send, and a
+    // classifier call would spend more: the screen isn't asked, and the result takes its fallback, wrapped, so even a
+    // replayed session never sees it unscreened.
+    if (deferred) {
+      const reason = "an error is held, so the node fails at its next send: the result screen was not asked, and the result takes its fallback, wrap";
+      defer(() => record({ event: "gate", decision: "wrap", rule: "result-screen", reason, tool }));
+      return wrapped;
+    }
     const res = await ask(resultScreen, text, options);
     defer(() => charge(ctx, res.costUsd));
     const wrap = res.verdict === "wrap" || res.verdict === "block";
@@ -371,9 +382,7 @@ function register(pi: ExtensionAPI, r: Ready, deps: GuardDeps): void {
         ? "the result screen flagged this result; it reaches the model as is"
         : "the result screen allowed this result";
     defer(() => record({ event: "gate", decision, rule: "result-screen", reason, tool, cost_usd: round(res.costUsd), classifier: classifierRecord(resultScreen, res) }));
-    // structuredContent is left out, so Pi drops it: it would carry the unwrapped text.
-    if (wrap) return { content: [{ type: "text", text: wrapText(text) }, ...content.filter((p) => p.type !== "text")] };
-    return changes;
+    return wrap ? wrapped : changes;
   });
 
   pi.on("before_provider_headers", (_event, ctx) => {
