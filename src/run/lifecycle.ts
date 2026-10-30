@@ -44,12 +44,18 @@
  * read Archon's status from result.json (a paused run exits 0, so the exit code
  * is never the status: spike 07 finding 5), check that the guard ran in every
  * Pi attempt (design §6a item 7; spike 08 finding 10), remove every object of
- * the run, and write the record.
+ * the run, and write the record. A run whose container is gone was removed
+ * around hapi (`mise run down`, a cleanup), which is removing its volumes too,
+ * so nothing is copied and it fails: a copy-out helper would race that removal
+ * (`volume is in use`).
  *
  * `reapRuns` runs first in `start` and `stop` (`supervise` is spawned by a
  * start that has just reaped): it finalizes a live record whose container has
  * exited, and stops and finalizes one past its deadline, so a supervisor that
- * died leaves nothing behind for long.
+ * died leaves nothing behind for long. Then retention, fail-closed: it deletes
+ * a finished run's dir only once record.json's `harvestedAt` (Plan 03's
+ * harvester sets it) is more than `runs.retention_days` ago, so an output no
+ * harvester has read is never lost.
  *
  * Everything that comes out of a run is untrusted data: stored and checked,
  * never executed, never read by git with its own config, never printed raw.
@@ -66,6 +72,7 @@ import { parseRunId, parseStart, runDeps, START_USAGE, STOP_USAGE, SUPERVISE_USA
 import { bounded, copyOut, HELPER_HOST_TIMEOUT_S, timedOut } from "./copyout";
 import {
   capacityProblem,
+  containerExists,
   createRun,
   isLive,
   keyProblem,
@@ -102,7 +109,7 @@ const safe = (s: string) => s.replace(/[^\x21-\x7e]/g, "?").slice(0, 100);
  * Run `body` with the whole `RunDeps`, as hapi: anyone else re-execs `hapi run <sub> <args>` as hapi first.
  * A failure prints `hapi run <sub>: <message>` and returns 1.
  */
-async function asHapi(sub: string, args: string[], partial: Partial<RunDeps>, body: (d: RunDeps) => Promise<number>): Promise<number> {
+export async function asHapi(sub: string, args: string[], partial: Partial<RunDeps>, body: (d: RunDeps) => Promise<number>): Promise<number> {
   const env = partial.env ?? process.env;
   const run = partial.run ?? runCommand;
   const who = currentUserOverride(env, partial.user);
@@ -121,7 +128,7 @@ async function asHapi(sub: string, args: string[], partial: Partial<RunDeps>, bo
 }
 
 /** The archon zone's secrets, from `$XDG_RUNTIME_DIR/hapi/env/archon.env` (`hapi secrets resolve` writes it). Fails closed when it is missing. */
-async function archonSecrets(env: RunDeps["env"]): Promise<Record<string, string>> {
+export async function archonSecrets(env: RunDeps["env"]): Promise<Record<string, string>> {
   const file = join(runtimeDir(env), ENV_DIR, "archon.env");
   let text: string;
   try {
@@ -411,16 +418,25 @@ async function finalizeLocked(rec: RunRecord, d: RunDeps): Promise<RunRecord> {
   if (disk.stopRequested === "timed-out") reasons.push(`the run passed its deadline (${disk.deadline}, from the work order's budget.minutes) and was stopped`);
   if (disk.stopRequested === "stopped") reasons.push("stopped by `hapi run stop`");
 
-  const copy = await copyOut(disk.volumes.out, out, d.runs.output_limits_mb, d);
-  const problems = [...copy.problems];
-  if (copy.copied.includes("run.bundle")) {
-    const p = await bundleProblem(join(out, "run.bundle"), d);
-    if (p !== undefined) problems.push(p);
+  const problems: string[] = [];
+  let archon: Awaited<ReturnType<typeof archonStatus>> = { problem: "nothing was copied out" };
+  if (!(await containerExists(d, disk.runId))) {
+    // Removed around hapi (`mise run down`, a cleanup: `docker wait` returns as `rm -f` kills it), and its volumes
+    // are going too: a helper would race that removal for them, and its `-v` of one just removed would make an
+    // unlabelled volume that nothing removes.
+    problems.push("the run's container was removed before the run was finalized (`mise run down`, or a cleanup): nothing was copied out");
+  } else {
+    const copy = await copyOut(disk.volumes.out, out, d.runs.output_limits_mb, d);
+    problems.push(...copy.problems);
+    if (copy.copied.includes("run.bundle")) {
+      const p = await bundleProblem(join(out, "run.bundle"), d);
+      if (p !== undefined) problems.push(p);
+    }
+    archon = await archonStatus(out, copy.copied);
+    if ("problem" in archon) problems.push(archon.problem);
+    const read = async (name: string) => (copy.copied.includes(name) ? readFile(join(out, name), "utf8") : undefined);
+    problems.push(...guardProblems(await read("transcript.jsonl"), await read("decisions.jsonl")));
   }
-  const archon = await archonStatus(out, copy.copied);
-  if ("problem" in archon) problems.push(archon.problem);
-  const read = async (name: string) => (copy.copied.includes(name) ? readFile(join(out, name), "utf8") : undefined);
-  problems.push(...guardProblems(await read("transcript.jsonl"), await read("decisions.jsonl")));
 
   let status: RunStatus;
   if (disk.stopRequested !== undefined) status = disk.stopRequested;
@@ -460,7 +476,9 @@ export async function finalizeRun(rec: RunRecord, deps: RunDeps): Promise<RunRec
 /**
  * Repair what a dead supervisor left, under the launcher's lock: every live record whose container has
  * exited is finalized, and every one past its deadline is stopped (timed-out) and finalized. A run another
- * process is finalizing is left to it. Throws after trying every run, naming those it couldn't finish.
+ * process is finalizing is left to it. Then retention (see the module comment): a finished run harvested
+ * more than `runs.retention_days` ago loses its dir. Throws after trying every run, naming those it couldn't
+ * finish.
  */
 export async function reapRuns(deps: RunDeps): Promise<void> {
   await withStartLock(deps, async () => {
@@ -477,11 +495,24 @@ export async function reapRuns(deps: RunDeps): Promise<void> {
         if (!lockHeld(e)) failures.push(`run ${rec.runId}: ${(e as Error).message}`);
       }
     }
+    const keep = deps.runs.retention_days * 86_400_000;
+    for (const rec of await listRecords(deps.stateDir)) {
+      // Only a time hapi's harvester wrote: anything else, or none, keeps the run.
+      const harvested = typeof rec.harvestedAt === "string" ? Date.parse(rec.harvestedAt) : Number.NaN;
+      if (rec.status === "live" || !Number.isFinite(harvested) || deps.now().getTime() - harvested <= keep) continue;
+      try {
+        await removeRunDir(deps.stateDir, rec.runId);
+        console.error(`hapi run: removed run ${rec.runId}: harvested ${rec.harvestedAt}, more than runs.retention_days (${deps.runs.retention_days}) ago`);
+      } catch (e) {
+        failures.push(`run ${rec.runId}: removing its dir failed: ${(e as Error).message}`);
+      }
+    }
     if (failures.length > 0) throw new Error(`reaping left runs unfinished: ${failures.join("; ")}`);
   });
 }
 
-const ended = (rec: RunRecord) => `run ${rec.runId}: ${rec.status}${rec.reason === undefined ? "" : `: ${rec.reason}`}`;
+/** How a run ended, as `supervise`, `stop` and `watch` print it. */
+export const ended = (rec: RunRecord) => `run ${rec.runId}: ${rec.status}${rec.reason === undefined ? "" : `: ${rec.reason}`}`;
 
 /** `hapi run supervise <run-id>` (internal; start spawns it): wait, stop at the deadline, finalize. */
 export async function runSupervise(args: string[], deps: Partial<RunDeps> = {}): Promise<number> {

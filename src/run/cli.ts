@@ -1,8 +1,8 @@
 /**
- * The `hapi run` command line (design §3.1): its usage lines and argument
+ * The `hapi run` command line (design §3.1, §3.2): its usage lines and argument
  * parsers, and the host-side defaults of `RunDeps` (./spec.ts): the real
  * docker runners, the run state dir, and the detached supervisor. The commands
- * themselves are ./lifecycle.ts's.
+ * themselves are ./lifecycle.ts's and ./view.ts's.
  */
 import { spawn } from "node:child_process";
 import { closeSync, mkdirSync, openSync } from "node:fs";
@@ -18,6 +18,8 @@ import type { RunDeps } from "./spec";
 export const START_USAGE = "usage: hapi run start --repo <path> --work-order <file> [--public] [--budget-usd <n>] [--retry-of <run-id>]";
 export const STOP_USAGE = "usage: hapi run stop <run-id>";
 export const SUPERVISE_USAGE = "usage: hapi run supervise <run-id>";
+export const WATCH_USAGE = "usage: hapi run watch <run-id>";
+export const LIST_USAGE = "usage: hapi run list";
 
 export interface StartOptions {
   /** A checkout (its .git dir is bound) or a bare repo: the run starts from its HEAD. */
@@ -84,6 +86,47 @@ export const runBytes: RunDeps["runBytes"] = async (cmd, env) => {
   return { code: await proc.exited, stdout: new Uint8Array(stdout), stderr };
 };
 
+/** The longest line `streamLines` passes on. */
+export const MAX_LINE_CHARS = 1024 * 1024;
+/** What `streamLines` passes on in place of a longer line: never a part of it, which could hold half a secret that redaction can't see. */
+export const OVERLONG_LINE = `[hapi: a line of over ${MAX_LINE_CHARS} characters was not shown]`;
+
+/** The real line runner: stdout and stderr each decoded as UTF-8 and split at "\n" as they come (see MAX_LINE_CHARS). */
+export const streamLines: RunDeps["stream"] = async (cmd, env, line) => {
+  let proc: Bun.Subprocess<"ignore", "pipe", "pipe">;
+  try {
+    proc = Bun.spawn(cmd, { env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  } catch {
+    throw new Error(`cannot run ${cmd[0]}: is it installed and on PATH?`);
+  }
+  const pump = async (from: ReadableStream<Uint8Array>) => {
+    const decoder = new TextDecoder();
+    let buf = "";
+    let over = false;
+    const emit = (text: string) => {
+      line(over || text.length > MAX_LINE_CHARS ? OVERLONG_LINE : text);
+      over = false;
+    };
+    const take = (text: string) => {
+      buf += text;
+      for (let i = buf.indexOf("\n"); i !== -1; i = buf.indexOf("\n")) {
+        emit(buf.slice(0, i));
+        buf = buf.slice(i + 1);
+      }
+      // A line that outgrows the cap is dropped as it comes, and shown as OVERLONG_LINE once it ends.
+      if (buf.length > MAX_LINE_CHARS) {
+        over = true;
+        buf = "";
+      }
+    };
+    for await (const chunk of from) take(decoder.decode(chunk, { stream: true }));
+    take(decoder.decode());
+    if (over || buf !== "") emit(buf);
+  };
+  await Promise.all([pump(proc.stdout), pump(proc.stderr)]);
+  return proc.exited;
+};
+
 /**
  * Starts `argv` in a session of its own (`detached`, so neither the caller's
  * exit nor its terminal's hangup ends it), from the checkout, with this
@@ -123,6 +166,7 @@ export async function runDeps(p: Partial<RunDeps>): Promise<RunDeps> {
   return {
     run: p.run ?? runCommand,
     runBytes: p.runBytes ?? runBytes,
+    stream: p.stream ?? streamLines,
     env,
     user: p.user ?? userInfo().username,
     now: p.now ?? (() => new Date()),

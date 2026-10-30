@@ -563,6 +563,29 @@ describe("removeRuns", () => {
     expect(f.steps).toContain("docker volume rm v1");
   });
 
+  test("a removal that fails because another process removed the same objects first (a supervisor finalizing its run) is no failure: only what is still listed is", async () => {
+    const f = fakes({
+      runs: { containers: ["c1"], networks: ["hapi-run-1"], volumes: ["v1", "v2"] },
+      failing: ["docker rm -f c1", "docker network rm hapi-run-1", "docker volume rm v1 v2"],
+    });
+    // Each failed removal is another process's win (the object is gone once its removal has failed), but v2's.
+    const winner = new Set<string>(["c1", "hapi-run-1", "v1"]);
+    const gone = new Set<string>();
+    const base = f.deps.run!;
+    f.deps.run = async (cmd, o) => {
+      const r = await base(cmd, o);
+      if (r.code !== 0) for (const n of cmd.slice(3)) if (winner.has(n)) gone.add(n);
+      const listing = cmd[1] === "ps" || cmd[2] === "ls";
+      return listing ? { ...r, stdout: r.stdout.split("\n").filter((l) => l !== "" && !gone.has(l)).map((l) => `${l}\n`).join("") } : r;
+    };
+    const e = await caught(removeRuns("hapi", f.deps.run!, f.deps.env!));
+    expect(e.message).toBe("removing the runs of hapi left something behind: docker volume rm v1 v2 failed (exit 1): boom");
+    // With v2 another process's win too, nothing is reported.
+    winner.add("v2");
+    gone.clear();
+    await removeRuns("hapi", f.deps.run!, f.deps.env!);
+  });
+
   test("a listing that fails throws, naming it, rather than reporting no runs", async () => {
     const f = fakes({ failing: [`docker ps -aq ${LABELS("hapi").join(" ")}`] });
     await expect(removeRuns("hapi", f.deps.run!, f.deps.env!)).rejects.toThrow(/docker ps -aq .* failed/);

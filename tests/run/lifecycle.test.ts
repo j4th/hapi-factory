@@ -419,6 +419,27 @@ describe("finalizeRun", () => {
     expect(stop).toBeLessThan(cmds.findIndex((c) => c.includes("docker run --rm")));
   });
 
+  test("a run whose container was removed around hapi (`mise run down`, a cleanup) is not copied out: no helper races that removal for its volumes, or makes an unlabelled one", async () => {
+    capture();
+    const f = fakeRun();
+    const rec = await seedRun(f, { id: ID, running: false, outputs: completedOutputs() });
+    // What `docker rm -f` leaves while the rest of the removal is still to come: the volumes, the network.
+    f.world.containers.delete(N);
+    const done = await finalizeRun(rec, f.deps);
+    const REMOVED = "the run's container was removed before the run was finalized (`mise run down`, or a cleanup): nothing was copied out";
+    expect([done.status, done.reason]).toEqual(["failed", REMOVED]);
+    // No volume is inspected or mounted, and nothing is copied; what is left is removed.
+    expect(f.calls.filter((c) => unbounded(c.cmd)[1] === "run" || c.cmd.join(" ").startsWith("docker volume inspect"))).toEqual([]);
+    expect(existsSync(join(f.deps.stateDir, ID, "out"))).toBe(false);
+    expect(f.world.networks.size + f.world.volumes.size).toBe(0);
+    // A stop asked for first still says how the run ended.
+    const g = fakeRun();
+    const stopped = await seedRun(g, { id: ID, running: false, stopRequested: "stopped", outputs: completedOutputs() });
+    g.world.containers.delete(N);
+    const s = await finalizeRun(stopped, g.deps);
+    expect([s.status, s.reason]).toEqual(["stopped", `stopped by \`hapi run stop\`; ${REMOVED}`]);
+  });
+
   test("a copy-out helper that never returns fails the run at the host's bound instead of hanging finalize, which still cleans up and lets go of the run's lock", async () => {
     capture();
     const f = fakeRun({ hangs: (c) => c.includes(COPY_SCRIPT) && c.at(-2) === "transcript.jsonl" });

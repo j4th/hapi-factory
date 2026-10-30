@@ -16,6 +16,7 @@ import { decideCommand } from "./decide/cli";
 import { policyBuild } from "./generate/index";
 import { mcpPin, mcpVerify } from "./mcp/lock";
 import { runStart, runStop, runSupervise } from "./run/lifecycle";
+import { runList, runWatch } from "./run/view";
 import {
   secretsAddMachine,
   secretsCheck,
@@ -146,6 +147,8 @@ register("stack down", stackDown, "Stop the stack and remove its containers and 
 register("run start", (args) => runStart(args), "Start one run of a work order in a hardened one-shot Archon container, on its own network, and print its id (as hapi)");
 register("run stop", (args) => runStop(args), "Stop one run (docker stop, 30 s grace), copy its outputs out and remove its container, network and volumes");
 register("run supervise", (args) => runSupervise(args), "Internal: wait for one run until its deadline, then finalize it (run start spawns it, detached)");
+register("run watch", (args) => runWatch(args), "Follow one run's docker logs while it runs, then print its copied transcript and how it ended; sanitized and redacted, read only");
+register("run list", (args) => runList(args), "List the runs this host knows, newest first: id, status, repo, work order, start and spend");
 register("token mint", tokenMint, "Mint a 1-hour GitHub App token for one repo into a 0600 file under $XDG_RUNTIME_DIR/hapi/tokens/");
 register("decide", (args) => decideCommand(args), "Run one typed decision (bash-gate, result-screen) on a state read from stdin; prints the result as JSON");
 register("audit", (args) => auditCommand(args), "Check the deployed config, pins, running stack, secrets setup and each --repo's GitHub settings against policy (docs/audit.md)");

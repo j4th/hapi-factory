@@ -52,6 +52,8 @@ export interface RunDeps {
   run: Runner;
   /** A runner whose stdout is bytes, never decoded: copy-out reads `run.bundle` through it. */
   runBytes: (cmd: string[], env: Record<string, string>) => Promise<{ code: number; stdout: Uint8Array; stderr: string }>;
+  /** A runner that hands each line of stdout and stderr to `line` as it comes, without its newline, and resolves to the exit code: `hapi run watch`'s `docker logs --follow`. */
+  stream: (cmd: string[], env: Record<string, string>, line: (text: string) => void) => Promise<number>;
   env: Env;
   user: string;
   now: () => Date;

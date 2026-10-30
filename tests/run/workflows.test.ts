@@ -79,7 +79,8 @@ describe("hapi-check-run", () => {
     const p = bash("posture");
     for (const s of ["id -u", "CapEff", "NoNewPrivs", "/app/package.json", "pi-coding-agent/package.json", "node --version", "uv --version", "python3.14 --version"]) expect(p).toContain(s);
     expect(p).toContain("curl -s -o /dev/null");
-    expect(p).toContain("%{http_code}");
+    // The proxy's answer to the CONNECT, then the origin's: a refused CONNECT leaves %{http_code} at 000.
+    expect(p).toContain("-w '%{http_connect} %{http_code}'");
     for (const u of ["https://api.anthropic.com/", "https://github.com/"]) expect(p).toContain(u);
     expect(p).toContain("/proc/self/mountinfo");
     for (const m of ["/tmp", '"$HOME"', "/.archon", "/opt/hapi/pi-agent"]) expect(p).toContain(m);

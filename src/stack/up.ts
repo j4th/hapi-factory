@@ -274,26 +274,37 @@ async function liveRuns(run: Runner, env: Env, project: string): Promise<string[
  * finding 13), then the networks, then the volumes. Only what the two labels select, never by name or prefix.
  * It tries every step and throws at the end naming the ones that failed: `down` is kill switch 3 and goes on to
  * `compose down` regardless. A disconnect that fails is not an error by itself (the proxy may be gone, or not
- * attached); the network removal after it says whether anything is left.
+ * attached); the network removal after it says whether anything is left. Nor is a removal that fails while
+ * nothing it named is still listed: a supervisor finalizing its run removes the same objects, and may have got
+ * there first (`not found`).
  *
  * With `o.runId`, only that run's objects (`org.hapi.run=<id>`): `hapi run` finalizes one run, or rolls back a
  * start, this way, disconnecting `o.egress` (its `RunDeps.egress`) when given.
  */
 export async function removeRuns(project: string, run: Runner, env: Env, o: { runId?: string; egress?: string } = {}): Promise<void> {
   const failures: string[] = [];
-  const attempt = async (cmd: string[]) => {
+  /** Remove `names` with `cmd`; a failure counts while `list` (their listing) still shows one of them, or can't say. */
+  const remove = async (cmd: string[], names: string[], list: string[]) => {
     const r = await run(cmd, { env: definedEnv(env), inherit: false });
-    if (r.code !== 0) failures.push(`${cmd.join(" ")} failed (exit ${r.code}): ${r.stderr?.trim() || "(no error output)"}`);
+    if (r.code === 0) return;
+    let left = names;
+    try {
+      left = (await listed(run, env, list)).filter((n) => names.includes(n));
+    } catch {}
+    if (left.length > 0) failures.push(`${cmd.join(" ")} failed (exit ${r.code}): ${r.stderr?.trim() || "(no error output)"}`);
   };
   const filters = runFilters(project, o.runId);
   const egress = o.egress ?? `${project}-egress-archon-1`;
-  const containers = await listed(run, env, ["docker", "ps", "-aq", ...filters]);
-  if (containers.length > 0) await attempt(["docker", "rm", "-f", ...containers]);
-  const networks = await listed(run, env, ["docker", "network", "ls", "--format", "{{.Name}}", ...filters]);
+  const ps = ["docker", "ps", "-aq", ...filters];
+  const containers = await listed(run, env, ps);
+  if (containers.length > 0) await remove(["docker", "rm", "-f", ...containers], containers, ps);
+  const nets = ["docker", "network", "ls", "--format", "{{.Name}}", ...filters];
+  const networks = await listed(run, env, nets);
   for (const n of networks) await run(["docker", "network", "disconnect", "-f", n, egress], { env: definedEnv(env), inherit: false });
-  if (networks.length > 0) await attempt(["docker", "network", "rm", ...networks]);
-  const volumes = await listed(run, env, ["docker", "volume", "ls", "-q", ...filters]);
-  if (volumes.length > 0) await attempt(["docker", "volume", "rm", ...volumes]);
+  if (networks.length > 0) await remove(["docker", "network", "rm", ...networks], networks, nets);
+  const vols = ["docker", "volume", "ls", "-q", ...filters];
+  const volumes = await listed(run, env, vols);
+  if (volumes.length > 0) await remove(["docker", "volume", "rm", ...volumes], volumes, vols);
   if (failures.length > 0) throw new Error(`removing the runs of ${project} left something behind: ${failures.join("; ")}`);
 }
 

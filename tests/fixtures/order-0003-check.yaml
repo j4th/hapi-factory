@@ -1,0 +1,23 @@
+# The run integration test's work order (tests/run/run.int.test.ts): one run of
+# hapi-check-run, the bash-only check workflow, so a run costs nothing. The test
+# writes variants of it (other ids, the test-only workflows of
+# tests/fixtures/run-pack/) for its other runs: a run's key is its work-order id
+# and commit, so each run needs an id or a commit of its own.
+id: 0003-check-run
+lane: direct
+workflow: hapi-check-run
+risk: low
+roles:
+  implement: small
+  review: small
+budget: { usd: 0.01, turns: 1, minutes: 10 }
+pieces:
+  - id: check-run
+    files: ["check.txt"]
+    size: small
+verify:
+  smoke: false
+egress_extra: []
+trace:
+  traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+sources: ["docs/runbooks/stack.md"]

@@ -3,7 +3,8 @@
  * networks, volumes, and the files in a run's output volume) and answers the
  * commands src/run makes as Docker would, plus a temp state dir, runtime dir,
  * build dir, source repo and work order. No Docker, git, sudo or network: the
- * git calls (the source's HEAD, the bundle's heads) are answered too.
+ * git calls (the source's HEAD, the bundle's heads) are answered too, and
+ * `docker logs --follow` streams `logs`.
  */
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -256,9 +257,21 @@ export function fakeRun(o: FakeOptions = {}) {
     return { code: 0, stdout: f.bytes.slice(0, Number(cmd.at(-1))), stderr: "" };
   };
 
+  // What `docker logs --follow` streams, then `afterLogs` runs (as a supervisor finalizing the run would) before it exits 0.
+  const live: { logs: string[]; afterLogs?: () => Promise<void> } = { logs: [] };
+  const stream: RunDeps["stream"] = async (cmd, env, line) => {
+    calls.push({ cmd, env, bytes: false });
+    o.onCall?.(cmd);
+    if (cmd[0] !== "docker" || cmd[1] !== "logs") throw new Error(`fake: unexpected streamed command ${cmd.join(" ")}`);
+    for (const l of live.logs) line(l);
+    await live.afterLogs?.();
+    return 0;
+  };
+
   const deps: RunDeps = {
     run,
     runBytes,
+    stream,
     env: o.env ?? { HOME: tmp, PATH: process.env.PATH ?? "/usr/bin:/bin", XDG_RUNTIME_DIR: xdg },
     user: o.user ?? "hapi",
     now: () => o.now ?? NOW,
@@ -272,7 +285,13 @@ export function fakeRun(o: FakeOptions = {}) {
     runs: { max_live: 1, retention_days: 14, ...o.runs, output_limits_mb: { bundle: 256, transcript: 64, decisions: 16, result: 4, ...o.runs?.output_limits_mb } },
     spawnDetached: async (argv) => void spawned.push(argv),
   };
-  return { deps, calls, world, spawned, tmp, xdg };
+  return {
+    deps, calls, world, spawned, tmp, xdg,
+    /** The lines `docker logs --follow` streams. */
+    logs: live.logs,
+    /** `live.afterLogs` runs once the streamed logs end, before `docker logs` exits. */
+    live,
+  };
 }
 
 /** The generated files a run binds (their contents don't matter here, only that they exist and hash). */
@@ -353,6 +372,7 @@ export async function seedRun(
     ...(o.reason === undefined ? {} : { reason: o.reason }),
     ...(o.retryOf === undefined ? {} : { retryOf: o.retryOf }),
     ...(o.stopRequested === undefined ? {} : { stopRequested: o.stopRequested }),
+    ...(o.harvestedAt === undefined ? {} : { harvestedAt: o.harvestedAt }),
   };
   mkdirSync(recordDir(deps.stateDir, o.id), { recursive: true, mode: 0o700 });
   await writeRecord(deps.stateDir, rec);

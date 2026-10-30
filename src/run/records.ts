@@ -165,6 +165,12 @@ export async function isLive(d: Pick<RunDeps, "run" | "env" | "project">, runId:
   return names.includes(runName(d.project, runId));
 }
 
+/** Whether run `runId`'s container exists, running or not. Throws when Docker can't say. */
+export async function containerExists(d: Pick<RunDeps, "run" | "env" | "project">, runId: string): Promise<boolean> {
+  const names = await listed(d.run, d.env, ["docker", "ps", "-a", ...runFilters(d.project, runId), "--format", "{{.Names}}"]);
+  return names.includes(runName(d.project, runId));
+}
+
 const at = (workOrder: string, sha: string) => `work order ${workOrder} at ${sha.slice(0, 12)}`;
 
 /** Why the key refuses this run, or undefined: see the module comment. */
