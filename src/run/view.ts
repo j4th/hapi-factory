@@ -18,8 +18,8 @@
  * goes through `sanitizeTerminal` (no escape sequence or control character
  * reaches the terminal), then `redactSecrets` with the archon zone's values,
  * read on the host from the env file `hapi secrets resolve` wrote; a live
- * run's lines come one at a time, so a private key's later lines are dropped
- * as they come (`livePrinter`). Without that file, watch fails closed and
+ * run's lines come one at a time, so a private key's later lines are hidden
+ * up to its END line (`livePrinter`). Without that file, watch fails closed and
  * prints nothing of the run. Redaction sees an exact value or a key format,
  * never an encoded or split one: it keeps keys off the screen, and is no
  * boundary.
@@ -29,7 +29,7 @@
  */
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { PEM_BODY_LINE, PEM_END_LINE, PEM_OPEN } from "../guard/secrets";
+import { closesPrivateKey, opensPrivateKey } from "../guard/secrets";
 import { definedEnv } from "../stack/up";
 import { LIST_USAGE, parseRunId, WATCH_USAGE } from "./cli";
 import { archonSecrets, asHapi, ended } from "./lifecycle";
@@ -84,29 +84,31 @@ const printer = (values: Record<string, string>) => (text: string) => {
   for (const line of redactSecrets(sanitizeTerminal(text), values).split("\n")) console.log(line);
 };
 
+/** What watch prints once in place of a live private key's later lines. */
+const HIDDEN = "[hapi: private-key redacted: lines hidden until its END line]";
+
 /**
  * The printer for a live run's `docker logs --follow`, which hands it one line at a time, so `redactSecrets` never
- * sees a private key's body beside its BEGIN line. After a line whose BEGIN line has no END line after it
- * (PEM_OPEN), each following body line (PEM_BODY_LINE, the guard's own rule) and the END line are dropped; the
- * first line that is neither ends the key and prints as usual. Stdout and stderr reach it through one callback, so
- * a line of the other stream inside a key ends it early: like all of watch's redaction, it keeps keys off the screen
- * and is no boundary.
+ * sees a private key's body beside its BEGIN line. A line that opens a key (a BEGIN line after its last END line,
+ * `opensPrivateKey`) prints redacted as usual, then HIDDEN once; every later line is hidden up to and including the
+ * next one that holds an END line, and past it if that line opens another key. Then printing goes on as normal; a
+ * stream that ends inside a key just stops. Stdout and stderr share the one callback, so the other stream's lines
+ * inside a key are hidden too.
  */
 const livePrinter = (values: Record<string, string>) => {
   const print = printer(values);
-  let open = false;
+  let hiding = false;
   return (line: string) => {
     const clean = sanitizeTerminal(line);
-    if (open) {
-      if (PEM_END_LINE.test(clean)) {
-        open = false;
-        return;
-      }
-      if (PEM_BODY_LINE.test(clean)) return;
-      open = false;
+    if (hiding) {
+      if (closesPrivateKey(clean)) hiding = opensPrivateKey(clean);
+      return;
     }
     print(line);
-    open = PEM_OPEN.test(clean);
+    if (opensPrivateKey(clean)) {
+      console.log(HIDDEN);
+      hiding = true;
+    }
   };
 };
 

@@ -75,24 +75,25 @@ describe("redactSecrets", () => {
     expect(redactSecrets(`${key}/${key}`, {})).toBe("[hapi: anthropic redacted]/[hapi: anthropic redacted]");
   });
 
-  test("a private key is redacted whole: its BEGIN line, its PEM body lines and its END line (ledger 168)", () => {
+  test("a private key is redacted whole, from its BEGIN line to its END line, or to the end of the text, marked so, with no END line (ledger 168)", () => {
     const body = Array.from({ length: 3 }, () => randomBytes(48).toString("base64"));
     const begin = "-----BEGIN " + "OPENSSH PRIVATE KEY-----";
     const end = "-----END " + "OPENSSH PRIVATE KEY-----";
-    const full = redactSecrets(`a\n${begin}\n${body.join("\n")}\n${end}\nb`, {});
-    expect(full).toBe("a\n[hapi: private-key redacted]\nb");
-    const cut = redactSecrets(`a ${begin}\n${body.join("\n")}`, {});
-    expect(cut).toBe("a [hapi: private-key redacted]");
-    for (const line of body) expect(full.includes(line) || cut.includes(line)).toBe(false);
-    // Two blocks are each redacted, and the text between them stays.
-    expect(redactSecrets(`${begin}\n${body[0]}\n${end}\nkeep this\n${begin}\n${body[1]}\n${end}`, {})).toBe(
-      "[hapi: private-key redacted]\nkeep this\n[hapi: private-key redacted]",
-    );
-    // Only the key's PEM lines: a lone BEGIN line keeps the prose after it, and a truncated key the text before the next.
-    expect(redactSecrets(`${begin}\nprose after a BEGIN line stays\nand so does this`, {})).toBe("[hapi: private-key redacted]\nprose after a BEGIN line stays\nand so does this");
-    expect(redactSecrets(`${begin}\n${body[0]}\nthe text between stays\n${begin}\n${body[1]}\n${end}`, {})).toBe(
-      "[hapi: private-key redacted]\nthe text between stays\n[hapi: private-key redacted]",
-    );
+    const outs = [
+      [`a\n${begin}\n${body.join("\n")}\n${end}\nb`, "a\n[hapi: private-key redacted]\nb"],
+      [`a ${begin}\n${body.join("\n")}\nand prose`, "a [hapi: private-key redacted to the end of the text: no END line]"],
+      // Two blocks are each redacted, and the text between them stays.
+      [`${begin}\n${body[0]}\n${end}\nkeep this\n${begin}\n${body[1]}\n${end}`, "[hapi: private-key redacted]\nkeep this\n[hapi: private-key redacted]"],
+      // JSON-escaped newlines, an indented YAML block, CRLF with trailing spaces.
+      [`{"private_key": "${begin}\\n${body.join("\\n")}\\n${end}\\n"}`, '{"private_key": "[hapi: private-key redacted]\\n"}'],
+      [`k: |\n  ${begin}\n${body.map((l) => `  ${l}`).join("\n")}\n  ${end}\nn: 1`, "k: |\n  [hapi: private-key redacted]\nn: 1"],
+      [`${begin} \r\n${body.map((l) => `${l}  `).join("\r\n")}\r\n${end}\r\nok`, "[hapi: private-key redacted]\r\nok"],
+    ].map(([text, want]) => {
+      const got = redactSecrets(text!, {});
+      expect(got).toBe(want!);
+      return got;
+    });
+    for (const line of body) expect(outs.some((o) => o.includes(line))).toBe(false);
   });
 });
 
@@ -161,13 +162,17 @@ describe("hapi run watch", () => {
     expect(out.join("\n")).not.toContain(key);
   });
 
-  test("live watch drops a private key's later lines, which docker logs hands on one at a time; the line after the key prints (ledger 168)", async () => {
+  test("live watch hides a private key's later lines, which docker logs hands on one at a time, up to and including its END line (ledger 168)", async () => {
     const { out } = capture();
     const f = ready();
     const body = Array.from({ length: 3 }, () => randomBytes(48).toString("base64"));
     const begin = "-----BEGIN " + "RSA PRIVATE KEY-----";
     const end = "-----END " + "RSA PRIVATE KEY-----";
-    f.logs.push("[probe] Started", `key: ${begin}`, "Proc-Type: 4,ENCRYPTED", "", ...body, end, "after the key", begin, body[0]!, "a truncated key ends here");
+    const NO_END = "[hapi: private-key redacted to the end of the text: no END line]";
+    const HIDDEN = "[hapi: private-key redacted: lines hidden until its END line]";
+    // A JSON-escaped key on one line holds its own END, so the normal whole-line path redacts it.
+    const json = `{"private_key": "${begin}\\n${body[0]}\\n${end}\\n"}`;
+    f.logs.push("[probe] Started", `key: ${begin}`, "Proc-Type: 4,ENCRYPTED", "", ...body.map((l) => `  ${l}`), `  ${end}`, "after the key", json, begin, body[0]!, "a truncated key hides the rest");
     await seedRun(f, { id: ID });
     f.live.afterLogs = async () => {
       const rec = (await readRecord(f.deps.stateDir, ID))!;
@@ -176,14 +181,32 @@ describe("hapi run watch", () => {
     expect(await runWatch([ID], f.deps)).toBe(0);
     expect(out).toEqual([
       "[probe] Started",
-      "key: [hapi: private-key redacted]",
+      `key: ${NO_END}`,
+      HIDDEN,
       "after the key",
-      "[hapi: private-key redacted]",
-      "a truncated key ends here",
+      '{"private_key": "[hapi: private-key redacted]\\n"}',
+      NO_END,
+      HIDDEN,
       "(no transcript.jsonl was copied out)",
       `run ${ID}: succeeded`,
     ]);
     for (const line of body) expect(out.join("\n")).not.toContain(line);
+  });
+
+  test("a live line of 10,000 BEGIN lines is handled in one pass, not quadratically", async () => {
+    const { out } = capture();
+    const f = ready();
+    const begin = "-----BEGIN " + "RSA PRIVATE KEY-----";
+    f.logs.push(begin.repeat(10_000), "hidden", "-----END " + "RSA PRIVATE KEY----- and the rest of its line, hidden too", "shown");
+    await seedRun(f, { id: ID });
+    f.live.afterLogs = async () => {
+      const rec = (await readRecord(f.deps.stateDir, ID))!;
+      await writeRecord(f.deps.stateDir, { ...rec, status: "succeeded" });
+    };
+    const started = performance.now();
+    expect(await runWatch([ID], f.deps)).toBe(0);
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(out.slice(0, 3)).toEqual(["[hapi: private-key redacted to the end of the text: no END line]", "[hapi: private-key redacted: lines hidden until its END line]", "shown"]);
   });
 
   test("a finished run's transcript rows are sanitized and redacted too, then its status and reason", async () => {

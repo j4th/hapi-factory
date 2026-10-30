@@ -184,26 +184,34 @@ test("a key-shaped string is redacted to [hapi: <pattern name> redacted], in too
   expect(readFileSync(join(h.out, "decisions.jsonl"), "utf8").includes(token)).toBe(false);
 });
 
-test("a private key is redacted whole: its BEGIN line, its PEM body lines and its END line (ledger 168)", async () => {
+test("a private key is redacted whole, from its BEGIN line to its END line, or to the end of the text, marked so, with no END line (ledger 168)", async () => {
   const h = setup({ settings: gatesOff });
   await h.start();
   const body = Array.from({ length: 4 }, () => randomBytes(48).toString("base64"));
   const begin = "-----BEGIN " + "RSA PRIVATE KEY-----";
   const end = "-----END " + "RSA PRIVATE KEY-----";
-  const full = await h.result("read", [{ type: "text", text: `before\n${begin}\n${body.join("\n")}\n${end}\nafter` }]);
-  expect(full.content).toEqual([{ type: "text", text: "before\n[hapi: private-key redacted]\nafter" }]);
-  const cut = await h.result("bash", [{ type: "text", text: `x ${begin}\n${body.slice(0, 2).join("\n")}` }]);
-  expect(cut.content).toEqual([{ type: "text", text: "x [hapi: private-key redacted]" }]);
+  const NO_END = "[hapi: private-key redacted to the end of the text: no END line]";
+  const outs: string[] = [];
+  const check = async (t: string, want: string) => {
+    const r = (await h.result("read", [{ type: "text", text: t }])) as { content: { text: string }[] };
+    outs.push(r.content[0]!.text);
+    expect(r.content[0]!.text).toBe(want);
+  };
+  await check(`before\n${begin}\n${body.join("\n")}\n${end}\nafter`, "before\n[hapi: private-key redacted]\nafter");
+  // With no END line the span runs to the end of the text, prose and all, and the marker says so: fail-closed.
+  await check(`x ${begin}\n${body.slice(0, 2).join("\n")}\nprose after it goes too`, `x ${NO_END}`);
   // Two blocks are each redacted, and the text between them stays.
-  const two = await h.result("read", [{ type: "text", text: `${begin}\n${body[0]}\n${end}\nkeep this\n${begin}\n${body[1]}\n${end}\ntail` }]);
-  expect(two.content).toEqual([{ type: "text", text: "[hapi: private-key redacted]\nkeep this\n[hapi: private-key redacted]\ntail" }]);
-  // The span is the key's PEM lines only (base64, a `Name: value` header, an empty line): a BEGIN line can't hide the
-  // prose after it, and a truncated key keeps the text between it and the next one.
-  const lone = await h.result("read", [{ type: "text", text: `${begin}\nthis prose is not a key, and stays.\nnor is this.` }]);
-  expect(lone.content).toEqual([{ type: "text", text: "[hapi: private-key redacted]\nthis prose is not a key, and stays.\nnor is this." }]);
-  const truncated = await h.result("read", [{ type: "text", text: `${begin}\n${body[0]}\nthe text between stays\n${begin}\nProc-Type: 4,ENCRYPTED\n\n${body[1]}\n${end}\nend` }]);
-  expect(truncated.content).toEqual([{ type: "text", text: "[hapi: private-key redacted]\nthe text between stays\n[hapi: private-key redacted]\nend" }]);
-  const shown = JSON.stringify([full, cut, two, truncated]) + readFileSync(join(h.out, "decisions.jsonl"), "utf8");
+  await check(`${begin}\n${body[0]}\n${end}\nkeep this\n${begin}\n${body[1]}\n${end}\ntail`, "[hapi: private-key redacted]\nkeep this\n[hapi: private-key redacted]\ntail");
+  // A service-account JSON file: the key is one string, its newlines escaped as \n.
+  const json = (key: string) => JSON.stringify({ type: "service_account", private_key: key, client_email: "x@example.invalid" });
+  await check(json(`${begin}\n${body.join("\n")}\n${end}\n`), json("[hapi: private-key redacted]\n"));
+  // An indented YAML block scalar, and CRLF line ends with trailing spaces.
+  await check(`key: |\n  ${begin}\n${body.map((l) => `  ${l}`).join("\n")}\n  ${end}\nnext: 1`, "key: |\n  [hapi: private-key redacted]\nnext: 1");
+  await check(`${begin}  \r\n${body.map((l) => `${l} `).join("\r\n")}\r\n${end}\r\nok`, "[hapi: private-key redacted]\r\nok");
+  // The truncating redaction is recorded like any other.
+  const recs = h.log().filter((r) => r.rule === "secret-redacted");
+  expect(recs.map((r) => r.secret)).toEqual(Array(outs.length).fill("private-key"));
+  const shown = outs.join("\n") + readFileSync(join(h.out, "decisions.jsonl"), "utf8");
   for (const line of body) expect(shown.includes(line)).toBe(false);
   // Finding one still needs only the BEGIN line: a write that holds the block blocks.
   expect((await h.tool("write", { path: "notes.txt", content: `${begin}\n${body[0]}\n${end}\n` }))?.reason).toContain("secret: private-key");

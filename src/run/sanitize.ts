@@ -4,7 +4,7 @@
  * no boundary). `hapi run watch` prints every line through both, and finalize keeps a run container's log through
  * both (./lifecycle.ts). Its own module so lifecycle.ts can use it: view.ts imports lifecycle.ts.
  */
-import { MIN_SECRET_CHARS, REDACT_PATTERNS } from "../guard/secrets";
+import { MIN_SECRET_CHARS, redactKeyFormats } from "../guard/secrets";
 
 // String sequences (OSC, DCS, SOS, PM, APC; 7- and 8-bit) up to their terminator (BEL or ST), or to the end of
 // the text when there is none; then CSI (7- and 8-bit), any other ESC sequence, and every C0 and C1 control but
@@ -22,12 +22,12 @@ export function sanitizeTerminal(text: string): string {
 /**
  * `text` with each exact value in `values` of MIN_SECRET_CHARS or more (longest first, so a value inside
  * another is redacted as the longer one), then each key format, replaced by `[hapi: <NAME> redacted]`. The key
- * formats are the guard's REDACT_PATTERNS: KEY_PATTERNS, with a private key redacted whole, body and all.
+ * formats are the guard's (`redactKeyFormats`): KEY_PATTERNS, with a private key redacted whole, body and all, to
+ * the end of the text when it has no END line.
  */
 export function redactSecrets(text: string, values: Record<string, string>): string {
   let out = text;
   const exact = Object.entries(values).filter(([, v]) => v.length >= MIN_SECRET_CHARS).sort((a, b) => b[1].length - a[1].length);
   for (const [name, value] of exact) out = out.split(value).join(`[hapi: ${name} redacted]`);
-  for (const { name, re } of REDACT_PATTERNS) out = out.replace(re, `[hapi: ${name} redacted]`);
-  return out;
+  return redactKeyFormats(out).text;
 }

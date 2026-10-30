@@ -74,28 +74,23 @@ export const PATTERN_NAMES: ReadonlySet<string> = new Set(KEY_PATTERNS.map((k) =
 
 const PEM_BEGIN = String.raw`-----BEGIN [A-Z ]*PRIVATE KEY-----`;
 const PEM_END = String.raw`-----END [A-Z ]*PRIVATE KEY-----`;
-/** What a line of a private key's body holds: base64, a `Name: value` header (an encrypted key's `Proc-Type:`), or nothing. */
-const PEM_BODY = String.raw`(?:[A-Za-z0-9+/=]+|[A-Za-z-]+: [^\r\n]*|)`;
-/** One whole line of a private key's body, without its newline (as `hapi run watch` gets a line). */
-export const PEM_BODY_LINE = new RegExp(`^${PEM_BODY}\\r?$`);
-/** One whole line that is a private key's END line. */
-export const PEM_END_LINE = new RegExp(`^${PEM_END}\\r?$`);
-/** A BEGIN line with no END line after it in the same text: the key's body is still to come. */
-export const PEM_OPEN = new RegExp(`${PEM_BEGIN}(?![\\s\\S]*${PEM_END})`);
 /**
- * A private key's block: its BEGIN line, then each following line while it is a body line (PEM_BODY), then its END
- * line if that comes next. It stops at the first line that is neither, so a BEGIN line alone hides no text after it,
- * and a truncated key never runs on into the next. Each body line is matched up to a line end it looks ahead for, so
- * a long line that isn't one costs one linear scan, never a backtracking blow-up.
+ * A private key's block: its BEGIN line to its END line, or to the end of the text when it has none (lazy, no `m`
+ * flag). It takes the whole block whatever its shape (`\n` escapes in a JSON string, an indented YAML block, CRLF,
+ * trailing spaces), and fails closed: with no END line, everything after the BEGIN line goes. A worker that hides
+ * its own text behind a BEGIN line hides it from the model too, so it gains nothing. A match with no END line runs
+ * to the end of the text and stops there, so the scan is linear.
  */
-const PRIVATE_KEY_BLOCK = new RegExp(`${PEM_BEGIN}(?:\\r?\\n${PEM_BODY}(?=\\r?\\n|$))*(?:\\r?\\n${PEM_END})?`, "g");
+const PRIVATE_KEY_BLOCK = new RegExp(`${PEM_BEGIN}[\\s\\S]*?(?:${PEM_END}|$)`, "g");
+const ENDS_IN_END = new RegExp(`${PEM_END}$`);
+/** What replaces a private key that had no END line, so a reader knows the rest of the text went with it. */
+export const NO_END_MARKER = "[hapi: private-key redacted to the end of the text: no END line]";
 
 /**
  * KEY_PATTERNS as redaction patterns, global, by the same names. `private-key` matches only a key's BEGIN line,
  * which is enough to find one (`findSecret`), but redacting that line alone would leave the key's body in the text,
  * so it is redacted as PRIVATE_KEY_BLOCK (ledger 168). That form lives here, not in policy/decisions/write-gate.ts,
- * which is under policy/**. Shared with `hapi run watch` (src/run/sanitize.ts), whose live printer uses the same
- * line rule (PEM_BODY_LINE) across the lines it is handed one at a time.
+ * which is under policy/**. Applied by `redactKeyFormats`, which `hapi run watch` shares (src/run/sanitize.ts).
  */
 export const REDACT_PATTERNS: readonly { name: string; re: RegExp }[] = KEY_PATTERNS.map(({ name, re }) => ({
   name,
@@ -103,10 +98,40 @@ export const REDACT_PATTERNS: readonly { name: string; re: RegExp }[] = KEY_PATT
 }));
 
 /**
+ * `text` with each REDACT_PATTERNS match replaced by `[hapi: <pattern name> redacted]`, or by NO_END_MARKER for a
+ * private key that ran to the end of the text, and the names found: a truncating redaction is recorded like any.
+ */
+export function redactKeyFormats(text: string): { text: string; names: string[] } {
+  const names: string[] = [];
+  let out = text;
+  for (const { name, re } of REDACT_PATTERNS) {
+    const next = out.replace(re, (m) => (name === "private-key" && !ENDS_IN_END.test(m) ? NO_END_MARKER : `[hapi: ${name} redacted]`));
+    if (next === out) continue;
+    names.push(name);
+    out = next;
+  }
+  return { text: out, names };
+}
+
+const BEGINS = new RegExp(PEM_BEGIN, "g");
+const ENDS = new RegExp(PEM_END, "g");
+const HAS_END = new RegExp(PEM_END);
+/** Where the last match of `re` (global) starts in `text`, or -1: one pass, no lookahead. */
+const lastAt = (re: RegExp, text: string): number => {
+  let at = -1;
+  for (const m of text.matchAll(re)) at = m.index;
+  return at;
+};
+/** Whether `line` opens a private key: a BEGIN line after its last END line, so the key's body is still to come. */
+export const opensPrivateKey = (line: string): boolean => lastAt(BEGINS, line) > lastAt(ENDS, line);
+/** Whether `line` holds a private key's END line. */
+export const closesPrivateKey = (line: string): boolean => HAS_END.test(line);
+
+/**
  * The text with every exact value replaced by `[hapi: <NAME> redacted]`, then
- * every REDACT_PATTERNS match by `[hapi: <pattern name> redacted]` (a private
- * key's whole block), and the names found: a key in a repo file the worker
- * reads is not sent on to a classifier.
+ * every key format (`redactKeyFormats`: a private key's whole block), and the
+ * names found: a key in a repo file the worker reads is not sent on to a
+ * classifier.
  */
 export function redact(text: string, s: Secrets): { text: string; names: string[] } {
   const names: string[] = [];
@@ -116,13 +141,8 @@ export function redact(text: string, s: Secrets): { text: string; names: string[
     names.push(name);
     out = out.split(value).join(`[hapi: ${name} redacted]`);
   }
-  for (const { name, re } of REDACT_PATTERNS) {
-    const next = out.replace(re, `[hapi: ${name} redacted]`);
-    if (next === out) continue;
-    names.push(name);
-    out = next;
-  }
-  return { text: out, names };
+  const keys = redactKeyFormats(out);
+  return { text: keys.text, names: [...names, ...keys.names] };
 }
 
 /** `redact` over every string inside a JSON value. */
