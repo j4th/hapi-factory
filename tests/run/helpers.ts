@@ -3,14 +3,16 @@
  * networks, volumes, and the files in a run's output volume) and answers the
  * commands src/run makes as Docker would, plus a temp state dir, runtime dir,
  * build dir, source repo and work order. No Docker, git, sudo or network: the
- * git calls (the source's HEAD, the bundle's heads) are answered too, and
- * `docker logs --follow` streams `logs`.
+ * git calls (the source's HEAD, the bundle's heads) are answered too,
+ * `docker logs --follow` streams `logs`, and `docker logs --tail` prints a
+ * container's `world.logs`.
  */
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import YAML from "yaml";
 import { envFileText } from "../../src/secrets/files";
 import { COPY_SCRIPT, LIST_SCRIPT } from "../../src/run/copyout";
+import { LOGS_SCRIPT } from "../../src/run/lifecycle";
 import { recordDir, type RunRecord, writeRecord } from "../../src/run/records";
 import type { RunDeps } from "../../src/run/spec";
 import { tempDir } from "../secrets/helpers";
@@ -47,6 +49,8 @@ export interface World {
   outputs: Record<string, FakeFile>;
   /** The owners of the run's two volumes when its container started. */
   ownersAtRun?: string[];
+  /** What `docker logs --tail` prints for a run container (stdout and stderr together), by container name. */
+  logs: Map<string, string>;
 }
 
 export const SHA = "4bf92f3577b34da6a3ce929d0e0e47364bf92f35";
@@ -131,7 +135,7 @@ export function fakeRun(o: FakeOptions = {}) {
     mkdirSync(join(buildDir, f, ".."), { recursive: true });
     writeFileSync(join(buildDir, f), text);
   }
-  const world: World = { containers: new Map(), networks: new Map(), volumes: new Map(), outputs: {} };
+  const world: World = { containers: new Map(), networks: new Map(), volumes: new Map(), outputs: {}, logs: new Map() };
   const calls: Call[] = [];
   const spawned: string[][] = [];
   const project = o.project ?? "hapi";
@@ -150,6 +154,10 @@ export function fakeRun(o: FakeOptions = {}) {
       const code = o.waitCode ?? 0;
       if (code === 0) c.running = false;
       return code === 0 ? ok("0\n") : fail("", code);
+    }
+    if (cmd[0] === "sh" && cmd[1] === "-c" && cmd[2] === LOGS_SCRIPT) {
+      if (!world.containers.has(cmd[4]!)) return fail(`Error response from daemon: No such container: ${cmd[4]}`);
+      return ok(world.logs.get(cmd[4]!) ?? "");
     }
     if (cmd[0] === "env" && cmd[1] === "-i") {
       if (cmd.includes("list-heads")) return ok(o.heads ?? `${SHA} HEAD\n`);

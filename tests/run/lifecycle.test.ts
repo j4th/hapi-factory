@@ -12,7 +12,7 @@ import { isAbsolute, join, relative } from "node:path";
 import { main } from "../../src/cli";
 import { runDeps, START_USAGE } from "../../src/run/cli";
 import { COPY_SCRIPT, HELPER_HOST_TIMEOUT_S, HELPER_KILL_AFTER_S, HELPER_TIMEOUT_S, LIST_SCRIPT } from "../../src/run/copyout";
-import { bundleProblem, finalizeRun, guardProblems, reapRuns, runStart, runStop, runSupervise } from "../../src/run/lifecycle";
+import { bundleProblem, finalizeRun, guardProblems, LOGS_SCRIPT, reapRuns, runStart, runStop, runSupervise } from "../../src/run/lifecycle";
 import { readRecord, RUN_ID, runKey } from "../../src/run/records";
 import { STOP_GRACE_S } from "../../src/run/spec";
 import { reexecScript, runCommand } from "../../src/stack/up";
@@ -393,7 +393,8 @@ describe("finalizeRun", () => {
 
   test("a run with no result.json, or one that doesn't parse, fails", async () => {
     capture();
-    const f = fakeRun();
+    // With the env file, so the container's (empty) log is kept and adds nothing to the reason.
+    const f = ready();
     const none = await finalizeRun(await seedRun(f, { id: ID, running: false, outputs: { "transcript.jsonl": file("{}\n") } }), f.deps);
     expect([none.status, none.reason]).toEqual(["failed", "no result.json was copied out"]);
     const g = fakeRun();
@@ -469,6 +470,66 @@ describe("finalizeRun", () => {
     const done = await finalizeRun(await seedRun(f, { id: ID, running: false, outputs: completedOutputs() }), f.deps);
     expect(done.status).toBe("succeeded");
     expect(done.reason).toMatch(new RegExp(`^cleanup left run objects behind: removing the runs of hapi left something behind: docker volume rm ${N}-work ${N}-out failed \\(exit 1\\): boom; \`mise run down\` removes them$`));
+  });
+});
+
+describe("the container's log, when no result.json came out (final review C-1)", () => {
+  const ESC = String.fromCharCode(27);
+  const OUT = (f: { deps: { stateDir: string } }) => join(f.deps.stateDir, ID, "out");
+
+  test("a run that died in the prelude keeps its log's tail in out/container.log (0600), sanitized then redacted, and its last line in the reason, before removal", async () => {
+    capture();
+    const f = ready();
+    f.world.logs.set(N, `Cloning into '/work/repo'...\n${ESC}[31mfatal: could not read ${f.secret}${ESC}[0m\n${ESC}]0;title${String.fromCharCode(7)}\nfatal: ${"x".repeat(300)}\n\n`);
+    const done = await finalizeRun(await seedRun(f, { id: ID, running: false, outputs: {} }), f.deps);
+    const kept = readFileSync(join(OUT(f), "container.log"), "utf8");
+    expect(kept).toBe(`Cloning into '/work/repo'...\nfatal: could not read [hapi: ANTHROPIC_API_KEY redacted]\n\nfatal: ${"x".repeat(300)}\n\n`);
+    expect(statSync(join(OUT(f), "container.log")).mode & 0o777).toBe(0o600);
+    expect(done.status).toBe("failed");
+    expect(done.reason).toBe(
+      `no result.json was copied out; no transcript.jsonl was copied out, so the guard-ran check could not be made; the container's last log line: fatal: ${"x".repeat(193)}…`,
+    );
+    // Read through its host bound, before the container went.
+    const cmds = f.calls.map((c) => c.cmd);
+    const logs = cmds.findIndex((c) => c.includes(LOGS_SCRIPT));
+    expect(cmds[logs]!.slice(0, 4)).toEqual(["timeout", "-k", "10", "150"]);
+    expect(unbounded(cmds[logs]!)).toEqual(["sh", "-c", `exec docker logs --tail 200 "$1" 2>&1`, "hapi-logs", N]);
+    expect(logs).toBeLessThan(cmds.findIndex((c) => c.join(" ") === `docker rm -f ${N}`));
+    expect(f.world.containers.size).toBe(0);
+  });
+
+  test("a run whose result.json came out keeps no log", async () => {
+    capture();
+    const f = ready();
+    f.world.logs.set(N, "all fine\n");
+    const done = await finalizeRun(await seedRun(f, { id: ID, running: false, outputs: completedOutputs() }), f.deps);
+    expect(done.status).toBe("succeeded");
+    expect(existsSync(join(OUT(f), "container.log"))).toBe(false);
+    expect(f.calls.some((c) => c.cmd.includes(LOGS_SCRIPT))).toBe(false);
+  });
+
+  test("an empty log is kept, and adds nothing to the reason", async () => {
+    capture();
+    const f = ready();
+    const done = await finalizeRun(await seedRun(f, { id: ID, running: false, outputs: { "transcript.jsonl": file("{}\n") } }), f.deps);
+    expect(done.reason).toBe("no result.json was copied out");
+    expect(readFileSync(join(OUT(f), "container.log"), "utf8")).toBe("");
+  });
+
+  test("a docker logs that fails or hangs, or no env file to redact with, is noted in the reason, and finalize goes on", async () => {
+    capture();
+    const cases: [Parameters<typeof fakeRun>[0], string, boolean][] = [
+      [{ failing: ["sh -c"] }, "the container's log could not be read (docker logs exited 1)", true],
+      [{ hangs: (c) => c[0] === "sh" }, "reading the container's log timed out after 150 s", true],
+      [{}, "the container's log was not kept, since nothing could redact it: ", false],
+    ];
+    for (const [o, note, envFile] of cases) {
+      const f = envFile ? ready(o) : fakeRun(o);
+      const done = await finalizeRun(await seedRun(f, { id: ID, running: false, outputs: { "transcript.jsonl": file("{}\n") } }), f.deps);
+      expect([note, done.status, done.reason?.startsWith(`no result.json was copied out; ${note}`)]).toEqual([note, "failed", true]);
+      expect(existsSync(join(OUT(f), "container.log"))).toBe(false);
+      expect(f.world.containers.size + f.world.networks.size + f.world.volumes.size).toBe(0);
+    }
   });
 });
 

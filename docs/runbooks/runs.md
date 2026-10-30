@@ -128,12 +128,13 @@ Each run has a directory on the host, owned by hapi: `${XDG_STATE_HOME:-~/.local
 
 | File | What it is |
 |---|---|
-| `record.json` | What the launcher started and how it ended: the id, key, repo, commit, work order, workflow, container, network, volumes, start, deadline, `status` and, when the run didn't succeed, a `reason` written by hapi's own checks (never text the run wrote). Plan 03's harvester adds `harvestedAt`. |
+| `record.json` | What the launcher started and how it ended: the id, key, repo, commit, work order, workflow, container, network, volumes, start, deadline, `status` and, when the run didn't succeed, a `reason` written by hapi's own checks. The one piece of it a run wrote is the last line of `out/container.log`, sanitized and redacted, and labelled `the container's last log line:`. Plan 03's harvester adds `harvestedAt`. |
 | `run.json` | The run's input, as bound into the container. |
 | `out/run.bundle` | The git bundle of the worker's commits, from the source commit to `HEAD`. Present if the worker committed. |
 | `out/result.json` | Archon's own record of the run (`workflow runs`, `workflow get`), including its status and spend. |
 | `out/transcript.jsonl` | Archon's run transcript. |
 | `out/decisions.jsonl` | hapi-guard's decision log: one JSON object per line, the first of each Pi node attempt a `session_start` ([generated configs](../generated-configs.md#what-hapi-guard-enforces)). |
+| `out/container.log` | Only for a run that left no `result.json`. Before the container is removed, finalize keeps the last 200 lines of its log (`docker logs --tail 200`, under the helpers' 150 s bound), stripped of escape sequences and control characters, then of the archon zone's secret values and key formats, as `watch` shows text. It is written 0600 by hapi, not copied from the run, and its last line is quoted in `reason`. Without the archon env file nothing could redact it, so it isn't kept, and `reason` says so. A run that died in the prelude (the clone, the checkout, Archon's CLI failing to start) leaves nothing else. |
 
 `<state dir>/supervise.log` (0600) holds the detached supervisors' output.
 
@@ -385,6 +386,7 @@ sudo -u hapi -H -- sh -c 'rm -rf "$HOME/hapi-check-work" "$HOME/hapi-check-repo.
 | `run <id> is live for <repo>: one live run per repo` | Another run of the same repo is live. Wait, or stop it. |
 | `N runs are live and runs.max_live is 1` | The cap in `policy/runs.yaml`. Wait for one to end, or stop one. |
 | `run <id> is live but has no record ...` | A run container exists with no record directory (the record was removed by hand). `docker rm -f hapi-run-<id>` as hapi, or `mise run down`. |
+| A run's status is `failed`, `reason` starts `no result.json was copied out` | The run died before the prelude's read-back, usually in the prelude itself: the clone, the checkout, or Archon's CLI failing to start. Read `out/container.log` in the run's directory (the last 200 lines of the container's log), and the line `reason` quotes from it. A `Permission denied` on `/src/repo.git` means the source isn't world-readable: the container reads it as another uid, so make it with `umask 022` ([`--repo`](#hapi-run-start)). |
 | `hapi run start: ... a step failed` after a `docker network` or `docker volume` error | `start` removes what it made. The rest of the message is Docker's own error: a daemon that isn't running (as hapi: `systemctl --user status docker`), or the archon image missing (run `mise run up`, which builds it). |
 | A run's status is `failed`, `reason` starts `guard did not run in node ...` | A Pi node attempt left no `session_start` record: hapi-guard failed to load, or the node never reached its hook. The run's output is not trusted. Read `out/transcript.jsonl` and `out/decisions.jsonl`. |
 | A run's status is `failed`, `reason` starts `the run paused` | v1 has no approval nodes and nothing can answer one, so a pause fails the run. Fix the workflow. |

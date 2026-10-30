@@ -43,8 +43,9 @@
  * read by host git with hardened flags in an empty dir: spike 07 finding 19),
  * read Archon's status from result.json (a paused run exits 0, so the exit code
  * is never the status: spike 07 finding 5), check that the guard ran in every
- * Pi attempt (design §6a item 7; spike 08 finding 10), remove every object of
- * the run, and write the record. A run whose container is gone was removed
+ * Pi attempt (design §6a item 7; spike 08 finding 10), keep the tail of the
+ * container's log when no result.json came out (`keepContainerLog`), remove
+ * every object of the run, and write the record. A run whose container is gone was removed
  * around hapi (`mise run down`, a cleanup), which is removing its volumes too,
  * so nothing is copied and it fails: a copy-out helper would race that removal
  * (`volume is in use`).
@@ -60,7 +61,8 @@
  * Everything that comes out of a run is untrusted data: stored and checked,
  * never executed, never read by git with its own config, never printed raw.
  */
-import { mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdtemp, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { RunFile } from "../generate/archon";
@@ -90,6 +92,7 @@ import {
   withStartLock,
   writeRecord,
 } from "./records";
+import { redactSecrets, sanitizeTerminal } from "./sanitize";
 import { APP_USER, PROXY_ALIAS, runArgs, type RunDeps, type RunInputs, runLabels, runName, STOP_GRACE_S } from "./spec";
 
 /** How long `finalizeRun` waits for another process finalizing the same run: the listing and four reads at their host bound and KILL, and the rest. */
@@ -384,6 +387,51 @@ export function guardProblems(transcript: string | undefined, decisions: string 
   return problems.length <= 5 ? problems : [...problems.slice(0, 5), `and ${problems.length - 5} more Pi attempts without a guard record`];
 }
 
+/** How many lines of a run container's log finalize keeps, for a run that left no result.json. */
+const LOG_TAIL = 200;
+/** The most of the log's last line a run's reason quotes. */
+const LOG_LINE_CHARS = 200;
+/** `sh -c LOGS_SCRIPT hapi-logs <container>`: the log's last LOG_TAIL lines, stdout and stderr in the order they were written. Fixed text. */
+export const LOGS_SCRIPT = `exec docker logs --tail ${LOG_TAIL} "$1" 2>&1`;
+
+/**
+ * Keep the tail of a run container's log in `<out>/container.log` (mode 0600), for a run that left no result.json.
+ * A run that died in the prelude (the clone, the sparse checkout, the Archon CLI failing to start) leaves nothing
+ * else, and removeRuns takes the log with the container (final review C-1). The log is untrusted text: it is
+ * sanitized, then redacted with the archon zone's values, in `watch`'s order, and it is not kept if they can't be
+ * read. The file is the host's own, never one of OUTPUT_FILES. Returns what the run's reason says of it, if
+ * anything: the log's last line, or why it wasn't kept. Never throws: nothing here may stop finalize.
+ */
+async function keepContainerLog(d: RunDeps, rec: RunRecord, out: string): Promise<string | undefined> {
+  let values: Record<string, string>;
+  try {
+    values = await archonSecrets(d.env);
+  } catch (e) {
+    return `the container's log was not kept, since nothing could redact it: ${(e as Error).message}`;
+  }
+  let r: Awaited<ReturnType<RunDeps["run"]>>;
+  try {
+    r = await d.run(bounded(["sh", "-c", LOGS_SCRIPT, "hapi-logs", rec.container]), { env: definedEnv(d.env), inherit: false });
+  } catch (e) {
+    return `the container's log could not be read: ${(e as Error).message}`;
+  }
+  if (timedOut(r.code)) return `reading the container's log timed out after ${HELPER_HOST_TIMEOUT_S} s`;
+  if (r.code !== 0) return `the container's log could not be read (docker logs exited ${r.code})`;
+  const text = redactSecrets(sanitizeTerminal(r.stdout), values);
+  const file = join(out, "container.log");
+  const tmp = join(out, `.container.log.${randomUUID()}.tmp`);
+  try {
+    await writeFile(tmp, text, { mode: 0o600, flag: "wx" });
+    await rename(tmp, file);
+  } catch (e) {
+    await rm(tmp, { force: true });
+    return `the container's log could not be written to ${file} (${(e as NodeJS.ErrnoException).code ?? (e as Error).message})`;
+  }
+  const last = text.split("\n").map((l) => l.trim()).filter((l) => l !== "").at(-1);
+  if (last === undefined) return undefined;
+  return `the container's last log line: ${last.length > LOG_LINE_CHARS ? `${last.slice(0, LOG_LINE_CHARS)}…` : last}`;
+}
+
 /** Archon's status of the run, from out/result.json's `run.status` (`workflow get`), or why it can't be read. */
 async function archonStatus(out: string, copied: string[]): Promise<{ status: string } | { problem: string }> {
   if (!copied.includes("result.json")) return { problem: "no result.json was copied out" };
@@ -433,6 +481,10 @@ async function finalizeLocked(rec: RunRecord, d: RunDeps): Promise<RunRecord> {
     if ("problem" in archon) problems.push(archon.problem);
     const read = async (name: string) => (copy.copied.includes(name) ? readFile(join(out, name), "utf8") : undefined);
     problems.push(...guardProblems(await read("transcript.jsonl"), await read("decisions.jsonl")));
+    if (!copy.copied.includes("result.json")) {
+      const log = await keepContainerLog(d, disk, out);
+      if (log !== undefined) problems.push(log);
+    }
   }
 
   let status: RunStatus;
