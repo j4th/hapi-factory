@@ -10,16 +10,15 @@
  * - The fresh build is `buildAll` into a temp dir, once per roster (`up
  *   --roster` picks one), and the deployed build must equal one of them
  *   exactly: every generated file byte for byte, as a regular file (never a
- *   symlink), and no other path, file or directory, anywhere under it. Archon
- *   mounts build/pi whole as Pi's agent dir, so a planted or stale
- *   settings.json, auth.json or extensions/ there would be read; and
+ *   symlink), and no other path, file or directory, anywhere under it. A run
+ *   binds build/pi's named files and its whole extensions/ directory into Pi's
+ *   agent dir (a tmpfs), so a planted extension there would be loaded; and
  *   `buildAll` never deletes, so a file policy stopped generating stays
- *   behind. The emitters are deterministic, so any difference is a hand
- *   edit, a stale build or a policy change not yet deployed. A difference is
+ *   behind. The emitters are deterministic, so any difference is a hand edit, a stale build or a policy change not yet deployed. A difference is
  *   named by file and key (YAML, JSON, env) or line (squid.conf), never by
  *   the deployed value; a path a fresh build doesn't have is named and never
  *   read.
- * - Each running container's `org.hapi.build-sha256` label must be that
+ * - Each running container's (the stack's, and each run's) `org.hapi.build-sha256` label must be that
  *   build's digest (`buildDigest`, src/stack/up.ts; H-147): Compose recreates
  *   a container whose config changed, not one whose bind-mounted file did, so
  *   a container with an older label may still run an older config.
@@ -34,7 +33,7 @@ import { loadPolicy } from "../../policy/load";
 import type { RosterName } from "../../policy/types";
 import { buildDigest, currentUserOverride, HAPI_CHECKOUT, HAPI_USER } from "../../stack/up";
 import { type AuditRun, type CheckResult, result } from "../types";
-import { containerName, isRunning, stackContainers } from "./runtime";
+import { containerName, isRunning, liveContainers } from "./runtime";
 
 export type Deployed = { dir: string } | { skip: string };
 
@@ -224,7 +223,7 @@ export async function generatedDrift(run: AuditRun): Promise<CheckResult[]> {
   // A container must have been started from the build that matches; with drift, from some fresh build at least.
   const expected = new Set(best.problems.length === 0 ? [best.build.digest] : builds.map((b) => b.digest));
 
-  const stack = await stackContainers(run);
+  const stack = await liveContainers(run);
   const labelProblems: string[] = [];
   let labels: string;
   if ("unavailable" in stack) labels = `${stack.unavailable}, so no container's build label was checked`;

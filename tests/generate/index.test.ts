@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import YAML from "yaml";
@@ -7,7 +7,7 @@ import { main } from "../../src/cli";
 import { emitArchon } from "../../src/generate/archon";
 import { emitEgress } from "../../src/generate/egress";
 import { emitHermes } from "../../src/generate/hermes";
-import { buildAll } from "../../src/generate/index";
+import { buildAll, bundleEntry, DECIDE_ENTRY, GUARD_ENTRY, REPO_ROOT } from "../../src/generate/index";
 import { emitMcp } from "../../src/generate/mcp";
 import { emitPi } from "../../src/generate/pi";
 import { loadPolicy } from "../../src/policy/load";
@@ -17,14 +17,21 @@ const p = loadPolicy("policy");
 const FILES = [
   "archon/archon.env",
   "archon/config.yaml",
+  "archon/empty.env",
+  "archon/gitconfig",
+  "archon/run-config.yaml",
+  "decide/hapi-decide.js",
   "egress/archon.squid.conf",
   "egress/hermes.squid.conf",
   "egress/research.squid.conf",
   "hermes/config.yaml",
   "mcp/hermes.mcp.json",
   "mcp/research.mcp.json",
+  "pi/extensions/hapi-guard.js",
   "pi/hapi-guard.json",
+  "pi/models-store.json",
   "pi/models.json",
+  "pi/settings.json",
 ];
 
 let temps: string[] = [];
@@ -50,8 +57,9 @@ function capture(): { out: string[]; err: string[] } {
 }
 
 describe("buildAll", () => {
-  // Task 3 wrote 8 files (1 Hermes, 2 Archon, 2 Pi, 3 egress); Task 3b adds the 2 per-zone mcp.json files.
-  test("writes the ten generated files and returns their paths", async () => {
+  // Task 3 wrote 8 files (1 Hermes, 2 Archon, 2 Pi, 3 egress); Task 3b adds the 2 per-zone mcp.json files;
+  // Plan 02 Task 4 adds 3 Archon run files, 2 Pi files, and the guard and hapi-decide bundles.
+  test("writes the seventeen generated files and returns their paths", async () => {
     const out = tempDir();
     const paths = await buildAll(p, out);
     expect(paths.map((f) => relative(out, f)).sort()).toEqual(FILES);
@@ -69,6 +77,8 @@ describe("buildAll", () => {
     add("pi", emitPi(p, "anthropic"));
     add("egress", emitEgress(p));
     add("mcp", emitMcp(p));
+    expected["pi/extensions/hapi-guard.js"] = await bundleEntry(GUARD_ENTRY, REPO_ROOT);
+    expected["decide/hapi-decide.js"] = await bundleEntry(DECIDE_ENTRY, REPO_ROOT);
     expect(Object.keys(expected).sort()).toEqual(FILES);
     for (const [file, text] of Object.entries(expected)) expect(readFileSync(join(out, file), "utf8")).toBe(text);
   });
@@ -117,10 +127,18 @@ describe("buildAll", () => {
       for (const f of FILES) {
         const text = readFileSync(join(out, f), "utf8");
         let head: string;
-        if (f.endsWith(".json")) {
+        if (f.endsWith(".js")) {
+          const lines = text.split("\n");
+          head = lines.slice(0, lines.findIndex((l) => !l.startsWith("//"))).join("\n");
+        } else if (f.endsWith(".json") && f !== "pi/models-store.json") {
           const parsed = JSON.parse(text);
           expect({ f, first: Object.keys(parsed)[0] }).toEqual({ f, first: "$comment" });
           head = parsed.$comment;
+        } else if (f === "pi/models-store.json") {
+          // Exempt: Pi reads this file as its model store, so it is bound read-only as exactly {}, with no $comment
+          // that Pi might treat as a catalog overlay (spike 08, finding 9; docs/generated-configs.md).
+          expect(text).toBe("{}\n");
+          continue;
         } else {
           const lines = text.split("\n");
           head = lines.slice(0, lines.findIndex((l) => !l.startsWith("#"))).join("\n");
@@ -129,6 +147,59 @@ describe("buildAll", () => {
         expect({ f, notice: head.includes("docs/generated-configs.md") }).toEqual({ f, notice: true });
       }
     }
+  });
+
+  test("nested output paths are created", async () => {
+    const out = tempDir();
+    await buildAll(p, out);
+    expect(existsSync(join(out, "pi/extensions/hapi-guard.js"))).toBe(true);
+    expect(readdirSync(join(out, "pi/extensions"))).toEqual(["hapi-guard.js"]);
+  });
+
+  test("the bundles are deterministic: two builds give identical bytes", async () => {
+    expect(await bundleEntry(GUARD_ENTRY, REPO_ROOT)).toBe(await bundleEntry(GUARD_ENTRY, REPO_ROOT));
+    expect(await bundleEntry(DECIDE_ENTRY, REPO_ROOT)).toBe(await bundleEntry(DECIDE_ENTRY, REPO_ROOT));
+  });
+
+  test("a bundle imports nothing but node:*", async () => {
+    for (const entry of [GUARD_ENTRY, DECIDE_ENTRY]) {
+      const text = await bundleEntry(entry, REPO_ROOT);
+      const specs = [...text.matchAll(/^(?:import|export)\b[^;\n]*?["']([^"']+)["']/gm)].map((m) => m[1]!);
+      expect(specs.every((s) => s.startsWith("node:"))).toBe(true);
+    }
+    await expect(bundleEntry("tests/generate/fixtures/external-import.ts", REPO_ROOT)).rejects.toThrow(/bun:sqlite/);
+  });
+
+  test("the built guard bundle, with no Pi agent dir to read, registers only a session_start that fails closed (tests/guard/bundle.test.ts covers the rest)", async () => {
+    const dir = tempDir();
+    await buildAll(p, dir);
+    const mod = await import(join(dir, "pi/extensions/hapi-guard.js"));
+    const handlers: Record<string, () => unknown> = {};
+    const saved = process.env.PI_CODING_AGENT_DIR;
+    delete process.env.PI_CODING_AGENT_DIR;
+    try {
+      mod.default({ on: (event: string, fn: () => unknown) => void (handlers[event] = fn) });
+    } finally {
+      if (saved !== undefined) process.env.PI_CODING_AGENT_DIR = saved;
+    }
+    expect(Object.keys(handlers)).toEqual(["session_start"]);
+    expect(handlers.session_start).toThrow("hapi-guard: PI_CODING_AGENT_DIR is not set; the node fails closed");
+  });
+
+  test("the hapi-decide bundle, run with bun from a temp dir under BUN_OPTIONS=--no-install, answers bash-gate --mock from stdin", async () => {
+    const dir = tempDir();
+    await buildAll(p, dir);
+    const run = Bun.spawnSync(["bun", "--no-env-file", join(dir, "decide/hapi-decide.js"), "bash-gate", "--mock"], {
+      cwd: dir,
+      stdin: new TextEncoder().encode("git status"),
+      env: { PATH: process.env.PATH ?? "", HOME: dir, BUN_OPTIONS: "--no-install" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect([run.exitCode, run.stderr.toString()]).toEqual([0, ""]);
+    const result = JSON.parse(run.stdout.toString().trim().split("\n").pop()!);
+    expect(result.via).toBe("mock");
+    expect(["allow", "block", "wrap", "flag"]).toContain(result.verdict);
   });
 
   test("two builds are byte-identical (no timestamps, stable order)", async () => {

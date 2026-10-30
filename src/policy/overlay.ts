@@ -7,7 +7,7 @@
  *   glob's modes (allow < ask < deny);
  * - add `egress_extra` hosts to the archon zone (the one exception to tighten-only),
  *   but never a forge host, since the archon zone has no forge route (spec §4.3);
- * - lower budgets;
+ * - lower budgets and run limits, and harden budget enforcement modes (soft < hard);
  * - set the repo's `default_risk` and `workflow` (spec §7). These are repo
  *   settings, not policy, so tighten-only doesn't apply: they appear on the
  *   result as `repo`, for Plan 03 to read.
@@ -23,7 +23,10 @@ import { forgeDomain, forgeHostMessage } from "./hosts";
 import { loadChecked, PolicyError } from "./load";
 import { RANK, SESSIONS, UNPROTECTED } from "./paths";
 import { check, pointerSegment } from "./schema";
-import type { Budgets, Policy, RepoOverlay, RepoSettings } from "./types";
+import type { Budgets, Enforcement, Policy, RepoOverlay, RepoSettings, Runs } from "./types";
+
+/** Tightening order of enforcement modes: soft < hard. */
+const ENFORCEMENT_RANK: Record<Enforcement, number> = { soft: 0, hard: 1 };
 
 /** An overlay tried to loosen policy. `path` is a JSON Pointer into the overlay, e.g. "/protected_paths/AGENTS.md/interactive". */
 export class PolicyLoosenError extends Error {
@@ -64,6 +67,7 @@ export function applyOverlay(p: Policy, o: RepoOverlay): Policy {
     archon.hosts = [...new Set([...archon.hosts, ...o.egress_extra])];
   }
   if (o.budgets) result.budgets = lowerBudgets(result.budgets, o.budgets);
+  if (o.runs) result.runs = lowerRuns(result.runs, o.runs);
   // Repo settings, not policy: no tighten-only check applies.
   const repo: RepoSettings = {};
   if (o.default_risk !== undefined) repo.default_risk = o.default_risk;
@@ -117,15 +121,17 @@ function tightenPaths(
   return Object.fromEntries(merged);
 }
 
+/** `to` must be at most `from`; the error names the raised key. */
+function lower(path: string, name: string, from: number, to: number | undefined): number {
+  if (to === undefined) return from;
+  if (to > from) throw new PolicyLoosenError(path, `raises ${name} from ${from} to ${to}`);
+  return to;
+}
+
 function lowerBudgets(base: Budgets, overlay: NonNullable<RepoOverlay["budgets"]>): Budgets {
-  const result = { ...base, workspaces: { ...base.workspaces } };
-  const lower = (path: string, name: string, from: number, to: number | undefined): number => {
-    if (to === undefined) return from;
-    if (to > from) throw new PolicyLoosenError(path, `raises ${name} from ${from} to ${to}`);
-    return to;
-  };
-  const { workspaces, ...scalars } = overlay;
-  for (const [key, value] of Object.entries(scalars) as [Exclude<keyof Budgets, "workspaces">, number][]) {
+  const result = { ...base, workspaces: { ...base.workspaces }, enforcement: { ...base.enforcement } };
+  const { workspaces, enforcement, ...scalars } = overlay;
+  for (const [key, value] of Object.entries(scalars) as [Exclude<keyof Budgets, "workspaces" | "enforcement">, number][]) {
     result[key] = lower(`/budgets/${pointerSegment(key)}`, `budgets.${key}`, base[key], value);
   }
   for (const [key, value] of Object.entries(workspaces ?? {}) as [keyof Budgets["workspaces"], number][]) {
@@ -133,6 +139,33 @@ function lowerBudgets(base: Budgets, overlay: NonNullable<RepoOverlay["budgets"]
       `/budgets/workspaces/${pointerSegment(key)}`,
       `the ${key} workspace budget`,
       base.workspaces[key],
+      value,
+    );
+  }
+  for (const [key, value] of Object.entries(enforcement ?? {}) as [keyof Budgets["enforcement"], Enforcement][]) {
+    const from = base.enforcement[key];
+    if (ENFORCEMENT_RANK[value] < ENFORCEMENT_RANK[from]) {
+      throw new PolicyLoosenError(
+        `/budgets/enforcement/${pointerSegment(key)}`,
+        `softens budgets.enforcement.${key} from ${from} to ${value}`,
+      );
+    }
+    result.enforcement[key] = value;
+  }
+  return result;
+}
+
+function lowerRuns(base: Runs, overlay: NonNullable<RepoOverlay["runs"]>): Runs {
+  const { output_limits_mb, ...scalars } = overlay;
+  const result = { ...base, output_limits_mb: { ...base.output_limits_mb } };
+  for (const [key, value] of Object.entries(scalars) as [Exclude<keyof Runs, "output_limits_mb">, number][]) {
+    result[key] = lower(`/runs/${pointerSegment(key)}`, `runs.${key}`, base[key], value);
+  }
+  for (const [key, value] of Object.entries(output_limits_mb ?? {}) as [keyof Runs["output_limits_mb"], number][]) {
+    result.output_limits_mb[key] = lower(
+      `/runs/output_limits_mb/${pointerSegment(key)}`,
+      `runs.output_limits_mb.${key}`,
+      base.output_limits_mb[key],
       value,
     );
   }

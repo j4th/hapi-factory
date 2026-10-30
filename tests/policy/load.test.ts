@@ -124,6 +124,7 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
       jev_monthly_usd: 2,
       run_usd: 3,
       hermes_max_turns: 60,
+      enforcement: { hapi_guard: "hard", archon: "hard" },
     });
     expect(p.approvals).toEqual([
       "merge",
@@ -133,6 +134,74 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
       "outbound_message",
       "spend_above_threshold",
     ]);
+  });
+
+  test("loads the new limits exactly", () => {
+    expect(p.budgets.enforcement).toEqual({ hapi_guard: "hard", archon: "hard" });
+    expect(p.runs).toEqual({
+      max_live: 1,
+      retention_days: 14,
+      output_limits_mb: { bundle: 256, transcript: 64, decisions: 16, result: 4 },
+    });
+    // The design screens every bash call by default: the skip list starts empty.
+    expect(p.gates).toEqual({
+      bash_gate: { enabled: true, skip_commands: [] },
+      result_screen: { enabled: true, tools: ["bash", "read"] },
+      max_state_chars: 6000,
+      classifiers: {
+        jev: { model: "~typesafe/jev-latest", unknown_call_usd: 0.001 },
+        haiku: { model: "claude-haiku-5-5", input_per_mtok: 0.1, output_per_mtok: 0.5 },
+      },
+    });
+  });
+
+  test("rejects an unknown enforcement", () => {
+    const text = readFileSync("policy/budgets.yaml", "utf8").replace(/archon: hard/, "archon: off");
+    const e = policyError(policyWith("budgets.yaml", text));
+    expect(e.file).toEndWith("budgets.yaml");
+    expect(e.message).toContain("/enforcement/archon: must be one of: hard, soft");
+  });
+
+  test("rejects max_live 0", () => {
+    const text = readFileSync("policy/runs.yaml", "utf8").replace(/max_live: 1/, "max_live: 0");
+    const e = policyError(policyWith("runs.yaml", text));
+    expect(e.file).toEndWith("runs.yaml");
+    expect(e.path).toBe("/max_live");
+  });
+
+  describe("a gate that is on needs Haiku as the fallback (Plan 02 has no other classifier for a repo that isn't public)", () => {
+    const jev = (enabled: boolean, fallback: string) =>
+      readFileSync("policy/flags.yaml", "utf8").replace(/^jev:.*$/m, `jev:          { enabled: ${enabled}, fallback: ${fallback}, via: openrouter }`);
+    const gates = readFileSync("policy/gates.yaml", "utf8");
+    const off = (text: string, gate: string) => text.replace(new RegExp(`(${gate}:\\s*enabled:) true`), "$1 false");
+    const message =
+      "on, but flags.jev.fallback is none, so a run that isn't public has no classifier whatever flags.jev.enabled says: set fallback to haiku, or turn the gate off here";
+
+    test("jev off with fallback haiku loads", () => {
+      expect(loadPolicy(policyWith("flags.yaml", jev(false, "haiku"))).flags.jev).toEqual({ enabled: false, fallback: "haiku", via: "openrouter" });
+    });
+
+    for (const enabled of [true, false]) {
+      test(`jev ${enabled ? "on" : "off"} with fallback none is refused, naming each gate that is on`, () => {
+        for (const gate of ["bash_gate", "result_screen"]) {
+          const dir = policyWith("flags.yaml", jev(enabled, "none"));
+          // Leave only this gate on.
+          writeFileSync(join(dir, "gates.yaml"), off(gates, gate === "bash_gate" ? "result_screen" : "bash_gate"));
+          const e = policyError(dir);
+          expect(e.file).toEndWith("gates.yaml");
+          expect(e.issues).toEqual([{ path: `/${gate}/enabled`, message }]);
+        }
+      });
+    }
+
+    test("both gates off with fallback none loads", () => {
+      for (const enabled of [true, false]) {
+        const dir = policyWith("flags.yaml", jev(enabled, "none"));
+        writeFileSync(join(dir, "gates.yaml"), off(off(gates, "result_screen"), "bash_gate"));
+        const p = loadPolicy(dir);
+        expect([p.flags.jev.enabled, p.gates.bash_gate.enabled, p.gates.result_screen.enabled]).toEqual([enabled, false, false]);
+      }
+    });
   });
 
   test("roles map every role to a tier", () => {
@@ -182,7 +251,7 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
       expect(vendor).toBe("opencode-go");
       expect(zeroRetention.has(id ?? "")).toBe(true);
     }
-    expect(r.large.model).toBe("opencode-go/kimi-k3.1-pro");
+    expect(r.large.model).toBe("opencode-go/kimi-k3");
     expect(r.medium.model).toBe("opencode-go/glm-5.3");
     const family = (m: string) => m.split("/")[1]?.match(/^[a-z]+/)?.[0];
     expect(family(r.large.model)).not.toBe(family(r.medium.model));

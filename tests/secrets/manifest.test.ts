@@ -136,12 +136,12 @@ describe("loadManifest", () => {
   });
 
   test("an env name hapi sets in the containers itself is refused, in any zone, naming each one (R4)", () => {
-    // HOST would rebind Archon off loopback, HTTPS_PROXY route around the proxy, PI_OFFLINE let Pi fetch packages.
+    // HTTPS_PROXY would route around the proxy, PI_OFFLINE let Pi fetch packages, ALL_PROXY cover what HTTP(S)_PROXY does not.
     const e = policyError(() =>
-      loadManifest(manifestFile(full().replace("  A: hapi-a", "  A: hapi-a\n  HTTPS_PROXY: hapi-a").replace("  B: hapi-b", "  HOST: hapi-b\n  PI_OFFLINE: hapi-b").replace("  D: hapi-a", "  ALL_PROXY: hapi-a"))),
+      loadManifest(manifestFile(full().replace("  A: hapi-a", "  A: hapi-a\n  HTTPS_PROXY: hapi-a").replace("  B: hapi-b", "  PI_OFFLINE: hapi-b").replace("  D: hapi-a", "  ALL_PROXY: hapi-a"))),
     );
-    expect(e.issues.map((i) => i.path)).toEqual(["/hermes/HTTPS_PROXY", "/archon/HOST", "/archon/PI_OFFLINE", "/host/ALL_PROXY"]);
-    expect(e.message).toContain("/archon/HOST: HOST is reserved: hapi sets it in the containers itself (src/stack/env.ts, stack/compose.yaml's environment:)");
+    expect(e.issues.map((i) => i.path)).toEqual(["/hermes/HTTPS_PROXY", "/archon/PI_OFFLINE", "/host/ALL_PROXY"]);
+    expect(e.message).toContain("/archon/PI_OFFLINE: PI_OFFLINE is reserved: hapi sets it in the containers itself (src/stack/env.ts, stack/compose.yaml's environment:)");
   });
 
   test("every reserved name is refused, and the committed manifest uses none", () => {
@@ -155,13 +155,13 @@ describe("loadManifest", () => {
   });
 
   test("a manifest built in code with a reserved name is refused too, before resolve fetches or writes anything", async () => {
-    const m = { archon: { ANTHROPIC_API_KEY: "hapi-a", HOST: "hapi-b" } };
-    expect(() => manifestEntries(m)).toThrow("archon/HOST: HOST is reserved");
+    const m = { archon: { ANTHROPIC_API_KEY: "hapi-a", PI_OFFLINE: "hapi-b" } };
+    expect(() => manifestEntries(m)).toThrow("archon/PI_OFFLINE: PI_OFFLINE is reserved");
     let fetched = false;
     const provider: SecretProvider = { name: "sops", downgrade: false, list: async () => [], fetch: async () => ((fetched = true), new Map()) };
     const dir = mkdtempSync(join(tmpdir(), "hapi-manifest-"));
     temps.push(dir);
-    await expect(resolveSecrets(m, provider, { outDir: join(dir, "hapi") })).rejects.toThrow("archon/HOST: HOST is reserved");
+    await expect(resolveSecrets(m, provider, { outDir: join(dir, "hapi") })).rejects.toThrow("archon/PI_OFFLINE: PI_OFFLINE is reserved");
     expect(fetched).toBe(false);
     expect(readdirSync(dir)).toEqual([]);
   });
@@ -172,9 +172,45 @@ describe("loadManifest", () => {
       "ALL_PROXY",
       "ARCHON_DOCKER",
       "ARCHON_TELEMETRY_DISABLED",
+      "BUN_OPTIONS",
+      "CLAUDE_BIN_PATH",
       "DO_NOT_TRACK",
+      "GIT_ALLOW_PROTOCOL",
+      "GIT_ASKPASS",
+      "GIT_CONFIG_COUNT",
+      "GIT_CONFIG_GLOBAL",
+      "GIT_CONFIG_KEY_0",
+      "GIT_CONFIG_KEY_1",
+      "GIT_CONFIG_KEY_10",
+      "GIT_CONFIG_KEY_11",
+      "GIT_CONFIG_KEY_12",
+      "GIT_CONFIG_KEY_2",
+      "GIT_CONFIG_KEY_3",
+      "GIT_CONFIG_KEY_4",
+      "GIT_CONFIG_KEY_5",
+      "GIT_CONFIG_KEY_6",
+      "GIT_CONFIG_KEY_7",
+      "GIT_CONFIG_KEY_8",
+      "GIT_CONFIG_KEY_9",
+      "GIT_CONFIG_NOSYSTEM",
+      "GIT_CONFIG_VALUE_0",
+      "GIT_CONFIG_VALUE_1",
+      "GIT_CONFIG_VALUE_10",
+      "GIT_CONFIG_VALUE_11",
+      "GIT_CONFIG_VALUE_12",
+      "GIT_CONFIG_VALUE_2",
+      "GIT_CONFIG_VALUE_3",
+      "GIT_CONFIG_VALUE_4",
+      "GIT_CONFIG_VALUE_5",
+      "GIT_CONFIG_VALUE_6",
+      "GIT_CONFIG_VALUE_7",
+      "GIT_CONFIG_VALUE_8",
+      "GIT_CONFIG_VALUE_9",
+      "GIT_EDITOR",
+      "GIT_PAGER",
+      "GIT_PROTOCOL_FROM_USER",
+      "GIT_TERMINAL_PROMPT",
       "HERMES_HOME",
-      "HOST",
       "HTTPS_PROXY",
       "HTTP_PROXY",
       "NO_PROXY",
@@ -208,6 +244,13 @@ describe("loadManifest", () => {
     expect(e.message).toContain(
       "/archon/SSL_CERT_FILE: SSL_CERT_FILE is reserved: it can change how a process runs, which code it loads or which TLS certificates it trusts (CONTROL_ENV_NAMES, src/stack/env.ts), so a secret may not set it. Give the secret another env name",
     );
+  });
+
+  test("a DOCKER_* secret is refused: the launcher spreads the archon zone's secrets over its `docker run` env, where one would point that call at another daemon", () => {
+    const e = policyError(() => loadManifest(manifestFile(full().replace("  B: hapi-b", "  B: hapi-b\n  DOCKER_HOST: hapi-b\n  DOCKER_CONFIG: hapi-b"))));
+    expect(e.issues.map((i) => i.path)).toEqual(["/archon/DOCKER_HOST", "/archon/DOCKER_CONFIG"]);
+    expect(e.message).toContain("/archon/DOCKER_HOST: DOCKER_HOST is reserved: env names starting DOCKER_ configure a runtime, the loader or a tool");
+    for (const name of ["DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "DOCKER_CERT_PATH", "DOCKER_TLS_VERIFY"]) expect([name, reservedEnvRule(name)?.includes("starting DOCKER_")]).toEqual([name, true]);
   });
 
   test("every name the ruling lists is refused, each exact name and each prefix too, and a name hapi sets keeps its own reason", () => {
@@ -263,7 +306,7 @@ describe("loadManifest", () => {
     for (const name of [...CONTROL_ENV_NAMES, ...CONTROL_ENV_PREFIXES, ...CONTROL_ENV_SUFFIXES]) expect(name).toMatch(/^[A-Z_][A-Z0-9_]*$/);
     for (const name of CONTROL_ENV_NAMES) expect([name, CONTROL_ENV_SUFFIXES.filter((s) => name.endsWith(s))]).toEqual([name, []]);
     for (const name of CONTROL_ENV_NAMES) expect([name, CONTROL_ENV_PREFIXES.filter((p) => name.startsWith(p))]).toEqual([name, []]);
-    expect(CONTROL_ENV_PREFIXES).toEqual(["ARCHON_", "BUN_", "CLAUDE_CODE_", "DYLD_", "GIT_CONFIG_", "HERMES_", "LD_", "MISE_", "NODE_", "NPM_CONFIG_", "PIP_", "PI_", "PYTHON", "S6_", "UV_"]);
+    expect(CONTROL_ENV_PREFIXES).toEqual(["ARCHON_", "BUN_", "CLAUDE_CODE_", "DOCKER_", "DYLD_", "GIT_CONFIG_", "HERMES_", "LD_", "MISE_", "NODE_", "NPM_CONFIG_", "PIP_", "PI_", "PYTHON", "S6_", "UV_"]);
   });
 
   test("the logical-name pattern", () => {

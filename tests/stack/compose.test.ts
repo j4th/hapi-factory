@@ -7,7 +7,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { emitArchon, PI_AGENT_DIR } from "../../src/generate/archon";
+import { ARCHON_ENV, emitArchon, PI_AGENT_DIR } from "../../src/generate/archon";
 import { PROXY_PORT } from "../../src/generate/egress";
 import { loadPolicy } from "../../src/policy/load";
 import { ENV_DIR } from "../../src/secrets/files";
@@ -51,7 +51,8 @@ describe("networks", () => {
     const nets = (name: string) => Object.keys(svc(name).networks ?? {}).sort();
     for (const z of ZONES) expect(nets(`egress-${z}`)).toEqual([`${z}-net`, "outbound"].sort());
     expect(nets("hermes")).toEqual(["hermes-net"]);
-    expect(nets("archon")).toEqual(["archon-net"]);
+    // archon is the run service: the launcher gives each run container a network of its own.
+    expect(nets("archon")).toEqual([]);
     for (const [name, s] of Object.entries(c.services)) {
       expect([name, s.network_mode]).toEqual([name, undefined]);
       if (!name.startsWith("egress-")) expect([name, Object.keys((s.networks as object) ?? {}).includes("outbound")]).toEqual([name, false]);
@@ -64,8 +65,9 @@ describe("networks", () => {
 });
 
 describe("hardening, on every service", () => {
+  // archon is `profiles: ["run"]`, `restart: "no"` and has no health check: it is the template of one container per run.
   for (const name of ["hermes", "archon", ...PROXIES]) {
-    test(`${name}: no capabilities, no new privileges, a non-root user, pid and memory limits, a read-only root, a health check`, () => {
+    test(`${name}: no capabilities, no new privileges, a non-root user, pid and memory limits, a read-only root${name === "archon" ? ", no restart" : ", a health check"}`, () => {
       const s = svc(name);
       expect(s.cap_drop).toEqual(["ALL"]);
       expect(s.cap_add).toBeUndefined();
@@ -76,8 +78,15 @@ describe("hardening, on every service", () => {
       expect(s.pids_limit).toBeGreaterThan(0);
       expect(String(s.mem_limit)).toMatch(/^\d+[mg]$/);
       expect(s.read_only).toBe(true);
-      expect(s.healthcheck?.test).toBeDefined();
-      expect(s.restart).toBe("unless-stopped");
+      if (name === "archon") {
+        expect(s.profiles).toEqual(["run"]);
+        expect(s.restart).toBe("no");
+        expect(s.healthcheck).toBeUndefined();
+      } else {
+        expect(s.profiles).toBeUndefined();
+        expect(s.healthcheck?.test).toBeDefined();
+        expect(s.restart).toBe("unless-stopped");
+      }
       // The labels Task 6's audit reads: who started the stack, and whether the dev bypass was on. A stack
       // started without `hapi stack up` (a raw `docker compose up`) says `unknown`, never "not dev-override".
       expect(s.labels["org.hapi.started-by"]).toBe("${HAPI_STARTED_BY:-unknown}");
@@ -154,11 +163,11 @@ describe("the zone services", () => {
   });
 
   for (const z of ZONE_SERVICES) {
-    test(`${z}: HTTP(S)_PROXY points at egress-${z}, loopback goes direct, and it starts once its proxy is healthy`, () => {
+    test(`${z}: HTTP(S)_PROXY points at egress-${z}, loopback goes direct${z === "archon" ? ", and it depends on nothing (a run container starts when the launcher says)" : ", and it starts once its proxy is healthy"}`, () => {
       const env = svc(z).environment as Record<string, string>;
       for (const v of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]) expect([v, env[v]]).toEqual([v, `http://egress-${z}:${PROXY_PORT}`]);
       for (const v of ["NO_PROXY", "no_proxy"]) expect([v, env[v]]).toEqual([v, "localhost,127.0.0.1,::1"]);
-      expect(svc(z).depends_on).toEqual({ [`egress-${z}`]: { condition: "service_healthy" } });
+      expect(svc(z).depends_on).toEqual(z === "archon" ? undefined : { [`egress-${z}`]: { condition: "service_healthy" } });
     });
 
     test(`${z}: its environment: is exactly serviceEnvironment("${z}"), every name reserved, so no secret can override it`, () => {
@@ -168,21 +177,31 @@ describe("the zone services", () => {
     });
   }
 
-  test("archon: every setting of the generated build/archon/archon.env is in its environment:, with the same value", () => {
+  test("archon: every setting of the generated build/archon/archon.env is in its environment:, with the same value, and there are ARCHON_ENV.length of them", () => {
     const generated = emitArchon(loadPolicy(join(REPO, "policy")))["archon.env"]!
       .split("\n")
       .filter((l) => l !== "" && !l.startsWith("#"))
       .map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)]);
-    expect(generated.length).toBe(6);
+    expect(generated.length).toBe(ARCHON_ENV.length);
     for (const [name, value] of generated) expect([name, svc("archon").environment[name!]]).toEqual([name, value]);
   });
 
-  test("archon: build/pi read-only at exactly PI_CODING_AGENT_DIR (PI_AGENT_DIR), its generated config read-only, state in volumes", () => {
+  test("archon has no volumes, networks, ports or healthcheck: its mounts, networks and tmpfs are the launcher's, per run", () => {
     const s = svc("archon");
-    expect(s.volumes).toContain(`../build/pi:${PI_AGENT_DIR}:ro`);
-    expect(s.volumes).toContain("../build/archon/config.yaml:/.archon/config.yaml:ro");
-    expect(s.volumes).toContain("archon-data:/.archon");
-    expect(s.volumes).toContain("archon-home:/home/appuser");
+    expect(s.volumes).toBeUndefined();
+    expect(s.networks).toBeUndefined();
+    expect(s.network_mode).toBeUndefined();
+    expect(s.ports).toBeUndefined();
+    expect(s.expose).toBeUndefined();
+    expect(s.healthcheck).toBeUndefined();
+    expect(s.depends_on).toBeUndefined();
+    // Server-era leftovers: nothing binds the server, and no text names one.
+    expect(JSON.stringify(s)).not.toMatch(/3090|archon-data|archon-home/);
+  });
+
+  test("archon: the user, the Pi agent dir its environment names, and ARCHON_DOCKER", () => {
+    const s = svc("archon");
+    expect(s.environment.PI_CODING_AGENT_DIR).toBe(PI_AGENT_DIR);
     expect(s.environment.ARCHON_DOCKER).toBe("true");
     expect(s.user).toBe("1001:1001");
   });
@@ -194,7 +213,7 @@ describe("the zone services", () => {
     expect(s.user).toBe("10000:10000");
   });
 
-  test("named volumes hold only state: hermes-data, archon-data and archon-home", () => {
-    expect(Object.keys(c.volumes ?? {}).sort()).toEqual(["archon-data", "archon-home", "hermes-data"]);
+  test("the named volumes are exactly hermes-data: a run's state lives in its own labelled volumes, made by the launcher", () => {
+    expect(Object.keys(c.volumes ?? {}).sort()).toEqual(["hermes-data"]);
   });
 });

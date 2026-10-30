@@ -1,0 +1,59 @@
+name: hapi-check-run
+description: "The run container's controls, read from inside it: identity, the sparse strip, Bun and git hardening, writable and read-only paths, the posture, one commit. Bash only, no model call (Plan 02 Task 6; hapi run check)."
+inputs:
+  work_order_id: { required: true }
+  traceparent: { default: "" }
+worktree:
+  enabled: false
+nodes:
+  # Not root, and the uid/gid the compose service names.
+  - id: whoami
+    bash: "whoami; id"
+  # The prelude's sparse strip: the working directory (the clone) has none of the three steering directories.
+  - id: strip
+    depends_on: [whoami]
+    bash: 'test ! -e .pi -a ! -e .agents -a ! -e .archon && echo "cwd=$(pwd): no .pi, .agents or .archon"'
+  # BUN_OPTIONS=--no-install: a script importing an uninstalled package fails to resolve, with no registry request.
+  - id: bun-no-install
+    depends_on: [strip]
+    bash: |
+      test "$BUN_OPTIONS" = --no-install
+      printf 'import leftPad from "left-pad";\nconsole.log(leftPad("a", 3));\n' > /tmp/x.ts
+      if bun /tmp/x.ts > /tmp/bun.out 2>&1; then echo "UNEXPECTED: left-pad resolved"; cat /tmp/bun.out; exit 1; fi
+      cat /tmp/bun.out
+      grep -q "Cannot find package" /tmp/bun.out
+  # The git env config is in force: core.hooksPath comes from the command scope, not a repo's .git/config.
+  - id: git-scope
+    depends_on: [bun-no-install]
+    bash: |
+      git config --show-scope --get core.hooksPath
+      test "$(git config --show-scope --get core.hooksPath | cut -f1)" = command
+      git config --show-scope --get-all safe.directory
+  # The writable paths: $HOME, Archon's home, and Pi's agent dir (a tmpfs with the generated files bound into it).
+  - id: writable
+    depends_on: [git-scope]
+    bash: 'echo x > "$HOME"/x && echo x > /.archon/x && echo x > /opt/hapi/pi-agent/probe && echo "HOME, /.archon and the Pi dir are writable"'
+  # A generated file in Pi's agent dir is read-only: a worker can't rewrite its own model pins.
+  - id: read-only
+    depends_on: [writable]
+    bash: |
+      if { echo x > /opt/hapi/pi-agent/models.json; } 2>/tmp/ro.err; then echo "UNEXPECTED: models.json writable"; exit 1; fi
+      cat /tmp/ro.err
+      grep -q "Read-only file system" /tmp/ro.err
+  # What Task 8's integration test records: the process's rights, the pinned versions, what the zone proxy lets
+  # through (its answer to the CONNECT, then the origin's, 000 for none: a refused CONNECT reaches no origin), and
+  # the mount flags (Docker's tmpfs mounts are noexec,nosuid,nodev).
+  - id: posture
+    depends_on: [read-only]
+    bash: |
+      echo "uid=$(id -u)"; grep -E '^(CapEff|NoNewPrivs)' /proc/self/status
+      echo "archon=$(jq -r .version /app/package.json) pi=$(jq -r .version /app/node_modules/@earendil-works/pi-coding-agent/package.json) node=$(node --version) uv=$(uv --version) python=$(python3.14 --version)"
+      for u in https://api.anthropic.com/ https://github.com/; do echo "$u $(curl -s -o /dev/null -m 5 -w '%{http_connect} %{http_code}' "$u")"; done
+      for mp in /tmp "$HOME" /.archon /opt/hapi/pi-agent; do
+        while read -r _ _ _ _ at opts _; do if [ "$at" = "$mp" ]; then echo "mount $mp $opts"; fi; done < /proc/self/mountinfo
+      done
+      true
+  # One commit, so the prelude's bundle (<sha>..HEAD) is exercised.
+  - id: commit
+    depends_on: [posture]
+    bash: 'echo check > check.txt && git add check.txt && git commit -q -m "hapi-check-run: one file" && git log --oneline -1 && git status --porcelain'

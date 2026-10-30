@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "repo-overlay.schema.json",
   "title": ".factory/config.yaml",
-  "description": "A target repo's overlay on the central policy (spec §7, §8.1). It may add or tighten protected paths, add egress_extra hosts and lower budgets, and it may set the repo's default_risk and workflow, which are repo settings rather than policy. Any other key is rejected. Loosening is caught by applyOverlay, which needs the base policy to compare against.",
+  "description": "A target repo's overlay on the central policy (spec §7, §8.1). It may add or tighten protected paths, add egress_extra hosts, lower budgets and run limits and harden enforcement modes, and it may set the repo's default_risk and workflow, which are repo settings rather than policy. Any other key is rejected. Loosening is caught by applyOverlay, which needs the base policy to compare against.",
   "type": "object",
   "properties": {
     "protected_paths": {
@@ -40,7 +40,35 @@
         "openrouter_monthly_usd": { "$ref": "policy-defs.schema.json#/$defs/usd" },
         "jev_monthly_usd": { "$ref": "policy-defs.schema.json#/$defs/usd" },
         "run_usd": { "$ref": "policy-defs.schema.json#/$defs/usd" },
-        "hermes_max_turns": { "$ref": "policy-defs.schema.json#/$defs/count" }
+        "hermes_max_turns": { "$ref": "policy-defs.schema.json#/$defs/count" },
+        "enforcement": {
+          "description": "Enforcement modes to harden: soft may become hard, never the reverse.",
+          "type": "object",
+          "properties": {
+            "hapi_guard": { "$ref": "policy-defs.schema.json#/$defs/enforcement" },
+            "archon": { "$ref": "policy-defs.schema.json#/$defs/enforcement" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "runs": {
+      "description": "Run limits to lower. Each value must be at most the base value.",
+      "type": "object",
+      "properties": {
+        "max_live": { "$ref": "policy-defs.schema.json#/$defs/count" },
+        "retention_days": { "$ref": "policy-defs.schema.json#/$defs/count" },
+        "output_limits_mb": {
+          "type": "object",
+          "properties": {
+            "bundle": { "$ref": "policy-defs.schema.json#/$defs/count" },
+            "transcript": { "$ref": "policy-defs.schema.json#/$defs/count" },
+            "decisions": { "$ref": "policy-defs.schema.json#/$defs/count" },
+            "result": { "$ref": "policy-defs.schema.json#/$defs/count" }
+          },
+          "additionalProperties": false
+        }
       },
       "additionalProperties": false
     },

@@ -19,6 +19,8 @@
 | `commands.yaml` | `policy-commands` | Hermes's command allowlist, as argv-exact rules; the Pi built-in tools workers get | The Hermes `hapi-cmd-allow` hook (default-deny, fail-closed; Plan 04); Archon `allowed_tools` per node |
 | `trusted_sources.yaml` | `policy-trusted-sources` | Source tiers T0–T3, and the hosts each egress zone may reach | The egress proxy allowlists (the real boundary); Hermes's web backend pins and blocklist; Anthropic `allowed_domains` |
 | `budgets.yaml` | `policy-budgets` | Workspace and key caps, the per-run target, Hermes's turn limit | Hermes `max_turns`; Archon `budget` on per-task children; hapi-guard limits; provider key limits (documented, applied by hand or API) |
+| `runs.yaml` | `policy-runs` | The run launcher's limits: live runs, retention, output sizes | The run launcher (Plan 02 Task 7) |
+| `gates.yaml` | `policy-gates` | The level-6 gates: the bash gate, the result screen and their classifiers | Pi hapi-guard and the gate classifiers (Plan 02 Tasks 3 and 5) |
 | `approvals.yaml` | `policy-approvals` | The fixed short list of actions that always need the operator | Not compiled in Plan 01; later plans enforce it |
 | `roles.yaml` | `policy-roles` | The default model tier per role | With the rosters: Archon tiers and aliases; Hermes model, auxiliary and delegation settings |
 | `rosters/{budget,anthropic,portable}.yaml` | `policy-roster` | Tier → provider, model and effort, one file per roster | See `roles.yaml` |
@@ -65,7 +67,13 @@ Code reads this with **`effectiveModes(policy, path)`** in `src/policy/paths.ts`
 
 The error names the problem, with the path JSON-escaped so it prints safely, e.g. `invalid path ".github\\workflows\\ci.yml": contains a backslash; separate segments with "/"` or `invalid path "a\u001bb": contains a control character (U+001B)`.
 
-A guard that isn't TypeScript, such as the Python hapi-path-guard (Plan 04), must implement the same rule and pass the same cases as `tests/policy/paths.test.ts`.
+**The shared vectors** are `tests/fixtures/path-vectors.json`, in the shape of `command-vectors.json`: `globs` lists `{glob, path, matches}` cases for `globMatches`, and `paths` lists `{path, interactive, unattended, workers, reason?}` cases against `policy/protected_paths.yaml`. A vector with `reason` is a path `effectiveModes` throws on, with an error containing `reason`, and every enforcer must deny it. Every enforcer runs the same file:
+
+- `tests/policy/paths.test.ts` runs it against `effectiveModes` itself;
+- **hapi-guard** (Plan 02, `src/guard/`), Pi's extension in a run container, bundles `effectiveModes` rather than reimplementing it. `tests/guard/paths.test.ts` runs every `paths` vector through its `write` and `edit` checks, and `tests/guard/bundle.test.ts` runs them through the built bundle, under `BUN_OPTIONS=--no-install`, as Pi loads it (H-087, H-089);
+- a guard that isn't TypeScript, such as the Python hapi-path-guard (Plan 04), must implement the same rule and pass the same vectors.
+
+When you change `protected_paths.yaml` or the matching rule, update the vectors in the same change.
 
 #### Glob syntax
 
@@ -211,8 +219,44 @@ All amounts are in USD.
 | `jev_monthly_usd` | 2 | Monthly cap on Jev's own OpenRouter key |
 | `run_usd` | 3.00 | Target spend per factory run |
 | `hermes_max_turns` | 60 | Hermes `agent.max_turns` |
+| `enforcement.hapi_guard` | `hard` | What Pi's hapi-guard does when the run crosses `run_usd` (Plan 02 Task 5) |
+| `enforcement.archon` | `hard` | The same for Archon's `factory-task` budget (Plan 03) |
+
+`enforcement` is a setting per enforcement point: `hard` stops the run at `run_usd`; `soft` lets it finish and flags it (`hapi:flagged`, spec §13.3). Both ship as `hard` and are required: the loader fills no defaults, so the fail-closed value lives in the YAML. An overlay may harden a mode but never soften it (soft < hard).
 
 The monthly caps are enforced at the provider. The operator sets them on the Console workspaces and OpenRouter keys; the [provider-keys runbook](runbooks/provider-keys.md) covers it. An OpenRouter key's cap is set as a limit that resets daily, the monthly cap divided by 31 (the runbook's rule), so a leaked key can spend only one day's share. The workspaces add up to the $200/month credit, and the default workspace is unused.
+
+### `runs.yaml`
+
+The run launcher's limits (Plan 02 Task 7; [the runs runbook](runbooks/runs.md) covers the launcher, the outputs and retention). Every key is required. An overlay may lower any of them, never raise one.
+
+| Key | Value | Meaning |
+|---|---|---|
+| `max_live` | 1 | Live runs at once; the launcher refuses the next (no queue until Plan 03's poller) |
+| `retention_days` | 14 | A run's files are removed this many days after its `harvestedAt`. Plan 02 sets none, so nothing is removed yet (H-206) |
+| `output_limits_mb.bundle` | 256 | The most the result bundle may be, in MB |
+| `output_limits_mb.transcript` | 64 | The most the run transcript may be |
+| `output_limits_mb.decisions` | 16 | The most the decisions log may be |
+| `output_limits_mb.result` | 4 | The most the result summary may be |
+
+An output file over its `output_limits_mb` cap is not copied out, and the run is recorded `failed`; the run itself is never stopped for it. All counts are whole numbers, at least 1 (`max_live: 0` is rejected).
+
+### `gates.yaml`
+
+The level-6 gate settings (Plan 02 Tasks 3 and 5). Every key is required. The file is central only: an overlay naming `gates` is an unknown key. A gate that is on needs a classifier, so `loadPolicy` refuses `enabled: true` while `flags.jev.fallback` is `none`, whatever `flags.jev.enabled` says. Jev answers only for a public repo, so Haiku is the only classifier a run that isn't public has. Set `fallback: haiku`, or turn the gate off in `gates.yaml`.
+
+| Key | Value | Meaning |
+|---|---|---|
+| `bash_gate.enabled` | true | Screen each worker bash call before it runs |
+| `bash_gate.skip_commands` | `[]` | Argv prefixes (such as `git status`) that skip the screen. The design screens every call, so the list starts empty; adding a prefix is the operator's choice. |
+| `result_screen.enabled` | true | Screen what a tool returns before the worker reads it |
+| `result_screen.tools` | `[bash, read]` | The tools whose results are screened (`bash`, `read`) |
+| `max_state_chars` | 6000 | The most characters of run state a classifier is shown. A result over it is never classified: it gets the decision file's fallback with `truncated: true`, so the result screen wraps it. With 6000, that covers most `read`s of a real source file and long bash output. |
+| `classifiers.jev.model` | `~typesafe/jev-latest` | Jev's OpenRouter model id (Task 11 confirms it passes the `hapi-jev` guardrail) |
+| `classifiers.jev.unknown_call_usd` | 0.001 | Cost charged to the run for a Jev call with unknown usage |
+| `classifiers.haiku.model` | `claude-haiku-5-5` | The fallback classifier, used when `flags.jev.fallback` is `haiku` |
+| `classifiers.haiku.input_per_mtok` | 0.1 | USD per million input tokens (Anthropic first-party rate, prompts up to 100K tokens) |
+| `classifiers.haiku.output_per_mtok` | 0.5 | USD per million output tokens (same rate card) |
 
 ### `approvals.yaml`
 
@@ -246,7 +290,7 @@ large:  { provider: pi, model: anthropic/claude-opus-5-5, effort: low, retry_eff
 |---|---|---|---|---|
 | `anthropic` | Normal operation | Haiku 5.5 on Pi | Sonnet 5.5 via the Claude provider | Opus 5.5 on Pi, effort low, retry high |
 | `budget` | The first end-to-end runs | Haiku 5.5 on Pi | Haiku 5.5 via the Claude provider | Haiku 5.5 on Pi |
-| `portable` | Proving model portability | `opencode-go/glm-5.3-flash` | `opencode-go/glm-5.3` | `opencode-go/kimi-k3.1-pro`, retry high |
+| `portable` | Proving model portability | `opencode-go/glm-5.3-flash` | `opencode-go/glm-5.3` | `opencode-go/kimi-k3`, retry high |
 
 **The `portable` roster** runs every tier on Pi through OpenCode Go. It may use **only models with 0-day retention and no training**. The ids and terms were checked against <https://opencode.ai/docs/go/> on 2026-10-26. DeepSeek is left out because its zero-retention agreement is renewed monthly. Review (GLM) runs on a different model family from implement (Kimi).
 
@@ -453,13 +497,14 @@ In a JSON Pointer, a `/` inside a key is written `~1` and a `~` is written `~0`.
 
 A target repo can adjust the central policy with an overlay in its `.factory/config.yaml` (spec §7). **An overlay may only tighten policy.** The one exception is `egress_extra`: it may add hosts, and the overlay file is itself protected (`.factory/**`), so adding one goes through a reviewed planning PR.
 
-An overlay has the five keys below. **Any other key is rejected.** Three of them change policy, and those may only tighten it, except for `egress_extra`. The other two, `default_risk` and `workflow`, are repo settings (spec §7). They don't loosen any policy, so the tighten-only rule doesn't apply to them.
+An overlay has the six keys below. **Any other key is rejected.** Four of them change policy, and those may only tighten it, except for `egress_extra`. The other two, `default_risk` and `workflow`, are repo settings (spec §7). They don't loosen any policy, so the tighten-only rule doesn't apply to them.
 
 | Key | What it may do |
 |---|---|
 | `protected_paths` | **Add** a glob, or **raise** a listed glob's modes (allow < ask < deny). An entry may name only some of the three modes. For a glob the base policy lists, the others keep their base value. A **new** glob may name only `ask` or `deny`; naming `allow` is rejected, because under [strictest-wins](#how-globs-combine) it can't change anything and so reads as a loosening attempt. Its unnamed modes are stored as `allow`, which adds no rule. A new glob that overlaps a protected one can tighten files under it but never loosen them. `null` asks to remove the glob, and that is **always rejected**. |
 | `egress_extra` | **Add** hosts to the `archon` zone's allowlist. The rules are the same as for any host. A [**forge host**](#trusted_sourcesyaml) (`github.com`, `githubusercontent.com`, `githubassets.com`, `ghcr.io`, `gitlab.com`, `bitbucket.org`, or a subdomain of one) is rejected, because the Archon zone must never reach the forge (spec §4.3). |
-| `budgets` | **Lower** any budget in `budgets.yaml`. Each value must be at most the base value. |
+| `budgets` | **Lower** any budget in `budgets.yaml`. Each value must be at most the base value. `enforcement` modes may be **hardened** (soft to hard), never softened. |
+| `runs` | **Lower** any limit in `runs.yaml` (`max_live`, `retention_days`, `output_limits_mb.*`). Never raise one. |
 | `default_risk` | The risk new work orders for this repo start from: `low`, `medium` or `high`. A repo setting, not policy: any value is accepted, `low` included. |
 | `workflow` | The Archon workflow this repo's work orders use by default. A lowercase slug, the same rule as a work order's `workflow` (so `factory-task`, not `Factory_Task` or `factory-`). A repo setting, not policy. |
 
@@ -502,6 +547,8 @@ These are the real error messages:
 | `default_risk: extreme` | `PolicyError: .factory/config.yaml: /default_risk: must be one of: low, medium, high` |
 | `workflow: Factory_Task` | `PolicyError: .factory/config.yaml: /workflow: must match pattern "^[a-z0-9]+(?:-[a-z0-9]+)*$"` |
 | `budgets: { run_usd: 5.00 }` | `PolicyLoosenError: /budgets/run_usd: raises budgets.run_usd from 3 to 5; overlays may only tighten policy` |
+| `budgets: { enforcement: { hapi_guard: soft } }` | `PolicyLoosenError: /budgets/enforcement/hapi_guard: softens budgets.enforcement.hapi_guard from hard to soft; overlays may only tighten policy` |
+| `runs: { max_live: 2 }` | `PolicyLoosenError: /runs/max_live: raises runs.max_live from 1 to 2; overlays may only tighten policy` |
 | `commands: { hermes: { allow: ["*"] } }` | `PolicyError: .factory/config.yaml: /commands: unknown key` |
 
 ## Work orders
@@ -592,6 +639,40 @@ orphaned <name> expected sha256:<locked>
 
 Exit codes are the CLI's: `0` success, `1` a failed check or a failed command (a bad policy or lock file is reported as `hapi mcp verify: <file>: <problem>`), and `2` a usage error, such as an unknown flag, a missing `--server` or an unknown server name.
 
+## `decide()` and the decision files
+
+`decide()` (`src/decide/index.ts`) is the one helper every typed decision goes through: the level-6 gates in hapi-guard (the bash gate and the result screen), and `hapi decide` on the command line.
+
+### A decision file
+
+A decision file is `policy/decisions/<name>.ts` and default-exports a `DecisionFile`: `name` (a slug equal to the file name), `questions` (Jev's typed questions: `noul`, `choice` or `score`), `fallback` (the careful verdict) and `verdict(answers)`. The thresholds live in `verdict`, in code, so changing one is a reviewed change to a protected path (`policy/**`). The three files:
+
+| File | Decides | Questions | Verdict | Fallback |
+|---|---|---|---|---|
+| `bash-gate.ts` | a worker's bash call, before it runs | `effect` (read_only, reversible, irreversible), `destructive_intent` | `block` at irreversible >= 0.6 or destructive >= 0.7; `flag` at >= 0.4 or >= 0.5; else `allow` | `block` |
+| `result-screen.ts` | what a tool returned, before the worker reads it | `injection` | `wrap` at >= 0.7; `flag` at >= 0.5; else `allow` | `wrap` |
+| `write-gate.ts` | a write whose content holds a credential | none: it exports `KEY_PATTERNS` and nothing goes to a classifier | (local pattern check) | n/a |
+
+### The order
+
+`decide(file, state, options)` tries, in order:
+
+1. **Jev**, through OpenRouter, only when `flags.jev.enabled` and the run is marked public (`options.jev.public`). Jev is a third-party service, so a private repo's state never goes there.
+2. **Haiku** (`classifiers.haiku.model`, through the Anthropic API), when `flags.jev.fallback` is `haiku`.
+3. **The file's `fallback` verdict**, when neither answers.
+
+The result says which one answered (`via`: `jev`, `haiku`, `default`, or `mock` offline), whether it was not the first choice (`fallback`), and in `error` one line on what failed, never the state or a key. If neither classifier is enabled `decide` throws: `loadPolicy` already refuses a gate that is on with no classifier, and the throw is the backstop.
+
+### Keys, state and cost
+
+- **Keys** come only from the caller, which reads `HAPI_JEV_OPENROUTER_API_KEY` and `ANTHROPIC_API_KEY`. Nothing reads another name: an unset key (`... is not set`) or one that isn't printable ASCII without whitespace (`... is malformed`, never quoted) is reported in `error` and that classifier is skipped. The Anthropic SDK's own environment (`ANTHROPIC_LOG`, `ANTHROPIC_OPEN_TELEMETRY*`, `ANTHROPIC_CUSTOM_HEADERS`) is switched off or overridden. `error` repeats only messages of errors this code knows; any other error is named by its type alone. The vendored Jev client has its environment lookup removed (`src/decide/vendor/ten-levels/SOURCE.md`).
+- **State** longer than `max_state_chars` is never classified, because the part past the limit would go unassessed yet could still be allowed. `decide()` sends nothing, charges nothing and returns the file's `fallback` (`block` for the bash gate, `wrap` for the result screen) with `via: "default"`, `fallback: true` and `truncated: true`. A state of exactly `max_state_chars` is sent whole.
+- **Cost** is added to the run's spend. Haiku: input tokens at `input_per_mtok` plus output tokens at `output_per_mtok`. Jev: the cost it reports, or `classifiers.jev.unknown_call_usd` when it reports none. A classifier that fails costs nothing.
+
+### `hapi decide <name> [--state-file file] [--public] [--mock]`
+
+Runs one decision on a state and prints the result as one JSON line. The state comes from `--state-file` or stdin, never from argv. `--public` marks the run public; `--mock` answers offline with the vendored mock and needs no policy directory. Without `--mock` it reads the gates and flags from `$HAPI_POLICY_DIR` (default `policy`). Exit 0: a result was printed (a fallback verdict counts); 1: the decision could not run; 2: a usage error or an unknown name.
+
 ## TypeScript API
 
 Later plans build on these functions:
@@ -617,6 +698,7 @@ Later plans build on these functions:
 | `hashToolSurface(surface): string` | `src/mcp/lock.ts` | `sha256:<hex>` of a surface's canonical JSON, order-independent ([the lock](#mcplockjson)) |
 | `verifyLock(p, lock, fetchSurface): Promise<{name, status, expected?, actual?}[]>` | `src/mcp/lock.ts` | Every catalog server's live surface against the lock: `ok`, `changed` or `unpinned`; and `orphaned` (no `actual`; never fetched) for a lock entry whose server isn't in the catalog. It rejects, fetching nothing, if any server lists a zone outside `MCP_ZONES`, as a policy built in code could |
 | `loadLock(file): McpLock` | `src/mcp/lock.ts` | Reads and checks a lock file. Throws `PolicyError`. |
+| `decide(file, state, options): Promise<DecideResult>` | `src/decide/index.ts` | Asks a classifier and applies a decision file's verdict ([the order](#decide-and-the-decision-files)). Throws only when no classifier is enabled. |
 | `pinOf(server)`, `canonicalJson(value)`, `lockJson(lock)` | `src/mcp/lock.ts` | A server's pin fields as a lock entry records them; the canonical JSON the hash uses; the lock as written to disk |
 | `validateWorkOrder(obj): WorkOrder` | `src/workorder/validate.ts` | Validates a parsed work order. Throws `WorkOrderError { path, message, issues }`. |
 | `loadWorkOrder(file): WorkOrder` | `src/workorder/validate.ts` | Reads, parses and validates a work-order file |

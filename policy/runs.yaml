@@ -1,0 +1,11 @@
+# yaml-language-server: $schema=schemas/policy-runs.schema.json
+#
+# Run limits (Plan 02). The run launcher reads them (Task 7); a repo overlay may
+# lower them, never raise them.
+max_live: 1             # live runs at once; the launcher refuses the next (no queue until Plan 03's poller)
+retention_days: 14      # a run's files are removed this many days after its harvestedAt; Plan 02 sets none, so nothing is removed yet (H-206)
+output_limits_mb:       # the most each output file may be; a larger one is not copied out and the run is recorded failed
+  bundle: 256           # the result bundle
+  transcript: 64        # the run transcript
+  decisions: 16         # the decisions log
+  result: 4             # the result summary

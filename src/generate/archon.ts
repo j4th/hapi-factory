@@ -8,21 +8,66 @@
  *   docs/reference/configuration.md: `{provider, model, effort}`, aliases start
  *   with "@". A pi-provider model is a Pi ref `<vendor>/<id>`; a claude one is
  *   an Anthropic model id. Both pass through unchanged.
- * - `archon.env`: the Archon container's environment: loopback bind, telemetry
- *   off, and the Pi worker settings (spec §9.2, §9.3). The record of what
- *   stack/compose.yaml's archon `environment:` sets (`ARCHON_ENV`), and what
- *   Task 6's audit compares the running container with.
+ * - `run-config.yaml`: the per-run `--config` layer (spike 07): the same tiers and
+ *   aliases, with `assistants.pi.enableExtensions` pinned on and
+ *   `workflows.autoResumeOnQuotaReset` off. It beats a repo's own
+ *   `.archon/config.yaml`, which Archon reads from the clone.
+ * - `gitconfig`: the run container's `~/.gitconfig`, read-only. It trusts the
+ *   source clone and Archon's workspace dirs, and names the worker.
+ * - `empty.env`: bound over `/.archon/.env`, so no env file of a repo or an earlier
+ *   run reaches Archon's workflows.
+ * - `archon.env`: the run container's environment: telemetry off, the Pi worker
+ *   settings, Bun's no-install and the git hardening (spec §9.2, §9.3, design
+ *   §6a). The record of what stack/compose.yaml's archon (run) service sets in
+ *   its `environment:` (`ARCHON_ENV`), and what the audit compares it with.
  */
 import YAML from "yaml";
 import { type ModelSpec, type Policy, ROLES, type RosterName, type Tier } from "../policy/types";
 import { hashComment, notice, wrap } from "./header";
 
 /**
- * Where the Archon container mounts build/pi, read-only (Plan 01 Task 5). Pi
- * reads models.json from here and hapi-guard its settings; nothing in the
- * container can write it.
+ * The fixed paths inside the run container (spike 07, spike 08). Every consumer
+ * (the launcher, hapi-guard, the audit) imports them from here.
  */
-export const PI_AGENT_DIR = "/opt/hapi/pi-agent";
+export const RUN_PATHS = {
+  /** Pi's agent dir: a tmpfs with build/pi's files bound read-only into it (Plan 02 Task 7). */
+  piDir: "/opt/hapi/pi-agent",
+  /** Where a run writes its output files. */
+  out: "/out",
+  /** The clone a worker edits. */
+  work: "/work/repo",
+  /** The bare source repo the clone comes from, read-only. */
+  source: "/src/repo.git",
+  /** The per-run input (a `RunFile`), bound read-only. */
+  runFile: "/run/hapi/run.json",
+  /** Where hapi-guard keeps its per-attempt ledger. */
+  ledgerDir: "/tmp/hapi-guard",
+  /** The home-scoped workflow pack, bound read-only. */
+  pack: "/.archon/workflows/hapi",
+} as const;
+
+/**
+ * The per-run input the launcher writes and binds read-only at
+ * `RUN_PATHS.runFile`. No work-order file enters the container.
+ */
+export interface RunFile {
+  run_id: string;
+  /** The work order's id. */
+  work_order: string;
+  traceparent: string;
+  /** Already `min(work order budget.usd, --budget-usd)`. */
+  budget_usd: number;
+  public: boolean;
+  workflow: string;
+  started_at: string;
+}
+
+/**
+ * Where the Archon container mounts Pi's agent dir (Plan 01 Task 5). Pi reads
+ * models.json from here and hapi-guard its settings; the files bound into it
+ * are read-only.
+ */
+export const PI_AGENT_DIR = RUN_PATHS.piDir;
 
 const TIERS: Tier[] = ["small", "medium", "large"];
 
@@ -34,7 +79,8 @@ function preset(spec: ModelSpec, effort = spec.effort): { provider: string; mode
   return { provider: spec.provider, model: spec.model, effort };
 }
 
-function configYaml(p: Policy, roster: RosterName): string {
+/** Archon's `config.yaml` or the run's `run-config.yaml`: the same tiers and aliases, and the settings the worker needs. */
+function configYaml(p: Policy, roster: RosterName, run: boolean): string {
   const r = p.rosters[roster];
   const tiers = Object.fromEntries(TIERS.map((t) => [t, preset(r[t])]));
   const aliases: Record<string, ReturnType<typeof preset>> = {};
@@ -46,15 +92,24 @@ function configYaml(p: Policy, roster: RosterName): string {
     if (spec.retry_effort !== undefined) aliases[`${name}-retry`] = preset(spec, spec.retry_effort);
   }
   const sorted = Object.fromEntries(Object.entries(aliases).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
-  const doc = new YAML.Document({ tiers, aliases: sorted });
+  // hapi-guard is a Pi extension, and Archon 0.12.1 only defaults enableExtensions on (H-181(b)).
+  const doc = new YAML.Document({
+    assistants: { pi: { enableExtensions: true } },
+    ...(run ? { workflows: { autoResumeOnQuotaReset: false } } : {}),
+    tiers,
+    aliases: sorted,
+  });
   doc.commentBefore = [
-    ...notice("Archon global config (~/.archon/config.yaml, Archon v0.12.1)", [
-      "policy/roles.yaml",
-      `policy/rosters/${roster}.yaml`,
-    ]),
+    ...notice(
+      run
+        ? "Archon run config (--config /opt/hapi/run-config.yaml, Archon v0.12.1)"
+        : "Archon global config (~/.archon/config.yaml, Archon v0.12.1)",
+      ["policy/roles.yaml", `policy/rosters/${roster}.yaml`],
+    ),
     "",
-    `tiers: the ${roster} roster. aliases: one per Archon role, at its tier in roles.yaml; "-retry"`,
-    "is the same model at the tier's retry_effort.",
+    `assistants: hapi-guard needs Pi's extensions on. tiers: the ${roster} roster. aliases: one per Archon role,`,
+    `at its tier in roles.yaml; "-retry" is the same model at the tier's retry_effort.`,
+    ...(run ? ["workflows: a run never resumes itself after a quota reset; the launcher decides."] : []),
   ]
     .map((l) => (l === "" ? "" : ` ${l}`))
     .join("\n");
@@ -62,29 +117,101 @@ function configYaml(p: Policy, roster: RosterName): string {
 }
 
 /**
+ * The git config the run container's git is held to, as `GIT_CONFIG_COUNT`
+ * KEY/VALUE pairs. Env config outranks `.git/config` and `config.worktree` for
+ * a single-valued key, so a repo (or a worker) that plants one of these in the
+ * clone changes nothing. It closes the program-running keys that are
+ * single-valued: hooks, fsmonitor, credential helpers, the askpass program,
+ * signing, external transports, background maintenance, submodule recursion
+ * and the attributes file. The residual is name-indexed drivers (`filter.<n>.*`,
+ * `diff.<n>.*`, `merge.<n>.driver`, via a planted `.gitattributes`) and
+ * `remote.<n>.uploadpack`, which no fixed key can cover (design §6a item 13;
+ * spike 07, finding 10).
+ */
+const GIT_CONFIG: readonly (readonly [key: string, value: string, why: string])[] = [
+  ["core.hooksPath", "/dev/null", "no repo hook runs: hooks come from an empty path"],
+  ["core.fsmonitor", "false", "no fsmonitor program: git status would run one a repo names"],
+  ["credential.helper", "", "no credential helper, and none a repo names"],
+  ["commit.gpgSign", "false", "no commit signing: it would run gpg.program"],
+  ["tag.gpgSign", "false", "no tag signing: it would run gpg.program"],
+  ["push.gpgSign", "false", "no push signing: it would run gpg.program"],
+  ["log.showSignature", "false", "log would not verify signatures, which runs gpg.program"],
+  ["core.askPass", "", "no askpass program"],
+  ["protocol.ext.allow", "never", "the ext:: transport runs a command, so it never runs"],
+  ["gc.auto", "0", "no automatic gc: it runs background maintenance"],
+  ["maintenance.auto", "false", "no automatic maintenance"],
+  ["submodule.recurse", "false", "no submodule recursion: a submodule is a second repo with its own config"],
+  ["core.attributesFile", "/dev/null", "no global attributes file: it could name filter drivers"],
+];
+
+/**
  * The container environment, in this order: name, value, why. Values never
- * need quoting. stack/compose.yaml sets every one in the archon service's
- * `environment:` (src/stack/env.ts), which beats any env_file, so no secret
- * can override them; tests/stack/compose.test.ts keeps the two equal.
+ * need quoting (an empty one is a set, empty variable). stack/compose.yaml's
+ * archon service sets every one in its `environment:` (src/stack/env.ts), which
+ * beats any env_file, so no secret can override them; the guard deletes only
+ * exact secret names, never these. tests/stack/compose.test.ts keeps the two
+ * equal. This is the whole non-proxy set: the launcher gives the proxy
+ * variables (`proxyEnv("archon")`) beside it.
  */
 export const ARCHON_ENV: readonly (readonly [name: string, value: string, why: string])[] = [
-  ["HOST", "127.0.0.1", "Archon's server listens on loopback only; it has no auth in SQLite mode (spec §9.2)"],
   ["ARCHON_TELEMETRY_DISABLED", "1", "no Archon telemetry"],
   ["DO_NOT_TRACK", "1", "the cross-tool telemetry opt-out, which Archon also honours"],
   ["PI_OFFLINE", "1", "Pi makes no network calls of its own: no installing the packages a repo's .pi/settings.json lists, no catalog refresh, no update check (spec §9.3: critical)"],
   ["PI_TELEMETRY", "0", "no Pi install telemetry"],
-  ["PI_CODING_AGENT_DIR", PI_AGENT_DIR, "Pi's agent dir: build/pi, mounted read-only (models.json, hapi-guard.json)"],
+  ["PI_CODING_AGENT_DIR", PI_AGENT_DIR, "Pi's agent dir: build/pi's files, bound read-only into a tmpfs (models.json, hapi-guard.json)"],
+  ["BUN_OPTIONS", "--no-install", "Bun never installs a package at run time, so a script the worker runs cannot pull one from the registry (design §6a item 5; spike 07, finding 11)"],
+  ["GIT_CONFIG_NOSYSTEM", "1", "git reads no /etc/gitconfig"],
+  ["GIT_CONFIG_GLOBAL", "/home/appuser/.gitconfig", "git's one global file is the generated, read-only gitconfig (safe.directory grants and the worker's name), never one under $HOME the worker could write"],
+  ["GIT_CONFIG_COUNT", String(GIT_CONFIG.length), "the number of KEY/VALUE pairs below, which override a repo's own .git/config for each key; they close the single-valued program-running keys, and the name-indexed drivers and remote.*.uploadpack stay a residual (design §6a item 13)"],
+  ...GIT_CONFIG.flatMap(([key, value, why], i): [string, string, string][] => [
+    [`GIT_CONFIG_KEY_${i}`, key, `config pair ${i}: ${why}`],
+    [`GIT_CONFIG_VALUE_${i}`, value, `config pair ${i}'s value`],
+  ]),
+  ["GIT_ALLOW_PROTOCOL", "file", "git speaks only the file transport (the clone is from a local path)"],
+  ["GIT_PROTOCOL_FROM_USER", "0", "a transport a repo asks for is treated as untrusted"],
+  ["GIT_TERMINAL_PROMPT", "0", "git never prompts on a terminal"],
+  ["GIT_ASKPASS", "", "no askpass program, set and empty so none is looked up"],
+  ["GIT_PAGER", "cat", "git's pager is cat: it runs no pager program a config names"],
+  ["GIT_EDITOR", "false", "git's editor is false: it runs no editor a config names"],
+  ["CLAUDE_BIN_PATH", "/app/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude", "the Claude Agent SDK's own binary, so Archon's claude nodes need no lookup on a PATH"],
+  ["ARCHON_DOCKER", "true", "Archon's home is /.archon (the run DB, workspaces, worktrees), as in its own compose file"],
 ];
 
 function archonEnv(): string {
   const head = hashComment([
-    ...notice("Archon container environment", ["the hardening settings of spec §9.2 and §9.3 (no policy file)"]),
+    ...notice("Archon container environment", ["the hardening settings of spec §9.2, §9.3 and design §6a (no policy file)"]),
   ]);
   const body = ARCHON_ENV.map(([key, value, why]) => `${hashComment(wrap(why))}\n${key}=${value}`).join("\n");
   return `${head}\n\n${body}\n`;
 }
 
-/** Archon's generated files: `config.yaml` and `archon.env`. Pure. */
+/** The directories Git is told to trust: the source clone, and Archon's workspaces and worktrees. */
+const SAFE_DIRECTORIES = [RUN_PATHS.source, "/.archon/workspaces", "/.archon/workspaces/*", "/.archon/worktrees", "/.archon/worktrees/*"];
+
+/**
+ * The run container's `~/.gitconfig` (spike 07, finding 3). The clone is owned by
+ * the worker, but its source (`/src/repo.git`) is bind-mounted from another uid,
+ * so Git's ownership check needs a `[safe]` entry. The `/.archon` entries are
+ * for worktrees, which `--no-worktree` doesn't use but which do no harm.
+ */
+function gitconfig(): string {
+  const head = hashComment(notice("Git config for the run container (~/.gitconfig)", ["the run container's paths (RUN_PATHS), no policy file"]));
+  const safe = SAFE_DIRECTORIES.map((d) => `\tdirectory = ${d}`).join("\n");
+  return `${head}\n[safe]\n${safe}\n[user]\n\tname = hapi-factory worker\n\temail = worker@hapi.invalid\n`;
+}
+
+/** Bound over `/.archon/.env`: only comments, so Archon loads no env file. */
+function emptyEnv(): string {
+  return `${hashComment(notice("An empty env file, bound over /.archon/.env so Archon's workflows get no env from a file", ["no policy file"]))}\n`;
+}
+
+/** Archon's generated files: the config, the run config, the env files and the gitconfig. Pure. */
 export function emitArchon(p: Policy, roster: RosterName = "anthropic"): Record<string, string> {
-  return { "config.yaml": configYaml(p, roster), "archon.env": archonEnv() };
+  return {
+    "config.yaml": configYaml(p, roster, false),
+    "run-config.yaml": configYaml(p, roster, true),
+    "archon.env": archonEnv(),
+    "empty.env": emptyEnv(),
+    gitconfig: gitconfig(),
+  };
 }

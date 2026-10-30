@@ -1,0 +1,20 @@
+name: hapi-test-sleep
+description: "Test only (tests/run/run.int.test.ts, bound through RunInputs.packDir): a run that stays live for watch, stop, the network and the refusals; or, by work-order id, one that fails (exit 42) or naps briefly. Bash only, no model call."
+inputs:
+  work_order_id: { required: true }
+  traceparent: { default: "" }
+worktree:
+  enabled: false
+nodes:
+  # Any other work order: live for five minutes, unless stopped.
+  - id: sleep
+    when: "$INPUTS.work_order_id != '0005-test-fail' && $INPUTS.work_order_id != '0006-test-nap'"
+    bash: "echo sleeping; sleep 300; echo woke"
+  # A failed run still yields its outputs.
+  - id: fail
+    when: "$INPUTS.work_order_id == '0005-test-fail'"
+    bash: "echo about to exit 42; exit 42"
+  # A run that ends on its own while watch follows it.
+  - id: nap
+    when: "$INPUTS.work_order_id == '0006-test-nap'"
+    bash: "echo napping; sleep 8; echo awake"

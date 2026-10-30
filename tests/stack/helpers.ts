@@ -6,9 +6,10 @@
  *
  * Everything a test creates carries the project's name: Compose's own
  * containers, networks and volumes, the images it builds, plus the label
- * `org.hapi.int=<project>` on every container started here with `docker run`.
- * `Project.down` removes exactly those, so other Docker workloads on the host
- * are never touched.
+ * `org.hapi.int=<project>` on every container started here with `docker run`,
+ * and on every container, network and volume `hapi run` makes for a test
+ * project (src/run/spec.ts `runLabels`). `Project.down` removes exactly those,
+ * so other Docker workloads on the host are never touched.
  *
  * Nothing a running stack uses is touched either. The project runs a
  * byte-for-byte copy of stack/ in its own temp dir, so the compose file's
@@ -223,12 +224,26 @@ export class Project {
     return found;
   }
 
-  /** Remove everything this project made: Compose's containers, networks and volumes, the labelled containers and the images it built. */
+  /**
+   * Remove everything this project made: Compose's containers, networks and volumes, the labelled containers,
+   * networks and volumes, and the images it built.
+   */
   async down(): Promise<void> {
+    const label = `label=org.hapi.int=${this.name}`;
+    const ls = async (cmd: string[]) => (await run(cmd)).stdout.split("\n").filter(Boolean);
     // The labelled containers first: Compose can't remove a network they are still attached to.
-    const ids = (await run(["docker", "ps", "-aq", "--filter", `label=org.hapi.int=${this.name}`])).stdout.split("\n").filter(Boolean);
+    const ids = await ls(["docker", "ps", "-aq", "--filter", label]);
     if (ids.length > 0) await run(["docker", "rm", "-f", "-v", ...ids]);
+    // A run's own network: Docker won't remove it while the project's egress-archon is attached (spike 07 finding 13).
+    for (const net of await ls(["docker", "network", "ls", "-q", "--filter", label])) {
+      const attached = await ls(["docker", "network", "inspect", "--format", "{{range .Containers}}{{println .Name}}{{end}}", net]);
+      for (const c of attached.filter((n) => n.startsWith(`${this.name}-`))) await run(["docker", "network", "disconnect", "-f", net, c]);
+      await run(["docker", "network", "rm", net]);
+    }
     const r = await this.compose(["down", "-v", "--remove-orphans", "-t", "5"], 180_000);
+    // A run's volumes, once nothing mounts them.
+    const volumes = await ls(["docker", "volume", "ls", "-q", "--filter", label]);
+    if (volumes.length > 0) await run(["docker", "volume", "rm", ...volumes]);
     // The images this project built (none if the zone services were skipped); never the real stack's.
     const built = (await run(["docker", "image", "ls", "--filter", `reference=${this.name}-*`, "--format", "{{.Repository}}:{{.Tag}}"])).stdout.split("\n").filter(Boolean);
     if (built.length > 0) await run(["docker", "image", "rm", ...built]);
@@ -236,14 +251,18 @@ export class Project {
     if (r.code !== 0) throw new Error(`docker compose -p ${this.name} down failed (exit ${r.code}): ${r.stderr.trim()}`);
   }
 
-  /** What is left of this project in Docker: containers, networks, volumes and images named after it. */
+  /** What is left of this project in Docker: containers, networks, volumes and images named after it, and containers, networks and volumes labelled with it. */
   async leftovers(): Promise<string[]> {
     const list = async (kind: string[], filter: string, field: string) =>
       (await run(["docker", ...kind, "--filter", filter, "--format", field])).stdout.split("\n").filter(Boolean);
+    // By name or by label, each kind once: a run's container and its network share a name.
+    const either = async (kind: string[], field: string) => [
+      ...new Set([...(await list(kind, `name=${this.name}`, field)), ...(await list(kind, `label=org.hapi.int=${this.name}`, field))]),
+    ];
     return [
-      ...(await list(["ps", "-a"], `name=${this.name}`, "{{.Names}}")),
-      ...(await list(["network", "ls"], `name=${this.name}`, "{{.Name}}")),
-      ...(await list(["volume", "ls"], `name=${this.name}`, "{{.Name}}")),
+      ...(await either(["ps", "-a"], "{{.Names}}")),
+      ...(await either(["network", "ls"], "{{.Name}}")),
+      ...(await either(["volume", "ls"], "{{.Name}}")),
       ...(await list(["image", "ls"], `reference=${this.name}-*`, "{{.Repository}}:{{.Tag}}")),
     ];
   }

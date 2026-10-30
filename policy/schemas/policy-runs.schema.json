@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "policy-runs.schema.json",
+  "title": "policy/runs.yaml",
+  "description": "The run launcher's limits (Plan 02): how many runs may be live, how long finished runs are kept and how large each run output may be. Every key is required: the loader fills no defaults.",
+  "type": "object",
+  "properties": {
+    "max_live": {
+      "description": "Runs that may be live (queued or running) at once; the launcher refuses the next one.",
+      "$ref": "policy-defs.schema.json#/$defs/count"
+    },
+    "retention_days": {
+      "description": "Days a finished run's files are kept before the launcher prunes them.",
+      "$ref": "policy-defs.schema.json#/$defs/count"
+    },
+    "output_limits_mb": {
+      "description": "The largest size in MB of each file a run may write; the launcher stops a run that exceeds one.",
+      "type": "object",
+      "properties": {
+        "bundle": {
+          "description": "The result bundle.",
+          "$ref": "policy-defs.schema.json#/$defs/count"
+        },
+        "transcript": {
+          "description": "The run transcript.",
+          "$ref": "policy-defs.schema.json#/$defs/count"
+        },
+        "decisions": {
+          "description": "The decisions log.",
+          "$ref": "policy-defs.schema.json#/$defs/count"
+        },
+        "result": {
+          "description": "The result summary.",
+          "$ref": "policy-defs.schema.json#/$defs/count"
+        }
+      },
+      "required": [
+        "bundle",
+        "transcript",
+        "decisions",
+        "result"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "max_live",
+    "retention_days",
+    "output_limits_mb"
+  ],
+  "additionalProperties": false
+}

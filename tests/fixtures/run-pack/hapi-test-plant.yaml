@@ -1,0 +1,40 @@
+name: hapi-test-plant
+description: "Test only (tests/run/run.int.test.ts, bound through RunInputs.packDir): plants core.fsmonitor and core.hooksPath in the clone's .git/config, then runs git status and a commit. Each planted script writes /out/marker-<name>, a name copy-out reports, so a run in which one ran fails. The control proves the plants are live without the env config. Bash only."
+inputs:
+  work_order_id: { required: true }
+  traceparent: { default: "" }
+worktree:
+  enabled: false
+nodes:
+  # The plants, where a repo or an earlier node could put them: scripts on the /work volume (a tmpfs is noexec,
+  # spike 07 finding 18, which would stop them for the wrong reason), named in the clone's own .git/config.
+  - id: plant
+    bash: |
+      set -e
+      mkdir -p /work/plant/hooks
+      mark() { printf '#!/bin/sh\necho ran > "${HAPI_MARK_DIR:-/out}/marker-%s"\n' "$1" > "$2"; chmod +x "$2"; }
+      mark fsmonitor /work/plant/fsmonitor
+      for h in pre-commit commit-msg post-commit post-index-change post-checkout reference-transaction; do mark "$h" "/work/plant/hooks/$h"; done
+      git config --local core.fsmonitor /work/plant/fsmonitor
+      git config --local core.hooksPath /work/plant/hooks
+      git config --local --get-regexp '^core\.(fsmonitor|hookspath)$'
+  # What Archon's own git and a worker's do, with the container's env config in force: no plant may run.
+  - id: use
+    depends_on: [plant]
+    bash: |
+      set -e
+      git status --short
+      echo planted > planted.txt
+      git add planted.txt
+      git commit -q -m "hapi-test-plant: one file"
+      git log --oneline -1
+      ls /out
+  # The control: the same git without the env config's pairs runs the fsmonitor plant (spike 07 c-hard), into /tmp,
+  # not /out, so it fails nothing. A plant that can't run would make the test above prove nothing.
+  - id: control
+    depends_on: [use]
+    bash: |
+      mkdir -p /tmp/control
+      env -u GIT_CONFIG_COUNT HAPI_MARK_DIR=/tmp/control git status --short > /dev/null
+      ls /tmp/control
+      test -e /tmp/control/marker-fsmonitor && echo "control: the planted fsmonitor runs without the env config"

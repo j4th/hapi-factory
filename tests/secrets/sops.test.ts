@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { SecretError } from "../../src/secrets/provider";
-import { AGE_MIN_VERSION, checkAgeKeyFile, resolveAgeDir, SOPS_METADATA_VERSION, type SopsRunner, sopsFileProblem, sopsProvider } from "../../src/secrets/providers/sops";
+import { AGE_MIN_VERSION, checkAgeKeyFile, miseWhereAge, resolveAgeDir, SOPS_METADATA_VERSION, type SopsRunner, sopsFileProblem, sopsProvider } from "../../src/secrets/providers/sops";
 import { caught, cleanup, ENC, FAKE_AGE_DIR, FAKE_KEY_FILE_TEXT, FAKE_RECIPIENT, sopsFileText, sopsStore, tempDir } from "./helpers";
 
 const FAKE = "sk-SECRET-123";
@@ -387,5 +387,32 @@ describe("the pinned age", () => {
     const empty = tempDir();
     await expect(resolveAgeDir({ where: async () => empty, version: async () => "v1.3.2" })).rejects.toThrow(/no age, age-keygen and age-plugin-batchpass under .*: run `mise install`/);
     await expect(resolveAgeDir({ where: async () => { throw new SecretError("`mise where age` failed (exit 1)"); }, version: async () => "v1.3.2" })).rejects.toThrow(/mise where age/);
+  });
+});
+
+describe("finding mise (H-196)", () => {
+  /** A temp HOME whose ~/.local/bin/mise answers `mise where age` with `where`, and an empty dir to be PATH. */
+  function home(where: string) {
+    const h = tempDir();
+    mkdirSync(join(h, ".local", "bin"), { recursive: true });
+    writeFileSync(join(h, ".local", "bin", "mise"), `#!/bin/sh\ntest "$1 $2" = "where age" && echo ${where}\n`, { mode: 0o755 });
+    return { HOME: h, PATH: tempDir() };
+  }
+
+  test("mise found at ~/.local/bin when PATH lacks it", async () => {
+    expect((await miseWhereAge(home("/opt/mise/age"))).trim()).toBe("/opt/mise/age");
+  });
+
+  test("the mise on PATH is tried first", async () => {
+    const env = home("/opt/mise/home-age");
+    const bin = tempDir();
+    writeFileSync(join(bin, "mise"), "#!/bin/sh\necho /opt/mise/path-age\n", { mode: 0o755 });
+    expect((await miseWhereAge({ ...env, PATH: bin })).trim()).toBe("/opt/mise/path-age");
+  });
+
+  test("with mise on neither, the error names both places and the fix", async () => {
+    const e = await caught(miseWhereAge({ HOME: tempDir(), PATH: tempDir() }));
+    expect(e).toBeInstanceOf(SecretError);
+    expect(e.message).toBe("cannot run mise (not on PATH, nor at ~/.local/bin/mise), which pins the age hapi uses: install mise, then `mise install` (README.md)");
   });
 });
