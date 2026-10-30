@@ -153,7 +153,7 @@ In Plan 02 the flag is an assertion, not a check: nothing on the host verifies i
 
 ## Rollout on hapi's checkout
 
-Once this branch has landed on `main`, and before the first run. Each step runs on the host, as hapi, in hapi's checkout; steps 1 to 3 are `mise` tasks, so they use hapi's `PATH` and runtime directory as above. Stop first if a run is live (`hapi run list`): `up` refuses while one is.
+Once this branch has landed on `main`, and before the first run. Each step runs on the host, started from your own terminal, as hapi in hapi's checkout, in the form above (hapi's `PATH` and runtime directory set). Stop first if a run is live (`hapi run list`): `up` refuses while one is.
 
 1. **Update hapi's checkout and install its dependencies.** `mise run setup` runs `bun install --frozen-lockfile`, which brings in `@anthropic-ai/sdk`, the package `hapi policy build` bundles into the guard and `hapi decide`. Without it `up` stops at its policy build.
 
@@ -165,15 +165,27 @@ Once this branch has landed on `main`, and before the first run. Each step runs 
 
    Expected: `git` fast-forwards and `bun install` finishes with no change to `bun.lock`.
 
-2. **Bring the stack up.** From your own terminal, as yourself; `up` re-execs as hapi.
+2. **Take the stack down once.** `archon` is now profile-only, so `up` never touches the previous deploy's long-lived `hapi-archon-1` container and would leave that stale Archon server running, with its old image and mounts. `down` removes it, and keeps the volumes.
 
    ```bash
-   mise run up
+   sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
+     export XDG_RUNTIME_DIR PATH="$HOME/.local/bin:$PATH"; \
+     cd "$HOME/hapi-factory" && exec mise run down'
+   ```
+
+   Expected: the containers and networks of project `hapi` removed, with no error.
+
+3. **Bring the stack up.**
+
+   ```bash
+   sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
+     export XDG_RUNTIME_DIR PATH="$HOME/.local/bin:$PATH"; \
+     cd "$HOME/hapi-factory" && exec mise run up'
    ```
 
    Expected: the three proxies and Hermes healthy, no `archon` container, and `docker compose build archon` having built `hapi-factory/archon:0.12.1`.
 
-3. **Audit.** As hapi, in hapi's checkout, with the stack up ([the stack runbook](stack.md#5-the-audit)); `<owner>/<name>` and `<file>` are yours:
+4. **Audit.** As hapi, in hapi's checkout, with the stack up ([the stack runbook](stack.md#5-the-audit)); `<owner>/<name>` and `<file>` are yours:
 
    ```bash
    sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
@@ -184,7 +196,7 @@ Once this branch has landed on `main`, and before the first run. Each step runs 
 
    Expected: two lines, the `mcp.tool-hashes` fail and `hapi audit: 14 pass, 1 fail, 0 skip` (not yet run live on the real host).
 
-4. **Remove the old Archon volumes, once.** The long-lived Archon container is gone, and its two volumes are left over, holding the old Archon's run database and Claude Code state. Nothing reads them, and the factory keeps nothing in them. The operator removes them. No container uses them after step 2, so the stack can stay up:
+5. **Remove the old Archon volumes, once.** The long-lived Archon container is gone, and its two volumes are left over, holding the old Archon's run database and Claude Code state. Nothing reads them, and the factory keeps nothing in them. The operator removes them. The old container is gone after the `down` in step 2, so nothing uses them and the stack can stay up:
 
    ```bash
    sudo -u hapi -H -- sh -c 'export XDG_RUNTIME_DIR="/run/user/$(id -u)" \
