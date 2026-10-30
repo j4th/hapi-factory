@@ -13,7 +13,7 @@ import { runAudit } from "../../src/audit/index";
 import { buildAll } from "../../src/generate/index";
 import { loadPolicy } from "../../src/policy/load";
 import { buildDigest } from "../../src/stack/up";
-import { cleanup, cleanWorld, files, only, REPO, tempDir } from "./helpers";
+import { cleanup, cleanWorld, files, only, REPO, runContainer, tempDir } from "./helpers";
 
 afterEach(cleanup);
 
@@ -31,7 +31,7 @@ describe("generated.drift", () => {
     const r = await drift(w);
     expect(r.status).toBe("pass");
     expect(r.detail).toContain("roster anthropic");
-    expect(r.detail).toContain("5 running containers");
+    expect(r.detail).toContain("4 running containers");
   });
 
   test("it finds the roster the stack was built with (`up --roster budget`)", async () => {
@@ -136,13 +136,26 @@ describe("generated.drift", () => {
 
   test("a container started from another build fails, naming it; one with no build label too", async () => {
     const w = await cleanWorld();
-    w.containers.find((c) => c.Name === "/hapi-archon-1")!.Config.Labels["org.hapi.build-sha256"] = "0".repeat(64);
+    w.containers.find((c) => c.Name === "/hapi-hermes-1")!.Config.Labels["org.hapi.build-sha256"] = "0".repeat(64);
     w.containers.find((c) => c.Name === "/hapi-egress-hermes-1")!.Config.Labels["org.hapi.build-sha256"] = "";
     const r = await drift(w);
     expect(r.status).toBe("fail");
-    expect(r.detail).toContain("hapi-archon-1 was started from another build");
+    expect(r.detail).toContain("hapi-hermes-1 was started from another build");
     expect(r.detail).toContain("hapi-egress-hermes-1 has no org.hapi.build-sha256 label");
     expect(r.detail).toContain("mise run up");
+  });
+
+  test("a run container with another build's digest fails, naming it; one from this build passes and is counted", async () => {
+    const w = await cleanWorld();
+    w.containers.push(runContainer(w, "aaaaaaaaaaaa"));
+    let r = await drift(w);
+    expect(r.status).toBe("pass");
+    expect(r.detail).toContain("5 running containers");
+    w.containers.push(runContainer(w, "bbbbbbbbbbbb", { labels: { "org.hapi.build-sha256": "0".repeat(64) } }));
+    r = await drift(w);
+    expect(r.status).toBe("fail");
+    expect(r.detail).toContain("hapi-run-bbbbbbbbbbbb was started from another build");
+    expect(r.detail).not.toContain("hapi-run-aaaaaaaaaaaa");
   });
 
   test("with the stack down it still compares the files, and says the labels were not checked", async () => {

@@ -13,7 +13,12 @@
  *   `ai tier list --json`, so it shows whether Archon read every generated
  *   alias (the `@<role>-retry` names, bare claude-provider model ids) and
  *   tier as generated (H-030). Each of the three commands must exit 0: one
- *   that exits non-zero fails, named, whatever it printed.
+ *   that exits non-zero fails, named, whatever it printed. It also reads
+ *   `assistants.pi.enableExtensions` back through Archon's own `loadConfig`
+ *   (it must be true: hapi-guard is a Pi extension, and Archon 0.12.1 only
+ *   defaults it on; H-152), and validates the shipped workflow pack bound at
+ *   /.archon/workflows/hapi, as a run sees it, failing on any node of it that
+ *   sets `pi.enableExtensions: false`.
  * - tools.hermes-validate: Hermes's own config code, in its image: every key
  *   of the deployed config must be one Hermes knows (its DEFAULT_CONFIG, or a
  *   reviewed key it reads outside it or under a key whose default is no
@@ -23,10 +28,10 @@
  *   `validate_config_structure` must report nothing (H-029). Hermes itself
  *   never warns about an unknown key.
  */
-import { readFile, stat } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import YAML from "yaml";
-import { PI_AGENT_DIR } from "../../generate/archon";
+import { PI_AGENT_DIR, RUN_PATHS } from "../../generate/archon";
 import { canonicalJson as canonical } from "../../mcp/lock";
 import { composeServices } from "../../stack/compose";
 import { HERMES_HOME, proxyEnv, serviceEnvironment } from "../../stack/env";
@@ -78,10 +83,15 @@ export function mountable(path: string, into = "the validation container"): stri
 /** The three read-only Archon commands the validation run makes, in order. */
 const ARCHON_COMMANDS = ["validate workflows --json", "ai alias list --json", "ai tier list --json"] as const;
 
-/** Runs in the Archon image: a scratch git repo (Archon needs one), then the three read-only commands, each followed by its exit code. Fixed text. */
+/** The fourth step: Archon's own `loadConfig` over the mounted config, printing what it makes of `assistants.pi.enableExtensions` (H-152). */
+const READ_BACK = "loadConfig: assistants.pi.enableExtensions";
+const READ_BACK_JS = 'import { loadConfig } from "/app/packages/core/src/config/config-loader.ts"; console.log(JSON.stringify((await loadConfig()).assistants?.pi?.enableExtensions))';
+
+/** Runs in the Archon image: a scratch git repo (Archon needs one), then the three read-only commands and the read-back, each followed by its exit code. Fixed text. */
 const ARCHON_SCRIPT =
   'd=$(mktemp -d) || exit 1; cd "$d" && git init -q . && git -c user.name=hapi-audit -c user.email=audit@hapi.invalid commit -q --allow-empty -m audit || exit 1; ' +
-  `for c in ${ARCHON_COMMANDS.map((c) => `"${c}"`).join(" ")}; do bun /app/packages/cli/src/cli.ts $c; printf "\\n@@hapi-audit %s@@\\n" "$?"; done`;
+  `for c in ${ARCHON_COMMANDS.map((c) => `"${c}"`).join(" ")}; do bun /app/packages/cli/src/cli.ts $c; printf "\\n@@hapi-audit %s@@\\n" "$?"; done; ` +
+  `bun -e '${READ_BACK_JS}'; printf "\\n@@hapi-audit %s@@\\n" "$?"`;
 
 const asRecord = (v: unknown) => (v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined);
 const text = (v: unknown) => (typeof v === "string" ? v : typeof asRecord(v)?.message === "string" ? (asRecord(v)!.message as string) : JSON.stringify(v));
@@ -136,6 +146,34 @@ function bindingProblems(kind: "alias" | "tier", generated: Record<string, unkno
   return problems;
 }
 
+/** The workflow pack a run binds at /.archon/workflows/hapi (the default `hapi run` uses). */
+const packOf = (root: string) => join(root, "archon", "workflows", "hapi");
+
+/** The pack's workflow files and every node of them that sets `pi.enableExtensions: false`, which would drop hapi-guard from that step. */
+async function packNodes(pack: string): Promise<{ workflows: number; problems: string[] } | { missing: string }> {
+  let names: string[];
+  try {
+    names = (await readdir(pack)).filter((n) => /\.ya?ml$/.test(n)).sort();
+  } catch (e) {
+    return { missing: `no workflow pack at ${pack} (${(e as NodeJS.ErrnoException).code ?? "error"}): a run binds it at ${RUN_PATHS.pack}` };
+  }
+  const problems: string[] = [];
+  for (const name of names) {
+    let doc: unknown;
+    try {
+      doc = YAML.parse(await readFile(join(pack, name), "utf8"));
+    } catch {
+      problems.push(`${name}: does not parse as YAML`);
+      continue;
+    }
+    for (const node of Array.isArray(asRecord(doc)?.nodes) ? (asRecord(doc)!.nodes as unknown[]) : []) {
+      const n = asRecord(node);
+      if (asRecord(n?.pi)?.enableExtensions === false) problems.push(`${name}: node ${String(n?.id ?? "(no id)")} sets pi.enableExtensions: false, so hapi-guard would not load in it`);
+    }
+  }
+  return { workflows: names.length, problems };
+}
+
 /** tools.archon-validate */
 export async function archonValidate(run: AuditRun): Promise<CheckResult[]> {
   const id = "tools.archon-validate";
@@ -146,6 +184,9 @@ export async function archonValidate(run: AuditRun): Promise<CheckResult[]> {
   if (!(await exists(config)) || !(await exists(pi))) return [result(id, "skip", `no deployed Archon config at ${config} (and Pi dir ${pi}): \`mise run up\` writes them`)];
   const img = await localImage(run, "archon");
   if ("skip" in img) return [result(id, "skip", img.skip)];
+  const pack = packOf(run.ctx.root);
+  const nodes = await packNodes(pack);
+  if ("missing" in nodes) return [result(id, "fail", nodes.missing)];
   const [uid, gid] = (img.user ?? "1001:1001").split(":");
   const proxies = new Set(Object.keys(proxyEnv("archon")));
   const env = Object.entries(serviceEnvironment("archon")).filter(([k]) => !proxies.has(k)).flatMap(([k, v]) => ["-e", `${k}=${v}`]);
@@ -153,16 +194,17 @@ export async function archonValidate(run: AuditRun): Promise<CheckResult[]> {
     "docker", "run", "--rm", "--pull", "never", "--network", "none", "--read-only",
     "--user", `${uid}:${gid ?? uid}`, "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
     "--tmpfs", "/tmp", "--tmpfs", `/.archon:uid=${uid},gid=${gid ?? uid}`, "--tmpfs", `/home/appuser:uid=${uid},gid=${gid ?? uid}`,
-    "-v", `${mountable(config)}:/.archon/config.yaml:ro`, "-v", `${mountable(pi)}:${PI_AGENT_DIR}:ro`,
+    "-v", `${mountable(config)}:/.archon/config.yaml:ro`, "-v", `${mountable(pi)}:${PI_AGENT_DIR}:ro`, "-v", `${mountable(pack)}:${RUN_PATHS.pack}:ro`,
     ...env, "--entrypoint", "sh", img.image, "-c", ARCHON_SCRIPT,
   ];
   const r = await run.ctx.exec(cmd, { timeoutMs: 300_000 });
   if (r.code !== 0) return [result(id, "fail", `the Archon validation run (${img.image}) exited ${r.code}: ${firstLine(r.stderr) || "no error output"}`)];
   const parts = r.stdout.split(/\n?@@hapi-audit (\d+)@@\n?/);
-  if (parts.length < 7) return [result(id, "fail", `could not read the Archon validation run's output (${img.image})`)];
-  // parts: [validate's output, its exit code, alias list's output, its exit code, tier list's output, its exit code, ...].
+  if (parts.length < 9) return [result(id, "fail", `could not read the Archon validation run's output (${img.image})`)];
+  // parts: [validate's output, its exit code, alias list's output, its exit code, tier list's output, its exit code, the read-back, its exit code, ...].
   // A command that exits non-zero fails whatever it printed: its output can't be taken as its verdict.
-  const exits = ARCHON_COMMANDS.map((command, i) => ({ command, code: parts[2 * i + 1]! })).filter((x) => x.code !== "0");
+  const exits = [...ARCHON_COMMANDS, READ_BACK].map((command, i) => ({ command, code: parts[2 * i + 1]! })).filter((x) => x.code !== "0");
+  const readBack = (parts[6] ?? "").trim().split("\n").at(-1)?.trim() ?? "";
   const v = readValidate(parts[0]!);
   const generated = (YAML.parse(await readFile(config, "utf8")) ?? {}) as { aliases?: Record<string, unknown>; tiers?: Record<string, unknown> };
   const json = (s: string): unknown => {
@@ -174,6 +216,8 @@ export async function archonValidate(run: AuditRun): Promise<CheckResult[]> {
   };
   const problems = [
     ...exits.map((x) => `archon ${x.command} exited ${x.code}`),
+    ...(readBack === "true" ? [] : [`assistants.pi.enableExtensions reads back as ${readBack === "" ? "nothing" : readBack} in Archon's loadConfig, not true (hapi-guard is a Pi extension; H-152)`]),
+    ...nodes.problems,
     ...("unreadable" in v ? [v.unreadable] : [...v.errors.map((e) => `error: ${e}`), ...v.warnings.map((w) => `parse warning: ${w}`)]),
     ...bindingProblems("alias", generated.aliases ?? {}, json(parts[2]!)),
     ...bindingProblems("tier", generated.tiers ?? {}, json(parts[4]!)),
@@ -189,7 +233,7 @@ export async function archonValidate(run: AuditRun): Promise<CheckResult[]> {
     result(
       id,
       "pass",
-      `archon validate workflows (${img.image}): ${v.workflows} workflows, no errors, no parse warnings; Archon reads all ${aliases} aliases and ${tiers} tiers as generated (ai alias list, ai tier list)${notes}`,
+      `archon validate workflows (${img.image}): ${v.workflows} workflows, no errors, no parse warnings; Archon reads all ${aliases} aliases and ${tiers} tiers as generated (ai alias list, ai tier list), and assistants.pi.enableExtensions is true (loadConfig); the pack ${RUN_PATHS.pack} has ${nodes.workflows} workflows and no node that turns Pi's extensions off${notes}`,
     ),
   ];
 }

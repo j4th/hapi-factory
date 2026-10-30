@@ -132,15 +132,28 @@ function atLeast(version: string, min: string): boolean {
 
 const AGE_BINARIES = ["age", "age-keygen", "age-plugin-batchpass"];
 
-/** `mise where age`, run from the checkout with the caller's environment (mise needs its own config and data dirs). */
-async function miseWhereAge(): Promise<string> {
+/** Where `scripts/host-setup.sh` installs mise for hapi, under HOME (the same path `hapi stack up` re-execs through). */
+const HOME_MISE = ".local/bin/mise";
+
+/**
+ * `mise where age`, run from the checkout with the caller's environment (mise needs its own config and data
+ * dirs). `mise` on PATH first, then `$HOME/.local/bin/mise`: a shell whose PATH lacks it (a non-login `sudo -u
+ * hapi`) still finds hapi's own install (H-196).
+ */
+export async function miseWhereAge(env: Env = process.env): Promise<string> {
   const cwd = (await defaultRepoRoot())[0]!;
-  let r: { code: number; stdout: string; stderr: string };
-  try {
-    r = await commandRunner("mise")(["where", "age"], { cwd, env: Object.fromEntries(Object.entries(process.env).filter((e): e is [string, string] => e[1] !== undefined)) });
-  } catch {
-    throw new SecretError("cannot run mise, which pins the age hapi uses: install mise, then `mise install` (README.md)");
+  const childEnv = Object.fromEntries(Object.entries(env).filter((e): e is [string, string] => e[1] !== undefined));
+  const candidates = ["mise", ...(env.HOME ? [join(env.HOME, HOME_MISE)] : [])];
+  let r: { code: number; stdout: string; stderr: string } | undefined;
+  for (const mise of candidates) {
+    try {
+      r = await commandRunner(mise)(["where", "age"], { cwd, env: childEnv });
+      break;
+    } catch {
+      // Can't start: try the next place.
+    }
   }
+  if (r === undefined) throw new SecretError(`cannot run mise (not on PATH, nor at ~/${HOME_MISE}), which pins the age hapi uses: install mise, then \`mise install\` (README.md)`);
   if (r.code !== 0) {
     const why = scrubToolError(r.stderr);
     throw new SecretError(`\`mise where age\` failed (exit ${r.code})${why ? `: ${why}` : ""}: run \`mise install\` in the hapi-factory checkout`);

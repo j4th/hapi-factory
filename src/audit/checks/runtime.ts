@@ -2,30 +2,40 @@
  * The runtime.* checks: what the running stack actually has, read with
  * `docker inspect` (spec §9.1, §9.2, §9.3, §11.3).
  *
- * - runtime.archon-env: the archon container's environment holds every value
- *   of `serviceEnvironment("archon")` (the Global Constraints' Archon and Pi
- *   settings, and its proxy), and its Pi agent dir and config are mounted
- *   read-only.
+ * - runtime.run-container: there is no long-lived archon container (a run is a
+ *   fresh container the launcher makes, src/run/spec.ts), so the check's subject
+ *   is the run definition: `runArgs` for a sample run must give Pi's agent dir
+ *   a tmpfs, bind every generated file (and /.archon/.env, empty, and the
+ *   workflow pack) read-only, carry every value of `serviceEnvironment("archon")`
+ *   and publish no port (H-197). Each live run container, found by its
+ *   `org.hapi.run` and `org.hapi.project` labels (never by Compose's), is held to
+ *   the same through `docker inspect`.
  * - runtime.hermes-no-yolo: Hermes's effective approval settings: no `--yolo`
  *   in its argv, no HERMES_YOLO_MODE or HERMES_YOLO in its env, HERMES_HOME
  *   where hapi puts it, and in the config mounted read-only at
  *   $HERMES_HOME/config.yaml, approvals.mode not off and no unattended mode
  *   that approves. The config is read as YAML 1.1, as Hermes reads it, where a
  *   bare `off` or `no` is false.
- * - runtime.dev-override: the labels `hapi stack up` puts on every container
- *   (H-147). `1` is the dev bypass (HAPI_ALLOW_CURRENT_USER=1); `unknown` or
+ * - runtime.dev-override: the labels `hapi stack up` (and the launcher, for a
+ *   run) puts on every container (H-147). `1` is the dev bypass (HAPI_ALLOW_CURRENT_USER=1); `unknown` or
  *   empty means a stack not started through `hapi stack up`, never "no
  *   bypass". Both fail, and so does this shell's own bypass
  *   (`currentUserOverride`), unless `--dev` makes them a skip.
  *
- * With no container of the Compose project, or no Docker, each is a skip.
+ * With no container of the Compose project, or no Docker, each but
+ * runtime.run-container (whose definition needs none) is a skip.
  */
 import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import YAML from "yaml";
-import { PI_AGENT_DIR } from "../../generate/archon";
+import { RUN_PATHS } from "../../generate/archon";
+import { runArgs, type RunInputs } from "../../run/spec";
+import { composeServices } from "../../stack/compose";
 import { HERMES_HOME, serviceEnvironment } from "../../stack/env";
-import { currentUserOverride, HAPI_USER, PROJECT } from "../../stack/up";
+import { currentUserOverride, HAPI_USER, PROJECT, runFilters } from "../../stack/up";
+import type { WorkOrder } from "../../workorder/validate";
 import { type AuditRun, type CheckResult, result } from "../types";
+import { freshBuilds } from "./generated";
 
 /** A container as `docker inspect` prints it (the fields the audit reads). */
 export interface Container {
@@ -34,35 +44,54 @@ export interface Container {
   Path?: string;
   Args?: string[];
   Config?: { Labels?: Record<string, string> | null; Env?: string[] | null; Cmd?: string[] | null; Entrypoint?: string[] | null };
-  Mounts?: { Source?: string; Destination?: string; RW?: boolean }[] | null;
+  Mounts?: { Type?: string; Source?: string; Destination?: string; RW?: boolean }[] | null;
+  HostConfig?: { PortBindings?: Record<string, unknown> | null; Tmpfs?: Record<string, string> | null };
 }
 
 export type Stack = { containers: Container[] } | { unavailable: string };
 
 const firstLine = (s: string) => (s.trim().split("\n")[0] ?? "").slice(0, 200);
 
-/** Every container of the Compose project `hapi`, running or not (memoized per audit). */
+/** The containers `docker ps -a` finds with these filters, inspected (the listing of a run is the argv after `docker ps -a -q --no-trunc`). */
+async function inspected(run: AuditRun, filters: string[]): Promise<Stack> {
+  let ps;
+  try {
+    ps = await run.ctx.exec(["docker", "ps", "-a", "-q", "--no-trunc", ...filters]);
+  } catch (e) {
+    return { unavailable: `docker is not available (${(e as Error).message})` };
+  }
+  if (ps.code !== 0) return { unavailable: `docker ps failed (exit ${ps.code}): ${firstLine(ps.stderr) || "no error output"}` };
+  const ids = ps.stdout.split("\n").map((l) => l.trim()).filter((l) => l !== "");
+  if (ids.length === 0) return { containers: [] };
+  const inspect = await run.ctx.exec(["docker", "inspect", ...ids]);
+  if (inspect.code !== 0) throw new Error(`docker inspect exited ${inspect.code}: ${firstLine(inspect.stderr) || "no error output"}`);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(inspect.stdout);
+  } catch {
+    parsed = undefined;
+  }
+  if (!Array.isArray(parsed)) throw new Error("docker inspect printed something that is not a JSON array of containers");
+  return { containers: parsed as Container[] };
+}
+
+/** Every container of the Compose project `hapi`, running or not (memoized per audit). Run containers are not among them: their Compose labels are blank. */
 export function stackContainers(run: AuditRun): Promise<Stack> {
-  return run.once("stack", async (): Promise<Stack> => {
-    let ps;
-    try {
-      ps = await run.ctx.exec(["docker", "ps", "-a", "-q", "--no-trunc", "--filter", `label=com.docker.compose.project=${PROJECT}`]);
-    } catch (e) {
-      return { unavailable: `docker is not available (${(e as Error).message})` };
-    }
-    if (ps.code !== 0) return { unavailable: `docker ps failed (exit ${ps.code}): ${firstLine(ps.stderr) || "no error output"}` };
-    const ids = ps.stdout.split("\n").map((l) => l.trim()).filter((l) => l !== "");
-    if (ids.length === 0) return { containers: [] };
-    const inspect = await run.ctx.exec(["docker", "inspect", ...ids]);
-    if (inspect.code !== 0) throw new Error(`docker inspect exited ${inspect.code}: ${firstLine(inspect.stderr) || "no error output"}`);
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(inspect.stdout);
-    } catch {
-      parsed = undefined;
-    }
-    if (!Array.isArray(parsed)) throw new Error("docker inspect printed something that is not a JSON array of containers");
-    return { containers: parsed as Container[] };
+  return run.once("stack", () => inspected(run, ["--filter", `label=com.docker.compose.project=${PROJECT}`]));
+}
+
+/** Every run container of hapi (`org.hapi.run` and `org.hapi.project=hapi`), running or not (memoized per audit). */
+export function runContainers(run: AuditRun): Promise<Stack> {
+  return run.once("runs", () => inspected(run, runFilters(PROJECT)));
+}
+
+/** The stack's containers and the run containers together, or why Docker can't say (memoized per audit). */
+export function liveContainers(run: AuditRun): Promise<Stack> {
+  return run.once("live", async (): Promise<Stack> => {
+    const [stack, runs] = await Promise.all([stackContainers(run), runContainers(run)]);
+    if ("unavailable" in stack) return stack;
+    if ("unavailable" in runs) return runs;
+    return { containers: [...stack.containers, ...runs.containers] };
   });
 }
 
@@ -87,34 +116,110 @@ async function running(run: AuditRun, id: string, service: string): Promise<Cont
   return c ?? result(id, "skip", `${service} is not running: \`docker compose -p ${PROJECT} ps\` shows why`);
 }
 
-/** runtime.archon-env */
-export async function archonEnv(run: AuditRun): Promise<CheckResult[]> {
-  const id = "runtime.archon-env";
-  const c = await running(run, id, "archon");
-  if ("status" in c) return [c];
-  const env = envOf(c);
-  const want = serviceEnvironment("archon");
+/** The tmpfs options Pi's agent dir gets (design §6a item 3): small, the appuser's, nobody else's. */
+const PI_TMPFS = "size=64m,uid=1001,gid=1001,mode=0700";
+
+/** What the run container must have, by destination: the generated files, /.archon/.env (empty, so Archon loads nothing over the environment) and the pack. */
+const READ_ONLY_DESTINATIONS = [
+  `${RUN_PATHS.piDir}/models.json`,
+  `${RUN_PATHS.piDir}/models-store.json`,
+  `${RUN_PATHS.piDir}/hapi-guard.json`,
+  "/.archon/config.yaml",
+  "/.archon/.env",
+  RUN_PATHS.pack,
+];
+
+/** What a live container's `Config.Env` says, as problems against `serviceEnvironment("archon")`. */
+function envProblems(env: Map<string, string>): string[] {
   const problems: string[] = [];
-  for (const [name, value] of Object.entries(want)) {
+  for (const [name, value] of Object.entries(serviceEnvironment("archon"))) {
     if (!env.has(name)) problems.push(`${name} is not set`);
     else if (env.get(name) !== value) problems.push(`${name} is not ${value}`);
   }
-  for (const dest of [PI_AGENT_DIR, "/.archon/config.yaml"]) {
-    const m = (c.Mounts ?? []).find((x) => x.Destination === dest);
+  return problems;
+}
+
+/** The sample run `runArgs` is asked about: none of it reaches Docker. */
+function sampleInputs(packDir: string): RunInputs {
+  const traceparent = "00-00000000000000000000000000000001-0000000000000001-01";
+  return {
+    runId: "000000000000",
+    repo: "/audit/sample/repo.git",
+    sha: "0".repeat(40),
+    workOrder: { id: "audit-sample", workflow: "hapi-check-run", trace: { traceparent }, budget: { usd: 1, turns: 1, minutes: 1 } } as WorkOrder,
+    public: false,
+    budgetUsd: 1,
+    packDir,
+  };
+}
+
+/** How the run definition's `docker run` argv falls short of what a run container must be; empty if it doesn't. */
+function definitionProblems(argv: string[], packDir: string): string[] {
+  const after = (flag: string) => argv.flatMap((a, i) => (argv[i - 1] === flag ? [a] : []));
+  const problems: string[] = [];
+  const tmpfs = after("--tmpfs").find((t) => t.startsWith(`${RUN_PATHS.piDir}:`));
+  if (tmpfs === undefined) problems.push(`no tmpfs at ${RUN_PATHS.piDir}`);
+  else if (tmpfs !== `${RUN_PATHS.piDir}:${PI_TMPFS}`) problems.push(`the tmpfs at ${RUN_PATHS.piDir} has options ${tmpfs.slice(RUN_PATHS.piDir.length + 1)}, not ${PI_TMPFS}`);
+  const binds = after("-v").map((v) => v.split(":") as [string, string, string?]);
+  // A source that is a path is a bind of a host file; a name is a per-run volume (/work and /out), which is meant to be written.
+  for (const [src, dst, mode] of binds) if (src.startsWith("/") && mode !== "ro") problems.push(`${dst} is not bound read-only`);
+  for (const dest of READ_ONLY_DESTINATIONS) if (!binds.some(([, dst]) => dst === dest)) problems.push(`nothing is bound at ${dest}`);
+  const pack = binds.find(([, dst]) => dst === RUN_PATHS.pack);
+  if (pack !== undefined && pack[0] !== packDir) problems.push(`${RUN_PATHS.pack} is bound from ${pack[0]}, not the default pack dir ${packDir}`);
+  const env = new Map(after("-e").filter((e) => e.includes("=")).map((e) => [e.slice(0, e.indexOf("=")), e.slice(e.indexOf("=") + 1)] as [string, string]));
+  problems.push(...envProblems(env));
+  if (argv.some((a) => ["-p", "--publish", "-P", "--publish-all"].includes(a) || a.startsWith("--publish="))) problems.push("it publishes a port (a run listens nowhere)");
+  return problems;
+}
+
+/** How a live run container's mounts, environment and ports fall short of the same. */
+function liveProblems(c: Container): string[] {
+  const problems: string[] = [];
+  const mounts = c.Mounts ?? [];
+  const tmpfs = mounts.find((m) => m.Destination === RUN_PATHS.piDir && m.Type === "tmpfs");
+  if (tmpfs === undefined) problems.push(`no tmpfs at ${RUN_PATHS.piDir}`);
+  else {
+    const options = c.HostConfig?.Tmpfs?.[RUN_PATHS.piDir];
+    if (options !== PI_TMPFS) problems.push(`the tmpfs at ${RUN_PATHS.piDir} has options ${options ?? "(none)"}, not ${PI_TMPFS}`);
+  }
+  for (const dest of READ_ONLY_DESTINATIONS) {
+    const m = mounts.find((x) => x.Destination === dest);
     if (m === undefined) problems.push(`nothing is mounted at ${dest}`);
     else if (m.RW !== false) problems.push(`${dest} is not mounted read-only`);
   }
-  const name = containerName(c);
-  if (problems.length > 0) {
-    return [
-      result(
-        id,
-        "fail",
-        `${name}: ${problems.join("; ")}. Its environment: is serviceEnvironment("archon") in src/stack/env.ts, set in stack/compose.yaml; restore the file and run \`mise run up\``,
-      ),
-    ];
+  problems.push(...envProblems(envOf(c)));
+  if (Object.keys(c.HostConfig?.PortBindings ?? {}).length > 0) problems.push("it publishes a port (a run listens nowhere)");
+  return problems;
+}
+
+/** runtime.run-container */
+export async function runContainer(run: AuditRun): Promise<CheckResult[]> {
+  const id = "runtime.run-container";
+  const { ctx } = run;
+  const service = (await composeServices(ctx.root)).archon;
+  if (service?.image === undefined) throw new Error("stack/compose.yaml has no archon service with an image: it is the run container's definition");
+  const fresh = (await freshBuilds(run))[0]!;
+  const packDir = join(ctx.root, "archon", "workflows", "hapi");
+  const argv = runArgs(service, sampleInputs(packDir), { project: PROJECT, image: service.image, root: ctx.root, buildDir: join(fresh.root, "build"), stateDir: "/audit/sample/state", user: ctx.user, env: ctx.env }, []);
+  const fix = "the run container's definition is stack/compose.yaml's archon service, translated by src/run/spec.ts: restore them";
+  const static_ = definitionProblems(argv, packDir);
+  if (static_.length > 0) return [result(id, "fail", `the run definition (runArgs, src/run/spec.ts): ${static_.join("; ")}. ${fix}`)];
+
+  const runs = await runContainers(run);
+  const live = "containers" in runs ? runs.containers.filter(isRunning) : [];
+  const bad = live.map((c) => [c, liveProblems(c)] as const).filter(([, p]) => p.length > 0);
+  if (bad.length > 0) {
+    return [result(id, "fail", `${bad.map(([c, p]) => `${containerName(c)}: ${p.join("; ")}`).join("; ")}. A live run container must be as the run definition says: stop it with \`hapi run stop <id>\`, then ${fix}`)];
   }
-  return [result(id, "pass", `${name} has all ${Object.keys(want).length} values of serviceEnvironment("archon") (${Object.entries(want).filter(([k]) => !/proxy/i.test(k)).map(([k, v]) => `${k}=${v}`).join(", ")}, and its proxy), and ${PI_AGENT_DIR} and /.archon/config.yaml mounted read-only`)];
+  const checked = "unavailable" in runs ? `no live run container was checked (${runs.unavailable})` : live.length === 0 ? "no live run container was checked (none is running)" : `${live.length} live run containers are as it says`;
+  const nonProxy = Object.entries(serviceEnvironment("archon")).filter(([k]) => !/proxy/i.test(k)).length;
+  return [
+    result(
+      id,
+      "pass",
+      `the run definition (runArgs, src/run/spec.ts) gives ${RUN_PATHS.piDir} a tmpfs (${PI_TMPFS}), binds ${READ_ONLY_DESTINATIONS.length} files (the generated ones, /.archon/.env and the pack ${packDir}) read-only, sets all ${Object.keys(serviceEnvironment("archon")).length} values of serviceEnvironment("archon") (${nonProxy} besides the proxy's) and publishes no port; ${checked}`,
+    ),
+  ];
 }
 
 /** A yolo variable's value that turns yolo on: anything but empty, 0, false, no or off. */
@@ -177,7 +282,7 @@ export async function devOverride(run: AuditRun): Promise<CheckResult[]> {
   if (shell.override) {
     problems.push(`this shell sets HAPI_ALLOW_CURRENT_USER=1 as ${shell.user}, not ${HAPI_USER}, so \`mise run up\` from it runs the stack as ${shell.user}`);
   }
-  const stack = await stackContainers(run);
+  const stack = await liveContainers(run);
   const containers = "containers" in stack ? stack.containers.filter(isRunning) : [];
   for (const c of containers) {
     const v = label(c, "org.hapi.dev-override") ?? "";

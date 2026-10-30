@@ -48,13 +48,19 @@ test("audit flags comment-triggered AI workflow", async () => {
   expect(r.detail).toContain("issue_comment");
 });
 
+test("the check list replaces runtime.archon-env (no long-lived archon) with runtime.run-container, and adds policy.budget-enforcement", () => {
+  expect(CHECK_IDS).toContain("runtime.run-container");
+  expect(CHECK_IDS).toContain("policy.budget-enforcement");
+  expect(CHECK_IDS).not.toContain("runtime.archon-env");
+});
+
 test("audit passes a clean fixture", async () => {
   const w = await cleanWorld();
   const results = await runAudit(w.ctx);
   expect(results.map((r) => r.id).sort()).toEqual([...CHECK_IDS].sort());
   for (const r of results) expect([r.id, r.status, r.detail]).toEqual([r.id, r.status === "skip" ? "skip" : "pass", r.detail]);
   // What can be checked without a repo or a secrets store passes.
-  for (const id of ["generated.drift", "runtime.archon-env", "runtime.hermes-no-yolo", "runtime.dev-override", "pins.versions", "tools.archon-validate", "tools.hermes-validate"]) {
+  for (const id of ["generated.drift", "runtime.run-container", "runtime.hermes-no-yolo", "runtime.dev-override", "pins.versions", "tools.archon-validate", "tools.hermes-validate", "policy.budget-enforcement"]) {
     expect([id, only(results, id).status]).toEqual([id, "pass"]);
   }
   // The live MCP comparison waits for Plan 04 (H-101), so it is a skip until then (H-026).
@@ -120,11 +126,13 @@ describe("hapi audit", () => {
         };
       } else w.dockerDown = true;
       const results = await runAudit(w.ctx);
-      for (const id of ["runtime.archon-env", "runtime.hermes-no-yolo", "runtime.dev-override", "tools.archon-validate", "tools.hermes-validate"]) {
+      for (const id of ["runtime.hermes-no-yolo", "runtime.dev-override", "tools.archon-validate", "tools.hermes-validate"]) {
         const r = only(results, id);
         expect([how, id, r.status]).toEqual([how, id, "skip"]);
         expect(r.detail.toLowerCase()).toContain("docker");
       }
+      // The run definition is checked without Docker.
+      expect([how, only(results, "runtime.run-container").status]).toEqual([how, "pass"]);
     }
   });
 

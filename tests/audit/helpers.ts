@@ -91,6 +91,7 @@ export interface Container {
   Args: string[];
   Config: { Labels: Record<string, string>; Env: string[]; Cmd: string[] | null; Entrypoint: string[] | null };
   Mounts: { Type: string; Source: string; Destination: string; RW: boolean }[];
+  HostConfig?: { PortBindings: Record<string, unknown>; Tmpfs?: Record<string, string> };
 }
 
 export interface Reply {
@@ -112,6 +113,8 @@ export interface World {
   containers: Container[];
   /** What the archon validation run prints: Archon's `validate workflows --json` output (an object or raw text). */
   archonValidate: { code: number; out: unknown };
+  /** What the `assistants.pi.enableExtensions` read-back prints (and its exit code). */
+  enableExtensions: { code: number; out: string };
   /** What the Hermes validation run prints (Hermes's defaults, effective config, issues). */
   hermes: { defaults: unknown; issues: { severity: string; message: string }[]; config_version: number; latest_config_version: number; effective?: unknown };
   /** Images `docker image inspect` finds. */
@@ -323,19 +326,6 @@ export async function cleanWorld(o: { repos?: boolean; workflows?: Record<string
         { Type: "bind", Source: join(build, "hermes", "config.yaml"), Destination: "/opt/data/config.yaml", RW: false },
       ],
     },
-    {
-      Id: "id-archon",
-      Name: "/hapi-archon-1",
-      State: { Running: true },
-      Path: "docker-entrypoint.sh",
-      Args: [],
-      Config: { Labels: labels("archon"), Env: envList(serviceEnvironment("archon")), Cmd: null, Entrypoint: ["docker-entrypoint.sh"] },
-      Mounts: [
-        { Type: "volume", Source: "/var/lib/docker/volumes/hapi_archon-data/_data", Destination: "/.archon", RW: true },
-        { Type: "bind", Source: join(build, "archon", "config.yaml"), Destination: "/.archon/config.yaml", RW: false },
-        { Type: "bind", Source: join(build, "pi"), Destination: "/opt/hapi/pi-agent", RW: false },
-      ],
-    },
   ];
   const ours = YAML.parse(readFileSync(join(build, "hermes", "config.yaml"), "utf8"));
   const defaults = readJson("hermes-v0.22.5-defaults.json");
@@ -345,6 +335,7 @@ export async function cleanWorld(o: { repos?: boolean; workflows?: Record<string
     digest,
     containers,
     archonValidate: { code: 0, out: readJson("archon-validate-v0.12.1.json") },
+    enableExtensions: { code: 0, out: "true" },
     hermes: { defaults, issues: [], config_version: 0, latest_config_version: 51, effective: hermesMerge(defaults, ours) },
     images: new Set([ARCHON_IMAGE, HERMES_IMAGE]),
     calls: [],
@@ -376,6 +367,55 @@ export async function cleanWorld(o: { repos?: boolean; workflows?: Record<string
   return world;
 }
 
+/**
+ * A live run container as `docker inspect` prints one: the labels and mounts a launcher-made container has
+ * (src/run/spec.ts; the Compose labels blank), Archon's whole environment, and no published port. Written out here,
+ * not read from `runArgs`, so the check's expectation is checked against an independent list.
+ */
+export function runContainer(w: World, id = "ab12cd34ef56", over: { labels?: Record<string, string> } = {}): Container {
+  const name = `hapi-run-${id}`;
+  const bind = (Source: string, Destination: string) => ({ Type: "bind", Source, Destination, RW: false });
+  return {
+    Id: `id-run-${id}`,
+    Name: `/${name}`,
+    State: { Running: true },
+    Path: "sh",
+    Args: ["/opt/hapi/run.sh", "hapi-check-run"],
+    Config: {
+      Labels: {
+        "com.docker.compose.project": "",
+        "com.docker.compose.service": "",
+        "com.docker.compose.version": "",
+        "org.hapi.run": id,
+        "org.hapi.project": "hapi",
+        "org.hapi.stack": "hapi-factory",
+        "org.hapi.started-by": "hapi",
+        "org.hapi.dev-override": "0",
+        "org.hapi.build-sha256": w.digest,
+        ...over.labels,
+      },
+      Env: [...Object.entries(serviceEnvironment("archon")).map(([k, v]) => `${k}=${v}`), "PATH=/usr/local/bin:/usr/bin:/bin"],
+      Cmd: null,
+      Entrypoint: ["sh"],
+    },
+    Mounts: [
+      ...["/tmp", "/home/appuser", "/.archon", "/opt/hapi/pi-agent"].map((Destination) => ({ Type: "tmpfs", Source: "", Destination, RW: true })),
+      ...["models.json", "models-store.json", "hapi-guard.json", "settings.json", "extensions"].map((f) => bind(join(w.build, "pi", f), `/opt/hapi/pi-agent/${f}`)),
+      bind(join(w.build, "archon", "config.yaml"), "/.archon/config.yaml"),
+      bind(join(w.build, "archon", "empty.env"), "/.archon/.env"),
+      bind(join(REPO, "archon", "workflows", "hapi"), "/.archon/workflows/hapi"),
+      bind(join(w.build, "archon", "run-config.yaml"), "/opt/hapi/run-config.yaml"),
+      bind(join(w.build, "archon", "gitconfig"), "/home/appuser/.gitconfig"),
+      bind(join(REPO, "stack", "archon", "run.sh"), "/opt/hapi/run.sh"),
+      bind("/state/runs/run.json", "/run/hapi/run.json"),
+      bind("/srv/src/.git", "/src/repo.git"),
+      { Type: "volume", Source: `/var/lib/docker/volumes/${name}-work/_data`, Destination: "/work", RW: true },
+      { Type: "volume", Source: `/var/lib/docker/volumes/${name}-out/_data`, Destination: "/out", RW: true },
+    ],
+    HostConfig: { PortBindings: {}, Tmpfs: { "/opt/hapi/pi-agent": "size=64m,uid=1001,gid=1001,mode=0700" } },
+  };
+}
+
 const ok = (stdout: string): ExecResult => ({ code: 0, stdout, stderr: "" });
 
 /** Archon's `ai alias list --json` and `ai tier list --json` for a config: what Archon v0.12.1 prints when it reads every binding. */
@@ -393,7 +433,18 @@ function fakeExec(w: World, cmd: string[]): ExecResult {
   if (cmd[0] === "env" && cmd.includes("git")) return fakeGit(w, cmd.slice(cmd.indexOf("git") + 1));
   if (cmd[0] !== "docker") return { code: 127, stdout: "", stderr: `${cmd[0]}: not found` };
   if (w.dockerDown) return { code: 1, stdout: "", stderr: "Cannot connect to the Docker daemon at unix:///run/user/1001/docker.sock. Is the docker daemon running?" };
-  if (cmd[1] === "ps") return ok(w.containers.map((c) => c.Id).join("\n") + (w.containers.length ? "\n" : ""));
+  if (cmd[1] === "ps") {
+    // `--filter label=k` or `label=k=v`, all of which must match.
+    const wanted = cmd.flatMap((a, i) => (cmd[i - 1] === "--filter" && a.startsWith("label=") ? [a.slice(6)] : []));
+    const hit = w.containers.filter((c) =>
+      wanted.every((f) => {
+        const eq = f.indexOf("=");
+        const have = c.Config.Labels[eq < 0 ? f : f.slice(0, eq)];
+        return have !== undefined && (eq < 0 || have === f.slice(eq + 1));
+      }),
+    );
+    return ok(hit.map((c) => c.Id).join("\n") + (hit.length ? "\n" : ""));
+  }
   if (cmd[1] === "inspect") {
     const ids = cmd.slice(2);
     return ok(JSON.stringify(w.containers.filter((c) => ids.includes(c.Id))));
@@ -408,7 +459,7 @@ function fakeExec(w: World, cmd: string[]): ExecResult {
       const b = archonBindings(mount.slice(0, -":/.archon/config.yaml:ro".length));
       const v = w.archonValidate;
       const text = typeof v.out === "string" ? v.out : JSON.stringify(v.out);
-      return ok(`${text}\n@@hapi-audit ${v.code}@@\n${JSON.stringify(b.aliases)}\n@@hapi-audit 0@@\n${JSON.stringify(b.tiers)}\n@@hapi-audit 0@@\n`);
+      return ok(`${text}\n@@hapi-audit ${v.code}@@\n${JSON.stringify(b.aliases)}\n@@hapi-audit 0@@\n${JSON.stringify(b.tiers)}\n@@hapi-audit 0@@\n${w.enableExtensions.out}\n@@hapi-audit ${w.enableExtensions.code}@@\n`);
     }
     if (cmd.some((a) => a.includes("hermes"))) return ok(`${JSON.stringify(w.hermes)}\n`);
   }

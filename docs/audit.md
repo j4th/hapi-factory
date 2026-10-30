@@ -1,6 +1,6 @@
 # hapi audit
 
-`mise run audit` (`hapi audit`) checks that what is deployed and running matches policy: the generated configs, the pins, the running stack's settings, the secrets setup, and each repo's GitHub settings. It is spec §11.8's "worse controls" measure: Phase 0 is done when `mise run audit` passes (spec §15). The code is `src/audit/`; the tests are `tests/audit/`.
+`mise run audit` (`hapi audit`) checks that what is deployed and running matches policy: the generated configs, the pins, the budget policy, the run container's definition, the running stack's settings, the secrets setup, and each repo's GitHub settings. It is spec §11.8's "worse controls" measure: Phase 0 is done when `mise run audit` passes (spec §15). The code is `src/audit/`; the tests are `tests/audit/`.
 
 - [Running it](#running-it): as hapi, the flags, the output and exit codes.
 - [pass, fail and skip](#pass-fail-and-skip), `--strict` and `--dev`.
@@ -34,7 +34,7 @@ mise run audit -- --strict --repo "$OWNER/hapi-factory" --github-token-file <fil
 It prints one line per check, then a summary:
 
 ```text
-pass  generated.drift         /home/hapi/hapi-factory/build equals a fresh build of /home/hapi/hapi-factory/policy (roster anthropic, 10 files); 5 running containers were started from it (org.hapi.build-sha256)
+pass  generated.drift         /home/hapi/hapi-factory/build equals a fresh build of /home/hapi/hapi-factory/policy (roster anthropic, 10 files); 4 running containers were started from it (org.hapi.build-sha256)
 skip  mcp.tool-hashes         the live tool surfaces can't be compared with the lock until Plan 04 wires the live fetch (`hapi mcp verify`, H-101); ...
 skip  github.rulesets         no --repo given
 ...
@@ -58,11 +58,12 @@ Without the stack and without `--repo`, as on a development machine, most checks
 | Check | Verifies | Spec | Needs |
 |---|---|---|---|
 | [`generated.drift`](#generateddrift) | The deployed build/ equals a fresh build of policy/, with no other file or directory in it, and every running container was started from it | §8.1, §11.8 | The deployed build/; Docker for the labels |
-| [`runtime.archon-env`](#runtimearchon-env) | The running archon's environment and read-only mounts | §9.2, §9.3 | Docker, the stack up |
+| [`runtime.run-container`](#runtimerun-container) | The run container's definition (tmpfs, read-only binds, environment, no port), and each live run container against it | §9.2, §9.3 | The checkout; Docker for live runs |
 | [`runtime.hermes-no-yolo`](#runtimehermes-no-yolo) | No yolo, and approvals not off, in Hermes's effective config | §9.1 | Docker, the stack up |
-| [`runtime.dev-override`](#runtimedev-override) | The stack was started by `hapi stack up` as hapi, without the dev bypass | §4.3, §11.3 | Docker, the stack up |
+| [`runtime.dev-override`](#runtimedev-override) | The stack, and each live run, was started as hapi, without the dev bypass | §4.3, §11.3 | Docker, the stack up |
+| [`policy.budget-enforcement`](#policybudget-enforcement) | At least one enforcer of `run_usd` is hard | design §3.5 | policy/ |
 | [`pins.versions`](#pinsversions) | Every tool, image and installed package pinned exactly | §11.6 | The checkout |
-| [`tools.archon-validate`](#toolsarchon-validate) | Archon's own validation of the deployed config: no errors, no parse warnings, every alias and tier read as generated | §9.2 | Docker, the Archon image |
+| [`tools.archon-validate`](#toolsarchon-validate) | Archon's own validation of the deployed config and the workflow pack: no errors, no parse warnings, every alias and tier read as generated, `assistants.pi.enableExtensions` true | §9.2 | Docker, the Archon image |
 | [`tools.hermes-validate`](#toolshermes-validate) | Hermes's own reading of the deployed config: every key known, every value read as written | §9.1 | Docker, the Hermes image |
 | [`mcp.tool-hashes`](#mcptool-hashes) | The MCP lock, its read-only tools, and the servers the stack runs | §10.1 | policy/ |
 | [`secrets.provider`](#secretsprovider) | The secrets provider (not the env-file downgrade), and for sops the recipients file and `recovery.age` | §11.5 | The secrets config |
@@ -74,9 +75,9 @@ Without the stack and without `--repo`, as on a development machine, most checks
 
 ### generated.drift
 
-**Verifies.** The deployed build/ (the one `hapi stack up` writes and the containers bind-mount: hapi's `~hapi/hapi-factory/build`, found from hapi's passwd entry; this checkout's `build/` when this shell sets `HAPI_ALLOW_CURRENT_USER=1`; or `--build-dir`) is exactly a fresh `buildAll` of `--policy`, for one of the three rosters (`up --roster` picks one; the detail names it): every generated file byte for byte, as a regular file (a symlink is a fail, and is never followed), and **no other path**, file or directory, anywhere under it. Archon mounts `build/pi` whole, read-only, as Pi's agent dir (`PI_CODING_AGENT_DIR`), so a planted or stale `settings.json`, `auth.json`, `models-store.json` or `extensions/` there would be read by Pi even though every generated file matches. The audit lists the deployed build recursively and names each such path (a directory once, with a trailing `/`), never reading it. The fresh builds go into temp dirs the audit removes; the deployed build/ is never written. Then each running container's `org.hapi.build-sha256` label must be that build's digest (`buildDigest`, `src/stack/up.ts`), the label `up` sets.
+**Verifies.** The deployed build/ (the one `hapi stack up` writes and the containers bind-mount: hapi's `~hapi/hapi-factory/build`, found from hapi's passwd entry; this checkout's `build/` when this shell sets `HAPI_ALLOW_CURRENT_USER=1`; or `--build-dir`) is exactly a fresh `buildAll` of `--policy`, for one of the three rosters (`up --roster` picks one; the detail names it): every generated file byte for byte, as a regular file (a symlink is a fail, and is never followed), and **no other path**, file or directory, anywhere under it. A run binds `build/pi`'s generated files and its whole `extensions/` directory, read-only, into Pi's agent dir (a tmpfs, `PI_CODING_AGENT_DIR`), so a planted extension there would be loaded by Pi even though every generated file matches, and a stray `auth.json` or other file beside them is one bind from being read. The audit lists the deployed build recursively and names each such path (a directory once, with a trailing `/`), never reading it. The fresh builds go into temp dirs the audit removes; the deployed build/ is never written. Then each running container's `org.hapi.build-sha256` label must be that build's digest (`buildDigest`, `src/stack/up.ts`), the label `up` sets and the launcher sets on a run container too: the stack's containers (Compose project `hapi`) and the run containers (labelled `org.hapi.run` and `org.hapi.project=hapi`) are both read.
 
-**Why.** The generators are deterministic ([docs/generated-configs.md](generated-configs.md)), so a difference is a hand edit, a stale build, or a policy change not yet deployed (spec §8.1; Review Focus 4: `approvals.mode: off` or `HOST=0.0.0.0` in a deployed file). Compose recreates a container whose config changed, not one whose bind-mounted file changed, so a container with another build's label may still run an older config.
+**Why.** The generators are deterministic ([docs/generated-configs.md](generated-configs.md)), so a difference is a hand edit, a stale build, or a policy change not yet deployed (spec §8.1; Review Focus 4: `approvals.mode: off` or `PI_OFFLINE=0` in a deployed file). Compose recreates a container whose config changed, not one whose bind-mounted file changed, so a container with another build's label may still run an older config.
 
 **Credential.** None: local files, and `docker inspect` for the labels.
 
@@ -84,17 +85,19 @@ Without the stack and without `--repo`, as on a development machine, most checks
 
 **Skip.** No hapi user on this host (pass `--build-dir`), no deployed build yet (`mise run up` writes it), or a build/ you can't read (run the audit as hapi). With the stack down it still compares the files and says the labels weren't checked.
 
-### runtime.archon-env
+### runtime.run-container
 
-**Verifies.** The running `archon` container's environment (from `docker inspect`) has every value of `serviceEnvironment("archon")` (`src/stack/env.ts`): `HOST=127.0.0.1`, `ARCHON_TELEMETRY_DISABLED=1`, `DO_NOT_TRACK=1`, `PI_OFFLINE=1`, `PI_TELEMETRY=0`, `PI_CODING_AGENT_DIR=/opt/hapi/pi-agent`, `ARCHON_DOCKER=true` and its proxy variables. And `/opt/hapi/pi-agent` and `/.archon/config.yaml` are mounted read-only.
+**Verifies.** There is no long-lived archon container: a run is a fresh container the launcher makes from `stack/compose.yaml`'s profile-only `archon` service (`runArgs`, `src/run/spec.ts`). So the check has two parts.
+- **The run definition, always, with no Docker.** `runArgs` for a sample run must give `/opt/hapi/pi-agent` a tmpfs with `size=64m,uid=1001,gid=1001,mode=0700`; bind every host file read-only (`:ro`), among them `models.json`, `models-store.json`, `hapi-guard.json`, `/.archon/config.yaml`, `/.archon/.env` (empty: Archon loads it over the process environment at every start) and the workflow pack at `/.archon/workflows/hapi` from the default pack dir (`archon/workflows/hapi`); carry every value of `serviceEnvironment("archon")` (`src/stack/env.ts`: `ARCHON_TELEMETRY_DISABLED=1`, `DO_NOT_TRACK=1`, `PI_OFFLINE=1`, `PI_TELEMETRY=0`, `PI_CODING_AGENT_DIR=/opt/hapi/pi-agent`, `BUN_OPTIONS`, the git settings, `ARCHON_DOCKER=true` and the proxy variables); and publish no port. A `runArgs` that throws (the service holds a key it doesn't translate) is a fail with its reason.
+- **Each live run container.** Any container labelled `org.hapi.run` and `org.hapi.project=hapi` that is running (found by those labels, never Compose's: the launcher blanks the three `com.docker.compose.*` labels the image carries) is read with `docker inspect`: a tmpfs at the Pi dir with those options, each of the same destinations mounted read-only, every value of `serviceEnvironment("archon")`, and no published port. The detail names the container.
 
-**Why.** These are the Global Constraints' Archon and Pi settings (spec §9.2: Archon's server has no auth and must listen on loopback; §9.3: `PI_OFFLINE=1` is critical, and the agent dir is read-only).
+**Why.** These are the Global Constraints' Archon and Pi settings (spec §9.3: `PI_OFFLINE=1` is critical, and a worker must not rewrite its own model pins; design §6a items 2 and 3: a writable `/.archon/.env` would override the environment). Archon's server no longer runs in the stack, so nothing listens (H-197).
 
-**Credential.** None: `docker inspect`.
+**Credential.** None: the checkout, and `docker inspect`.
 
-**Fix.** A missing or different value means the container wasn't started from `stack/compose.yaml` as committed: restore the file and run `mise run up`. The detail names the variable and the value policy sets, never the running one.
+**Fix.** The run container is `stack/compose.yaml`'s `archon` service as `src/run/spec.ts` translates it: restore both, then `mise run up` builds the image. A live run that differs was not made by the launcher as committed: `hapi run stop <id>`, then fix the cause.
 
-**Skip.** The stack isn't running, archon isn't running, or Docker isn't available.
+**Skip.** Never: the definition needs only the checkout. With Docker unavailable, or no run live, the detail says no live run container was checked.
 
 ### runtime.hermes-no-yolo
 
@@ -110,7 +113,7 @@ Without the stack and without `--repo`, as on a development machine, most checks
 
 ### runtime.dev-override
 
-**Verifies.** The labels `hapi stack up` puts on every container: `org.hapi.dev-override=0` and `org.hapi.started-by=hapi` on every running one. `1` is the dev bypass (`HAPI_ALLOW_CURRENT_USER=1`); `unknown` or an empty value means a stack not started through `hapi stack up` (a raw `docker compose up`), never "no bypass". It also fails when this shell itself sets the bypass as a user other than hapi (`currentUserOverride`, `src/stack/up.ts`), since `mise run up` from it would run the stack as that user. It reads only the Docker of the user running the audit (`docker ps` on whatever daemon that user's CLI reaches). Run as hapi, as documented, it never sees a bypass stack on the operator's own Docker: it catches one only when it runs as the user who started it (H-193).
+**Verifies.** The labels `hapi stack up` puts on every container, and the launcher on every run container: `org.hapi.dev-override=0` and `org.hapi.started-by=hapi` on every running one, the stack's and each live run's (labelled `org.hapi.run` and `org.hapi.project=hapi`). `1` is the dev bypass (`HAPI_ALLOW_CURRENT_USER=1`); `unknown` or an empty value means a stack not started through `hapi stack up` (a raw `docker compose up`), never "no bypass". It also fails when this shell itself sets the bypass as a user other than hapi (`currentUserOverride`, `src/stack/up.ts`), since `mise run up` from it would run the stack as that user. It reads only the Docker of the user running the audit (`docker ps` on whatever daemon that user's CLI reaches). Run as hapi, as documented, it never sees a bypass stack on the operator's own Docker: it catches one only when it runs as the user who started it (H-193).
 
 **Why.** The bypass is a dev-only downgrade: no dedicated user and no rootless Docker (spec §4.3, §11.3). It must never pass a normal audit.
 
@@ -119,6 +122,18 @@ Without the stack and without `--repo`, as on a development machine, most checks
 **Fix.** Stop the stack (`mise run down`) and start it with `mise run up` as hapi, without `HAPI_ALLOW_CURRENT_USER` ([the dev bypass](runbooks/stack.md#the-dev-bypass-hapi_allow_current_user1)).
 
 **Skip.** The stack isn't running or Docker isn't available, and this shell sets no bypass. With `--dev`, a bypass is a skip saying what was found.
+
+### policy.budget-enforcement
+
+**Verifies.** In `policy/budgets.yaml`, `enforcement.hapi_guard` and `enforcement.archon` are not both `soft`: at least one enforcer of `run_usd` is `hard`, so something stops a run at its target instead of flagging it and letting it finish.
+
+**Why.** Design §3.5: `run_usd` is a target, and a soft enforcer only reports. With both soft, a run can spend without limit. A repo overlay may harden a mode, never soften it, so only central policy can fail this.
+
+**Credential.** None: policy/.
+
+**Fix.** Set one of the two to `hard` in `policy/budgets.yaml`, in a PR; then `mise run up`.
+
+**Skip.** Never.
 
 ### pins.versions
 
@@ -136,14 +151,16 @@ How a `RUN` is read: BuildKit's leading flags (`--mount=…`, `--network=…`, `
 
 ### tools.archon-validate
 
-**Verifies.** Archon's own reading of the deployed `archon/config.yaml` and Pi dir, in the image the stack runs:
+**Verifies.** Archon's own reading of the deployed `archon/config.yaml` and Pi dir, and of the shipped workflow pack, in the image the stack runs:
 - `archon validate workflows --json` reports no error and **no parse warning**. Archon only warns about a key it doesn't know (an `unknown key ... will be ignored` parse warning) and drops it, and exits 0, so the audit treats a parse warning as a failure. Its other warnings are listed in the detail.
 - `archon ai alias list --json` and `ai tier list --json` show every generated alias and tier with its `effective` binding equal to the generated one: the `@<role>-retry` names, the bare claude-provider model ids and the `{provider, model, effort}` syntax are read as generated (H-030). A binding Archon refuses fails the whole run with Archon's error.
-- Each of the three commands exits 0. One that exits non-zero fails, named (`archon validate workflows --json exited 1`), even if what it printed reads as clean.
+- **The `assistants` read-back (H-152).** Archon's own `loadConfig` (`/app/packages/core/src/config/config-loader.ts`), run with `bun -e` over the mounted config, prints `assistants.pi.enableExtensions`, and it must be `true`. hapi-guard is a Pi extension, and Archon 0.12.1 only defaults the setting on, so a config it didn't read as written (or one that dropped the key) would leave a run unguarded. A read-back of `false`, `undefined` or nothing fails.
+- **The pack.** The shipped workflow pack (`archon/workflows/hapi`) is bound read-only at `/.archon/workflows/hapi`, where a run finds it, so `validate workflows` covers it; and the audit fails on any node of it with `pi.enableExtensions: false`, which would drop hapi-guard from that step. A missing pack is a fail.
+- Each of the four commands (the three above and the read-back) exits 0. One that exits non-zero fails, named (`archon validate workflows --json exited 1`), even if what it printed reads as clean.
 
-It runs `docker run --rm --pull never --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true` as the image's user, with only the deployed config and Pi dir mounted read-only, the archon settings of `serviceEnvironment` and no secret, in a scratch git repo inside the container (Archon needs one). The image is the one `mise run up` built (`hapi-factory/archon:0.12.1`), or else `stack/archon/Dockerfile`'s pinned `FROM` if that is here. It never pulls, and never touches the running stack.
+It runs `docker run --rm --pull never --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true` as the image's user, with only the deployed config, Pi dir and the pack mounted read-only, the archon settings of `serviceEnvironment` and no secret, in a scratch git repo inside the container (Archon needs one). The image is the one `mise run up` built (`hapi-factory/archon:0.12.1`), or else `stack/archon/Dockerfile`'s pinned `FROM` if that is here. It never pulls, and never touches the running stack.
 
-**Why.** Spec §9.2: fail on parse warnings, since unknown keys are otherwise dropped silently. Review Focus 5: an upstream that ignores a generated key after an upgrade.
+**Why.** Spec §9.2: fail on parse warnings, since unknown keys are otherwise dropped silently. Review Focus 5: an upstream that ignores a generated key after an upgrade. Design §3.6 (H-152): the guard loads only if `enableExtensions` is on, in the config and in every node.
 
 **Credential.** None: no network, no secret.
 
@@ -309,7 +326,7 @@ On 2026-10-27, against the pinned images (`ghcr.io/coleam00/archon:0.12.1@sha256
 
 - **Spend limits** (spec §11.8 lists them with the audit): provider-side caps aren't read by any check (H-151).
 - **Live MCP surfaces:** `mcp.tool-hashes` compares the lock with a running server's surface once Plan 04 wires the fetch (H-101).
-- **Unknown top-level keys in Archon's config.yaml:** Archon 0.12.1 ignores them without a word, so `tools.archon-validate` can't see them; today the generated file holds only `tiers` and `aliases`, which Archon checks strictly (H-152).
+- **Unknown top-level keys in Archon's config.yaml:** Archon 0.12.1 ignores them without a word, so `tools.archon-validate` can't see them; today the generated file holds `assistants`, `tiers` and `aliases`, of which Archon checks the last two strictly and the audit reads `assistants.pi.enableExtensions` back (H-152).
 - **The audit in CI** (spec §11.8: "It runs in CI on hapi-factory"): `.github/workflows/ci.yml` is a protected path (H-154).
 - **Reusable workflows and other triggers:** `repo.ai-workflows` doesn't follow a job that calls a reusable workflow, or flag `workflow_run` (H-155).
 - **A job's default token:** a job with no `permissions` block, in a workflow with none, gets the repository's default GITHUB_TOKEN permissions (read and write under the permissive setting), which `repo.ai-workflows` doesn't read; such a job counts only through its expressions and its checkout. A read-only token (`read-all`, read scopes) doesn't count either, and neither does an action whose own `action.yml` defaults an input to `${{ github.token }}`, since the audit doesn't fetch the action (H-155).

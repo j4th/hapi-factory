@@ -56,9 +56,26 @@ export async function bundleEntry(entry: string, root: string): Promise<string> 
   return text;
 }
 
+const bundles = new Map<string, Promise<string>>();
+
+/**
+ * `bundleEntry`, worked out once per process for each (entry, root): the bundles don't depend on the roster, and
+ * the audit builds every roster. A bundle that fails is not kept, so the next build tries again.
+ */
+function bundleOnce(entry: string, root: string): Promise<string> {
+  const key = `${root}\0${entry}`;
+  let bundle = bundles.get(key);
+  if (bundle === undefined) {
+    bundle = bundleEntry(entry, root);
+    bundles.set(key, bundle);
+    bundle.catch(() => bundles.delete(key));
+  }
+  return bundle;
+}
+
 /** `files` plus the bundle of `entry` at `name`. */
 async function withBundle(files: Record<string, string>, name: string, entry: string): Promise<Record<string, string>> {
-  return { ...files, [name]: await bundleEntry(entry, REPO_ROOT) };
+  return { ...files, [name]: await bundleOnce(entry, REPO_ROOT) };
 }
 
 export const ROSTERS: readonly RosterName[] = ["budget", "anthropic", "portable"];

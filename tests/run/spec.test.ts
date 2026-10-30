@@ -38,6 +38,7 @@ describe("runArgs", () => {
       "docker", "run", "-d", "--pull", "never", "--name", N,
       "--label", `org.hapi.run=${ID}`, "--label", "org.hapi.project=hapi",
       "--label", "org.hapi.stack=hapi-factory", "--label", "org.hapi.started-by=hapi", "--label", "org.hapi.dev-override=0", "--label", `org.hapi.build-sha256=${digest}`,
+      "--label", "com.docker.compose.project=", "--label", "com.docker.compose.service=", "--label", "com.docker.compose.version=",
       "--user", "1001:1001", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", "--pids-limit", "2048", "--memory", "4g",
       "--log-driver", "json-file", "--log-opt", "max-size=10m", "--log-opt", "max-file=3", "--network", N,
       "--tmpfs", "/tmp:size=1g,uid=1001,gid=1001,mode=1777",
@@ -66,6 +67,13 @@ describe("runArgs", () => {
     const before = argv.find((a) => a.startsWith("org.hapi.build-sha256="));
     await Bun.write(join(f.deps.buildDir, "pi", "models.json"), '{"providers":{"edited":{}}}\n');
     expect(runArgs(await archon(), inputs(), f.deps, []).find((a) => a.startsWith("org.hapi.build-sha256="))).not.toBe(before);
+  });
+
+  test("the image's Compose labels are blanked, so compose-label tools never see a run as the archon service", async () => {
+    // The Compose-built image carries these three (docker image inspect hapi-factory/archon:0.12.1), and a container inherits its image's labels.
+    const argv = runArgs(await archon(), inputs(), fakeRun().deps, []);
+    for (const k of ["project", "service", "version"]) expect(argv).toContain(`com.docker.compose.${k}=`);
+    expect(argv.filter((a) => a.startsWith("com.docker.compose.")).every((a) => a.endsWith("="))).toBe(true);
   });
 
   test("test-project runs are named <project>-run-<id> and carry org.hapi.int", async () => {

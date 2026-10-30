@@ -15,7 +15,7 @@
  *   switches and the reaper find it, plus `org.hapi.int` for a test project;
  *   the stack's labels are computed as `up` computes them (who started it, the
  *   dev bypass, the build's digest), since the service's are Compose
- *   interpolations;
+ *   interpolations; and the image's `com.docker.compose.*` labels, blanked;
  * - its own internal network, which the launcher makes and joins
  *   `egress-archon` to under the alias the proxy variables name;
  * - tmpfs mounts for `$HOME`, `/.archon` and Pi's agent dir, so nothing a run
@@ -161,6 +161,14 @@ const LABEL_VALUES: Record<string, (d: Started) => string> = {
   "org.hapi.build-sha256": (d) => d.digest,
 };
 
+/**
+ * The Compose labels the archon image carries (`docker image inspect hapi-factory/archon:0.12.1`: the build leaves
+ * them on it), which a container inherits. Blank, so a live run is never the archon service of the Compose project
+ * `hapi` to `docker ps --filter label=com.docker.compose.project=hapi`, `compose ps` or the audit's stack
+ * checks; the audit finds runs by `org.hapi.run` and `org.hapi.project`.
+ */
+const COMPOSE_LABELS = ["com.docker.compose.project", "com.docker.compose.service", "com.docker.compose.version"];
+
 const isMap = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
 const strings = (v: unknown, key: string): string[] => {
   const list = typeof v === "string" ? [v] : v;
@@ -259,6 +267,7 @@ export function runArgs(
     "docker", "run", "-d", "--pull", "never", "--name", name,
     ...runLabels(d.project, r.runId),
     ...labels(service, { user: who.user, override: who.override, digest: buildInUse(d.buildDir) }),
+    ...COMPOSE_LABELS.flatMap((k) => ["--label", `${k}=`]),
     ...hardening(service),
     "--network", name,
     ...strings(service.tmpfs ?? [], "tmpfs").flatMap((t) => ["--tmpfs", t]),
