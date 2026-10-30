@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { KEY_PATTERNS } from "../../policy/decisions/write-gate";
 import { wrapText } from "../../src/guard/gates";
 import hapiGuard from "../../src/guard/index";
+import { redact, type Secrets } from "../../src/guard/secrets";
 import { assistant, cleanupAll, FAKE_ENV, FakePi, gatesOff, RUN_ID, setup } from "./harness";
 
 afterEach(cleanupAll);
@@ -216,6 +217,19 @@ test("a private key is redacted whole, from its BEGIN line to its END line, or t
   // Finding one still needs only the BEGIN line: a write that holds the block blocks.
   expect((await h.tool("write", { path: "notes.txt", content: `${begin}\n${body[0]}\n${end}\n` }))?.reason).toContain("secret: private-key");
   expect((await h.tool("bash", { command: `printf '%s' '${begin}'` }))?.reason).toContain("secret: private-key");
+});
+
+test("a private key is redacted before the other key formats, whose character classes could swallow its BEGIN marker", () => {
+  const none: Secrets = { values: [], anthropicKey: undefined, jevKey: undefined, unset: [] };
+  const body = Array.from({ length: 3 }, () => randomBytes(48).toString("base64"));
+  const block = ["-----BEGIN " + "RSA PRIVATE KEY-----", ...body, "-----END " + "RSA PRIVATE KEY-----"].join("\n");
+  // slack's [A-Za-z0-9-]{10,} would take `-----BEGIN`, and anthropic's [A-Za-z0-9_-]{20,} the dashes and `-----BEGIN`.
+  for (const prefix of ["xo" + "xb-", ["sk", "ant", "-".repeat(15)].join("-")]) {
+    const r = redact(`${prefix}${block}\nafter`, none);
+    for (const line of body) expect([prefix, r.text.includes(line)]).toEqual([prefix, false]);
+    expect(r.names).toContain("private-key");
+    expect(r.text.endsWith("[hapi: private-key redacted]\nafter")).toBe(true);
+  }
 });
 
 describe("a tool_result whose bookkeeping throws still returns its redaction (final review A-1)", () => {

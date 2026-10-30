@@ -90,12 +90,14 @@ export const NO_END_MARKER = "[hapi: private-key redacted to the end of the text
  * KEY_PATTERNS as redaction patterns, global, by the same names. `private-key` matches only a key's BEGIN line,
  * which is enough to find one (`findSecret`), but redacting that line alone would leave the key's body in the text,
  * so it is redacted as PRIVATE_KEY_BLOCK (ledger 168). That form lives here, not in policy/decisions/write-gate.ts,
- * which is under policy/**. Applied by `redactKeyFormats`, which `hapi run watch` shares (src/run/sanitize.ts).
+ * which is under policy/**. Applied by `redactKeyFormats`, which `hapi run watch` shares (src/run/sanitize.ts), in
+ * this order: `private-key` first, because another pattern's character class can swallow its BEGIN marker (slack's
+ * `[A-Za-z0-9-]{10,}` takes the `-----BEGIN` of `xoxb------BEGIN ...`), and the key's body would then go unredacted.
  */
 export const REDACT_PATTERNS: readonly { name: string; re: RegExp }[] = KEY_PATTERNS.map(({ name, re }) => ({
   name,
   re: name === "private-key" ? PRIVATE_KEY_BLOCK : new RegExp(re.source, `${re.flags.replace("g", "")}g`),
-}));
+})).sort((a, b) => Number(b.name === "private-key") - Number(a.name === "private-key"));
 
 /**
  * `text` with each REDACT_PATTERNS match replaced by `[hapi: <pattern name> redacted]`, or by NO_END_MARKER for a
