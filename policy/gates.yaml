@@ -2,8 +2,9 @@
 #
 # Level-6 gates (Plan 02): the screens Pi's hapi-guard runs on a worker's bash
 # calls and on what its tools return (Tasks 3 and 5). Central policy only: a repo
-# overlay can't name this file. A gate may be on only while flags.jev has a
-# classifier (jev enabled, or fallback haiku); otherwise loadPolicy refuses it.
+# overlay can't name this file. A gate may be on only while flags.jev.fallback is
+# haiku (Plan 02 has no other classifier for a repo that isn't public);
+# otherwise loadPolicy refuses it.
 bash_gate:
   enabled: true
   skip_commands: []     # argv prefixes that skip the screen, e.g. "git status"; empty screens every call
