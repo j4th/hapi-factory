@@ -31,7 +31,9 @@
  * - `before_provider_request`: rule 4's clamp and H-184's payload check;
  * - `message_end` and `turn_end`: the spend update, the ledger write, the stop.
  *
- * Every hook but tool_call fails the node by throwing (brief §2.9).
+ * Every hook but tool_call fails the node by throwing (brief §2.9). tool_result
+ * never throws, since a throw there would drop its redaction: it holds the error,
+ * and the next before_provider_headers or turn_end throws it.
  */
 import { lstatSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
@@ -44,7 +46,7 @@ import { DecisionLog, type Entry } from "./log";
 import { bindsThinking, BINDING_BETA, clamp, isPayload, modelProblem, pinOf } from "./model";
 import { checkWrite, protectedTable, realDir, type Roots } from "./paths";
 import type { ExtensionAPI, ExtensionContext, ToolCallEvent, ToolResultEvent, ToolResultEventResult } from "./pi-api";
-import { findSecret, redact, redactDeep, type Secrets, takeSecrets, withUnset } from "./secrets";
+import { findSecret, PATTERN_NAMES, redact, redactDeep, type Secrets, takeSecrets, withUnset } from "./secrets";
 import { checkShell } from "./shell";
 
 export interface GuardDeps {
@@ -139,6 +141,27 @@ function register(pi: ExtensionAPI, r: Ready, deps: GuardDeps): void {
   const table = protectedTable(s.protected_paths);
   let ledger: Ledger | undefined;
   let flagged = false;
+  /**
+   * The first error a tool_result caught. Pi keeps a result's original content
+   * when tool_result throws, so a throw there (a full /tmp failing the ledger
+   * save, say) would undo rule 6's redaction (final review A-1). The error is
+   * held instead: every later tool call blocks, and the next send or turn end
+   * throws it, which fails the node.
+   */
+  let deferred: { error: unknown } | undefined;
+  /** Run `f`, holding a throw in `deferred`. False if it threw. */
+  const defer = (f: () => void): boolean => {
+    try {
+      f();
+      return true;
+    } catch (error) {
+      deferred ??= { error };
+      return false;
+    }
+  };
+  const rethrow = () => {
+    if (deferred) throw deferred.error;
+  };
   /** Ledger files already logged as reset. */
   const reported = new Set<string>();
   /** Write a record, but never before session_start's: that one is always an attempt's first. */
@@ -242,6 +265,7 @@ function register(pi: ExtensionAPI, r: Ready, deps: GuardDeps): void {
       record({ event: "tool_call", decision: "allow", rule: "rules", reason: "no rule blocked it", tool });
       return undefined;
     };
+    if (deferred) return block({ rule: "deferred", reason: "an earlier tool result's bookkeeping failed, so the node fails at its next send" });
     if (!KNOWN_TOOLS.has(tool)) return block({ rule: "unknown-tool", reason: `${shown(tool)} is not a tool hapi-guard knows` });
     if (s.budgets.mode === "hard") {
       const { total } = spend(ctx);
@@ -323,20 +347,20 @@ function register(pi: ExtensionAPI, r: Ready, deps: GuardDeps): void {
     const names = new Set<string>();
     const content = event.content.map((part) => (part.type === "text" && typeof part.text === "string" ? { ...part, text: redactDeep(part.text, secrets, names) as string } : part));
     const structured = event.structuredContent === undefined ? undefined : redactDeep(event.structuredContent, secrets, names);
-    let changes: ToolResultEventResult | undefined;
-    if (names.size > 0) {
-      changes = { content, ...(event.structuredContent === undefined ? {} : { structuredContent: structured }) };
-      for (const name of [...names].sort()) {
-        record({ event: "tool_result", decision: "flag", rule: "secret-redacted", reason: `the result held the value of ${name}; the model sees it redacted`, tool, secret: name });
-      }
+    const changes: ToolResultEventResult | undefined =
+      names.size === 0 ? undefined : { content, ...(event.structuredContent === undefined ? {} : { structuredContent: structured }) };
+    // From here on nothing may throw, or the redaction is lost: `defer` holds the error for the next send.
+    for (const name of [...names].sort()) {
+      const held = PATTERN_NAMES.has(name) ? `a key shaped like ${name}` : `the value of ${name}`;
+      defer(() => record({ event: "tool_result", decision: "flag", rule: "secret-redacted", reason: `the result held ${held}; the model sees it redacted`, tool, secret: name }));
     }
-    if (!ledger) return changes;
-    account(ctx);
+    // Over a hard budget `account` throws: the result is then not screened, which would spend more.
+    if (!ledger || !defer(() => account(ctx))) return changes;
     if (!s.gates.result_screen.enabled || !(s.gates.result_screen.tools as string[]).includes(tool)) return changes;
     const text = content.flatMap((p) => (p.type === "text" && typeof p.text === "string" ? [p.text] : [])).join("\n");
     if (text.trim() === "") return changes;
     const res = await ask(resultScreen, text, options);
-    charge(ctx, res.costUsd);
+    defer(() => charge(ctx, res.costUsd));
     const wrap = res.verdict === "wrap" || res.verdict === "block";
     const decision = wrap ? "wrap" : res.verdict === "flag" ? "flag" : "allow";
     const reason = wrap
@@ -346,13 +370,14 @@ function register(pi: ExtensionAPI, r: Ready, deps: GuardDeps): void {
       : res.verdict === "flag"
         ? "the result screen flagged this result; it reaches the model as is"
         : "the result screen allowed this result";
-    record({ event: "gate", decision, rule: "result-screen", reason, tool, cost_usd: round(res.costUsd), classifier: classifierRecord(resultScreen, res) });
+    defer(() => record({ event: "gate", decision, rule: "result-screen", reason, tool, cost_usd: round(res.costUsd), classifier: classifierRecord(resultScreen, res) }));
     // structuredContent is left out, so Pi drops it: it would carry the unwrapped text.
     if (wrap) return { content: [{ type: "text", text: wrapText(text) }, ...content.filter((p) => p.type !== "text")] };
     return changes;
   });
 
   pi.on("before_provider_headers", (_event, ctx) => {
+    rethrow();
     started().countSend();
     account(ctx);
   });
@@ -360,7 +385,11 @@ function register(pi: ExtensionAPI, r: Ready, deps: GuardDeps): void {
   pi.on("before_provider_request", (event, ctx) => {
     started();
     const payload = event.payload;
-    if (!isPayload(payload)) return undefined;
+    if (!isPayload(payload)) {
+      const reason = "the provider payload is not an object";
+      record({ event: "provider_request", decision: "fail", rule: "payload", reason });
+      throw new Error(`hapi-guard: ${reason}; the node fails`);
+    }
     const found = pinOf(ctx.model, s);
     if ("problem" in found) {
       record({ event: "provider_request", decision: "fail", rule: "model-pin", reason: found.problem });
@@ -385,6 +414,7 @@ function register(pi: ExtensionAPI, r: Ready, deps: GuardDeps): void {
   });
 
   pi.on("turn_end", (_event, ctx) => {
+    rethrow();
     started();
     account(ctx);
   });

@@ -16,13 +16,14 @@
  *   dropped. `flag` logs it.
  *
  * What a gate sends is only its question's state (the command, or the result
- * text), scrubbed of the exact secret values rule 6 knows; decide() refuses a
- * state over `gates.max_state_chars` and returns the file's fallback. Jev is
- * asked only when run.json says the repo is public (design §3.4): the run file
- * is the launcher's, and no env variable can set it. Every call's cost goes to
- * the ledger (rule 3), and a classifier failure takes the file's fallback
- * (`block`, `wrap`), logged with `fallback: true`. Worst case a gate waits about
- * two minutes (Jev 30 s, then Haiku 30 s with two retries and backoff).
+ * text), scrubbed of the exact secret values rule 6 knows and of KEY_PATTERNS'
+ * key formats; decide() refuses a state over `gates.max_state_chars` and
+ * returns the file's fallback. Jev is asked only when run.json says the repo is
+ * public (design §3.4): the run file is the launcher's, and no env variable can
+ * set it. Every call's cost goes to the ledger (rule 3), and a classifier
+ * failure takes the file's fallback (`block`, `wrap`), logged with `fallback:
+ * true`. Worst case a gate waits about two minutes (Jev 30 s, then Haiku 30 s
+ * with two retries and backoff).
  */
 import bashGate from "../../policy/decisions/bash-gate";
 import resultScreen from "../../policy/decisions/result-screen";

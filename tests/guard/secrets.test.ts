@@ -5,11 +5,11 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { chmodSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { KEY_PATTERNS } from "../../policy/decisions/write-gate";
 import hapiGuard from "../../src/guard/index";
-import { cleanupAll, FAKE_ENV, FakePi, gatesOff, setup } from "./harness";
+import { assistant, cleanupAll, FAKE_ENV, FakePi, gatesOff, RUN_ID, setup } from "./harness";
 
 afterEach(cleanupAll);
 
@@ -160,4 +160,53 @@ test("tool_result text holding a secret value is redacted to [hapi: <NAME> redac
   const rec = h.log().at(-1);
   expect([rec.event, rec.decision, rec.rule, rec.secret]).toEqual(["tool_result", "flag", "secret-redacted", "ANTHROPIC_API_KEY"]);
   expect(await h.result("read", [{ type: "text", text: "nothing secret" }])).toBeUndefined();
+});
+
+test("a key-shaped string is redacted to [hapi: <pattern name> redacted], in tool results and records, and logged like a value", async () => {
+  const h = setup({ settings: gatesOff });
+  await h.start();
+  const token = SAMPLES["github-token"]!;
+  const aws = SAMPLES["aws-key-id"]!;
+  const r = await h.result("read", [{ type: "text", text: `GH=${token}\nAWS=${aws} ${FAKE_ENV.CLAUDE_API_KEY}` }], { structuredContent: { text: token } });
+  expect(r).toEqual({
+    content: [{ type: "text", text: "GH=[hapi: github-token redacted]\nAWS=[hapi: aws-key-id redacted] [hapi: CLAUDE_API_KEY redacted]" }],
+    structuredContent: { text: "[hapi: github-token redacted]" },
+  });
+  const recs = h.log().filter((x) => x.rule === "secret-redacted");
+  expect(recs.map((x) => [x.event, x.decision, x.secret, x.reason])).toEqual([
+    ["tool_result", "flag", "CLAUDE_API_KEY", "the result held the value of CLAUDE_API_KEY; the model sees it redacted"],
+    ["tool_result", "flag", "aws-key-id", "the result held a key shaped like aws-key-id; the model sees it redacted"],
+    ["tool_result", "flag", "github-token", "the result held a key shaped like github-token; the model sees it redacted"],
+  ]);
+  // A name the guard logs as given is scrubbed of a key shape too.
+  await h.tool(`tool-${token}`, {});
+  expect(readFileSync(join(h.out, "decisions.jsonl"), "utf8").includes(token)).toBe(false);
+});
+
+describe("a tool_result whose bookkeeping throws still returns its redaction (final review A-1)", () => {
+  test("an unwritable ledger: the result is redacted, and the next tool call, send and turn end fail", async () => {
+    const h = setup({ settings: gatesOff });
+    await h.start();
+    const dir = join(h.ledgerDir, RUN_ID);
+    chmodSync(dir, 0o500);
+    try {
+      const r = await h.result("bash", [{ type: "text", text: `ANTHROPIC_API_KEY=${FAKE_ENV.ANTHROPIC_API_KEY}` }]);
+      expect(r).toEqual({ content: [{ type: "text", text: "ANTHROPIC_API_KEY=[hapi: ANTHROPIC_API_KEY redacted]" }] });
+      expect((await h.tool("bash", { command: "ls" }))?.reason).toStartWith("hapi-guard: an earlier tool result's bookkeeping failed");
+      await expect(h.fire("before_provider_headers", { headers: {} })).rejects.toThrow("EACCES");
+      await expect(h.fire("turn_end", { turnIndex: 0, message: { role: "assistant" } })).rejects.toThrow("EACCES");
+    } finally {
+      chmodSync(dir, 0o700);
+    }
+  });
+
+  test("a spent hard budget: the result is redacted (and not screened), and the next send fails", async () => {
+    const h = setup({ run: (r) => (r.budget_usd = 0.01) });
+    await h.start();
+    h.entries.push(assistant(0.02));
+    const r = await h.result("read", [{ type: "text", text: `key ${FAKE_ENV.OPENCODE_API_KEY}` }]);
+    expect(r).toEqual({ content: [{ type: "text", text: "key [hapi: OPENCODE_API_KEY redacted]" }] });
+    expect(h.log().filter((x) => x.event === "gate")).toEqual([]);
+    await expect(h.fire("before_provider_headers", { headers: {} })).rejects.toThrow("the run's budget of $0.01 is spent ($0.02)");
+  });
 });

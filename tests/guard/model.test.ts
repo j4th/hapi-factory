@@ -135,6 +135,17 @@ describe("at before_provider_request", () => {
     expect(payload.max_tokens).toBe(64000);
   });
 
+  test("a payload that is not an object fails the node: it is never sent unchecked", async () => {
+    const h = setup({ settings: gatesOff });
+    await h.start();
+    for (const payload of [undefined, null, "text", [anthropicPayload()]]) {
+      await expect(h.fire("before_provider_request", { payload })).rejects.toThrow("hapi-guard: the provider payload is not an object; the node fails");
+    }
+    expect(h.log().filter((r) => r.decision === "fail").map((r) => [r.event, r.rule, r.reason])).toEqual(
+      Array(4).fill(["provider_request", "payload", "the provider payload is not an object"]),
+    );
+  });
+
   test("a model with no pin at request time fails", async () => {
     const h = setup({ settings: gatesOff });
     await h.start();

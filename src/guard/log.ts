@@ -11,7 +11,8 @@
  * finding 10), and fails a run in which a Pi attempt left no such record.
  *
  * A record names a secret, never its value: every string in it is scrubbed of
- * the exact values rule 6 knows before it is written. A classifier record holds
+ * the exact values rule 6 knows, and of KEY_PATTERNS' key formats, before it is
+ * written. A classifier record holds
  * its answers (probabilities and confidence), never the state it was shown.
  * OTel spans come later with the observability profile; the fields are theirs.
  */

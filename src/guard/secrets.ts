@@ -6,8 +6,9 @@
  * checked for the exact value of every secret the guard was started with and
  * for KEY_PATTERNS' key formats. A match blocks, and the decision log names the
  * secret or the pattern, never the value. Tool results are redacted to
- * `[hapi: <NAME> redacted]` before the model sees them, and every log record,
- * block reason and classifier state is scrubbed the same way. Values shorter
+ * `[hapi: <NAME> redacted]` (or `[hapi: <pattern name> redacted]` for a key
+ * format) before the model sees them, and every log record, block reason and
+ * classifier state is scrubbed the same way. Values shorter
  * than MIN_SECRET_CHARS aren't matched: no key is that short, and matching one
  * would block ordinary text. Encoded forms (base64, split strings) aren't seen.
  *
@@ -68,7 +69,15 @@ export function findSecret(text: string, s: Secrets): { name: string; exact: boo
   return undefined;
 }
 
-/** The text with every exact value replaced by `[hapi: <NAME> redacted]`, and the names found. */
+/** KEY_PATTERNS' names, which never clash with an env name (those are upper case). */
+export const PATTERN_NAMES: ReadonlySet<string> = new Set(KEY_PATTERNS.map((k) => k.name));
+const GLOBAL_PATTERNS = KEY_PATTERNS.map(({ name, re }) => ({ name, re: new RegExp(re.source, `${re.flags.replace("g", "")}g`) }));
+
+/**
+ * The text with every exact value replaced by `[hapi: <NAME> redacted]`, then
+ * every KEY_PATTERNS match by `[hapi: <pattern name> redacted]`, and the names
+ * found: a key in a repo file the worker reads is not sent on to a classifier.
+ */
 export function redact(text: string, s: Secrets): { text: string; names: string[] } {
   const names: string[] = [];
   let out = text;
@@ -76,6 +85,12 @@ export function redact(text: string, s: Secrets): { text: string; names: string[
     if (!out.includes(value)) continue;
     names.push(name);
     out = out.split(value).join(`[hapi: ${name} redacted]`);
+  }
+  for (const { name, re } of GLOBAL_PATTERNS) {
+    const next = out.replace(re, `[hapi: ${name} redacted]`);
+    if (next === out) continue;
+    names.push(name);
+    out = next;
   }
   return { text: out, names };
 }
