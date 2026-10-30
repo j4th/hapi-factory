@@ -211,7 +211,7 @@ Once this branch has landed on `main`, and before the first run. Each step runs 
 
 The first run that spends real money, and the one that shows hapi-guard, the egress proxy and copy-out working together on hapi's rootless Docker. Spike 07 and spike 08 ran everything on a developer's own Docker with fakes or no network; this check settles what they left unverified.
 
-**Cost.** A few cents of Anthropic credit for Run A (one Haiku 5.5 node at low effort, capped at $0.25 by the work order and the workflow), a fraction of a cent for Run B (capped at $0.0001, so it stops after its first request), and, if Jev answers the bash gate, a few tenths of a cent of OpenRouter credit. If a command here is not what you expected, stop and do not retry: every run is capped, but each retry spends again.
+**Cost.** A few cents of Anthropic credit for Run A (one Haiku 5.5 node at low effort, capped at $0.25 by the work order and the workflow), a fraction of a cent for Run B (capped at $0.0001, so it stops after its first request), about as much as Run A for Run C (the same node, and its gates' Haiku calls, a fraction of a cent, also on Anthropic credit), and, if Jev answers Run A's bash gate, a few tenths of a cent of OpenRouter credit. If a command here is not what you expected, stop and do not retry: every run is capped, but each retry spends again.
 
 **Before you start**, the rollout above is done (steps 1 to 3, so hapi's checkout has this branch, `mise run setup` has run, and `mise run up` has brought the stack up) and `hapi run list` shows no live run. `jq` must be installed on the host. Every block runs **on the host, from your own terminal, as yourself**, handing one script to hapi's `sh`, as above. The runs' files are under `${XDG_STATE_HOME:-~/.local/state}/hapi/runs/<run-id>/` in hapi's home.
 
@@ -255,7 +255,7 @@ sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
   hapi-run watch 0123456789ab
 ```
 
-Expected: the container's log, then the stored transcript and how the run ended. **The status may be `succeeded` or `failed`, as the model's reply goes** (it was told to overwrite a file it can't, so it may say so and stop). What passes the check is the guard's records, in step 4, not the status. Then list it:
+Expected: the container's log, then the stored transcript and how the run ended. **The status may be `succeeded` or `failed`, as the model's reply goes** (it was told to overwrite a file it can't, so it may say so and stop). What passes the check is the guard's records, in step 5, not the status. Then list it:
 
 ```bash
 sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
@@ -281,9 +281,23 @@ sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
 
 Expected: a run id, `<run-b>`, **not** a refusal as a duplicate. Follow it with `watch` as above; it must end `failed`.
 
-### 4. Read the guard's records
+### 4. Run C, a run that isn't public
 
-Both commands print fields hapi-guard chose (events, rule names, decisions, the classifier's name, route and cost), never the `reason` text or a tool's input, which can hold what the run wrote. Run each for `<run-a>` and for `<run-b>`; the filter is the argument in single quotes and the run id the last word.
+Runs A and B are `--public`, so Jev answers their gates, and Haiku only if Jev fails. A run that isn't public, Plan 03's default for a private repo, has only Haiku. Run C's work order (`0003-check-guard-private`) is Run A's with an id of its own, so its run key is new, and it is started **without `--public`**, so both gates go through Haiku. Start it once Run B has ended (one live run per repo):
+
+```bash
+sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
+  export XDG_RUNTIME_DIR PATH="$HOME/.local/bin:$PATH"; \
+  cd "$HOME/hapi-factory" && exec mise run hapi -- run start \
+  --repo "$HOME/hapi-check-repo.git" \
+  --work-order archon/checks/work-order-private.yaml'
+```
+
+Expected: a run id, `<run-c>`, **not** a refusal as a duplicate. Follow it with `watch` and `list` as for Run A. Its status, too, may be `succeeded` or `failed`.
+
+### 5. Read the guard's records
+
+These commands print fields hapi-guard chose (events, rule names, decisions, the classifier's name, route and cost), never the `reason` text or a tool's input, which can hold what the run wrote. Run each for `<run-a>`, `<run-b>` and `<run-c>`: each run's records are in its own directory, `runs/<run-id>/out/`. The filter is the argument in single quotes and the run id the last word.
 
 The decision log, one line per record, tab-separated: event, rule, decision, tool, then for a gate the classifier's decision file, `via`, `fallback` and cost:
 
@@ -331,7 +345,9 @@ Then the cost line, `SPEND` in `list` and a `succeeded` or `failed` status as ab
 
 **Run B.** `run start` printed a run id, and the run is expected to end `failed`. **The pass line is the decision log's `budget  run-budget  fail`** (possibly after earlier `tool_call  run-budget  block` lines, the same rule refusing tool calls). The node's failure carries the hard-stop message, `hapi-guard: the run's budget of $0.0001 is spent ($<spent>); the node fails (budgets.enforcement.hapi_guard: hard)`, after about one request, and the second `grep -c` should print `1` or more. If the run ends `succeeded`, or that count is `0`, record it and report it: it is unverified that a throw from `message_end`, `turn_end` or `before_provider_headers` surfaces its text in the transcript, so it is a finding for Plan 02, not an operator error. Only a missing `budget  run-budget  fail` line is a failed check.
 
-**Both runs.** Every Pi attempt has a `session_start` record. The run's status is not `failed` with a `reason` that starts `guard did not run in node` (see Troubleshooting): that check is the same fact, made by finalize. Run B ends `failed` for the budget, so its `reason` is hapi's check or Archon's status, never `guard did not run`.
+**Run C.** The same lines as Run A, but on the bash-gate line the classifier's columns must say Haiku answered as the first choice: `gate  bash-gate  allow  bash  <decision> haiku false <cost>`. That shows Haiku's request (thinking disabled, `output_config.effort: low`, a JSON schema format), the Anthropic key and the proxy's route to the API all work. A result-screen line, if there is one, says `haiku false` too. **A `via` of `default`, or a `fallback` of `true`, is a failure to fix before merge**: no classifier answered, so every run of a private repo would block every bash call and wrap every result.
+
+**Every run.** Every Pi attempt has a `session_start` record. The run's status is not `failed` with a `reason` that starts `guard did not run in node` (see Troubleshooting): that check is the same fact, made by finalize. Run B ends `failed` for the budget, so its `reason` is hapi's check or Archon's status, never `guard did not run`.
 
 ### What it settles
 
@@ -342,6 +358,7 @@ Then the cost line, `SPEND` in `list` and a `succeeded` or `failed` status as ab
 | Copy-out on hapi's rootless Docker (spike 07, finding 14) | `ls -l` shows `result.json`, `transcript.jsonl` and `decisions.jsonl` (and no `run.bundle`: the worker never committed), each `-rw-------` and owned by hapi. |
 | The real Squid behind the `egress-archon` alias (spike 07, finding 13) | Run A's node got a model reply through the proxy: a cost source is printed and `SPEND` is not `-`. A refusal would show as a node error in `watch`. |
 | The live model's pins equal the catalog (spike 08) | `session_start  session-start  allow` for every attempt, with no `model-pin` line. |
+| The Haiku classifier's request, which every run of a private repo depends on (`src/decide/haiku.ts`: thinking disabled, low effort, a JSON schema format, through the zone's proxy) | Run C's bash-gate line: `via` `haiku`, `fallback` `false`, and a cost. `via` `default` (or `fallback` `true`) means the request, the key or the route failed: a failure to fix before merge. |
 | The Jev model id (`~typesafe/jev-latest`) against the `hapi-jev` guardrail | On the bash-gate line, `via` is `jev` and `fallback` is `false`: the guardrail passed the id, and the gate's cost is in the last column. `via` `haiku` with `fallback` `true` means the guardrail refused the id (or Jev was unavailable): record which. `via` `default` means no classifier answered, and the gate blocked. |
 | `meta.cost.source` | The printed `source` value: `provider` is the model's own usage, anything else says Pi estimated it. |
 
@@ -349,7 +366,7 @@ Record the output of each command and the values the table asks for. They are wh
 
 ### Clean up
 
-The check leaves two runs' directories (they stay, by [retention](#retention)), the repo and its working copy in hapi's home. Remove the repos once you have what you need; `rm -rf` here acts only on hapi's own files, as hapi:
+The check leaves three runs' directories (they stay, by [retention](#retention)), the repo and its working copy in hapi's home. Remove the repos once you have what you need; `rm -rf` here acts only on hapi's own files, as hapi:
 
 ```bash
 sudo -u hapi -H -- sh -c 'rm -rf "$HOME/hapi-check-work" "$HOME/hapi-check-repo.git"'

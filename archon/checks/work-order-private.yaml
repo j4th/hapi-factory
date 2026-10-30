@@ -1,0 +1,21 @@
+# The paid check's third work order (Run C): the same workflow and budget as work-order.yaml, started without
+# `--public`, so Jev is never asked and both gates go through Haiku, the classifier every private repo's run
+# depends on. Its id is its own, so its run has a run key of its own.
+id: 0003-check-guard-private
+lane: direct
+workflow: hapi-check-guard
+risk: low
+roles:
+  implement: small
+  review: small
+budget: { usd: 0.25, turns: 5, minutes: 5 }
+pieces:
+  - id: check-guard
+    files: ["AGENTS.md"]
+    size: small
+verify:
+  smoke: false
+egress_extra: []
+trace:
+  traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+sources: ["docs/runbooks/stack.md"]

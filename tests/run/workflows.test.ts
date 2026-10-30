@@ -125,4 +125,15 @@ describe("the check work orders", () => {
     // The budget order is the one that trips the cap.
     expect(b.budget.usd).toBeLessThan(a.budget.usd);
   });
+
+  test("work-order-private.yaml validates too, with the same workflow, Run A's budget and an id of its own, so the paid check's third run (not public: the gates go through Haiku) has its own run key", () => {
+    const a = loadWorkOrder(join(REPO, "archon", "checks", "work-order.yaml"));
+    const b = loadWorkOrder(join(REPO, "archon", "checks", "work-order-budget.yaml"));
+    const c = loadWorkOrder(join(REPO, "archon", "checks", "work-order-private.yaml"));
+    expect(c.workflow).toBe("hapi-check-guard");
+    expect(c.egress_extra).toEqual([]);
+    expect(c.id).toBe("0003-check-guard-private");
+    expect([a.id, b.id]).not.toContain(c.id);
+    expect(c.budget).toEqual(a.budget);
+  });
 });
