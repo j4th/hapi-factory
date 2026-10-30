@@ -28,14 +28,33 @@ while kill -0 "$pid" 2>/dev/null; do wait "$pid" || rc=$?; done
 # From here on, nothing may abort: a failed, stopped or timed-out run still leaves what it can. Each failure
 # is noted on stderr (the launcher's live view is `docker logs`).
 set +e
+# The bundle first, so what the worker committed is exactly what it is. Then the strip: the worker could write
+# the clone, and the CLI calls below read the repo's .archon (config, env) from it, so the three steering
+# directories go before any Archon call. A commit that holds them is in the bundle, where the host's diff gate sees it.
+head=$(git -C /work/repo rev-parse HEAD) || echo "prelude: no HEAD" >&2
+if [ "$head" != "$2" ]; then git -C /work/repo bundle create /out/run.bundle "$2..HEAD" || echo "prelude: bundle failed" >&2; fi
+rm -rf /work/repo/.archon /work/repo/.pi /work/repo/.agents || echo "prelude: strip failed" >&2
 CLI="bun --no-env-file /app/packages/cli/src/cli.ts"
 runs=$($CLI workflow runs --json --cwd /work/repo) || echo "prelude: workflow runs failed" >&2
 id=$(printf '%s' "$runs" | jq -r '.runs[0].id // empty') || echo "prelude: no run id" >&2
-run=$($CLI workflow get "$id" --json --verbose --cwd /work/repo) || echo "prelude: workflow get failed" >&2
+run=null
+if printf '%s' "$id" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+  run=$($CLI workflow get "$id" --json --verbose --cwd /work/repo) || echo "prelude: workflow get failed" >&2
+else
+  echo "prelude: run id is not a run id, no workflow get" >&2
+fi
 printf '{"runs":%s,"run":%s}\n' "${runs:-null}" "${run:-null}" > /out/result.json || echo "prelude: result.json failed" >&2
-# The transcript is where `workflow get` says it is: its path depends on how the workflow was registered.
+# The transcript is where `workflow get` says it is (its path depends on how the workflow was registered), but
+# that path comes from state the worker could write, so it is copied only if it is this run's own log: a regular
+# file, no link anywhere in its path, at /.archon/workspaces/<...>/logs/<run id>.jsonl.
 tp=$(printf '%s' "$run" | jq -r '.transcript_path // empty') || echo "prelude: no transcript path" >&2
-if [ -n "$tp" ]; then cp "$tp" /out/transcript.jsonl || echo "prelude: transcript copy failed" >&2; fi
-head=$(git -C /work/repo rev-parse HEAD) || echo "prelude: no HEAD" >&2
-if [ "$head" != "$2" ]; then git -C /work/repo bundle create /out/run.bundle "$2..HEAD" || echo "prelude: bundle failed" >&2; fi
+if [ -n "$tp" ]; then
+  real=$(realpath "$tp" 2>/dev/null)
+  case "$real" in
+    /.archon/workspaces/*/logs/"$id".jsonl)
+      if [ "$real" = "$tp" ] && [ -f "$real" ] && [ ! -L "$real" ]; then cp "$real" /out/transcript.jsonl || echo "prelude: transcript copy failed" >&2
+      else echo "prelude: transcript path is not a plain file of this run, not copied" >&2; fi ;;
+    *) echo "prelude: transcript path is outside this run's logs, not copied" >&2 ;;
+  esac
+fi
 exit "$rc"

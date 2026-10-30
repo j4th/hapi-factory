@@ -5,7 +5,7 @@
  * the temp dir, everything else (git, the sparse strip, the trap, the post-run steps) is the script's own.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { REPO } from "../stack/helpers";
 import { cleanup, tempDir } from "../secrets/helpers";
@@ -76,6 +76,14 @@ describe("the text of run.sh", () => {
     expect(after.filter((l) => l.includes(">&2")).length).toBeGreaterThanOrEqual(4);
   });
 
+  test("after the workflow: the bundle, then the strip of .archon/.pi/.agents, then the read-back, then the validated transcript copy", () => {
+    const at = (needle: string) => text.indexOf(needle);
+    const order = [at("bundle create"), at("rm -rf /work/repo/.archon /work/repo/.pi /work/repo/.agents"), at("workflow runs --json"), at("workflow get"), at("cp \"$real\"")];
+    expect(order.every((n) => n > 0)).toBe(true);
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+    expect(text).toContain("realpath");
+  });
+
   test("it writes result.json, the transcript from workflow get's transcript_path, and the bundle only if HEAD moved; and never the launcher's run.json", () => {
     expect(text).toContain("/out/result.json");
     expect(text).toContain("/out/transcript.jsonl");
@@ -111,7 +119,8 @@ function sandbox() {
   const sha = git(seed, "rev-parse", "HEAD");
   git(root, "clone", "-q", "--bare", seed, join(root, "src.git"));
   const script = text
-    .replace("mkdir -p /.archon/workspaces /.archon/worktrees", `mkdir -p ${root}/archon/workspaces ${root}/archon/worktrees`)
+    .replaceAll("/.archon/workspaces", `${root}/archon/workspaces`)
+    .replace("/.archon/worktrees", `${root}/archon/worktrees`)
     .replaceAll("/src/repo.git", `${root}/src.git`)
     .replaceAll("/work/repo", `${root}/work/repo`)
     .replaceAll("/out/", `${root}/out/`)
@@ -132,24 +141,35 @@ case "$1 $2" in
     trap 'echo got-term > "${root}/state/term"; kill "$s" 2>/dev/null; exit 143' TERM
     sleep 30 & s=$!; wait "$s"
   fi
+  if [ -n "$FAKE_PLANT" ]; then
+    mkdir -p "${root}/work/repo/.archon" "${root}/work/repo/.pi" "${root}/work/repo/.agents"
+    echo "planted: true" > "${root}/work/repo/.archon/config.yaml"
+  fi
   if [ -n "$FAKE_COMMIT" ]; then
     (cd "${root}/work/repo" && echo more >> README.md && git -c user.name=t -c user.email=t@example.invalid commit -qam B)
   fi
   exit "\${FAKE_RC:-0}" ;;
-"workflow runs") echo '{"runs":[{"id":"run-1","status":"failed"}],"total":1}' ;;
-"workflow get") [ -n "$FAKE_GET_FAILS" ] && exit 1; echo '{"status":"failed","transcript_path":"${root}/state/transcript.jsonl"}' ;;
+"workflow runs")
+  if [ -e "${root}/work/repo/.archon" ] || [ -e "${root}/work/repo/.pi" ] || [ -e "${root}/work/repo/.agents" ]; then echo present > "${root}/state/readback.saw-dirs"; fi
+  echo '{"runs":[{"id":"5299f3cc-f79d-43a2-98a9-a14cca1818c6","status":"failed"}],"total":1}' ;;
+"workflow get") [ -n "$FAKE_GET_FAILS" ] && exit 1; printf '{"status":"failed","transcript_path":"%s"}\n' "\${FAKE_TP:-${root}/archon/workspaces/_local/repo/logs/5299f3cc-f79d-43a2-98a9-a14cca1818c6.jsonl}" ;;
 esac
 `,
     { mode: 0o755 },
   );
-  writeFileSync(join(root, "state", "transcript.jsonl"), '{"type":"node_start"}\n');
+  writeFileSync(join(root, "state", "outside.jsonl"), "outside\n");
+  const RUN_ID = "5299f3cc-f79d-43a2-98a9-a14cca1818c6";
+  const logs = join(root, "archon", "workspaces", "_local", "repo", "logs");
+  mkdirSync(logs, { recursive: true });
+  const transcript = join(logs, `${RUN_ID}.jsonl`);
+  writeFileSync(transcript, '{"type":"node_start"}\n');
   const start = (env: Record<string, string> = {}) =>
     Bun.spawn(["sh", file, "hapi-check-run", sha, "0001-wo", "00-aaaa-bbbb-01"], {
       env: { PATH: `${bin}:${process.env.PATH}`, HOME: root, ...env },
       stdout: "pipe",
       stderr: "pipe",
     });
-  return { root, sha, start };
+  return { root, sha, start, transcript, logs, RUN_ID };
 }
 
 describe.skipIf(!HAVE_JQ)("run.sh, run on a sandbox with a stand-in Archon CLI", () => {
@@ -172,7 +192,7 @@ describe.skipIf(!HAVE_JQ)("run.sh, run on a sandbox with a stand-in Archon CLI",
     );
     const result = JSON.parse(readFileSync(join(s.root, "out", "result.json"), "utf8"));
     expect(Object.keys(result)).toEqual(["runs", "run"]);
-    expect(result.runs.runs[0].id).toBe("run-1");
+    expect(result.runs.runs[0].id).toBe(s.RUN_ID);
     expect(result.run.status).toBe("failed");
     expect(readFileSync(join(s.root, "out", "transcript.jsonl"), "utf8")).toBe('{"type":"node_start"}\n');
     expect(existsSync(join(s.root, "out", "run.bundle"))).toBe(false);
@@ -205,6 +225,74 @@ describe.skipIf(!HAVE_JQ)("run.sh, run on a sandbox with a stand-in Archon CLI",
     expect(result.run).toBeNull();
     expect(result.runs.total).toBe(1);
     expect(existsSync(join(s.root, "out", "transcript.jsonl"))).toBe(false);
+  });
+
+  test("before any Archon read-back, the repo's .archon, .pi and .agents are gone (a worker-planted config is never loaded), and the bundle was made first", async () => {
+    const s = sandbox();
+    const p = s.start({ FAKE_PLANT: "1", FAKE_COMMIT: "1" });
+    expect(await p.exited).toBe(0);
+    const clone = join(s.root, "work", "repo");
+    for (const d of [".archon", ".pi", ".agents"]) expect([d, existsSync(join(clone, d))]).toEqual([d, false]);
+    expect(existsSync(join(s.root, "state", "readback.saw-dirs"))).toBe(false);
+    expect(existsSync(join(s.root, "out", "run.bundle"))).toBe(true);
+  });
+
+  describe("the transcript path comes from state the worker can write, so only this run's own log is copied", () => {
+    const copied = (s: ReturnType<typeof sandbox>) => existsSync(join(s.root, "out", "transcript.jsonl"));
+
+    test("a plain file at .../logs/<run id>.jsonl is copied", async () => {
+      const s = sandbox();
+      const p = s.start();
+      expect(await p.exited).toBe(0);
+      expect(copied(s)).toBe(true);
+      expect(await new Response(p.stderr).text()).not.toContain("transcript path");
+    });
+
+    test("a symlink at the right name is not copied, nor is a file reached through a linked directory", async () => {
+      const s = sandbox();
+      rmSync(s.transcript);
+      symlinkSync(join(s.root, "state", "outside.jsonl"), s.transcript);
+      const p = s.start();
+      expect(await p.exited).toBe(0);
+      expect(copied(s)).toBe(false);
+      expect(await new Response(p.stderr).text()).toContain("transcript path");
+      const t = sandbox();
+      const other = join(t.root, "elsewhere");
+      mkdirSync(other);
+      writeFileSync(join(other, `${t.RUN_ID}.jsonl`), "x\n");
+      const via = join(t.root, "archon", "workspaces", "_local", "link-logs");
+      symlinkSync(other, via);
+      const q = t.start({ FAKE_TP: join(via, `${t.RUN_ID}.jsonl`) });
+      expect(await q.exited).toBe(0);
+      expect(copied(t)).toBe(false);
+    });
+
+    test("/proc/self/environ and a file outside /.archon/workspaces are not copied", async () => {
+      for (const tp of ["/proc/self/environ", "/etc/passwd"]) {
+        const s = sandbox();
+        const p = s.start({ FAKE_TP: tp });
+        expect(await p.exited).toBe(0);
+        expect([tp, copied(s)]).toEqual([tp, false]);
+        expect(await new Response(p.stderr).text()).toContain("outside this run's logs");
+      }
+      const s = sandbox();
+      const p = s.start({ FAKE_TP: join(s.root, "state", "outside.jsonl") });
+      expect(await p.exited).toBe(0);
+      expect(copied(s)).toBe(false);
+    });
+
+    test("a log of another run, or outside a logs/ directory, is not copied", async () => {
+      for (const where of ["other-run", "not-logs"]) {
+        const s = sandbox();
+        const state = join(s.root, "archon", "workspaces", "_local", "repo", "state");
+        mkdirSync(state, { recursive: true });
+        const tp = where === "other-run" ? join(s.logs, "00000000-0000-0000-0000-000000000000.jsonl") : join(state, `${s.RUN_ID}.jsonl`);
+        writeFileSync(tp, "x\n");
+        const p = s.start({ FAKE_TP: tp });
+        expect(await p.exited).toBe(0);
+        expect([where, copied(s)]).toEqual([where, false]);
+      }
+    });
   });
 
   test("TERM reaches the workflow's process, and the outputs are still written", async () => {
