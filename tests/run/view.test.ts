@@ -5,7 +5,7 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { main } from "../../src/cli";
 import { reapRuns } from "../../src/run/lifecycle";
@@ -15,7 +15,7 @@ import { redactSecrets, sanitizeTerminal } from "../../src/run/sanitize";
 import { runList, runWatch, transcriptLines } from "../../src/run/view";
 import { capture, cleanup } from "../secrets/helpers";
 import { treeSnapshot } from "../stack/helpers";
-import { fakeRun, fakeSecret, NOW, seedRun, writeArchonEnv } from "./helpers";
+import { fakeRun, fakeSecret, NOW, seedRun, writeZoneEnv } from "./helpers";
 
 afterEach(cleanup);
 
@@ -34,7 +34,7 @@ const githubLike = () => "gh" + "p_" + pick(ALNUM, 36);
 function ready(o: Parameters<typeof fakeRun>[0] = {}) {
   const f = fakeRun(o);
   const secret = fakeSecret("ANTHROPIC_API_KEY");
-  writeArchonEnv(f.xdg, { ANTHROPIC_API_KEY: secret });
+  writeZoneEnv(f.xdg, "archon", { ANTHROPIC_API_KEY: secret });
   return { ...f, secret };
 }
 
@@ -58,6 +58,13 @@ describe("sanitizeTerminal", () => {
     expect(sanitizeTerminal(text)).toBe("ared b c d ef ");
     expect(sanitizeTerminal(`x${ESC}`)).toBe("x");
     expect(sanitizeTerminal("plain text: [node] Started, 100% done; tabs\tand ünïcödé")).toBe("plain text: [node] Started, 100% done; tabs\tand ünïcödé");
+  });
+
+  test("the bidi embedding, override and isolate controls go (H-220, Trojan Source): U+202A–202E and U+2066–2069; other text stays", () => {
+    const controls = [0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069].map((c) => String.fromCodePoint(c));
+    expect(sanitizeTerminal(`run ab12cd34ef56: ${controls.join("")}deliaf${controls[2]} ok`)).toBe("run ab12cd34ef56: deliaf ok");
+    // Their neighbours stay: U+2029 and U+206A are not among them, nor is right-to-left text itself.
+    expect(sanitizeTerminal("a\u2029b\u206ac שלום")).toBe("a\u2029b\u206ac שלום");
   });
 });
 
@@ -152,10 +159,10 @@ describe("hapi run watch", () => {
     };
     expect(await runWatch([ID], f.deps)).toBe(0);
     expect(out).toEqual([
-      "[probe] Started",
-      "",
-      "token [hapi: ANTHROPIC_API_KEY redacted] and [hapi: anthropic redacted]",
-      "[probe] exec_output exit 0: saw [hapi: ANTHROPIC_API_KEY redacted]",
+      "| [probe] Started",
+      "|",
+      "| token [hapi: ANTHROPIC_API_KEY redacted] and [hapi: anthropic redacted]",
+      "| [probe] exec_output exit 0: saw [hapi: ANTHROPIC_API_KEY redacted]",
       `run ${ID}: succeeded`,
     ]);
     expect(out.join("\n")).not.toContain(f.secret);
@@ -180,12 +187,12 @@ describe("hapi run watch", () => {
     };
     expect(await runWatch([ID], f.deps)).toBe(0);
     expect(out).toEqual([
-      "[probe] Started",
-      `key: ${NO_END}`,
+      "| [probe] Started",
+      `| key: ${NO_END}`,
       HIDDEN,
-      "after the key",
-      '{"private_key": "[hapi: private-key redacted]\\n"}',
-      NO_END,
+      "| after the key",
+      '| {"private_key": "[hapi: private-key redacted]\\n"}',
+      `| ${NO_END}`,
       HIDDEN,
       "(no transcript.jsonl was copied out)",
       `run ${ID}: succeeded`,
@@ -206,7 +213,7 @@ describe("hapi run watch", () => {
     const started = performance.now();
     expect(await runWatch([ID], f.deps)).toBe(0);
     expect(performance.now() - started).toBeLessThan(1000);
-    expect(out.slice(0, 3)).toEqual(["[hapi: private-key redacted to the end of the text: no END line]", "[hapi: private-key redacted: lines hidden until its END line]", "shown"]);
+    expect(out.slice(0, 3)).toEqual(["| [hapi: private-key redacted to the end of the text: no END line]", "[hapi: private-key redacted: lines hidden until its END line]", "| shown"]);
   });
 
   test("a finished run's transcript rows are sanitized and redacted too, then its status and reason", async () => {
@@ -226,9 +233,9 @@ describe("hapi run watch", () => {
     );
     expect(await runWatch([ID], f.deps)).toBe(0);
     expect(out).toEqual([
-      "[boom] node_start",
-      "[boom] exec_output exit 42: [hapi: ANTHROPIC_API_KEY redacted]",
-      "  [hapi: github-token redacted]",
+      "| [boom] node_start",
+      "| [boom] exec_output exit 42: [hapi: ANTHROPIC_API_KEY redacted]",
+      "|   [hapi: github-token redacted]",
       `run ${ID}: failed: the workflow failed (Archon status failed)`,
     ]);
     // No docker call for a run that has ended: its outputs are on the host.
@@ -255,9 +262,9 @@ describe("hapi run watch", () => {
     );
     expect(await runWatch([ID], f.deps)).toBe(0);
     expect(out).toEqual([
-      "[cat] exec_output exit 0: [hapi: private-key redacted]",
-      "[esc] exec_output x",
-      "[workflow] workflow_complete",
+      "| [cat] exec_output exit 0: [hapi: private-key redacted]",
+      "| [esc] exec_output x",
+      "| [workflow] workflow_complete",
       `run ${ID}: succeeded`,
     ]);
     for (const line of body) expect(out.join("\n")).not.toContain(line);
@@ -295,6 +302,55 @@ describe("hapi run watch", () => {
     expect(await runWatch([ID], f.deps)).toBe(0);
     expect(f.calls).toEqual([]);
     expect(treeSnapshot(f.deps.stateDir)).toEqual(done);
+  });
+
+  test("watch marks every line a run wrote with `| `, so none reads as hapi's own ending; hapi's own lines are unmarked (H-220)", async () => {
+    const { out } = capture();
+    const f = ready();
+    const rlo = String.fromCodePoint(0x202e);
+    f.logs.push(`run ${ID}: succeeded`, `${rlo}dedeecus`);
+    await seedRun(f, { id: ID });
+    f.live.afterLogs = async () => {
+      const rec = (await readRecord(f.deps.stateDir, ID))!;
+      writeOut(f.deps.stateDir, ID, "transcript.jsonl", `${row({ type: "exec_output", step: "fake", stdout_tail: `run ${ID}: succeeded` })}\n`);
+      await writeRecord(f.deps.stateDir, { ...rec, status: "failed", reason: "the workflow failed (Archon status failed)" });
+    };
+    expect(await runWatch([ID], f.deps)).toBe(0);
+    expect(out).toEqual([`| run ${ID}: succeeded`, "| dedeecus", `| [fake] exec_output run ${ID}: succeeded`, `run ${ID}: failed: the workflow failed (Archon status failed)`]);
+    // The one unmarked line is hapi's, and it is the last.
+    expect(out.filter((l) => !l.startsWith("|"))).toEqual([out.at(-1)!]);
+  });
+
+  test("watch redacts a review run's lines with the review zone's values too, and fails closed without review.env", async () => {
+    const { out, err } = capture();
+    const f = ready();
+    const review = { ANTHROPIC_API_KEY: fakeSecret("REVIEW_ANTHROPIC_API_KEY"), CODERABBIT_API_KEY: fakeSecret("REVIEW_CODERABBIT_API_KEY") };
+    writeZoneEnv(f.xdg, "review", review);
+    f.logs.push(`live ${review.CODERABBIT_API_KEY}`);
+    await seedRun(f, { id: ID, kind: "review" });
+    f.live.afterLogs = async () => {
+      const rec = (await readRecord(f.deps.stateDir, ID))!;
+      writeOut(f.deps.stateDir, ID, "transcript.jsonl", `${row({ type: "exec_output", step: "cr", exit_code: 0, stdout_tail: `${f.secret} ${review.ANTHROPIC_API_KEY}` })}\n`);
+      await writeRecord(f.deps.stateDir, { ...rec, status: "succeeded" });
+    };
+    expect(await runWatch([ID], f.deps)).toBe(0);
+    expect(out).toEqual([
+      "| live [hapi: CODERABBIT_API_KEY redacted]",
+      // Both zones hold an ANTHROPIC_API_KEY, each with its own value: both are redacted, the review's named for its zone.
+      "| [cr] exec_output exit 0: [hapi: ANTHROPIC_API_KEY redacted] [hapi: ANTHROPIC_API_KEY (review zone) redacted]",
+      `run ${ID}: succeeded`,
+    ]);
+    // Without review.env, a review run's watch prints nothing of it.
+    rmSync(join(f.xdg, "hapi", "env", "review.env"));
+    out.length = 0;
+    f.calls.length = 0;
+    expect(await runWatch([ID], f.deps)).toBe(1);
+    expect(out).toEqual([]);
+    expect(err.at(-1)).toBe(`hapi run watch: ${join(f.xdg, "hapi", "env", "review.env")} is missing: run \`mise run up\` first`);
+    expect(f.calls).toEqual([]);
+    // A worker's watch needs only the archon zone's file.
+    await seedRun(f, { id: "bbbbbbbbbbbb", status: "succeeded", objects: false });
+    expect(await runWatch(["bbbbbbbbbbbb"], f.deps)).toBe(0);
   });
 
   test("watch fails closed: with no archon env file to redact with, it prints nothing of the run", async () => {

@@ -12,7 +12,7 @@ import { runAudit } from "../../src/audit/index";
 import { diskProblem, GIB } from "../../src/run/disk";
 import { RUN_DISK } from "../../src/run/locks";
 import * as spec from "../../src/run/spec";
-import { cleanup, cleanWorld, type Container, DOCKER_ROOT, goodDisks, only, REPO, runContainer, tempDir } from "./helpers";
+import { cleanup, cleanWorld, type Container, DOCKER_ROOT, goodDisks, type Kind, only, REPO, REVIEW_ZONE_KEYS, runContainer, tempDir } from "./helpers";
 
 afterEach(cleanup);
 
@@ -45,6 +45,8 @@ describe("runtime.run-container", () => {
     expect(r.status).toBe("pass");
     expect(r.detail).toContain("/opt/hapi/pi-agent");
     expect(r.detail).toContain("no live run container was checked");
+    // Every kind's definition is checked, each with its own prelude and proxy.
+    expect(r.detail).toContain("for each of the 4 run kinds (worker, verify, review and fix)");
   });
 
   test("a spec that drops the Pi dir's tmpfs fails, naming it", async () => {
@@ -204,6 +206,128 @@ describe("runtime.run-container", () => {
     expect(r.status).toBe("fail");
     expect(r.detail).toContain("hapi-run-ab12cd34ef56: its stop timeout is Docker's default, not 30");
     expect(r.detail).toContain("hapi-run-0123456789ab: its stop timeout is 10, not 30");
+  });
+
+  describe("the kinds (design §3.5)", () => {
+    const KINDS: Kind[] = ["worker", "verify", "review", "fix"];
+    /** A key-shaped value, built at run time so no scanner sees a key in the source. */
+    const VALUE = ["fake", "audit", "zone", "key", "0123456789"].join("-");
+
+    test("each live container is held to its own kind's definition; one without org.hapi.kind is held to the worker's, and an unknown kind fails", async () => {
+      const w = await cleanWorld();
+      w.containers.push(runContainer(w), ...KINDS.map((kind, i) => runContainer(w, `aaaaaaaaaaa${i}`, { kind })));
+      const r = await check(w, "runtime.run-container");
+      expect([r.status, r.detail]).toEqual(["pass", expect.stringContaining("5 live run containers are as their kind's definition says")]);
+
+      const v = await cleanWorld();
+      // A worker's container that says it is a verify's; a review's that says nothing (so it is held to the worker's); a kind that isn't one.
+      v.containers.push(
+        runContainer(v, "aaaaaaaaaaaa", { labels: { "org.hapi.kind": "verify" } }),
+        (() => {
+          const c = runContainer(v, "bbbbbbbbbbbb", { kind: "review" });
+          delete c.Config.Labels["org.hapi.kind"];
+          return c;
+        })(),
+        runContainer(v, "cccccccccccc", { labels: { "org.hapi.kind": "build" } }),
+        runContainer(v, "dddddddddddd", { kind: "fix" }),
+      );
+      const bad = await check(v, "runtime.run-container");
+      expect(bad.status).toBe("fail");
+      for (const part of [
+        "hapi-run-aaaaaaaaaaaa: nothing is mounted at /opt/hapi/verify.sh",
+        "/opt/hapi/run.sh is mounted but the run definition has no such mount",
+        "it runs sh /opt/hapi/run.sh hapi-check-run, not sh /opt/hapi/verify.sh factory-verify",
+        "hapi-run-bbbbbbbbbbbb: nothing is mounted at /opt/hapi/run.sh",
+        "/run/hapi/inputs is mounted but the run definition has no such mount",
+        "HTTP_PROXY is not http://egress-archon:3128",
+        "hapi-run-cccccccccccc: carries org.hapi.kind=build, which is no run kind",
+      ]) expect([part, bad.detail.includes(part)]).toEqual([part, true]);
+      expect(bad.detail).not.toContain("hapi-run-dddddddddddd");
+      // A label value that isn't plain is not shown.
+      const u = await cleanWorld();
+      u.containers.push(runContainer(u, "aaaaaaaaaaaa", { labels: { "org.hapi.kind": "x\u001b[2Jy" } }));
+      expect((await check(u, "runtime.run-container")).detail).toContain("carries org.hapi.kind=(a value that is not shown), which is no run kind");
+    });
+
+    test("a live verify container holding any key fails, naming the variable, never its value; one whose proxy isn't egress-archon's fails as an env mismatch", async () => {
+      const w = await cleanWorld();
+      const live = runContainer(w, "aaaaaaaaaaaa", { kind: "verify" });
+      for (const name of ["ANTHROPIC_API_KEY", "BRAVE_SEARCH_API_KEY", "HAPI_FACTORY_APP_PRIVATE_KEY"]) setEnv(live, name, VALUE);
+      w.containers.push(live);
+      const r = await check(w, "runtime.run-container");
+      expect(r.status).toBe("fail");
+      for (const name of ["ANTHROPIC_API_KEY", "BRAVE_SEARCH_API_KEY", "HAPI_FACTORY_APP_PRIVATE_KEY"]) expect(r.detail).toContain(`${name} is set: a verify container holds no key`);
+      expect(r.detail).not.toContain(VALUE);
+      // Its own environment holds no key: git's config pairs are no zone's names (spike 09, T19: the check must not match GIT_CONFIG_KEY_<n>).
+      const clean = await cleanWorld();
+      const plain = runContainer(clean, "aaaaaaaaaaaa", { kind: "verify" });
+      expect(plain.Config.Env.some((e) => e.startsWith("GIT_CONFIG_KEY_0="))).toBe(true);
+      clean.containers.push(plain);
+      expect((await check(clean, "runtime.run-container")).status).toBe("pass");
+      // Its proxy is the archon zone's: the review zone's is an env mismatch.
+      const p = await cleanWorld();
+      const proxied = runContainer(p, "aaaaaaaaaaaa", { kind: "verify" });
+      setEnv(proxied, "HTTPS_PROXY", "http://egress-review:3128");
+      p.containers.push(proxied);
+      expect((await check(p, "runtime.run-container")).detail).toContain("hapi-run-aaaaaaaaaaaa: HTTPS_PROXY is not http://egress-archon:3128");
+    });
+
+    test("a live review container carrying an archon-zone key fails, and one holding only the review zone's keys passes", async () => {
+      expect(REVIEW_ZONE_KEYS).toEqual(["ANTHROPIC_API_KEY", "CLAUDE_API_KEY", "CODERABBIT_API_KEY"]);
+      const w = await cleanWorld();
+      const ok = runContainer(w, "aaaaaaaaaaaa", { kind: "review" });
+      for (const name of ["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"]) setEnv(ok, name, VALUE);
+      w.containers.push(ok);
+      expect((await check(w, "runtime.run-container")).status).toBe("pass");
+      const v = await cleanWorld();
+      const bad = runContainer(v, "aaaaaaaaaaaa", { kind: "review" });
+      for (const name of ["ANTHROPIC_API_KEY", "OPENCODE_API_KEY"]) setEnv(bad, name, VALUE);
+      v.containers.push(bad);
+      const r = await check(v, "runtime.run-container");
+      expect(r.status).toBe("fail");
+      expect(r.detail).toContain("OPENCODE_API_KEY is set: a review container holds only its zone's keys");
+      expect(r.detail).not.toContain("ANTHROPIC_API_KEY is set");
+      expect(r.detail).not.toContain(VALUE);
+      // A worker holds the archon zone's keys, and none of another zone's: CodeRabbit's is the review zone's, Slack's Hermes's.
+      const x = await cleanWorld();
+      const worker = runContainer(x, "aaaaaaaaaaaa", { kind: "worker" });
+      for (const name of ["ANTHROPIC_API_KEY", "CLAUDE_API_KEY", "OPENCODE_API_KEY", "HAPI_JEV_OPENROUTER_API_KEY"]) setEnv(worker, name, VALUE);
+      const fix = runContainer(x, "bbbbbbbbbbbb", { kind: "fix" });
+      for (const name of ["CODERABBIT_API_KEY", "SLACK_BOT_TOKEN"]) setEnv(fix, name, VALUE);
+      x.containers.push(worker, fix);
+      const y = await check(x, "runtime.run-container");
+      expect(y.detail).not.toContain("hapi-run-aaaaaaaaaaaa");
+      for (const name of ["CODERABBIT_API_KEY", "SLACK_BOT_TOKEN"]) expect(y.detail).toContain(`${name} is set: a fix container holds only its zone's keys`);
+    });
+
+    test("with no zoneKeys in its context, the zones are stack/secrets.yaml's: until the review zone is there, a review container holding a key fails", async () => {
+      const w = await cleanWorld();
+      delete w.ctx.zoneKeys;
+      const review = runContainer(w, "aaaaaaaaaaaa", { kind: "review" });
+      setEnv(review, "ANTHROPIC_API_KEY", VALUE);
+      const worker = runContainer(w, "bbbbbbbbbbbb", { kind: "worker" });
+      setEnv(worker, "OPENCODE_API_KEY", VALUE);
+      w.containers.push(review, worker);
+      const r = await check(w, "runtime.run-container");
+      expect(r.detail).toContain("hapi-run-aaaaaaaaaaaa: ANTHROPIC_API_KEY is set: a review container holds only its zone's keys");
+      expect(r.detail).not.toContain("hapi-run-bbbbbbbbbbbb");
+    });
+
+    test("every kind's run definition is checked: an inputs bind, a kind label or a review proxy dropped fails, naming the kind", async () => {
+      let r = await withSpec(without("-v", (v) => v.endsWith(":/run/hapi/inputs:ro")));
+      expect(r.status).toBe("fail");
+      expect(r.detail).toContain("review: nothing is bound at /run/hapi/inputs");
+      expect(r.detail).toContain("fix: nothing is bound at /run/hapi/inputs");
+      expect(r.detail).not.toMatch(/(worker|verify): nothing is bound at \/run\/hapi\/inputs/);
+      r = await withSpec(without("--label", (v) => v.startsWith("org.hapi.kind=")));
+      for (const k of KINDS) expect(r.detail).toContain(`${k}: it does not label its container org.hapi.kind=${k}`);
+      r = await withSpec((argv) => argv.map((a) => a.replace("egress-review", "egress-archon")));
+      expect(r.detail).toContain("review: HTTP_PROXY is not http://egress-review:3128");
+      expect(r.detail).not.toContain("worker:");
+      // A verify definition that binds a secret by name: verify holds no key.
+      r = await withSpec((argv) => (argv.includes("/opt/hapi/verify.sh") ? [...argv.slice(0, argv.indexOf("-w")), "-e", "ANTHROPIC_API_KEY", ...argv.slice(argv.indexOf("-w"))] : argv));
+      expect(r.detail).toContain("verify: it passes ANTHROPIC_API_KEY, a key, to a container that holds none");
+    });
   });
 
   test("a stopped run container is not checked", async () => {

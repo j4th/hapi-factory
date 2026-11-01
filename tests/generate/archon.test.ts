@@ -25,6 +25,7 @@ test("RUN_PATHS holds the run container's fixed paths", () => {
     pack: "/.archon/workflows/hapi",
     order: "/run/hapi/order.json",
     task: "/run/hapi/task.md",
+    inputs: "/run/hapi/inputs",
   });
   expect(RUN_PATHS.piDir).toBe(PI_AGENT_DIR);
   // The host's copies of the work order and its task text, beside run.json: Task 11's nodes and prompts read them, never the clone's order.yaml.
@@ -34,6 +35,10 @@ test("RUN_PATHS holds the run container's fixed paths", () => {
   // A run of Plan 03 also says its kind, round, turn budget and base commit.
   const engine: RunFile = { ...run, kind: "fix", round: 1, turns: 10, base: "a".repeat(40) };
   expect(Object.keys(engine)).toHaveLength(11);
+  // A review's or fix's inputs dir (Plan 03 Task 8), beside run.json; a review's run file says whether CodeRabbit's step runs.
+  expect(RUN_PATHS.inputs).toBe("/run/hapi/inputs");
+  const review: RunFile = { ...engine, kind: "review", round: 0, coderabbit: false };
+  expect(Object.keys(review)).toHaveLength(12);
 });
 
 test("config.yaml holds assistants.pi.enableExtensions: true for every roster (H-181(b))", () => {

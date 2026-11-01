@@ -4,15 +4,21 @@
  *
  * - runtime.run-container: there is no long-lived archon container (a run is a
  *   fresh container the launcher makes, src/run/spec.ts), so the check's subject
- *   is the run definition: `runArgs` for a sample run must give Pi's agent dir
- *   a tmpfs, bind every host file (build/'s generated ones and the run's own
- *   guard settings and run config, /.archon/.env, empty, the workflow pack, the
- *   prelude, the run file, the work order and its task text, and the source
- *   repo) read-only, carry every value of `serviceEnvironment("archon")`,
- *   publish no port (H-197), and carry every hardening flag and the stop
- *   timeout. Each live run container, found by its `org.hapi.run` and
- *   `org.hapi.project` labels (never by Compose's), is held to that argv through
- *   `docker inspect` (`liveProblems`).
+ *   is the run definition, one per run kind (src/run/kinds.ts; design §3.5):
+ *   `runArgs` for a sample run of each kind must give Pi's agent dir a tmpfs,
+ *   bind every host file (build/'s generated ones and the run's own guard
+ *   settings and run config, /.archon/.env, empty, the workflow pack, the kind's
+ *   prelude, the run file, the work order and its task text, the source repo,
+ *   a review's or fix's inputs dir, and the kind's extra binds) read-only,
+ *   carry every value of `serviceEnvironment("archon")` with the kind's proxy
+ *   (egress-review's for a review), label its container with its kind, run its
+ *   kind's prelude and workflow, publish no port (H-197), and carry every
+ *   hardening flag and the stop timeout. Each live run container, found by its
+ *   `org.hapi.run` and `org.hapi.project` labels (never by Compose's), is held
+ *   through `docker inspect` to the argv of its own `org.hapi.kind` (a worker's
+ *   when it has none; any other value fails), `liveProblems`, and to its kind's
+ *   command and keys, `kindProblems`: it holds only its kind's zone's keys, and
+ *   a verify none, named, never shown.
  * - runtime.hermes-no-yolo: Hermes's effective approval settings: no `--yolo`
  *   in its argv, no HERMES_YOLO_MODE or HERMES_YOLO in its env, HERMES_HOME
  *   where hapi puts it, and in the config mounted read-only at
@@ -42,13 +48,15 @@ import YAML from "yaml";
 import { RUN_PATHS } from "../../generate/archon";
 import { loadPolicy } from "../../policy/load";
 import { dataRootOf, diskProblem, GIB, probeFs } from "../../run/disk";
+import { KIND_LABEL, type KindProfile, kindProfile, proxyZoneOf, RUN_KINDS, type RunKind } from "../../run/kinds";
 import { RUN_DISK } from "../../run/locks";
 import { APP_HOME, APP_USER, NO_NEW_PRIVILEGES, runArgs, type RunInputs, STOP_GRACE_S } from "../../run/spec";
+import { loadManifest, MANIFEST_FILE, manifestEntries } from "../../secrets/manifest";
 import { composeServices } from "../../stack/compose";
-import { HERMES_HOME, serviceEnvironment } from "../../stack/env";
+import { HERMES_HOME, proxyEnv, serviceEnvironment } from "../../stack/env";
 import { currentUserOverride, HAPI_USER, PROJECT, runFilters } from "../../stack/up";
 import type { WorkOrder } from "../../workorder/validate";
-import { type AuditRun, type CheckResult, result } from "../types";
+import { type AuditContext, type AuditRun, type CheckResult, result } from "../types";
 import { freshBuilds } from "./generated";
 
 /** A container as `docker inspect` prints it (the fields the audit reads). */
@@ -141,49 +149,103 @@ async function running(run: AuditRun, id: string, service: string): Promise<Cont
 /** The tmpfs options Pi's agent dir gets (design §6a item 3): small, the appuser's, nobody else's. */
 const PI_TMPFS = "size=64m,uid=1001,gid=1001,mode=0700";
 
-/**
- * What the run container must have bound read-only, by destination: every host file runArgs binds (build/'s generated
- * files and the run's own `hapi-guard.json` and run config, /.archon/.env (empty, so Archon loads nothing over the
- * environment), the pack, the prelude, the run file, the host's copies of the work order and its task text, and the
- * source repo). The live check holds a container to runArgs' own output, so only this list catches a bind runArgs
- * drops (CodeRabbit, on PR #13 and locally).
- */
-const READ_ONLY_DESTINATIONS = [
-  `${RUN_PATHS.piDir}/models.json`,
-  `${RUN_PATHS.piDir}/models-store.json`,
-  `${RUN_PATHS.piDir}/hapi-guard.json`,
-  `${RUN_PATHS.piDir}/settings.json`,
-  `${RUN_PATHS.piDir}/extensions`,
-  "/.archon/config.yaml",
-  "/.archon/.env",
-  RUN_PATHS.pack,
-  "/opt/hapi/run-config.yaml",
-  `${APP_HOME}/.gitconfig`,
-  "/opt/hapi/run.sh",
-  RUN_PATHS.runFile,
-  RUN_PATHS.order,
-  RUN_PATHS.task,
-  RUN_PATHS.source,
-];
+/** The prelude a run container of `profile`'s kind runs, as its entrypoint's first argument. */
+const preludeOf = (profile: KindProfile) => `/opt/hapi/${profile.prelude}`;
 
-/** What a live container's `Config.Env` says, as problems against `serviceEnvironment("archon")`. */
-function envProblems(env: Map<string, string>): string[] {
+/**
+ * What a run container of `profile`'s kind must have bound read-only, by destination: every host file runArgs binds
+ * (build/'s generated files and the run's own `hapi-guard.json` and run config, /.archon/.env (empty, so Archon loads
+ * nothing over the environment), the pack, the kind's prelude, the run file, the host's copies of the work order and
+ * its task text, the source repo, a review's or fix's inputs dir, and each of the kind's extra binds). The live check
+ * holds a container to runArgs' own output, so only this list catches a bind runArgs drops (CodeRabbit, on PR #13 and
+ * locally).
+ */
+function readOnlyDestinations(profile: KindProfile, buildDir: string): string[] {
+  return [
+    `${RUN_PATHS.piDir}/models.json`,
+    `${RUN_PATHS.piDir}/models-store.json`,
+    `${RUN_PATHS.piDir}/hapi-guard.json`,
+    `${RUN_PATHS.piDir}/settings.json`,
+    `${RUN_PATHS.piDir}/extensions`,
+    "/.archon/config.yaml",
+    "/.archon/.env",
+    RUN_PATHS.pack,
+    "/opt/hapi/run-config.yaml",
+    `${APP_HOME}/.gitconfig`,
+    preludeOf(profile),
+    RUN_PATHS.runFile,
+    RUN_PATHS.order,
+    RUN_PATHS.task,
+    RUN_PATHS.source,
+    ...(profile.inputs ? [RUN_PATHS.inputs] : []),
+    ...profile.extraBinds({ buildDir }).map(([, dst]) => dst),
+  ];
+}
+
+/**
+ * The environment a run container of `profile`'s kind carries: `serviceEnvironment("archon")` (src/stack/env.ts, the
+ * code's own list, not the compose file's), with its kind's zone's proxy variables: the review zone's for a review.
+ */
+function kindEnvironment(profile: KindProfile): Map<string, string> {
+  return new Map(Object.entries({ ...serviceEnvironment("archon"), ...proxyEnv(proxyZoneOf(profile)) }));
+}
+
+/** What `env` says, as problems against `want`: each of its values, none missing. */
+function envProblems(env: Map<string, string>, want: Map<string, string>): string[] {
   const problems: string[] = [];
-  for (const [name, value] of Object.entries(serviceEnvironment("archon"))) {
+  for (const [name, value] of want) {
     if (!env.has(name)) problems.push(`${name} is not set`);
     else if (env.get(name) !== value) problems.push(`${name} is not ${value}`);
   }
   return problems;
 }
 
-/** The sample run `runArgs` is asked about: none of it reaches Docker. */
-function sampleInputs(packDir: string): RunInputs {
+/** A word a container's labels or command hold, shown only if it is plain enough. */
+const shown = (s: string) => (/^[A-Za-z0-9._/:@=+-]{1,200}$/.test(s) ? s : "(a value that is not shown)");
+
+/** Each zone's env names: the context's, or each zone of stack/secrets.yaml. */
+function zoneKeysOf(ctx: AuditContext): Record<string, string[]> {
+  if (ctx.zoneKeys !== undefined) return ctx.zoneKeys;
+  const out: Record<string, string[]> = {};
+  for (const e of manifestEntries(loadManifest(join(ctx.root, MANIFEST_FILE)))) (out[e.zone] ??= []).push(e.key);
+  return out;
+}
+
+/**
+ * The keys in `env` that a run container of `profile`'s kind may not hold, by name only, never a value: any env name
+ * some zone of `zoneKeys` holds is a key, and a container holds only its own zone's (design §3.5), a verify none.
+ * Names no zone holds aren't keys: the service's own environment, git's `GIT_CONFIG_KEY_<n>` pairs among them
+ * (spike 09, T19), and PATH.
+ */
+export function keyProblems(env: Iterable<string>, profile: KindProfile, zoneKeys: Record<string, string[]>): string[] {
+  const any = new Set(Object.values(zoneKeys).flat());
+  const own = new Set(profile.zone === undefined ? [] : (zoneKeys[profile.zone] ?? []));
+  const why = profile.zone === undefined ? `a ${profile.kind} container holds no key` : `a ${profile.kind} container holds only its zone's keys`;
+  return [...env].filter((name) => any.has(name) && !own.has(name)).sort().map((name) => `${name} is set: ${why}`);
+}
+
+/**
+ * How a live run container falls short of its kind beyond its mounts and environment: it must run its kind's prelude
+ * (`sh /opt/hapi/<prelude>`) and, for a verify or a review, its kind's workflow, and hold no key its kind's zone
+ * doesn't (`keyProblems`).
+ */
+export function kindProblems(c: Container, profile: KindProfile, zoneKeys: Record<string, string[]>): string[] {
+  const problems: string[] = [];
+  const want = ["sh", preludeOf(profile), ...(profile.workflow === undefined ? [] : [profile.workflow])];
+  const have = [c.Path ?? "", ...(c.Args ?? [])].slice(0, want.length);
+  if (want.some((w, i) => have[i] !== w)) problems.push(`it runs ${have.map(shown).join(" ")}, not ${want.join(" ")}`);
+  problems.push(...keyProblems(envOf(c).keys(), profile, zoneKeys));
+  return problems;
+}
+
+/** The sample run of `kind` that `runArgs` is asked about: none of it reaches Docker. */
+function sampleInputs(packDir: string, kind: RunKind): RunInputs {
   const traceparent = "00-00000000000000000000000000000001-0000000000000001-01";
   return {
     runId: "000000000000",
     repo: "/audit/sample/repo.git",
     sha: "0".repeat(40),
-    workOrder: { id: "audit-sample", workflow: "hapi-check-run", trace: { traceparent }, budget: { usd: 1, turns: 1, minutes: 1 } } as WorkOrder,
+    workOrder: { id: `audit-sample-${kind}`, workflow: "hapi-check-run", trace: { traceparent }, budget: { usd: 1, turns: 1, minutes: 1 } } as WorkOrder,
     public: false,
     budgetUsd: 1,
     packDir,
@@ -196,6 +258,12 @@ export interface RunShape {
   binds: Map<string, { src: string; ro: boolean }>;
   volumes: Set<string>;
   env: Map<string, string>;
+  /** The `-e NAME` entries: the secrets passed by name, their values left to the docker CLI. */
+  secretNames: string[];
+  labels: Map<string, string>;
+  /** `--entrypoint`, then what follows the image: the prelude and its arguments. */
+  entrypoint: string | undefined;
+  args: string[];
   capDrop: string[];
   readOnly: boolean;
   securityOpt: string[];
@@ -219,6 +287,10 @@ export function shapeOf(argv: string[]): RunShape {
     binds: new Map(),
     volumes: new Set(),
     env: new Map(after("-e").filter((e) => e.includes("=")).map((e) => [e.slice(0, e.indexOf("=")), e.slice(e.indexOf("=") + 1)] as [string, string])),
+    secretNames: after("-e").filter((e) => !e.includes("=")),
+    labels: new Map(after("--label").map((l) => (l.includes("=") ? [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)] : [l, ""]) as [string, string])),
+    entrypoint: after("--entrypoint")[0],
+    args: argv.includes("--entrypoint") ? argv.slice(argv.indexOf("--entrypoint") + 3) : [],
     capDrop: after("--cap-drop"),
     readOnly: argv.includes("--read-only"),
     securityOpt: after("--security-opt"),
@@ -238,20 +310,26 @@ export function shapeOf(argv: string[]): RunShape {
 }
 
 /**
- * How the run definition's `docker run` argv falls short of what a run container must be; empty if it doesn't: Pi's
- * tmpfs, every bind read-only, the default pack dir, the environment, no published port, every hardening flag
+ * How the run definition of `profile`'s kind falls short of what its run container must be; empty if it doesn't:
+ * Pi's tmpfs, every bind read-only and none of its kind's missing, the default pack dir, its kind's environment and
+ * label, its prelude and workflow, no key for a kind that holds none, no published port, every hardening flag
  * (`--cap-drop ALL`, `--read-only`, no-new-privileges, user 1001:1001, a pids and a memory limit) and the stop timeout.
  */
-function definitionProblems(want: RunShape, packDir: string): string[] {
+function definitionProblems(want: RunShape, packDir: string, profile: KindProfile, buildDir: string): string[] {
   const problems: string[] = [];
   const tmpfs = want.tmpfs.get(RUN_PATHS.piDir);
   if (tmpfs === undefined) problems.push(`no tmpfs at ${RUN_PATHS.piDir}`);
   else if (tmpfs !== PI_TMPFS) problems.push(`the tmpfs at ${RUN_PATHS.piDir} has options ${tmpfs}, not ${PI_TMPFS}`);
   for (const [dst, b] of want.binds) if (!b.ro) problems.push(`${dst} is not bound read-only`);
-  for (const dest of READ_ONLY_DESTINATIONS) if (!want.binds.has(dest)) problems.push(`nothing is bound at ${dest}`);
+  for (const dest of readOnlyDestinations(profile, buildDir)) if (!want.binds.has(dest)) problems.push(`nothing is bound at ${dest}`);
   const pack = want.binds.get(RUN_PATHS.pack);
   if (pack !== undefined && pack.src !== packDir) problems.push(`${RUN_PATHS.pack} is bound from ${pack.src}, not the default pack dir ${packDir}`);
-  problems.push(...envProblems(want.env));
+  problems.push(...envProblems(want.env, kindEnvironment(profile)));
+  if (want.labels.get(KIND_LABEL) !== profile.kind) problems.push(`it does not label its container ${KIND_LABEL}=${profile.kind}`);
+  const command = ["sh", preludeOf(profile), ...(profile.workflow === undefined ? [] : [profile.workflow])];
+  const has = [want.entrypoint ?? "", ...want.args].slice(0, command.length);
+  if (command.some((w, i) => has[i] !== w)) problems.push(`it runs ${has.join(" ") || "(no entrypoint)"}, not ${command.join(" ")}`);
+  if (profile.zone === undefined) for (const name of want.secretNames) problems.push(`it passes ${name}, a key, to a container that holds none`);
   if (want.ports) problems.push("it publishes a port (a run listens nowhere)");
   if (!want.capDrop.includes("ALL")) problems.push("it does not drop ALL capabilities");
   if (!want.readOnly) problems.push("its root filesystem is not read-only");
@@ -285,7 +363,7 @@ export function liveProblems(c: Container, want: RunShape, packDir: string): str
     else if (dest === RUN_PATHS.pack && m.Source !== packDir) problems.push(`${dest} is mounted from ${m.Source}, not the default pack dir ${packDir}`);
   }
   for (const m of mounts) if (m.Destination !== undefined && !want.binds.has(m.Destination) && !want.volumes.has(m.Destination)) problems.push(`${m.Destination} is mounted but the run definition has no such mount`);
-  problems.push(...envProblems(envOf(c)));
+  problems.push(...envProblems(envOf(c), want.env));
   if (Object.keys(c.HostConfig?.PortBindings ?? {}).length > 0) problems.push("it publishes a port (a run listens nowhere)");
   const h = c.HostConfig ?? {};
   for (const cap of want.capDrop) if (!(h.CapDrop ?? []).includes(cap)) problems.push(`it does not drop ${cap} capabilities`);
@@ -307,25 +385,55 @@ export async function runContainer(run: AuditRun): Promise<CheckResult[]> {
   if (service?.image === undefined) throw new Error("stack/compose.yaml has no archon service with an image: it is the run container's definition");
   const fresh = (await freshBuilds(run))[0]!;
   const packDir = join(ctx.root, "archon", "workflows", "hapi");
-  const argv = runArgs(service, sampleInputs(packDir), { project: PROJECT, image: service.image, root: ctx.root, buildDir: join(fresh.root, "build"), stateDir: "/audit/sample/state", user: ctx.user, env: ctx.env }, []);
-  const fix = "the run container's definition is stack/compose.yaml's archon service, translated by src/run/spec.ts: restore them";
-  const want = shapeOf(argv);
-  const static_ = definitionProblems(want, packDir);
+  const buildDir = join(fresh.root, "build");
+  const fix = "the run container's definition is stack/compose.yaml's archon service, translated by src/run/spec.ts for each kind's profile (src/run/kinds.ts): restore them";
+  // One definition per kind, each checked on its own.
+  const wants = new Map<RunKind, RunShape>();
+  const static_: string[] = [];
+  for (const kind of RUN_KINDS) {
+    const profile = kindProfile(kind);
+    const argv = runArgs(service, sampleInputs(packDir, kind), { project: PROJECT, image: service.image, root: ctx.root, buildDir, stateDir: "/audit/sample/state", user: ctx.user, env: ctx.env }, [], profile);
+    const want = shapeOf(argv);
+    const p = definitionProblems(want, packDir, profile, buildDir);
+    if (p.length > 0) static_.push(`${kind}: ${p.join("; ")}`);
+    wants.set(kind, want);
+  }
   if (static_.length > 0) return [result(id, "fail", `the run definition (runArgs, src/run/spec.ts): ${static_.join("; ")}. ${fix}`)];
 
   const runs = await runContainers(run);
   const live = "containers" in runs ? runs.containers.filter(isRunning) : [];
-  const bad = live.map((c) => [c, liveProblems(c, want, packDir)] as const).filter(([, p]) => p.length > 0);
+  const zoneKeys = zoneKeysOf(ctx);
+  const bad = live
+    .map((c) => {
+      // A container's kind is its label; a Plan 02 run container has none, and is a worker's.
+      const label = c.Config?.Labels?.[KIND_LABEL];
+      if (label !== undefined && !(RUN_KINDS as readonly string[]).includes(label)) return [c, [`carries ${KIND_LABEL}=${shown(label)}, which is no run kind`]] as const;
+      const kind = (label ?? "worker") as RunKind;
+      return [c, [...liveProblems(c, wants.get(kind)!, packDir), ...kindProblems(c, kindProfile(kind), zoneKeys)]] as const;
+    })
+    .filter(([, p]) => p.length > 0);
   if (bad.length > 0) {
-    return [result(id, "fail", `${bad.map(([c, p]) => `${containerName(c)}: ${p.join("; ")}`).join("; ")}. A live run container must be as the run definition says: stop it with \`hapi run stop <id>\`, then ${fix}`)];
+    return [
+      result(
+        id,
+        "fail",
+        `${bad.map(([c, p]) => `${containerName(c)}: ${p.join("; ")}`).join("; ")}. A live run container must be as its kind's run definition says, and hold only its kind's zone's keys: stop it with \`hapi run stop <id>\`, then ${fix}`,
+      ),
+    ];
   }
-  const checked = "unavailable" in runs ? `no live run container was checked (${runs.unavailable})` : live.length === 0 ? "no live run container was checked (none is running)" : `${live.length} live run containers are as it says`;
+  const checked =
+    "unavailable" in runs
+      ? `no live run container was checked (${runs.unavailable})`
+      : live.length === 0
+        ? "no live run container was checked (none is running)"
+        : `${live.length} live run containers are as their kind's definition says, each holding only its kind's zone's keys`;
   const nonProxy = Object.entries(serviceEnvironment("archon")).filter(([k]) => !/proxy/i.test(k)).length;
+  const binds = RUN_KINDS.map((k) => `${k} ${readOnlyDestinations(kindProfile(k), buildDir).length}`).join(", ");
   return [
     result(
       id,
       "pass",
-      `the run definition (runArgs, src/run/spec.ts) gives ${RUN_PATHS.piDir} a tmpfs (${PI_TMPFS}), binds all ${READ_ONLY_DESTINATIONS.length} host files (build/'s generated ones and the run's own guard settings and run config, /.archon/.env, the pack ${packDir}, the prelude, the run file, the work order and its task text, and the source repo) read-only, sets all ${Object.keys(serviceEnvironment("archon")).length} values of serviceEnvironment("archon") (${nonProxy} besides the proxy's), publishes no port, and has every hardening flag and a ${STOP_GRACE_S} s stop timeout; ${checked}`,
+      `the run definition (runArgs, src/run/spec.ts), for each of the ${RUN_KINDS.length} run kinds (${RUN_KINDS.join(", ").replace(/, ([^,]+)$/, " and $1")}), gives ${RUN_PATHS.piDir} a tmpfs (${PI_TMPFS}), binds every host file its kind has (${binds}: build/'s generated ones and the run's own guard settings and run config, /.archon/.env, the pack ${packDir}, its prelude, the run file, the work order and its task text, the source repo, and a review's or fix's inputs dir) read-only, sets all ${Object.keys(serviceEnvironment("archon")).length} values of serviceEnvironment("archon") (${nonProxy} besides the proxy's, which are egress-review's for a review), labels its container with its kind and runs its kind's prelude, passes no key to a verify, publishes no port, and has every hardening flag and a ${STOP_GRACE_S} s stop timeout; ${checked}`,
     ),
   ];
 }

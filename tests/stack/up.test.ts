@@ -505,15 +505,18 @@ describe("networkProblem (one network: a run's own, and each zone network)", () 
 const LABELS = (project: string) => ["--filter", `label=${RUN_LABEL}`, "--filter", `label=${PROJECT_LABEL}=${project}`];
 
 describe("removeRuns", () => {
-  test("removes the run containers, disconnects the egress proxy from each run network, removes the networks, then the volumes: the exact docker calls, in order", async () => {
+  test("with no egress named, removeRuns disconnects both proxies from every run network: it removes the run containers, disconnects egress-archon and egress-review from each run network, removes the networks, then the volumes: the exact docker calls, in order", async () => {
     const f = fakes({ runs: { containers: ["c1", "c2"], networks: ["hapi-run-1", "hapi-run-2"], volumes: ["hapi-run-1-work", "hapi-run-1-out"] } });
     await removeRuns("hapi", f.deps.run!, f.deps.env!);
     expect(f.calls.map((c) => c.cmd)).toEqual([
       ["docker", "ps", "-aq", ...LABELS("hapi")],
       ["docker", "rm", "-f", "c1", "c2"],
       ["docker", "network", "ls", "--format", "{{.Name}}", ...LABELS("hapi")],
+      // `down` doesn't know each network's kind: a review's joined egress-review, every other kind's egress-archon.
       ["docker", "network", "disconnect", "-f", "hapi-run-1", "hapi-egress-archon-1"],
+      ["docker", "network", "disconnect", "-f", "hapi-run-1", "hapi-egress-review-1"],
       ["docker", "network", "disconnect", "-f", "hapi-run-2", "hapi-egress-archon-1"],
+      ["docker", "network", "disconnect", "-f", "hapi-run-2", "hapi-egress-review-1"],
       ["docker", "network", "rm", "hapi-run-1", "hapi-run-2"],
       ["docker", "volume", "ls", "-q", ...LABELS("hapi")],
       ["docker", "volume", "rm", "hapi-run-1-work", "hapi-run-1-out"],
@@ -530,15 +533,17 @@ describe("removeRuns", () => {
     expect(calls.filter((c) => c[1] === "rm" || c[2] === "rm" || c[2] === "disconnect")).toEqual([
       ["docker", "rm", "-f", "c1"],
       ["docker", "network", "disconnect", "-f", "hapi-int-ab12cd34-run-9", "hapi-int-ab12cd34-egress-archon-1"],
+      ["docker", "network", "disconnect", "-f", "hapi-int-ab12cd34-run-9", "hapi-int-ab12cd34-egress-review-1"],
       ["docker", "network", "rm", "hapi-int-ab12cd34-run-9"],
       ["docker", "volume", "rm", "hapi-int-ab12cd34-run-9-out"],
     ]);
     expect(JSON.stringify(calls)).not.toContain('"hapi-egress-archon-1"');
+    expect(JSON.stringify(calls)).not.toContain('"hapi-egress-review-1"');
   });
 
-  test("with a run id and an egress container, it selects that one run's objects and disconnects that container", async () => {
+  test("with a run id and its egress containers, it selects that one run's objects and disconnects only those containers", async () => {
     const f = fakes({ runs: { containers: ["c1"], networks: ["hapi-run-ab12cd34ef56"], volumes: ["hapi-run-ab12cd34ef56-work", "hapi-run-ab12cd34ef56-out"] } });
-    await removeRuns("hapi", f.deps.run!, f.deps.env!, { runId: "ab12cd34ef56", egress: "hapi-egress-archon-1" });
+    await removeRuns("hapi", f.deps.run!, f.deps.env!, { runId: "ab12cd34ef56", egress: ["hapi-egress-archon-1"] });
     const one = ["--filter", `label=${RUN_LABEL}=ab12cd34ef56`, "--filter", `label=${PROJECT_LABEL}=hapi`];
     expect(f.calls.map((c) => c.cmd)).toEqual([
       ["docker", "ps", "-aq", ...one],
@@ -551,14 +556,18 @@ describe("removeRuns", () => {
     ]);
     // A test project's egress container is the one given.
     const g = fakes({ runs: { networks: ["p-run-ab12cd34ef56"] } });
-    await removeRuns("p", g.deps.run!, g.deps.env!, { runId: "ab12cd34ef56", egress: "p-egress-archon-1" });
-    expect(g.calls.find((c) => c.cmd[2] === "disconnect")!.cmd).toEqual(["docker", "network", "disconnect", "-f", "p-run-ab12cd34ef56", "p-egress-archon-1"]);
+    await removeRuns("p", g.deps.run!, g.deps.env!, { runId: "ab12cd34ef56", egress: ["p-egress-archon-1"] });
+    expect(g.calls.filter((c) => c.cmd[2] === "disconnect").map((c) => c.cmd)).toEqual([["docker", "network", "disconnect", "-f", "p-run-ab12cd34ef56", "p-egress-archon-1"]]);
+    // A review run's: egress-review alone.
+    const h = fakes({ runs: { networks: ["hapi-run-ab12cd34ef56"] } });
+    await removeRuns("hapi", h.deps.run!, h.deps.env!, { runId: "ab12cd34ef56", egress: ["hapi-egress-review-1"] });
+    expect(h.calls.filter((c) => c.cmd[2] === "disconnect").map((c) => c.cmd)).toEqual([["docker", "network", "disconnect", "-f", "hapi-run-ab12cd34ef56", "hapi-egress-review-1"]]);
   });
 
   test("removeRuns with volumes: false neither lists nor removes a volume", async () => {
     const f = fakes({ runs: { containers: ["c1"], networks: ["hapi-run-1"], volumes: ["hapi-run-1-work", "hapi-run-1-out"] } });
     await removeRuns("hapi", f.deps.run!, f.deps.env!, { volumes: false });
-    expect(f.calls.map((c) => c.cmd.slice(0, 3).join(" "))).toEqual(["docker ps -aq", "docker rm -f", "docker network ls", "docker network disconnect", "docker network rm"]);
+    expect(f.calls.map((c) => c.cmd.slice(0, 3).join(" "))).toEqual(["docker ps -aq", "docker rm -f", "docker network ls", "docker network disconnect", "docker network disconnect", "docker network rm"]);
     // The default is true: the volumes are listed and removed.
     const g = fakes({ runs: { volumes: ["hapi-run-1-out"] } });
     await removeRuns("hapi", g.deps.run!, g.deps.env!, {});
@@ -625,7 +634,7 @@ describe("hapi stack down", () => {
     expect(f.calls.map((c) => c.cmd.slice(0, 3).join(" "))).toEqual(["docker ps -aq", "docker network ls", "docker volume ls", "docker compose -p"]);
   });
 
-  test("down removes run containers, disconnects egress-archon from each run network, removes the run networks and volumes, then runs compose down", async () => {
+  test("down removes run containers, disconnects egress-archon and egress-review from each run network, removes the run networks and volumes, then runs compose down", async () => {
     capture();
     const f = fakes({ env: hapiEnv(), runs: { containers: ["c1"], networks: ["hapi-run-1"], volumes: ["hapi-run-1-out"] } });
     expect(await stackDown([], f.deps)).toBe(0);
@@ -634,6 +643,7 @@ describe("hapi stack down", () => {
       ["docker", "rm", "-f", "c1"],
       ["docker", "network", "ls", "--format", "{{.Name}}", ...LABELS("hapi")],
       ["docker", "network", "disconnect", "-f", "hapi-run-1", "hapi-egress-archon-1"],
+      ["docker", "network", "disconnect", "-f", "hapi-run-1", "hapi-egress-review-1"],
       ["docker", "network", "rm", "hapi-run-1"],
       ["docker", "volume", "ls", "-q", ...LABELS("hapi")],
       ["docker", "volume", "rm", "hapi-run-1-out"],

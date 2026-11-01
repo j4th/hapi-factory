@@ -10,7 +10,7 @@
  * filesystem facts come from `deps.probeFs`, never from a real mount; the
  * cleanup helper empties the host dirs it is given.
  */
-import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import YAML from "yaml";
 import { envFileText } from "../../src/secrets/files";
@@ -361,13 +361,28 @@ export const BUILD_FILES: Record<string, string> = {
   roster: "anthropic\n",
 };
 
-/** The archon zone's env file, as `hapi secrets resolve` writes it, at `<xdg>/hapi/env/archon.env`. Values are built at run time. */
-export function writeArchonEnv(xdg: string, values: Record<string, string>): string {
+/**
+ * A zone's env file, as `hapi secrets resolve` writes it, at `<xdg>/hapi/env/<zone>.env`. Values are built at run
+ * time. The review zone's is a fixture here: Task 9 makes the zone real, so nothing in these tests needs it.
+ */
+export function writeZoneEnv(xdg: string, zone: "archon" | "review", values: Record<string, string>): string {
   const dir = join(xdg, "hapi", "env");
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const path = join(dir, "archon.env");
-  writeFileSync(path, envFileText("archon", values), { mode: 0o600 });
+  const path = join(dir, `${zone}.env`);
+  writeFileSync(path, envFileText(zone, values), { mode: 0o600 });
   return path;
+}
+
+/**
+ * A workflow pack in a temp dir: hapi's own (archon/workflows/hapi/*.yaml), copied, plus a bash-only stand-in for
+ * each of `names` the pack doesn't have yet (Task 11 writes factory-verify and factory-review).
+ */
+export function stubPack(names: string[]): string {
+  const dir = tempDir("hapi-run-pack-");
+  const pack = join(REPO, "archon", "workflows", "hapi");
+  for (const f of readdirSync(pack).filter((n) => n.endsWith(".yaml"))) copyFileSync(join(pack, f), join(dir, f));
+  for (const n of names) if (!existsSync(join(dir, `${n}.yaml`))) writeFileSync(join(dir, `${n}.yaml`), `name: ${n}\nnodes:\n  - id: noop\n    bash: "true"\n`);
+  return dir;
 }
 
 /** A fake secret value, built at run time so no scanner sees a key in the source. */
@@ -415,7 +430,7 @@ export async function seedRun(
 ): Promise<RunRecord> {
   const { deps, world } = f;
   const name = `${deps.project}-run-${o.id}`;
-  const optional = ["kind", "parent", "round", "budgetUsd", "spendUsd", "roster", "policyHash", "retry", "turns", "model"] as const;
+  const optional = ["kind", "parent", "round", "budgetUsd", "spendUsd", "roster", "policyHash", "retry", "turns", "model", "forgeRepo"] as const;
   const rec: RunRecord = {
     runId: o.id,
     key: o.key ?? "k".repeat(64),
@@ -441,7 +456,9 @@ export async function seedRun(
   if (o.objects !== false) {
     const labels = { "org.hapi.run": o.id, "org.hapi.project": deps.project };
     world.containers.set(name, { name, labels, running: o.running ?? true });
-    world.networks.set(name, { labels, internal: true, endpoints: new Set([deps.egress]) });
+    // The proxy its kind joined: egress-review for a review, the project's egress-archon for every other kind.
+    const egress = o.kind === "review" ? `${deps.project}-egress-review-1` : deps.egress;
+    world.networks.set(name, { labels, internal: true, endpoints: new Set([egress]) });
     world.volumes.set(`${name}-work`, { labels, owner: "1001:1001", files: new Map() });
     world.volumes.set(`${name}-out`, { labels, owner: "1001:1001", files: new Map(Object.entries(o.outputs ?? {})) });
     for (const v of [`${name}-work`, `${name}-out`]) {

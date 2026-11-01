@@ -9,21 +9,27 @@
  * there is a usage error).
  *
  * `startRun(d, o)` is what the poller calls: a parsed work order, a source (the
- * repo's mirror, which holds no credential) and an explicit commit in, the run's
- * record out, or the refusal as a thrown error, so nothing scrapes stdout. It
- * prints nothing. It refuses, before anything is made, at the first of these
- * that fails:
+ * repo's mirror, or the harvester's checked copy of it, neither of which holds a
+ * credential) and an explicit commit in, the run's record out, or the refusal
+ * as a thrown error, so nothing scrapes stdout. Each phase of a work order is a
+ * run of its own kind (`o.kind`), whose profile (./kinds.ts `kindProfile`;
+ * design §3.5) decides its container. It prints nothing. It refuses, before
+ * anything is made, at the first of these that fails:
  * 1. reap (`reapRuns`);
  * 2. `egress_extra`, in the work order or the repo's overlay: refused until a
  *    per-run proxy exists (H-088, H-207);
- * 3. the workflow: one of hapi's pack (`packNodes`), which must parse, name each
+ * 3. the run's kind, and its workflow: its kind's (`factory-verify`,
+ *    `factory-review`) or, for a worker or a fix, the work order's own, which
+ *    must be one of hapi's pack (`packNodes`), which must parse, name each
  *    workflow by its file's stem and keep `pi.enableExtensions` on;
- * 4. the run's kind, round, budget (it may only lower the work order's
- *    budget.usd) and retry, each in range;
+ * 4. the run's round, budget (it may only lower the work order's budget.usd),
+ *    retry and GitHub repo (`forgeRepo`, an owner/name), each in range;
  * 5. the run disk against `runs.disk` (`diskProblem`, ./disk.ts: refused under
  *    `hard`; under `soft` a warning, which startRun returns on its result for
  *    the caller to show; H-217);
- * 6. the archon zone's env file (missing: run `mise run up`);
+ * 6. its kind's zone's env file: the archon zone's for a worker or a fix, the
+ *    review zone's for a review (missing: run `mise run up`). A verify run holds
+ *    no key of any kind, so it reads none;
  * 7. the source (`sourceGitDir`);
  * 8. the commit: a commit id, which the source holds (host git with no config);
  * 9. the roster `build/roster` names (`readRoster`, ./spec.ts);
@@ -34,31 +40,36 @@
  *     (`runs.phases.round_usd` for every kind but `worker`);
  * 11. the parent, for every kind but `worker`: the work order's worker run, whose
  *     sha is the run's base commit (`RunFile.base`);
- * 12. the run's own files (./records.ts `PER_RUN_FILES`): its `hapi-guard.json`
+ * 12. the inputs dir (`StartOptions.inputsDir`): a review and a fix need one, a
+ *     worker and a verify take none, and it holds only regular files named for
+ *     `RUN_INPUTS`' (./records.ts `inputsProblem`): never a bundle;
+ * 13. the run's own files (./records.ts `PER_RUN_FILES`): its `hapi-guard.json`
  *     and run config, generated from that policy for that roster, and the host's
  *     copies of its work order and task text; and the container's argv
- *     (`runArgs`).
+ *     (`runArgs`, for its kind's profile).
  * The run's key names its kind, round and pass (./records.ts `keyPart`), so the
  * engine's runs never meet a hand run's key, nor an earlier pass's. Then it makes
  * the run:
- * 1. under the launcher's lock: admission (the key, one live run per repo,
- *    `runs.max_live`; ./records.ts), then the run's dir with record.json,
- *    run.json and its own files;
+ * 1. under the launcher's lock: admission (the key; one live run per repo, by
+ *    its git dir and its `forgeRepo`, m23; `runs.max_live`; ./records.ts), then
+ *    the run's dir with record.json, run.json, its own files and, for a review
+ *    or a fix, its copy of the inputs dir;
  * 2. the run's own network, `--internal`, checked with `networkProblem`;
- * 3. `egress-archon` joined to it under the alias the proxy variables name
- *    (spike 07 finding 13);
+ * 3. its kind's proxy joined to it (`egressOf`: egress-archon, or egress-review
+ *    for a review) under the alias the proxy variables name (spike 07 finding
+ *    13);
  * 4. the two volumes, each bind-backed on a dir of its own on the run disk
  *    (`volumeDir`, made 0700 and checked before the volume: Docker would make a
  *    volume on a missing dir and fail only at `docker run`, spike 09 finding
  *    17), chowned to 1001 by a one-shot helper with CAP_CHOWN alone: a fresh
  *    volume's root is root's (spike 07 finding 12). Like every helper, it runs
  *    under the host's `timeout` (./copyout.ts `bounded`);
- * 5. the run container, its secrets passed by name, their values in the docker
- *    CLI's env only;
+ * 5. the run container, its kind's secrets passed by name, their values in the
+ *    docker CLI's env only (a verify run's has none);
  * 6. a detached `hapi run supervise <id>`, awaited until its process has
  *    started: one that can't start is a failed step.
- * A failure in 2-6 removes what start made (egress disconnected before its
- * network goes) and the run's dir, then releases the lock. A supervisor that
+ * A failure in 2-6 removes what start made (its kind's egress disconnected before
+ * its network goes) and the run's dir, then releases the lock. A supervisor that
  * starts and then dies is left to the reap (below): nothing in start can see it.
  *
  * `hapi run start`, by hand, is a thin wrapper: it reads the work order file,
@@ -80,17 +91,19 @@
  * `finalizeRun`, under the run's own lock and once only: stop the container if
  * it still runs (no volume a live worker can write is ever read), then, under
  * the run disk's lock (./locks.ts; H-210), which `down` holds while it removes
- * runs, copy the outputs out (./copyout.ts), check the bundle (exactly one head, `HEAD`,
- * read by host git with hardened flags in an empty dir: spike 07 finding 19),
+ * runs, copy its kind's outputs out (./copyout.ts), check the bundle (exactly
+ * one head, `HEAD`, read by host git with hardened flags in an empty dir: spike
+ * 07 finding 19),
  * read Archon's status from result.json (a paused run exits 0, so the exit code
  * is never the status: spike 07 finding 5), check that the guard ran in every
  * Pi attempt (design §6a item 7; spike 08 finding 10), keep the tail of the
  * container's log when no result.json came out (`keepContainerLog`); then
  * write the record, with the run's spend and turns when they are known
  * (./spend.ts), before anything is removed, so a finalizer that dies next
- * leaves the outcome (H-219); then remove every object of the run, empty and
- * remove its volumes' dirs on the run disk (`removeVolumeDirs`), and, only if
- * that cleanup fails, add its reason to the record as it then is. A run whose
+ * leaves the outcome (H-219); then remove every object of the run, disconnecting
+ * only its kind's egress, empty and remove its volumes' dirs on the run disk
+ * (`removeVolumeDirs`), and, only if that cleanup fails, add its reason to the
+ * record as it then is. A run whose
  * container is gone was removed around hapi (`mise run down`, a cleanup, a
  * prune), so nothing is copied and it fails: a copy-out helper would race a
  * removal of its volumes (`volume is in use`). The finalize leaves its volumes,
@@ -122,6 +135,7 @@ import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, w
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { packNodes } from "../audit/checks/tools";
+import { parseOwnerRepo } from "../forge/github/app-token";
 import { emitArchon, type RunFile } from "../generate/archon";
 import { emitPi } from "../generate/pi";
 import { loadPolicy, PolicyError } from "../policy/load";
@@ -132,15 +146,16 @@ import { composeServices } from "../stack/compose";
 import { currentUserOverride, definedEnv, HAPI_USER, listed, networkProblem, reexec, removeRuns, runCommand, runFilters } from "../stack/up";
 import { loadWorkOrder, type WorkOrder } from "../workorder/validate";
 import { parseRunId, parseStart, runDeps, START_USAGE, STOP_USAGE, SUPERVISE_USAGE } from "./cli";
-import { bounded, copyOut, HELPER_HOST_TIMEOUT_S, HELPER_KILL_AFTER_S, OUTPUT_FILES, timedOut } from "./copyout";
+import { bounded, copyOut, HELPER_HOST_TIMEOUT_S, HELPER_KILL_AFTER_S, timedOut } from "./copyout";
 import { diskProblem, dockerDataRoot, removeVolumeDirs, volumeDir } from "./disk";
 import { hardenedGit } from "./git";
-import { RUN_KINDS, type RunKind } from "./kinds";
+import { egressOf, type KindProfile, kindProfile, MAX_OUTPUTS, RUN_KINDS, type RunKind } from "./kinds";
 import { withStackLock } from "./locks";
 import {
   capacityProblem,
   containerExists,
   createRun,
+  inputsProblem,
   isLive,
   keyPart,
   keyProblem,
@@ -161,19 +176,19 @@ import {
   writeRecord,
 } from "./records";
 import { redactSecrets, sanitizeTerminal } from "./sanitize";
-import { APP_USER, PROXY_ALIAS, readRoster, runArgs, type RunDeps, type RunInputs, runLabels, runName, STOP_GRACE_S } from "./spec";
+import { APP_USER, readRoster, runArgs, type RunDeps, type RunInputs, runLabels, runName, STOP_GRACE_S } from "./spec";
 import { spendOfRun, turnsOfRun } from "./spend";
 
 /**
  * How long `finalizeRun` waits for another process finalizing the same run: its stop's grace (STOP_GRACE_S, 30 s),
  * then its bounded helper calls, each at its host bound and KILL: three fixed ones (the listing, the container's log
- * and the run disk's cleanup helper) and a read per output file (OUTPUT_FILES, four): 7 × (150 + 10) = 1120 s, and
- * 100 s for the rest: 1250 s in all. The same loop waits on the run disk's lock (./locks.ts), which is one lock for
- * every run: `down` holds it for seconds, while it removes the runs, but another run's copy-out, or a reap's
- * finalize, holds it for up to about five bounded calls (5 × 160 s). With `runs.max_live` at 1 only one run is ever
+ * and the run disk's cleanup helper) and a read per output of the kind with the most (MAX_OUTPUTS, four: a worker's,
+ * a fix's and a review's): 7 × (150 + 10) = 1120 s, and 100 s for the rest: 1250 s in all. The same loop waits on
+ * the run disk's lock (./locks.ts), which is one lock for every run: `down` holds it for seconds, while it removes
+ * the runs, but another run's copy-out, or a reap's finalize, holds it for up to about five bounded calls (5 × 160 s). With `runs.max_live` at 1 only one run is ever
  * finalizing, so those holds can't stack; raising `max_live` needs this wait revisited.
  */
-export const FINALIZE_WAIT_S = STOP_GRACE_S + (3 + OUTPUT_FILES.length) * (HELPER_HOST_TIMEOUT_S + HELPER_KILL_AFTER_S) + 100;
+export const FINALIZE_WAIT_S = STOP_GRACE_S + (3 + MAX_OUTPUTS) * (HELPER_HOST_TIMEOUT_S + HELPER_KILL_AFTER_S) + 100;
 
 const firstLine = (s: string | undefined) => (s ?? "").trim().split("\n")[0]?.slice(0, 300) || "(no error output)";
 /** Printable ASCII only, and short: for a name a run made (a node path, an attempt id, a ref). */
@@ -201,9 +216,12 @@ export async function asHapi(sub: string, args: string[], partial: Partial<RunDe
   }
 }
 
-/** The archon zone's secrets, from `$XDG_RUNTIME_DIR/hapi/env/archon.env` (`hapi secrets resolve` writes it). Fails closed when it is missing. */
-export async function archonSecrets(env: RunDeps["env"]): Promise<Record<string, string>> {
-  const file = join(runtimeDir(env), ENV_DIR, "archon.env");
+/**
+ * A zone's secrets, from `$XDG_RUNTIME_DIR/hapi/env/<zone>.env` (`hapi secrets resolve` writes it): the archon zone's
+ * for a worker or a fix, the review zone's for a review. Fails closed when it is missing.
+ */
+export async function zoneSecrets(zone: "archon" | "review", env: RunDeps["env"]): Promise<Record<string, string>> {
+  const file = join(runtimeDir(env), ENV_DIR, `${zone}.env`);
   let text: string;
   try {
     text = await readFile(file, "utf8");
@@ -217,6 +235,22 @@ export async function archonSecrets(env: RunDeps["env"]): Promise<Record<string,
   } catch (e) {
     throw new Error(`${file}: ${(e as Error).message}`);
   }
+}
+
+/**
+ * The values text a run of `kind` wrote is redacted with, by name: the archon zone's, and for a review the review
+ * zone's too. Where both zones hold a name with different values (each zone has its own ANTHROPIC_API_KEY), the
+ * review's is named `<NAME> (review zone)`, so neither value is lost. Fails closed: a zone file it can't read throws.
+ * `hapi run watch` and a kept container log (`keepContainerLog`) both use it.
+ */
+export async function redactionValues(env: RunDeps["env"], kind: RunKind): Promise<Record<string, string>> {
+  const values = { ...(await zoneSecrets("archon", env)) };
+  if (kind !== "review") return values;
+  for (const [name, value] of Object.entries(await zoneSecrets("review", env))) {
+    if (!Object.hasOwn(values, name)) values[name] = value;
+    else if (values[name] !== value) values[`${name} (review zone)`] = value;
+  }
+  return values;
 }
 
 /** The git dir to bind as the source, its real path: `<repo>/.git`, or `repo` itself when it is bare. */
@@ -254,9 +288,10 @@ async function headOf(gitDir: string, d: RunDeps): Promise<string> {
 
 /**
  * Steps 2-6 of making a run (see the module comment), each of which throws on failure. Only the run container's
- * docker CLI gets the secrets, in its env; an error from it is scrubbed of their values.
+ * docker CLI gets the secrets, in its env; an error from it is scrubbed of their values. Its kind's proxy joins the
+ * run's network under the alias its proxy variables name (`profile.egress`).
  */
-async function createRunObjects(d: RunDeps, rec: RunRecord, argv: string[], secrets: Record<string, string>): Promise<void> {
+async function createRunObjects(d: RunDeps, rec: RunRecord, argv: string[], secrets: Record<string, string>, profile: KindProfile): Promise<void> {
   const labels = runLabels(d.project, rec.runId);
   const must = async (what: string, cmd: string[], env = definedEnv(d.env)) => {
     const r = await d.run(cmd, { env, inherit: false });
@@ -279,7 +314,7 @@ async function createRunObjects(d: RunDeps, rec: RunRecord, argv: string[], secr
   }
   const problem = networkProblem(Array.isArray(parsed) ? parsed[0] : undefined);
   if (problem !== undefined) throw new Error(problem);
-  await must(`docker network connect ${rec.network} ${d.egress}`, ["docker", "network", "connect", "--alias", PROXY_ALIAS, rec.network, d.egress]);
+  for (const egress of egressOf(d, profile)) await must(`docker network connect ${rec.network} ${egress}`, ["docker", "network", "connect", "--alias", profile.egress, rec.network, egress]);
   for (const v of [rec.volumes.work, rec.volumes.out]) {
     const dir = volumeDir(d.diskDir, v);
     await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -341,9 +376,20 @@ export interface StartOptions {
   retryOf?: string;
   /** The repo's `.factory/config.yaml` at the run's commit, applied over the central policy for this run (H-172). */
   overlay?: RepoOverlay;
-  /** What a review or fix reads: no kind binds one yet, so it is refused. */
+  /**
+   * What a review or a fix reads, which Task 13 writes: a dir holding only `RUN_INPUTS`' files (./kinds.ts), copied
+   * into the run's dir and bound read-only at `RUN_PATHS.inputs`. Required for a review and a fix, refused for a
+   * worker and a verify.
+   */
   inputsDir?: string;
+  /** The GitHub repository the run is of, `owner/name` (Task 13: `Discovered.repo`): one live run per repo counts by it (m23). */
+  forgeRepo?: string;
 }
+
+/** Why a kind that takes an inputs dir needs one. */
+const INPUTS_FOR: Partial<Record<RunKind, string>> = { fix: "its findings go in it", review: "the diff and verify's results go in it" };
+/** Why a kind that takes none refuses one. */
+const NO_INPUTS: Partial<Record<RunKind, string>> = { verify: ": its source already holds the bundle's commits" };
 
 const COMMIT = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
 const OVERLAY_FILE = ".factory/config.yaml";
@@ -424,23 +470,28 @@ export async function startRun(d: RunDeps, o: StartOptions): Promise<StartedRun>
   const order = o.workOrder;
   if (order.egress_extra.length > 0) throw new Error("egress_extra isn't supported yet (design §3.1, H-088); remove it or wait for the per-run proxy");
   if ((o.overlay?.egress_extra ?? []).length > 0) throw new Error(`${OVERLAY_LABEL} adds egress_extra hosts, which aren't supported yet (H-207): remove them`);
+  if (!RUN_KINDS.includes(o.kind)) throw new Error(`${JSON.stringify(o.kind)} is not a run kind (${RUN_KINDS.join(", ").replace(/, ([^,]+)$/, " or $1")})`);
+  const profile = kindProfile(o.kind);
+  // A verify or review runs its kind's workflow; a worker or a fix runs the work order's own.
+  const workflow = profile.workflow ?? order.workflow;
   // Archon also resolves its bundled workflows by name, and hapi reviews only its own pack's (paid check, 2026-10-31).
   const pack = await packNodes(d.packDir);
   if ("missing" in pack) throw new Error(pack.missing);
   if (pack.problems.length > 0) throw new Error(`hapi's pack has a problem: ${pack.problems.join("; ")}`);
-  if (!pack.workflows.some((w) => w.name === order.workflow)) {
-    throw new Error(`the work order's workflow ${JSON.stringify(order.workflow)} is not in hapi's pack (${d.packDir}): a run may use only the pack's workflows, never one of Archon's bundled ones, which hapi doesn't review`);
+  if (!pack.workflows.some((w) => w.name === workflow)) {
+    const whose = profile.workflow === undefined ? "the work order's workflow" : `a ${o.kind} run's workflow`;
+    throw new Error(`${whose} ${JSON.stringify(workflow)} is not in hapi's pack (${d.packDir}): a run may use only the pack's workflows, never one of Archon's bundled ones, which hapi doesn't review`);
   }
-  if (!RUN_KINDS.includes(o.kind)) throw new Error(`${JSON.stringify(o.kind)} is not a run kind (${RUN_KINDS.join(", ").replace(/, ([^,]+)$/, " or $1")})`);
   const round = o.round ?? 0;
   if (!wholeFrom0(round)) throw new Error(`the run's round ${round} is not a whole number of at least 0`);
   if (o.budgetUsd !== undefined && !(Number.isFinite(o.budgetUsd) && o.budgetUsd >= 0)) throw new Error(`the run's budget ${o.budgetUsd} is not a number of at least 0`);
   if (o.budgetUsd !== undefined && o.budgetUsd > order.budget.usd) throw new Error(`the run's budget ${o.budgetUsd} is above the work order's budget.usd (${order.budget.usd}): it may only lower it`);
   if (o.retry !== undefined && !wholeFrom0(o.retry)) throw new Error(`the run's retry ${o.retry} is not a whole number of at least 0`);
-  if (o.inputsDir !== undefined) throw new Error("a run's inputsDir isn't bound yet: no run kind takes an inputs dir");
+  if (o.forgeRepo !== undefined && parseOwnerRepo(o.forgeRepo) === undefined) throw new Error(`the run's forgeRepo ${JSON.stringify(o.forgeRepo.slice(0, 120))} is not a GitHub repository's owner/name`);
   if (o.kind === "worker" && o.parent !== undefined) throw new Error("a worker run takes no parent: it is the work order's first run, and its own base");
   const disk = await checkRunDisk(d);
-  const secrets = await archonSecrets(d.env);
+  // A verify run holds no key of any kind (design §3.5): no zone's env file is read for it.
+  const secrets = profile.zone === undefined ? {} : await zoneSecrets(profile.zone, d.env);
   const repo = await sourceGitDir(o.repoGitDir);
   await commitIn(d, repo, o.sha);
   const roster = readRoster(d.buildDir);
@@ -455,6 +506,10 @@ export async function startRun(d: RunDeps, o: StartOptions): Promise<StartedRun>
     throw new Error(`the run's budget ${o.budgetUsd} is above a ${o.kind} run's cap, the smaller of the work order's budget.usd (${order.budget.usd}) and runs.phases.round_usd (${phases.round_usd}): it may only lower it`);
   }
   const base = o.kind === "worker" ? o.sha : (await parentOf(d, o)).sha;
+  if (profile.inputs && o.inputsDir === undefined) throw new Error(`a ${o.kind} run needs an inputs dir (StartOptions.inputsDir): ${INPUTS_FOR[o.kind]}`);
+  if (!profile.inputs && o.inputsDir !== undefined) throw new Error(`a ${o.kind} run takes no inputs dir${NO_INPUTS[o.kind] ?? ""}`);
+  const inputs = o.inputsDir === undefined ? undefined : await inputsProblem(o.inputsDir);
+  if (inputs !== undefined) throw new Error(inputs);
 
   // The run's own files: the guard's settings and Archon's run layer, from the overlaid policy for build/roster's
   // roster, with the work order's tiers for implement and review; and the host's copies of the order and its task.
@@ -470,13 +525,13 @@ export async function startRun(d: RunDeps, o: StartOptions): Promise<StartedRun>
 
   const runId = newRunId();
   const budgetUsd = o.budgetUsd ?? cap;
-  const inputs: RunInputs = { runId, repo, sha: o.sha, workOrder: order, public: o.public, budgetUsd, packDir: d.packDir };
-  const argv = runArgs(service, inputs, d, Object.keys(secrets));
+  const runInputs: RunInputs = { runId, repo, sha: o.sha, workOrder: order, public: o.public, budgetUsd, packDir: d.packDir };
+  const argv = runArgs(service, runInputs, d, Object.keys(secrets), profile);
   const started = d.now();
   const name = runName(d.project, runId);
   const alias = o.kind === "verify" ? undefined : o.kind === "review" ? order.roles.review : order.roles.implement;
   const rec: RunRecord = {
-    runId, key: runKey(order.id, o.sha, keyPart(o.kind, round, o.retry)), project: d.project, repo, sha: o.sha, workOrder: order.id, workflow: order.workflow,
+    runId, key: runKey(order.id, o.sha, keyPart(o.kind, round, o.retry)), project: d.project, repo, sha: o.sha, workOrder: order.id, workflow,
     container: name, network: name, volumes: { work: `${name}-work`, out: `${name}-out` },
     startedAt: started.toISOString(), deadline: new Date(started.getTime() + order.budget.minutes * 60_000).toISOString(), status: "live",
     ...(o.retryOf === undefined ? {} : { retryOf: o.retryOf }),
@@ -486,27 +541,30 @@ export async function startRun(d: RunDeps, o: StartOptions): Promise<StartedRun>
     policyHash: createHash("sha256").update(JSON.stringify(applied)).digest("hex"),
     ...(o.retry === undefined ? {} : { retry: o.retry }),
     ...(alias === undefined ? {} : { model: applied.rosters[roster][alias].model }),
+    ...(o.forgeRepo === undefined ? {} : { forgeRepo: o.forgeRepo }),
   };
   const runFile: RunFile = {
-    run_id: runId, work_order: order.id, traceparent: order.trace.traceparent, budget_usd: budgetUsd, public: o.public, workflow: order.workflow, started_at: rec.startedAt,
+    run_id: runId, work_order: order.id, traceparent: order.trace.traceparent, budget_usd: budgetUsd, public: o.public, workflow, started_at: rec.startedAt,
     kind: o.kind, round, turns: o.kind === "fix" ? Math.min(order.budget.turns, phases.round_turns) : order.budget.turns, base,
+    // A review's CodeRabbit node runs only when the overlaid policy says so (Task 11 reads it).
+    ...(o.kind === "review" ? { coderabbit: phases.coderabbit } : {}),
   };
 
   await withStartLock(d, async () => {
     const records = await listRecords(d.stateDir);
     const refused =
       keyProblem(records, { key: rec.key, workOrder: order.id, sha: o.sha, ...(o.retryOf === undefined ? {} : { retryOf: o.retryOf }) }) ??
-      capacityProblem(await liveRuns(d), records, repo, d);
+      capacityProblem(await liveRuns(d), records, { repo, ...(o.forgeRepo === undefined ? {} : { forgeRepo: o.forgeRepo }) }, d);
     if (refused !== undefined) throw new Error(refused);
-    await createRun(d.stateDir, rec, runFile, files);
+    await createRun(d.stateDir, rec, runFile, files, o.inputsDir);
     try {
-      await createRunObjects(d, rec, argv, secrets);
+      await createRunObjects(d, rec, argv, secrets, profile);
     } catch (e) {
       let cleanup = "What start had created was removed.";
       try {
         // The volumes go here, and their dirs on the run disk go with them at the next reap: its sweep removes a
         // run's dir whose volume is gone and whose run has no live record, as this run has none after removeRunDir.
-        await removeRuns(d.project, d.run, d.env, { runId, egress: d.egress });
+        await removeRuns(d.project, d.run, d.env, { runId, egress: egressOf(d, profile) });
       } catch (x) {
         cleanup = `Removing what start had created failed too (${(x as Error).message}): \`mise run down\` removes it.`;
       }
@@ -689,14 +747,15 @@ export const LOGS_SCRIPT = `exec docker logs --tail ${LOG_TAIL} "$1" 2>&1`;
  * Keep the tail of a run container's log in `<out>/container.log` (mode 0600), for a run that left no result.json.
  * A run that died in the prelude (the clone, the sparse checkout, the Archon CLI failing to start) leaves nothing
  * else, and removeRuns takes the log with the container (final review C-1). The log is untrusted text: it is
- * sanitized, then redacted with the archon zone's values, in `watch`'s order, and it is not kept if they can't be
- * read. The file is the host's own, never one of OUTPUT_FILES. Returns what the run's reason says of it, if
- * anything: the log's last line, or why it wasn't kept. Never throws: nothing here may stop finalize.
+ * sanitized, then redacted with the archon zone's values, and a review's with the review zone's too
+ * (`redactionValues`), in `watch`'s order, and it is not kept if they can't be read. The file is the host's own,
+ * never one of a kind's outputs. Returns what the run's reason says of it, if anything: the log's last line, or why
+ * it wasn't kept. Never throws: nothing here may stop finalize.
  */
 async function keepContainerLog(d: RunDeps, rec: RunRecord, out: string): Promise<string | undefined> {
   let values: Record<string, string>;
   try {
-    values = await archonSecrets(d.env);
+    values = await redactionValues(d.env, rec.kind ?? "worker");
   } catch (e) {
     return `the container's log was not kept, since nothing could redact it: ${(e as Error).message}`;
   }
@@ -747,6 +806,8 @@ function statusReason(status: string): string {
 async function finalizeLocked(rec: RunRecord, d: RunDeps): Promise<RunRecord> {
   const disk = (await readRecord(d.stateDir, rec.runId)) ?? rec;
   if (disk.status !== "live") return disk;
+  // A Plan 02 record has no kind: it is a worker's.
+  const profile = kindProfile(disk.kind ?? "worker");
   // No volume a live worker can still write is ever read.
   if (await isLive(d, disk.runId)) await stopContainer(d, disk);
   const out = join(recordDir(d.stateDir, disk.runId), "out");
@@ -767,7 +828,7 @@ async function finalizeLocked(rec: RunRecord, d: RunDeps): Promise<RunRecord> {
       problems.push("the run's container was removed before the run was finalized (`mise run down`, or a cleanup): nothing was copied out");
       return { problem: "nothing was copied out" };
     }
-    const copy = await copyOut(disk.volumes.out, out, d.runs.output_limits_mb, d);
+    const copy = await copyOut(disk.volumes.out, out, profile.outputs, d.runs.output_limits_mb, d);
     problems.push(...copy.problems);
     if (copy.copied.includes("run.bundle")) {
       const p = await bundleProblem(join(out, "run.bundle"), d);
@@ -812,7 +873,7 @@ async function finalizeLocked(rec: RunRecord, d: RunDeps): Promise<RunRecord> {
 
   const cleanup: string[] = [];
   try {
-    await removeRuns(d.project, d.run, d.env, { runId: disk.runId, egress: d.egress, volumes: !gone });
+    await removeRuns(d.project, d.run, d.env, { runId: disk.runId, egress: egressOf(d, profile), volumes: !gone });
     // A kept volume keeps its dirs on the run disk: the cleanup helper runs only for volumes removeRuns removed.
     if (!gone) {
       try {

@@ -408,12 +408,13 @@ describe.skipIf(!INT || !ONLINE)("hapi run on a real Docker (a throwaway project
     expect(r.code).toBe(0);
     const w = await quietly(() => runWatch([r.id], deps(PACK)));
     expect(w.code).toBe(0);
-    // docker logs while it ran (Archon's progress lines), then the copied transcript, then how it ended.
-    const started = w.out.indexOf("[nap] Started");
-    const completed = w.out.findIndex((l) => l.startsWith("[nap] Completed"));
-    const row = w.out.indexOf("[nap] exec_output exit 0: napping");
+    // docker logs while it ran (Archon's progress lines), then the copied transcript, each line the run's marked `| `
+    // (H-220), then how it ended, hapi's own line, unmarked.
+    const started = w.out.indexOf("| [nap] Started");
+    const completed = w.out.findIndex((l) => l.startsWith("| [nap] Completed"));
+    const row = w.out.indexOf("| [nap] exec_output exit 0: napping");
     expect({ order: [started >= 0, completed > started, row > completed], out: w.out }).toEqual({ order: [true, true, true], out: w.out });
-    expect(w.out[row + 1]).toBe("  awake");
+    expect(w.out[row + 1]).toBe("|   awake");
     expect(w.out.at(-1)).toBe(`run ${r.id}: succeeded`);
     // Nothing printed holds an escape sequence or a secret value.
     expect(w.out.filter((l) => /[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(l) || l.includes("fake-hapi-"))).toEqual([]);

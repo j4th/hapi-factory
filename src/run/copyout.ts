@@ -9,7 +9,9 @@
  * - the volume must exist (a `-v` of a missing one would make an unlabelled
  *   volume that `down` never finds);
  * - a listing first (`LIST_SCRIPT`), under a `timeout` inside the helper: any
- *   name that isn't one of `OUTPUT_FILES` is reported and never read;
+ *   name that isn't one of the run's kind's outputs (./kinds.ts
+ *   `kindProfile`; a run.bundle in a verify's or a review's `/out` is one) is
+ *   reported and never read;
  * - then each output (`COPY_SCRIPT`), only if it is a regular file and not a
  *   symlink (`[ -f ] && [ ! -L ]`: `-f` alone follows a link, and a FIFO
  *   would block the read), at most its cap plus one byte, so an oversize file
@@ -29,18 +31,8 @@ import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Runs } from "../policy/types";
 import { definedEnv, PROJECT, PROJECT_LABEL, RUN_LABEL } from "../stack/up";
+import type { KindProfile } from "./kinds";
 import { APP_USER, type RunDeps } from "./spec";
-
-/** The files a run may leave, in the order they are copied; each has a cap in runs.output_limits_mb. */
-export const OUTPUT_FILES = ["result.json", "transcript.jsonl", "decisions.jsonl", "run.bundle"] as const;
-export type OutputFile = (typeof OUTPUT_FILES)[number];
-
-const LIMIT_OF: Record<OutputFile, keyof Runs["output_limits_mb"]> = {
-  "result.json": "result",
-  "transcript.jsonl": "transcript",
-  "decisions.jsonl": "decisions",
-  "run.bundle": "bundle",
-};
 
 /** Seconds a helper may spend on its work inside its container: the listing, or reading one file. */
 export const HELPER_TIMEOUT_S = 120;
@@ -96,11 +88,18 @@ function helper(volume: string, d: Pick<RunDeps, "project" | "image">): string[]
 }
 
 /**
- * Copy the outputs of the run whose out volume is `volume` into `dest` (made 0700), each within its cap in
- * `limits`. Returns the names copied and every problem, in a run's order; a missing output is no problem (a
- * bash-only run writes no decisions, an unchanged one no bundle). Never throws for what the volume holds.
+ * Copy `outputs`, the run's kind's (./kinds.ts `kindProfile`), out of the run whose out volume is `volume` into `dest`
+ * (made 0700), each within its own limit in `limits`. Returns the names copied and every problem, in the outputs'
+ * order; a missing output is no problem (a bash-only run writes no decisions, an unchanged one no bundle). Never
+ * throws for what the volume holds.
  */
-export async function copyOut(volume: string, dest: string, limits: Runs["output_limits_mb"], deps: RunDeps): Promise<{ copied: string[]; problems: string[] }> {
+export async function copyOut(
+  volume: string,
+  dest: string,
+  outputs: KindProfile["outputs"],
+  limits: Runs["output_limits_mb"],
+  deps: RunDeps,
+): Promise<{ copied: string[]; problems: string[] }> {
   await mkdir(dest, { recursive: true, mode: 0o700 });
   const env = definedEnv(deps.env);
   // A helper's `-v` of a volume that isn't there would make an unlabelled one, which nothing would remove.
@@ -110,12 +109,12 @@ export async function copyOut(volume: string, dest: string, limits: Runs["output
   if (timedOut(listing.code)) return { copied: [], problems: [`listing the run's output volume ${TIMED_OUT}: nothing was copied`] };
   if (listing.code !== 0) return { copied: [], problems: [`listing the run's output volume failed (helper exit ${listing.code}): nothing was copied`] };
   const names = listing.stdout.split("\0").slice(0, -1);
-  const known = new Set<string>(OUTPUT_FILES);
+  const known = new Set<string>(outputs.map((o) => o.name));
   const others = names.filter((n) => !known.has(n));
   const copied: string[] = [];
   const problems: string[] = [];
-  for (const name of OUTPUT_FILES.filter((n) => names.includes(n))) {
-    const cap = limits[LIMIT_OF[name]] * MB;
+  for (const { name, limit } of outputs.filter((o) => names.includes(o.name))) {
+    const cap = limits[limit] * MB;
     const final = join(dest, name);
     const tmp = join(dest, `.${name}.${randomUUID()}.tmp`);
     const r = await deps.runBytes(bounded([...helper(volume, deps), COPY_SCRIPT, "hapi-copyout", name, String(cap + 1)]), env);
@@ -124,7 +123,7 @@ export async function copyOut(volume: string, dest: string, limits: Runs["output
     if (r.code === 3) problem = `${name} in the run's output volume is not a regular file (a symlink, a FIFO or a directory): not copied`;
     else if (timedOut(r.code)) problem = `copying ${name} out ${TIMED_OUT}: not copied`;
     else if (r.code !== 0) problem = `copying ${name} out failed (helper exit ${r.code}): not copied`;
-    else if (r.stdout.length > cap) problem = `${name} is over its ${limits[LIMIT_OF[name]]} MB limit (runs.output_limits_mb.${LIMIT_OF[name]}, policy/runs.yaml): not copied`;
+    else if (r.stdout.length > cap) problem = `${name} is over its ${limits[limit]} MB limit (runs.output_limits_mb.${limit}, policy/runs.yaml): not copied`;
     if (problem === undefined) {
       try {
         await writeFile(tmp, r.stdout, { mode: 0o600, flag: "wx" });

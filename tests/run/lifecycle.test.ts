@@ -8,18 +8,19 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, relative } from "node:path";
 import YAML from "yaml";
 import { main } from "../../src/cli";
+import { emitEgress } from "../../src/generate/egress";
 import { emitPi } from "../../src/generate/pi";
 import { loadPolicy } from "../../src/policy/load";
 import { applyOverlay } from "../../src/policy/overlay";
 import type { Policy, RepoOverlay, Tier } from "../../src/policy/types";
 import { runDeps, START_USAGE } from "../../src/run/cli";
-import { COPY_SCRIPT, HELPER_HOST_TIMEOUT_S, HELPER_KILL_AFTER_S, HELPER_TIMEOUT_S, LIST_SCRIPT, OUTPUT_FILES } from "../../src/run/copyout";
+import { COPY_SCRIPT, HELPER_HOST_TIMEOUT_S, HELPER_KILL_AFTER_S, HELPER_TIMEOUT_S, LIST_SCRIPT } from "../../src/run/copyout";
 import { CLEAN_SCRIPT, GIB, volumeDir } from "../../src/run/disk";
-import type { RunKind } from "../../src/run/kinds";
+import { MAX_OUTPUTS, type RunKind } from "../../src/run/kinds";
 import {
   bundleProblem, FINALIZE_WAIT_S, finalizeRun, guardProblems, LOGS_SCRIPT, reapRuns, rolesProblem, runStart, runStop, runSupervise, type StartOptions, startRun,
 } from "../../src/run/lifecycle";
@@ -30,7 +31,7 @@ import { reexecScript, runCommand } from "../../src/stack/up";
 import { loadWorkOrder } from "../../src/workorder/validate";
 import { capture, caught, cleanup, tempDir } from "../secrets/helpers";
 import { REPO } from "../stack/helpers";
-import { type Call, completedOutputs, fakeRepo, fakeRun, fakeSecret, file, NOW, SHA, SHA2, seedRun, unbounded, writeArchonEnv, writeOrder } from "./helpers";
+import { type Call, completedOutputs, fakeRepo, fakeRun, fakeSecret, file, NOW, SHA, SHA2, seedRun, stubPack, unbounded, writeOrder, writeZoneEnv } from "./helpers";
 
 afterEach(cleanup);
 
@@ -39,13 +40,31 @@ const N = `hapi-run-${ID}`;
 const ARCHON_RUN = "f0e1d2c3-0000-4000-8000-000000000001";
 const TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
 
-/** A fake world with the archon env file in place, a source repo and a valid work order. */
+/**
+ * A fake world with both zones' env files in place, a source repo, a valid work order, and a pack that holds the
+ * verify and review workflows too (`stubPack`). The review zone is a fixture: its values are its own, none of them the
+ * archon zone's, and Task 9 makes the zone real.
+ */
 function ready(o: Parameters<typeof fakeRun>[0] = {}) {
   const f = fakeRun(o);
+  f.deps.packDir = stubPack(["factory-verify", "factory-review"]);
   const secret = fakeSecret("ANTHROPIC_API_KEY");
-  writeArchonEnv(f.xdg, { ANTHROPIC_API_KEY: secret });
-  return { ...f, secret, repo: fakeRepo(f.tmp), order: writeOrder(f.tmp) };
+  writeZoneEnv(f.xdg, "archon", { ANTHROPIC_API_KEY: secret });
+  const review = { ANTHROPIC_API_KEY: fakeSecret("REVIEW_ANTHROPIC_API_KEY"), CLAUDE_API_KEY: fakeSecret("REVIEW_CLAUDE_API_KEY") };
+  writeZoneEnv(f.xdg, "review", review);
+  return { ...f, secret, review, repo: fakeRepo(f.tmp), order: writeOrder(f.tmp) };
 }
+
+/** An inputs dir in `tmp` holding `files` (name to text): what Task 13 hands a review or fix run. */
+function inputsIn(tmp: string, files: Record<string, string> = {}, name = "inputs"): string {
+  const dir = join(tmp, name);
+  mkdirSync(dir);
+  for (const [n, text] of Object.entries(files)) writeFileSync(join(dir, n), text);
+  return dir;
+}
+
+/** The `docker network disconnect` calls made, as argv. */
+const disconnects = (calls: Call[]) => calls.map((c) => c.cmd).filter((c) => c[1] === "network" && c[2] === "disconnect");
 
 /** The calls that create, connect or run something (not listings, inspects, `docker info` or git), a helper with its host bound. */
 const changes = (calls: Call[]) =>
@@ -173,7 +192,7 @@ describe("hapi run start: refusals", () => {
   test("a secret that would shadow the run's environment is refused before anything starts", async () => {
     const { err } = capture();
     const f = ready();
-    writeArchonEnv(f.xdg, { PI_OFFLINE: "0" });
+    writeZoneEnv(f.xdg, "archon", { PI_OFFLINE: "0" });
     expect(await runStart(["--repo", f.repo, "--work-order", f.order], f.deps)).toBe(1);
     expect(err[0]).toMatch(/^hapi run start: the archon zone's env file: PI_OFFLINE is reserved/);
     expect(changes(f.calls)).toEqual([]);
@@ -545,7 +564,8 @@ describe("startRun", () => {
         `the parent run ${P} is a run of work order 0099-other, not of 0003-check-run`,
         seeded({ workOrder: "0099-other" }),
       ],
-      ["an inputs dir", () => ({ kind: "review", parent: P, inputsDir: "/srv/inputs" }), "a run's inputsDir isn't bound yet: no run kind takes an inputs dir", seeded()],
+      ["a worker with an inputs dir", (a) => ({ inputsDir: inputsIn(a.f.tmp) }), "a worker run takes no inputs dir"],
+      ["a forgeRepo that isn't one", () => ({ forgeRepo: "not a repo" }), 'the run\'s forgeRepo "not a repo" is not a GitHub repository\'s owner/name'],
       // An overlay that loosens the central policy, or fails its schema, names the repo's file (the poller's discovery refuses both first).
       [
         "an overlay that loosens the policy",
@@ -660,7 +680,7 @@ describe("startRun", () => {
     await seedRun(f, { id: P, status: "succeeded", objects: false, sha: SHA2 });
     // More turns than a round may take, so the cap shows.
     const long = { ...order, budget: { ...order.budget, turns: ph.round_turns + 10 } };
-    const rec = await startRun(f.deps, base({ workOrder: long, kind: "fix", parent: P, round: 1 }));
+    const rec = await startRun(f.deps, base({ workOrder: long, kind: "fix", parent: P, round: 1, inputsDir: inputsIn(f.tmp, { "findings.md": "# findings\n" }) }));
     expect([rec.key, rec.parent, rec.round, rec.budgetUsd, rec.sha]).toEqual([runKey("0003-check-run", SHA, "fix:1"), P, 1, Math.min(3, ph.round_usd), SHA]);
     expect(rec.retry).toBeUndefined();
     expect(rec.model).toBe(POLICY.rosters.anthropic[order.roles.implement].model);
@@ -680,9 +700,181 @@ describe("startRun", () => {
       const r = api();
       await seedRun(r.f, { id: P, status: "succeeded", objects: false });
       const reviewed = { ...r.order, roles: { implement: "small" as const, review: "medium" as const } };
-      const review = await startRun(r.f.deps, r.base({ workOrder: reviewed, kind: "review", parent: P, ...(overlay === undefined ? {} : { overlay }) }));
+      const review = await startRun(r.f.deps, r.base({ workOrder: reviewed, kind: "review", parent: P, inputsDir: inputsIn(r.f.tmp), ...(overlay === undefined ? {} : { overlay }) }));
       expect([review.model, review.deadline]).toEqual([POLICY.rosters.anthropic.medium.model, minutes(30)]);
     }
+  });
+
+  describe("the kinds (design §3.5)", () => {
+    const L = "0c0d0e0f0a0b";
+    /** A world whose work order may be reviewed (roles.review on a claude tier with another model), with its worker run P seeded. */
+    async function kinded(o: Parameters<typeof fakeRun>[0] = {}) {
+      const a = api(o);
+      await seedRun(a.f, { id: P, status: "succeeded", objects: false });
+      const reviewed = { ...a.order, roles: { implement: "small" as const, review: "medium" as const } };
+      const review = (over: Partial<StartOptions> = {}): StartOptions =>
+        a.base({ workOrder: reviewed, kind: "review", parent: P, inputsDir: inputsIn(a.f.tmp, { "diff.patch": "diff --git a/x b/x\n", "verify.json": "{}\n" }, `inputs-${randomName()}`), ...over });
+      return { ...a, review };
+    }
+    let counter = 0;
+    const randomName = () => String(counter++);
+    const runCall = (calls: Call[]) => calls.find((c) => c.cmd[1] === "run" && c.cmd[2] === "-d")!;
+
+    test("a verify run's docker CLI gets no secret, in env or argv; egress-archon joins its network as a worker's does; its container carries org.hapi.kind=verify", async () => {
+      capture();
+      const { f, base } = await kinded();
+      const rec = await startRun(f.deps, base({ kind: "verify", parent: P, budgetUsd: 0 }));
+      const name = `hapi-run-${rec.runId}`;
+      expect(f.calls.filter((c) => c.cmd[2] === "connect").map((c) => c.cmd)).toEqual([["docker", "network", "connect", "--alias", "egress-archon", name, "hapi-egress-archon-1"]]);
+      const run = runCall(f.calls);
+      for (const v of [f.secret, ...Object.values(f.review)]) {
+        expect(Object.values(run.env)).not.toContain(v);
+        expect(JSON.stringify(f.calls)).not.toContain(v);
+      }
+      // No `-e NAME` at all: every -e is the service's K=V.
+      expect(run.cmd.filter((a, i) => run.cmd[i - 1] === "-e" && !a.includes("="))).toEqual([]);
+      // Its proxy entry carries no key: the proxy variables name egress-archon with no credential in them, and the
+      // archon zone's Squid config adds no header (and no peer login) to any request it passes on.
+      const proxies = run.cmd.filter((a) => /^(HTTPS?_PROXY|https?_proxy)=/.test(a));
+      expect(proxies).toHaveLength(4);
+      for (const a of proxies) {
+        const u = new URL(a.slice(a.indexOf("=") + 1));
+        expect([a, u.hostname, u.username, u.password]).toEqual([a, "egress-archon", "", ""]);
+      }
+      expect(emitEgress(POLICY)["archon.squid.conf"]!).not.toMatch(/header|login=|cache_peer/i);
+      expect(f.world.containers.get(name)!.labels["org.hapi.kind"]).toBe("verify");
+      expect(run.cmd.slice(-5)).toEqual(["/opt/hapi/verify.sh", "factory-verify", SHA, "0003-check-run", TRACEPARENT]);
+      expect([rec.workflow, runJson(f, rec.runId).workflow, Object.hasOwn(runJson(f, rec.runId), "coderabbit")]).toEqual(["factory-verify", "factory-verify", false]);
+      expect(existsSync(join(f.deps.stateDir, rec.runId, "inputs"))).toBe(false);
+      // It reads no zone's env file, so it starts with neither in place.
+      const g = await kinded();
+      rmSync(join(g.f.xdg, "hapi", "env"), { recursive: true });
+      expect((await startRun(g.f.deps, g.base({ kind: "verify", parent: P, budgetUsd: 0 }))).kind).toBe("verify");
+    });
+
+    test("a review run's docker CLI env holds the review zone's values and none of the archon zone's, and egress-review joins its network as egress-review", async () => {
+      capture();
+      const { f, review } = await kinded();
+      const rec = await startRun(f.deps, review());
+      const name = `hapi-run-${rec.runId}`;
+      expect(f.calls.filter((c) => c.cmd[2] === "connect").map((c) => c.cmd)).toEqual([["docker", "network", "connect", "--alias", "egress-review", name, "hapi-egress-review-1"]]);
+      const run = runCall(f.calls);
+      expect([run.env.ANTHROPIC_API_KEY, run.env.CLAUDE_API_KEY]).toEqual([f.review.ANTHROPIC_API_KEY, f.review.CLAUDE_API_KEY]);
+      expect(Object.values(run.env)).not.toContain(f.secret);
+      expect(run.cmd.join("\n")).not.toContain(f.review.ANTHROPIC_API_KEY);
+      expect(run.cmd.filter((a, i) => run.cmd[i - 1] === "-e" && !a.includes("="))).toEqual(["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"]);
+      expect(run.cmd).toContain("HTTPS_PROXY=http://egress-review:3128");
+      expect(f.world.containers.get(name)!.labels["org.hapi.kind"]).toBe("review");
+      expect(run.cmd.slice(-5)).toEqual(["/opt/hapi/review.sh", "factory-review", SHA, "0003-check-run", TRACEPARENT]);
+      // run.json says whether CodeRabbit's step runs: the overlaid phases.coderabbit, off by default, on by the repo's overlay.
+      expect(runJson(f, rec.runId)).toMatchObject({ kind: "review", workflow: "factory-review", coderabbit: POLICY.runs.phases.coderabbit });
+      const g = await kinded();
+      const on = await startRun(g.f.deps, g.review({ overlay: { runs: { phases: { coderabbit: true } } } }));
+      expect(runJson(g.f, on.runId).coderabbit).toBe(true);
+    });
+
+    test("a review run without its zone file is refused", async () => {
+      capture();
+      const { f, review } = await kinded();
+      rmSync(join(f.xdg, "hapi", "env", "review.env"));
+      const before = ids(f);
+      expect((await caught(startRun(f.deps, review()))).message).toBe(`${join(f.xdg, "hapi", "env", "review.env")} is missing: run \`mise run up\` first`);
+      expect([changes(f.calls), ids(f)]).toEqual([[], before]);
+    });
+
+    test("a fix or review run needs an inputs dir holding only RUN_INPUTS' files, copied into its run dir 0755 with 0644 files; a worker or verify run takes none", async () => {
+      capture();
+      type K = Awaited<ReturnType<typeof kinded>>;
+      const holding = (k: K, make: (dir: string) => void) => {
+        const dir = inputsIn(k.f.tmp, {}, `in-${randomName()}`);
+        make(dir);
+        return dir;
+      };
+      const cases: [what: string, over: (k: K) => StartOptions, text: (k: K, o: StartOptions) => string][] = [
+        ["a fix without one", (k) => k.base({ kind: "fix", parent: P }), () => "a fix run needs an inputs dir (StartOptions.inputsDir): its findings go in it"],
+        [
+          "a review without one",
+          (k) => {
+            const { inputsDir: _, ...none } = k.review();
+            return none;
+          },
+          () => "a review run needs an inputs dir (StartOptions.inputsDir): the diff and verify's results go in it",
+        ],
+        ["a verify with one", (k) => k.base({ kind: "verify", parent: P, inputsDir: inputsIn(k.f.tmp, {}, "v") }), () => "a verify run takes no inputs dir: its source already holds the bundle's commits"],
+        ["a worker with one", (k) => k.base({ inputsDir: inputsIn(k.f.tmp, {}, "w") }), () => "a worker run takes no inputs dir"],
+        [
+          "a symlink",
+          (k) => k.base({ kind: "fix", parent: P, inputsDir: holding(k, (d) => symlinkSync("/etc/passwd", join(d, "findings.md"))) }),
+          (_, o) => `${o.inputsDir}/findings.md: the inputs dir holds only regular files, not a symlink or a directory`,
+        ],
+        [
+          "a directory",
+          (k) => k.review({ inputsDir: holding(k, (d) => mkdirSync(join(d, "diff.patch"))) }),
+          (_, o) => `${o.inputsDir}/diff.patch: the inputs dir holds only regular files, not a symlink or a directory`,
+        ],
+        [
+          "a name that isn't plain",
+          (k) => k.base({ kind: "fix", parent: P, inputsDir: holding(k, (d) => writeFileSync(join(d, "evil\u001b[2Jname"), "x")) }),
+          () => "the inputs dir holds a name that isn't plain ([A-Za-z0-9._-], at most 64 characters): not shown",
+        ],
+        [
+          "a bundle",
+          (k) => k.base({ kind: "fix", parent: P, inputsDir: holding(k, (d) => writeFileSync(join(d, "run.bundle"), "# v2 git bundle\n")) }),
+          (_, o) => `${o.inputsDir}/run.bundle is none of RUN_INPUTS' files (diff.patch, verify.json, findings.md): an inputs dir never holds a bundle`,
+        ],
+        [
+          "a path that isn't a dir",
+          (k) => k.base({ kind: "fix", parent: P, inputsDir: join(k.f.tmp, "order.yaml") }),
+          (k) => `the inputs dir ${join(k.f.tmp, "order.yaml")} is not a directory`,
+        ],
+      ];
+      for (const [what, over, text] of cases) {
+        const k = await kinded();
+        const o = over(k);
+        const before = ids(k.f);
+        const e = await caught(startRun(k.f.deps, o));
+        expect([what, e.message]).toEqual([what, text(k, o)]);
+        expect([what, changes(k.f.calls), ids(k.f)]).toEqual([what, [], before]);
+      }
+
+      // Accepted: copied into the run's dir, the dir 0755 and each file 0644 whatever the source's modes, and bound read-only.
+      const k = await kinded();
+      const dir = inputsIn(k.f.tmp, { "findings.md": "# findings\n" }, "fix-in");
+      chmodSync(join(dir, "findings.md"), 0o600);
+      const old = process.umask(0o077);
+      let rec: Awaited<ReturnType<typeof startRun>>;
+      try {
+        rec = await startRun(k.f.deps, k.base({ kind: "fix", parent: P, round: 1, inputsDir: dir }));
+      } finally {
+        process.umask(old);
+      }
+      const copy = join(k.f.deps.stateDir, rec.runId, "inputs");
+      expect([statSync(copy).mode & 0o777, readdirSync(copy), statSync(join(copy, "findings.md")).mode & 0o777]).toEqual([0o755, ["findings.md"], 0o644]);
+      expect(readFileSync(join(copy, "findings.md"), "utf8")).toBe("# findings\n");
+      expect(runCall(k.f.calls).cmd).toContain(`${copy}:/run/hapi/inputs:ro`);
+      // A review's holds the diff and verify's results; an empty one is an inputs dir too (a review whose verify phase is off).
+      const r = await kinded();
+      const reviewed = await startRun(r.f.deps, r.review());
+      expect(readdirSync(join(r.f.deps.stateDir, reviewed.runId, "inputs")).sort()).toEqual(["diff.patch", "verify.json"]);
+      const e = await kinded();
+      const empty = await startRun(e.f.deps, e.review({ inputsDir: inputsIn(e.f.tmp, {}, "empty") }));
+      expect(readdirSync(join(e.f.deps.stateDir, empty.runId, "inputs"))).toEqual([]);
+    });
+
+    test("one live run per GitHub repo (m23): a verify on a scratch source counts against a run live on the mirror of the same forgeRepo", async () => {
+      capture();
+      const { f, base, gitDir } = await kinded({ runs: { max_live: 2 } });
+      const scratch = realpathSync(join(fakeRepo(f.tmp, "scratch"), ".git"));
+      // A run of another work order of the same repo, live on the mirror.
+      await seedRun(f, { id: L, repo: gitDir, workOrder: "0004-other", forgeRepo: "example-owner/sandbox" });
+      const e = await caught(startRun(f.deps, base({ repoGitDir: scratch, kind: "verify", parent: P, budgetUsd: 0, forgeRepo: "example-owner/sandbox" })));
+      expect(e.message).toBe(`run ${L} is live for example-owner/sandbox: one live run per repo (H-090); wait for it, or stop it with \`hapi run stop ${L}\``);
+      expect(changes(f.calls)).toEqual([]);
+      // Another GitHub repo's verify, below max_live, starts, and its record names its repo.
+      const other = await startRun(f.deps, base({ repoGitDir: scratch, kind: "verify", parent: P, budgetUsd: 0, forgeRepo: "example-owner/other" }));
+      expect([other.repo, other.forgeRepo]).toEqual([scratch, "example-owner/other"]);
+      expect((await readRecord(f.deps.stateDir, other.runId))!.forgeRepo).toBe("example-owner/other");
+    });
   });
 
   test("an engine pass never meets a hand run's key, and a retry's worker starts beside a succeeded worker of the same commit", async () => {
@@ -865,6 +1057,50 @@ describe("finalizeRun", () => {
     expect([failed.status, failed.reason]).toEqual(["failed", "the workflow failed (Archon status failed)"]);
   });
 
+  test("finalize copies out each kind's own outputs: a verify run's verify.json comes out, and a run.bundle in its /out is a name no verify run leaves", async () => {
+    capture();
+    const f = fakeRun();
+    const done = await finalizeRun(await seedRun(f, { id: ID, kind: "verify", running: false, outputs: { ...completedOutputs(), "verify.json": file('{"check":"passed"}\n') } }), f.deps);
+    expect(done.status).toBe("succeeded");
+    expect(readdirSync(join(f.deps.stateDir, ID, "out")).sort()).toEqual(["result.json", "transcript.jsonl", "verify.json"]);
+    const g = fakeRun();
+    const bundled = await finalizeRun(
+      await seedRun(g, { id: ID, kind: "verify", running: false, outputs: { ...completedOutputs(), "verify.json": file("{}\n"), "run.bundle": file(new Uint8Array([0x23])) } }),
+      g.deps,
+    );
+    expect([bundled.status, bundled.reason]).toEqual(["failed", "the run's output volume holds 1 names that are not run outputs (run.bundle): not copied"]);
+    expect(readdirSync(join(g.deps.stateDir, ID, "out")).sort()).toEqual(["result.json", "transcript.jsonl", "verify.json"]);
+    // Never read, so never checked as a bundle.
+    expect(g.calls.some((c) => c.cmd.includes("list-heads"))).toBe(false);
+    // A review's own: its decisions and CodeRabbit's NDJSON.
+    const h = ready();
+    const reviewed = await finalizeRun(
+      await seedRun(h, { id: ID, kind: "review", running: false, outputs: { ...completedOutputs(), "decisions.jsonl": file(""), "coderabbit.ndjson": file('{"type":"complete"}\n') } }),
+      h.deps,
+    );
+    expect(reviewed.status).toBe("succeeded");
+    expect(readdirSync(join(h.deps.stateDir, ID, "out")).sort()).toEqual(["coderabbit.ndjson", "decisions.jsonl", "result.json", "transcript.jsonl"]);
+  });
+
+  test("finalize and a rolled-back start disconnect only the egress the run joined: hapi-egress-archon-1 for verify, hapi-egress-review-1 for review", async () => {
+    capture();
+    for (const [kind, egress] of [["verify", "hapi-egress-archon-1"], ["review", "hapi-egress-review-1"]] as const) {
+      const f = ready();
+      const done = await finalizeRun(await seedRun(f, { id: ID, kind, running: false, outputs: completedOutputs() }), f.deps);
+      expect([kind, done.status, disconnects(f.calls)]).toEqual([kind, "succeeded", [["docker", "network", "disconnect", "-f", N, egress]]]);
+      expect([kind, f.world.networks.size]).toEqual([kind, 0]);
+    }
+    // A review's start that fails at its `docker run` disconnects egress-review, and never egress-archon.
+    const f = ready({ failing: ["docker run -d"] });
+    await seedRun(f, { id: "0a0b0c0d0e0f", status: "succeeded", objects: false });
+    const order = { ...loadWorkOrder(f.order), roles: { implement: "small" as const, review: "medium" as const } };
+    const gitDir = realpathSync(join(f.repo, ".git"));
+    const e = await caught(startRun(f.deps, { repoGitDir: gitDir, workOrder: order, sha: SHA, public: false, kind: "review", parent: "0a0b0c0d0e0f", inputsDir: inputsIn(f.tmp) }));
+    expect(e.message).toMatch(/^docker run hapi-run-[0-9a-f]{12} failed \(exit 1\): boom\. What start had created was removed\.$/);
+    expect(disconnects(f.calls).map((c) => c.at(-1))).toEqual(["hapi-egress-review-1"]);
+    expect([f.world.containers.size, f.world.networks.size, f.world.volumes.size]).toEqual([0, 0, 0]);
+  });
+
   test("finalize disconnects egress-archon before removing the network", async () => {
     capture();
     const f = fakeRun();
@@ -1012,9 +1248,11 @@ describe("finalizeRun", () => {
   });
 });
 
-test("a finalize waits on another long enough for that one's stop and every bounded call, the container's log among them, and the run disk's cleanup", () => {
-  // The stop's grace, then the three fixed calls (the listing, the container's log, the cleanup helper) and a read per output, each at its host bound and KILL.
-  expect(FINALIZE_WAIT_S).toBeGreaterThanOrEqual(STOP_GRACE_S + (3 + OUTPUT_FILES.length) * (HELPER_HOST_TIMEOUT_S + HELPER_KILL_AFTER_S));
+test("a finalize waits long enough for every kind's bounded calls", () => {
+  // The stop's grace, then the three fixed calls (the listing, the container's log, the cleanup helper) and a read per
+  // output of the kind with the most (MAX_OUTPUTS), each at its host bound and KILL, and 100 s for the rest.
+  expect(FINALIZE_WAIT_S).toBe(STOP_GRACE_S + (3 + MAX_OUTPUTS) * (HELPER_HOST_TIMEOUT_S + HELPER_KILL_AFTER_S) + 100);
+  // 30 + 7 × 160 + 100: the number Task 4 pinned, now from MAX_OUTPUTS (4).
   expect(FINALIZE_WAIT_S).toBe(1250);
 });
 
@@ -1100,6 +1338,27 @@ describe("the container's log, when no result.json came out (final review C-1)",
     expect(unbounded(cmds[logs]!)).toEqual(["sh", "-c", `exec docker logs --tail 200 "$1" 2>&1`, "hapi-logs", N]);
     expect(logs).toBeLessThan(cmds.findIndex((c) => c.join(" ") === `docker rm -f ${N}`));
     expect(f.world.containers.size).toBe(0);
+  });
+
+  test("a review run's kept log is redacted with the review zone's values too, and isn't kept without review.env", async () => {
+    capture();
+    const f = ready();
+    f.world.logs.set(N, `a ${f.secret} b ${f.review.ANTHROPIC_API_KEY} c ${f.review.CLAUDE_API_KEY}\n`);
+    await finalizeRun(await seedRun(f, { id: ID, kind: "review", running: false, outputs: {} }), f.deps);
+    // The two zones hold ANTHROPIC_API_KEY with different values, so each is redacted, the review's named for its zone.
+    expect(readFileSync(join(OUT(f), "container.log"), "utf8")).toBe("a [hapi: ANTHROPIC_API_KEY redacted] b [hapi: ANTHROPIC_API_KEY (review zone) redacted] c [hapi: CLAUDE_API_KEY redacted]\n");
+    const g = ready();
+    rmSync(join(g.xdg, "hapi", "env", "review.env"));
+    g.world.logs.set(N, `b ${g.review.ANTHROPIC_API_KEY}\n`);
+    const done = await finalizeRun(await seedRun(g, { id: ID, kind: "review", running: false, outputs: {} }), g.deps);
+    expect(done.reason).toContain(`the container's log was not kept, since nothing could redact it: ${join(g.xdg, "hapi", "env", "review.env")} is missing`);
+    expect(existsSync(join(OUT(g), "container.log"))).toBe(false);
+    // A worker's log needs only the archon zone's file.
+    const h = ready();
+    rmSync(join(h.xdg, "hapi", "env", "review.env"));
+    h.world.logs.set(N, `x ${h.secret}\n`);
+    await finalizeRun(await seedRun(h, { id: ID, running: false, outputs: {} }), h.deps);
+    expect(readFileSync(join(OUT(h), "container.log"), "utf8")).toBe("x [hapi: ANTHROPIC_API_KEY redacted]\n");
   });
 
   test("a run whose result.json came out keeps no log", async () => {

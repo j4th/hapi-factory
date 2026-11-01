@@ -32,8 +32,10 @@ export const HERMES_HOME = "/opt/data";
 /**
  * A zone's proxy variables: HTTP(S)_PROXY, in both cases, at the zone's own
  * egress proxy, and loopback direct. Every zone container gets exactly these.
+ * The review zone has no service of its own: a review run is a run container
+ * of the archon service whose proxy variables are these (src/run/spec.ts).
  */
-export function proxyEnv(zone: "hermes" | "archon" | "research"): Record<string, string> {
+export function proxyEnv(zone: "hermes" | "archon" | "research" | "review"): Record<string, string> {
   const proxy = `http://egress-${zone}:${PROXY_PORT}`;
   const direct = "localhost,127.0.0.1,::1";
   return { HTTP_PROXY: proxy, HTTPS_PROXY: proxy, http_proxy: proxy, https_proxy: proxy, NO_PROXY: direct, no_proxy: direct };

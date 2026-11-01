@@ -5,7 +5,8 @@
  *
  * A run (Plan 02, `hapi run`) is a container of its own, made from the `archon`
  * service of the compose file, on a network of its own that the launcher joins
- * `egress-archon` to; compose does not know it. Every such object carries
+ * its kind's proxy to (`egress-archon`, or `egress-review` for a review run,
+ * src/run/kinds.ts); compose does not know it. Every such object carries
  * `RUN_LABEL` and `PROJECT_LABEL`, which is how `up` sees a live run and
  * `removeRuns` (and so `down`) finds what to remove.
  *
@@ -44,8 +45,8 @@
  * running (`liveRuns`): recreating egress-archon would cut its egress, and
  * nothing has been built or written yet.
  *
- * `down` is `removeRuns` (the run containers, then egress-archon's hold on each
- * run network, then the run networks and volumes), then `docker compose -p hapi
+ * `down` is `removeRuns` (the run containers, then egress-archon's and
+ * egress-review's hold on each run network, then the run networks and volumes), then `docker compose -p hapi
  * down`, by project name, so it needs no compose file or build/: it is kill
  * switch 3 (spec §11.8). It removes the runs holding the run disk's lock
  * (`withStackLock`, src/run/locks.ts; H-210), which a finalize holds while it
@@ -287,9 +288,10 @@ async function liveRuns(run: Runner, env: Env, project: string): Promise<string[
 }
 
 /**
- * Removes every run object of `project`: the labelled containers (`rm -f`), then `<project>-egress-archon-1`'s
- * attachment to each labelled network (Docker refuses to remove a network with an endpoint attached, spike 07
- * finding 13), then the networks, then the volumes. Only what the two labels select, never by name or prefix.
+ * Removes every run object of `project`: the labelled containers (`rm -f`), then each egress proxy's attachment to
+ * each labelled network (Docker refuses to remove a network with an endpoint attached, spike 07 finding 13): both
+ * `<project>-egress-archon-1` and `<project>-egress-review-1`, since a review run's network has the second and every
+ * other kind's the first (src/run/kinds.ts), then the networks, then the volumes. Only what the two labels select, never by name or prefix.
  * It tries every removal and throws at the end naming the ones that failed. A listing that fails (`docker ps`,
  * `network ls`, `volume ls`) throws at once and skips the steps after it: that almost always means the daemon is
  * down, when they would fail too. Either way `down`, kill switch 3, goes on to `compose down`. A disconnect that
@@ -298,11 +300,12 @@ async function liveRuns(run: Runner, env: Env, project: string): Promise<string[
  * finalizing its run removes the same objects, and may have got there first (`not found`).
  *
  * With `o.runId`, only that run's objects (`org.hapi.run=<id>`): `hapi run` finalizes one run, or rolls back a
- * start, this way, disconnecting `o.egress` (its `RunDeps.egress`) when given. With `o.volumes` false (the default
+ * start, this way, disconnecting only `o.egress`, the proxies its kind joined (src/run/kinds.ts `egressOf`), when
+ * given. With `o.volumes` false (the default
  * is true), the volumes are neither listed nor removed: the one way to keep them, for `down` without the run disk's
  * lock, and for a finalize whose volumes must stay.
  */
-export async function removeRuns(project: string, run: Runner, env: Env, o: { runId?: string; egress?: string; volumes?: boolean } = {}): Promise<void> {
+export async function removeRuns(project: string, run: Runner, env: Env, o: { runId?: string; egress?: string[]; volumes?: boolean } = {}): Promise<void> {
   const failures: string[] = [];
   /** Remove `names` with `cmd`; a failure counts while `list` (their listing) still shows one of them, or can't say. */
   const remove = async (cmd: string[], names: string[], list: string[]) => {
@@ -315,13 +318,13 @@ export async function removeRuns(project: string, run: Runner, env: Env, o: { ru
     if (left.length > 0) failures.push(`${cmd.join(" ")} failed (exit ${r.code}): ${r.stderr?.trim() || "(no error output)"}`);
   };
   const filters = runFilters(project, o.runId);
-  const egress = o.egress ?? `${project}-egress-archon-1`;
+  const egress = o.egress ?? [`${project}-egress-archon-1`, `${project}-egress-review-1`];
   const ps = ["docker", "ps", "-aq", ...filters];
   const containers = await listed(run, env, ps);
   if (containers.length > 0) await remove(["docker", "rm", "-f", ...containers], containers, ps);
   const nets = ["docker", "network", "ls", "--format", "{{.Name}}", ...filters];
   const networks = await listed(run, env, nets);
-  for (const n of networks) await run(["docker", "network", "disconnect", "-f", n, egress], { env: definedEnv(env), inherit: false });
+  for (const n of networks) for (const e of egress) await run(["docker", "network", "disconnect", "-f", n, e], { env: definedEnv(env), inherit: false });
   if (networks.length > 0) await remove(["docker", "network", "rm", ...networks], networks, nets);
   if (o.volumes !== false) {
     const vols = ["docker", "volume", "ls", "-q", ...filters];

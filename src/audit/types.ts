@@ -76,6 +76,11 @@ export interface AuditContext {
   secrets?: SecretsDeps;
   /** What runtime.run-disk reads the run disk's filesystem with; default: src/run/disk.ts `probeFs` (tests inject a fake). */
   probeFs?: FsProbe;
+  /**
+   * Each zone's env names, zone to names, which runtime.run-container holds a live run container's keys to: one holds
+   * only its kind's zone's keys, a verify none. Default: each zone of stack/secrets.yaml (tests add a review zone).
+   */
+  zoneKeys?: Record<string, string[]>;
 }
 
 /** One audit: its context, and what its checks share, each computed at most once. */

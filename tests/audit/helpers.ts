@@ -21,6 +21,7 @@ import { loadPolicy } from "../../src/policy/load";
 import { type FsProbe, GIB } from "../../src/run/disk";
 import { RUN_DISK } from "../../src/run/locks";
 import { envFileText } from "../../src/secrets/files";
+import { loadManifest, MANIFEST_FILE } from "../../src/secrets/manifest";
 import { serviceEnvironment } from "../../src/stack/env";
 import { buildDigest } from "../../src/stack/up";
 
@@ -344,6 +345,19 @@ export function hostEnv(env: Record<string, string>): void {
 }
 
 /**
+ * The review zone's env names, a fixture: Task 9 adds the zone to stack/secrets.yaml, so nothing here needs it. Its
+ * Claude Code keys (`ANTHROPIC_API_KEY`, which Claude Code sends, and `CLAUDE_API_KEY`, Archon's name for it) and
+ * CodeRabbit's.
+ */
+export const REVIEW_ZONE_KEYS = ["ANTHROPIC_API_KEY", "CLAUDE_API_KEY", "CODERABBIT_API_KEY"];
+
+/** Each zone's env names, as the clean world gives the audit: stack/secrets.yaml's zones, plus the fixture review zone. */
+export function zoneKeys(): Record<string, string[]> {
+  const manifest = loadManifest(join(REPO, MANIFEST_FILE));
+  return { ...Object.fromEntries(Object.entries(manifest).map(([zone, names]) => [zone, Object.keys(names ?? {})])), review: REVIEW_ZONE_KEYS };
+}
+
+/**
  * A clean world: everything as `hapi stack up` leaves it. `o.repos` adds the
  * repo above to `--repo`; `o.workflows` its workflow files.
  */
@@ -418,6 +432,7 @@ export async function cleanWorld(o: { repos?: boolean; workflows?: Record<string
     user: "hapi",
     exec: async (cmd) => fakeExec(world, cmd),
     probeFs: goodDisks,
+    zoneKeys: zoneKeys(),
     fetch: (async (input: string | URL | Request, init: RequestInit = {}) => {
       const call: FetchCall = { method: init.method ?? "GET", url: String(input), headers: Object.fromEntries(new Headers(init.headers).entries()) };
       world.requests.push(call);
@@ -431,20 +446,32 @@ export async function cleanWorld(o: { repos?: boolean; workflows?: Record<string
   return world;
 }
 
+/** The run kinds, as the audit's fixtures name them. */
+export type Kind = "worker" | "verify" | "review" | "fix";
+
 /**
- * A live run container as `docker inspect` prints one: the labels and mounts a launcher-made container has
- * (src/run/spec.ts; the Compose labels blank), Archon's whole environment, and no published port. Written out here,
- * not read from `runArgs`, so the check's expectation is checked against an independent list.
+ * A live run container as `docker inspect` prints one: the labels and mounts a launcher-made container of `over.kind`
+ * has (src/run/spec.ts; the Compose labels blank), Archon's whole environment with its kind's proxy, its prelude's
+ * command, and no published port. With no kind it has no `org.hapi.kind` label, as a Plan 02 worker had. Written out
+ * here, not read from `runArgs` or `kindProfile`, so the check's expectation is checked against an independent list:
+ * - worker and fix: run.sh, the work order's workflow, egress-archon; a fix's inputs dir too;
+ * - verify: verify.sh, factory-verify, egress-archon, no inputs;
+ * - review: review.sh, factory-review, egress-review, its inputs dir.
  */
-export function runContainer(w: World, id = "ab12cd34ef56", over: { labels?: Record<string, string> } = {}): Container {
+export function runContainer(w: World, id = "ab12cd34ef56", over: { labels?: Record<string, string>; kind?: Kind } = {}): Container {
   const name = `hapi-run-${id}`;
+  const kind = over.kind ?? "worker";
+  const prelude = { worker: "run.sh", fix: "run.sh", verify: "verify.sh", review: "review.sh" }[kind];
+  const workflow = { worker: "hapi-check-run", fix: "hapi-check-run", verify: "factory-verify", review: "factory-review" }[kind];
+  const env = { ...serviceEnvironment("archon") };
+  if (kind === "review") for (const k of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]) env[k] = "http://egress-review:3128";
   const bind = (Source: string, Destination: string) => ({ Type: "bind", Source, Destination, RW: false });
   return {
     Id: `id-run-${id}`,
     Name: `/${name}`,
     State: { Running: true },
     Path: "sh",
-    Args: ["/opt/hapi/run.sh", "hapi-check-run"],
+    Args: [`/opt/hapi/${prelude}`, workflow],
     Config: {
       Labels: {
         "com.docker.compose.project": "",
@@ -452,13 +479,14 @@ export function runContainer(w: World, id = "ab12cd34ef56", over: { labels?: Rec
         "com.docker.compose.version": "",
         "org.hapi.run": id,
         "org.hapi.project": "hapi",
+        ...(over.kind === undefined ? {} : { "org.hapi.kind": over.kind }),
         "org.hapi.stack": "hapi-factory",
         "org.hapi.started-by": "hapi",
         "org.hapi.dev-override": "0",
         "org.hapi.build-sha256": w.digest,
         ...over.labels,
       },
-      Env: [...Object.entries(serviceEnvironment("archon")).map(([k, v]) => `${k}=${v}`), "PATH=/usr/local/bin:/usr/bin:/bin"],
+      Env: [...Object.entries(env).map(([k, v]) => `${k}=${v}`), "PATH=/usr/local/bin:/usr/bin:/bin"],
       Cmd: null,
       Entrypoint: ["sh"],
       User: "1001:1001",
@@ -473,11 +501,12 @@ export function runContainer(w: World, id = "ab12cd34ef56", over: { labels?: Rec
       bind(join(REPO, "archon", "workflows", "hapi"), "/.archon/workflows/hapi"),
       bind(join(w.build, "archon", "run-config.yaml"), "/opt/hapi/run-config.yaml"),
       bind(join(w.build, "archon", "gitconfig"), "/home/appuser/.gitconfig"),
-      bind(join(REPO, "stack", "archon", "run.sh"), "/opt/hapi/run.sh"),
+      bind(join(REPO, "stack", "archon", prelude), `/opt/hapi/${prelude}`),
       bind("/state/runs/run.json", "/run/hapi/run.json"),
       bind("/state/runs/order.json", "/run/hapi/order.json"),
       bind("/state/runs/task.md", "/run/hapi/task.md"),
       bind("/srv/src/.git", "/src/repo.git"),
+      ...(kind === "review" || kind === "fix" ? [bind("/state/runs/inputs", "/run/hapi/inputs")] : []),
       { Type: "volume", Source: `/var/lib/docker/volumes/${name}-work/_data`, Destination: "/work", RW: true },
       { Type: "volume", Source: `/var/lib/docker/volumes/${name}-out/_data`, Destination: "/out", RW: true },
     ],

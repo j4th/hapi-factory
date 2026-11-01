@@ -8,6 +8,9 @@
  *   with the repo's overlay applied, H-172), and the host's copies of its work
  *   order and task text, each bound read-only into the container, whose uid is
  *   another host uid under rootless Docker;
+ * - `inputs/` (0755, its files 0644), for a review or a fix: the host's copy of
+ *   the inputs dir the caller named (`RUN_INPUTS`' files alone, ./kinds.ts),
+ *   bound read-only at `RUN_PATHS.inputs`;
  * - `out/`: the outputs copy-out brought back (./copyout.ts), 0600 each.
  * Nothing a run writes lands here but through copy-out.
  *
@@ -21,7 +24,10 @@
  *   hand run (`hapi run start`) keeps Plan 02's two-part key; every engine
  *   key has a part, so the two never meet;
  * - one live run per repo (spec §4.4, H-090), and at most `runs.max_live` in
- *   all (`capacityProblem`).
+ *   all (`capacityProblem`). A repo is its source's git dir, and its GitHub
+ *   `owner/name` when the start names one (`forgeRepo`, m23): a verify or a
+ *   review starts from a scratch copy of the mirror, another git dir, and still
+ *   counts against its repo.
  *
  * Liveness is Docker's, never a pid that could be reused: a run is live while
  * a container named `runName` with both its labels is running (`isLive`,
@@ -30,12 +36,14 @@
  * so it never counts.
  */
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { chmod, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { chmod, lstat, mkdir, open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { parseOwnerRepo } from "../forge/github/app-token";
 import type { RunFile } from "../generate/archon";
 import { withStoreLock } from "../secrets/store-files";
 import { definedEnv, listed, runFilters } from "../stack/up";
-import { RUN_KINDS, type RunKind } from "./kinds";
+import { INPUTS_DIR, RUN_INPUTS, RUN_KINDS, type RunKind } from "./kinds";
 import { type RunDeps, runName } from "./spec";
 
 /** Whether an error is a held lock: defined in ./locks.ts, which src/stack/up.ts can import too, and re-exported here for the launcher's locks. */
@@ -85,6 +93,8 @@ export interface RunRecord {
   turns?: number;
   /** The model the run's alias names in its roster: `@implement`'s for a worker or fix, `@review`'s for a review; none for a verify, which runs no model. */
   model?: string;
+  /** The GitHub repository the run is of, `owner/name` (the poller's `Discovered.repo`, Task 13): one live run per repo counts by it too (m23). A hand run has none. */
+  forgeRepo?: string;
 }
 
 /** The files a run's dir holds beside record.json and run.json, each bound read-only into the container: see the module comment. */
@@ -129,13 +139,15 @@ const count = (v: unknown) => v === undefined || (typeof v === "number" && Numbe
 
 /**
  * `x` as a record of run `runId`, or undefined if it isn't one: a kind that is no run kind, a budget or spend that
- * isn't a finite number of at least 0, or a round, turns or retry that isn't a whole number of at least 0, isn't.
+ * isn't a finite number of at least 0, a round, turns or retry that isn't a whole number of at least 0, or a
+ * forgeRepo that isn't a GitHub repository's owner/name, isn't.
  */
 function asRecord(x: unknown, runId: string): RunRecord | undefined {
   const r = x as Partial<RunRecord> | null;
   if (r === null || typeof r !== "object" || r.runId !== runId || !STATUSES.includes(r.status as RunStatus)) return undefined;
   if (r.kind !== undefined && !RUN_KINDS.includes(r.kind)) return undefined;
   if (![r.budgetUsd, r.spendUsd].every(amount) || ![r.round, r.turns, r.retry].every(count)) return undefined;
+  if (r.forgeRepo !== undefined && (typeof r.forgeRepo !== "string" || parseOwnerRepo(r.forgeRepo) === undefined)) return undefined;
   const text = [r.key, r.project, r.repo, r.sha, r.workOrder, r.workflow, r.container, r.network, r.startedAt, r.deadline, r.volumes?.work, r.volumes?.out];
   return text.every((t) => typeof t === "string") ? (r as RunRecord) : undefined;
 }
@@ -186,11 +198,69 @@ export async function listRecords(stateDir: string): Promise<RunRecord[]> {
   return out;
 }
 
+/** A name in an inputs dir that may be shown: plain, and short. */
+const PLAIN_NAME = /^[A-Za-z0-9._-]{1,64}$/;
+const INPUT_NAMES: readonly string[] = Object.values(RUN_INPUTS);
+
 /**
- * Make the run's dir (it must not exist), with its record, its run file and each of `PER_RUN_FILES`; a write that
- * fails removes the dir again.
+ * Why `dir` can't be a run's inputs dir, or undefined: it must be a directory (not a symlink to one) holding only
+ * regular files, each named for one of `RUN_INPUTS`' files. It may be empty: a review whose verify phase is off has no
+ * verify.json. A name that isn't plain is never shown.
  */
-export async function createRun(stateDir: string, rec: RunRecord, runFile: RunFile, files: Record<(typeof PER_RUN_FILES)[number], string>): Promise<void> {
+export async function inputsProblem(dir: string): Promise<string | undefined> {
+  const at = await lstat(dir).catch(() => undefined);
+  if (at === undefined || !at.isDirectory()) return `the inputs dir ${dir} is not a directory`;
+  let names: string[];
+  try {
+    names = (await readdir(dir)).sort();
+  } catch (e) {
+    return `the inputs dir ${dir} can't be read (${(e as NodeJS.ErrnoException).code ?? "error"})`;
+  }
+  for (const name of names) {
+    if (!PLAIN_NAME.test(name)) return "the inputs dir holds a name that isn't plain ([A-Za-z0-9._-], at most 64 characters): not shown";
+    const entry = await lstat(join(dir, name)).catch(() => undefined);
+    if (entry === undefined || !entry.isFile()) return `${dir}/${name}: the inputs dir holds only regular files, not a symlink or a directory`;
+    if (!INPUT_NAMES.includes(name)) return `${dir}/${name} is none of RUN_INPUTS' files (${INPUT_NAMES.join(", ")}): an inputs dir never holds a bundle`;
+  }
+  return undefined;
+}
+
+/**
+ * Copy the inputs dir `from` into `<dir>/inputs` (0755, each file 0644: the container reads them as another host
+ * uid). Each file is opened without following a link and must be a regular file named for one of `RUN_INPUTS`' files,
+ * as `inputsProblem` checked before the launcher's lock; anything else now throws.
+ */
+async function copyInputs(from: string, dir: string): Promise<void> {
+  const to = join(dir, INPUTS_DIR);
+  await mkdir(to, { mode: 0o755 });
+  await chmod(to, 0o755);
+  for (const name of (await readdir(from)).sort()) {
+    if (!INPUT_NAMES.includes(name)) throw new Error(`the inputs dir ${from} changed after it was checked: it holds a name that is none of RUN_INPUTS' files`);
+    const fh = await open(join(from, name), constants.O_RDONLY | constants.O_NOFOLLOW);
+    let bytes: Buffer;
+    try {
+      if (!(await fh.stat()).isFile()) throw new Error(`${from}/${name} changed after it was checked: it is not a regular file`);
+      bytes = await fh.readFile();
+    } finally {
+      await fh.close();
+    }
+    const file = join(to, name);
+    await writeFile(file, bytes, { flag: "wx" });
+    await chmod(file, 0o644);
+  }
+}
+
+/**
+ * Make the run's dir (it must not exist), with its record, its run file and each of `PER_RUN_FILES`, and, for a
+ * review or a fix, its copy of the inputs dir `inputsFrom` (`copyInputs`); a write that fails removes the dir again.
+ */
+export async function createRun(
+  stateDir: string,
+  rec: RunRecord,
+  runFile: RunFile,
+  files: Record<(typeof PER_RUN_FILES)[number], string>,
+  inputsFrom?: string,
+): Promise<void> {
   await mkdir(stateDir, { recursive: true, mode: 0o700 });
   const dir = recordDir(stateDir, rec.runId);
   await mkdir(dir, { mode: 0o700 });
@@ -203,6 +273,7 @@ export async function createRun(stateDir: string, rec: RunRecord, runFile: RunFi
       // The container reads it as uid 1001, another host uid under rootless Docker: readable by all, whatever the umask.
       await chmod(file, 0o644);
     }
+    if (inputsFrom !== undefined) await copyInputs(inputsFrom, dir);
   } catch (e) {
     await rm(dir, { recursive: true, force: true });
     throw e;
@@ -249,15 +320,23 @@ export function keyProblem(records: RunRecord[], want: { key: string; workOrder:
   return undefined;
 }
 
-/** Why the live runs leave no room for one more on `repo`, or undefined: one per repo (H-090), `maxLive` in all. */
-export function capacityProblem(live: string[], records: RunRecord[], repo: string, d: Pick<RunDeps, "stateDir" | "project" | "runs">): string | undefined {
+/**
+ * Why the live runs leave no room for one more on `want`'s repo, or undefined: one per repo (H-090), `maxLive` in all.
+ * A live run is of the same repo when its source is the same git dir, or when the start names a GitHub repo
+ * (`forgeRepo`, m23) and the live run's record names the same one: a verify on a scratch copy of the mirror counts
+ * against a worker live on the mirror.
+ */
+export function capacityProblem(live: string[], records: RunRecord[], want: { repo: string; forgeRepo?: string }, d: Pick<RunDeps, "stateDir" | "project" | "runs">): string | undefined {
   const byId = new Map(records.map((r) => [r.runId, r]));
   for (const id of live) {
     const r = byId.get(id);
     if (r === undefined) {
       return `run ${id} is live but has no record in ${d.stateDir}, so its repo is unknown: remove it with \`docker rm -f ${runName(d.project, id)}\`, or \`mise run down\``;
     }
-    if (r.repo === repo) return `run ${id} is live for ${repo}: one live run per repo (H-090); wait for it, or stop it with \`hapi run stop ${id}\``;
+    const forge = want.forgeRepo !== undefined && r.forgeRepo === want.forgeRepo;
+    if (forge || r.repo === want.repo) {
+      return `run ${id} is live for ${forge ? want.forgeRepo : want.repo}: one live run per repo (H-090); wait for it, or stop it with \`hapi run stop ${id}\``;
+    }
   }
   if (live.length >= d.runs.max_live) {
     return `${live.length} runs are live and runs.max_live is ${d.runs.max_live} (policy/runs.yaml): wait for one to end, or stop one with \`hapi run stop <id>\``;

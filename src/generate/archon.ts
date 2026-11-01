@@ -52,6 +52,11 @@ export const RUN_PATHS = {
   order: "/run/hapi/order.json",
   /** The work order's task text (its task.md), bound read-only; empty when it has none. */
   task: "/run/hapi/task.md",
+  /**
+   * A review's or fix's inputs dir, bound read-only (Plan 03 Task 8): the host's copy of `RUN_INPUTS`' files
+   * (src/run/kinds.ts), the diff and verify's results for a review, the review's findings for a fix.
+   */
+  inputs: "/run/hapi/inputs",
 } as const;
 
 /**
@@ -77,6 +82,8 @@ export interface RunFile {
   turns?: number;
   /** The work order's base commit, the one its worker run started from (Task 11's CodeRabbit node: `jq -r .base /run/hapi/run.json`). */
   base?: string;
+  /** A review run's alone: whether its CodeRabbit step runs, the overlaid policy's `runs.phases.coderabbit`. */
+  coderabbit?: boolean;
 }
 
 /**

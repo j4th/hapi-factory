@@ -10,10 +10,10 @@ import { mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } fro
 import { join } from "node:path";
 import { RUN_KINDS } from "../../src/run/kinds";
 import { runStart } from "../../src/run/lifecycle";
-import { isLive, keyPart, keyProblem, readRecord, RUN_ID, runKey, type RunRecord } from "../../src/run/records";
+import { capacityProblem, isLive, keyPart, keyProblem, readRecord, RUN_ID, runKey, type RunRecord } from "../../src/run/records";
 import { PROJECT_LABEL, RUN_LABEL } from "../../src/stack/up";
 import { capture, caught, cleanup, tempDir } from "../secrets/helpers";
-import { fakeRepo, fakeRun, fakeSecret, SHA, seedRun, writeArchonEnv, writeOrder } from "./helpers";
+import { fakeRepo, fakeRun, fakeSecret, SHA, seedRun, writeOrder, writeZoneEnv } from "./helpers";
 
 afterEach(cleanup);
 
@@ -103,6 +103,37 @@ describe("readRecord", () => {
   });
 });
 
+describe("forgeRepo (m23)", () => {
+  test("a record's forgeRepo, when it has one, is a GitHub repository's owner/name", async () => {
+    const state = (rec: object) => {
+      const dir = tempDir("hapi-records-");
+      mkdirSync(join(dir, "aaaaaaaaaaaa"));
+      writeFileSync(join(dir, "aaaaaaaaaaaa", "record.json"), JSON.stringify(rec));
+      return dir;
+    };
+    const base = rec("aaaaaaaaaaaa", "succeeded", "2026-10-29T10:00:00Z");
+    for (const forgeRepo of ["example-owner", "a/b/c", "../x", "owner/..", "", 7, null]) {
+      const e = await caught(readRecord(state({ ...base, forgeRepo }), "aaaaaaaaaaaa"));
+      expect([forgeRepo, e.message]).toEqual([forgeRepo, expect.stringContaining("is not a run record hapi wrote")]);
+    }
+    expect((await readRecord(state({ ...base, forgeRepo: "example-owner/sandbox" }), "aaaaaaaaaaaa"))!.forgeRepo).toBe("example-owner/sandbox");
+    expect((await readRecord(state(base), "aaaaaaaaaaaa"))!.forgeRepo).toBeUndefined();
+  });
+
+  test("capacityProblem keys one live run per repo by forgeRepo when the start has one, and by the source's git dir always", () => {
+    const d = { stateDir: "/state", project: "hapi", runs: { max_live: 5 } } as Parameters<typeof capacityProblem>[3];
+    const mirror = { ...rec("aaaaaaaaaaaa", "live", "2026-10-29T10:00:00Z"), repo: "/engine/mirrors/example-owner/sandbox.git", forgeRepo: "example-owner/sandbox" };
+    const refused = "run aaaaaaaaaaaa is live for example-owner/sandbox: one live run per repo (H-090); wait for it, or stop it with `hapi run stop aaaaaaaaaaaa`";
+    // A verify from a scratch copy of the same repo: another git dir, the same GitHub repo.
+    expect(capacityProblem(["aaaaaaaaaaaa"], [mirror], { repo: "/engine/scratch/0003/repo.git", forgeRepo: "example-owner/sandbox" }, d)).toBe(refused);
+    expect(capacityProblem(["aaaaaaaaaaaa"], [mirror], { repo: "/engine/scratch/0003/repo.git", forgeRepo: "example-owner/other" }, d)).toBeUndefined();
+    // The same git dir is the same repo, whatever either says of GitHub (a hand run names none).
+    expect(capacityProblem(["aaaaaaaaaaaa"], [mirror], { repo: mirror.repo }, d)).toBe(`run aaaaaaaaaaaa is live for ${mirror.repo}: one live run per repo (H-090); wait for it, or stop it with \`hapi run stop aaaaaaaaaaaa\``);
+    // A run that isn't live doesn't count.
+    expect(capacityProblem([], [mirror], { repo: "/x.git", forgeRepo: "example-owner/sandbox" }, d)).toBeUndefined();
+  });
+});
+
 describe("keyProblem", () => {
   const want = { key: KEY, workOrder: "0003-check-run", sha: SHA };
 
@@ -134,7 +165,7 @@ describe("keyProblem", () => {
 
 describe("admission, under the lock", () => {
   async function start(f: ReturnType<typeof fakeRun>, repo: string) {
-    writeArchonEnv(f.xdg, { ANTHROPIC_API_KEY: fakeSecret("ANTHROPIC_API_KEY") });
+    writeZoneEnv(f.xdg, "archon", { ANTHROPIC_API_KEY: fakeSecret("ANTHROPIC_API_KEY") });
     return runStart(["--repo", repo, "--work-order", writeOrder(f.tmp)], f.deps);
   }
   const LIVE_LIST = ["docker", "ps", "--filter", "label=org.hapi.run", "--filter", "label=org.hapi.project=hapi", "--format", '{{.Label "org.hapi.run"}}\t{{.Names}}'];
