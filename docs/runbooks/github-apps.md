@@ -43,7 +43,7 @@ Set these permissions **exactly**. Everything not listed is **No access**, inclu
 
 | | `hapi-planner` | `hapi-factory` |
 |---|---|---|
-| Used by | Hermes. A host helper mints a 1-hour token per session, outside the container (spec §9.1, `hapi-gh-token`). | The harvester, a host script run by the `hapi` user (spec §9.4) |
+| Used by | Hermes. A host helper mints a 1-hour token per session, outside the container (spec §9.1, `hapi-gh-token`). | The harvester, a host script run by the `hapi` user (spec §9.4), and the run engine: `forgeToken` mints this App's tokens for the mirror (fetch), the push, PR writes and reads, and the poller's read of CodeRabbit's check run |
 | Branches | `plan/*` | `factory/*` |
 | Private key | In your secrets store, as `hapi-host-planner-app-private-key` | In your secrets store, as `hapi-host-factory-app-private-key` |
 | App ID | In your secrets store, as `hapi-host-planner-app-id` | In your secrets store, as `hapi-host-factory-app-id` |
@@ -69,6 +69,26 @@ CodeRabbit's round uses two of them: its reviews and review comments are read wi
 - It refuses a repo that `policy/repos.yaml` does not register, and a repo whose `hapi-factory` installation is not the id `policy/repos.yaml` records.
 - `markReady` (a draft PR to ready for review) is the only GraphQL call (`markPullRequestReadyForReview`): GitHub's REST "Update a pull request" takes no `draft` field (checked against API version `2026-03-10`).
 - GitHub documents these routes as accepting Pull requests (the issue-comment, label and "List issue events" routes accept Issues or Pull requests), so the factory App needs no Issues permission. "Get repository permissions for a user" needs only Metadata, and its `role_name` tells triage and maintain apart.
+
+## Adding a permission to an existing App
+
+When a release adds a permission to an App (Plan 03 adds **Checks: Read-only** to `hapi-factory`), do this once, after the release is merged and hapi's checkout has pulled it:
+
+1. **Settings → Developer settings → GitHub Apps → hapi-factory → Permissions & events → Repository permissions → Checks: Read-only → Save changes.**
+2. **Settings → Applications → Installed GitHub Apps → hapi-factory → Configure**, then review and accept the new permission.
+3. Run the audit as hapi (`<file>` is your audit token file, mode 0600; docs/runbooks/stack.md §5):
+
+   ```bash
+   sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
+     export XDG_RUNTIME_DIR PATH="$HOME/.local/bin:$PATH"; \
+     cd "$HOME/hapi-factory" && exec mise run audit -- \
+     --repo <owner>/hapi-factory --strict --github-token-file <file>' \
+     | grep -E '^(fail|skip) |github\.app-perms|^hapi audit:'
+   ```
+
+   Paste back the `github.app-perms` line (expected `pass`), the summary line, and the permissions line from the installation's page ("Read access to checks and metadata", "Read and write access to code and pull requests").
+
+**The window:** until step 2 is done, the installation lacks Checks. `hapi token mint --app factory` and a `checks` `forgeToken` ask for a permission the installation does not have, GitHub refuses them (HTTP 422), and `github.app-perms` fails.
 
 ## Creating each App
 

@@ -26,9 +26,9 @@ export function githubForge(o: { repo: string; token: string; fetch?: typeof fet
     const rec = (v: unknown, field: string): Record<string, unknown> => asRecord(v) ?? (() => { throw miss(field); })();
     const str = (r: Record<string, unknown>, k: string, label = k): string => (typeof r[k] === "string" ? (r[k] as string) : (() => { throw miss(label); })());
     const num = (r: Record<string, unknown>, k: string, label = k): number => (typeof r[k] === "number" ? (r[k] as number) : (() => { throw miss(label); })());
-    const sub = (r: Record<string, unknown>, k: string): Record<string, unknown> => {
+    const sub = (r: Record<string, unknown>, k: string, label = `${k}.id`): Record<string, unknown> => {
       const v = asRecord(r[k]);
-      if (v === undefined) throw miss(`${k}.id`);
+      if (v === undefined) throw miss(label);
       return v;
     };
     const person = (r: Record<string, unknown>, k: string) => {
@@ -41,15 +41,20 @@ export function githubForge(o: { repo: string; token: string; fetch?: typeof fet
   const toPr = (json: unknown, method: string, path: string): PrInfo => {
     const { rec, str, num, sub, miss } = reader(method, path);
     const r = rec(json, "number");
-    const head = sub(r, "head");
-    const base = sub(r, "base");
+    const head = sub(r, "head", "head.sha");
+    const base = sub(r, "base", "base.ref");
     if (!Array.isArray(r.labels)) throw miss("labels");
     const state = str(r, "state");
+    if (state !== "open" && state !== "closed") throw miss("state");
+    if (typeof r.draft !== "boolean") throw miss("draft");
+    // GitHub gives `merged` on a single PR and only `merged_at` in a listing.
+    const merged = typeof r.merged === "boolean" ? r.merged : typeof r.merged_at === "string" ? true : r.merged_at === null ? false : undefined;
+    if (merged === undefined) throw miss("merged");
     return {
       number: num(r, "number"),
-      state: state === "open" ? "open" : "closed",
-      merged: typeof r.merged === "boolean" ? r.merged : r.merged_at !== null && r.merged_at !== undefined,
-      draft: r.draft === true,
+      state,
+      merged,
+      draft: r.draft,
       headSha: str(head, "sha", "head.sha"),
       headRef: str(head, "ref", "head.ref"),
       baseRef: str(base, "ref", "base.ref"),
@@ -91,14 +96,18 @@ export function githubForge(o: { repo: string; token: string; fetch?: typeof fet
       const path = `${R}/pulls/${n}`;
       const r = reader("GET", path);
       const j = r.rec(await restOk(f, "GET", path, t, 200), "node_id");
-      if (j.draft !== true) return;
+      if (typeof j.draft !== "boolean") throw r.miss("draft");
+      if (!j.draft) return;
       const res = await rest(f, "POST", "/graphql", t, { query: MARK_READY, variables: { id: r.str(j, "node_id") } });
       if (res.status !== 200) throw replyError("POST", "/graphql", res);
-      const errors = asRecord(res.json)?.errors;
+      const reply = asRecord(res.json);
+      const errors = reply?.errors;
       if (Array.isArray(errors) && errors.length > 0) {
         const msg = asRecord(errors[0])?.message;
         throw bad("POST", "/graphql", typeof msg === "string" ? msg.replace(/\s+/g, " ").slice(0, 200) : "the mutation returned errors");
       }
+      // A 200 with no data and no errors did not mark the PR ready.
+      if (asRecord(reply?.data) === undefined) throw bad("POST", "/graphql", "the reply has no data");
     },
     async addLabels(n, labels) {
       await restOk(f, "POST", `${R}/issues/${n}/labels`, t, 200, { labels });

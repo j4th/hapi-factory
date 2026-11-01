@@ -17,12 +17,12 @@ export type TokenPurpose = "mirror" | "push" | "pr" | "checks";
  * The permissions each purpose asks for. CodeRabbit's round needs two: its reviews and review comments
  * through a "pr" forge, its check run through a "checks" forge.
  */
-export const PURPOSE_PERMISSIONS: Record<TokenPurpose, Permissions> = {
-  mirror: { contents: "read" },
-  push: { contents: "write" },
-  pr: { pull_requests: "write" },
-  checks: { checks: "read" },
-};
+export const PURPOSE_PERMISSIONS: Readonly<Record<TokenPurpose, Readonly<Permissions>>> = Object.freeze({
+  mirror: Object.freeze({ contents: "read" }),
+  push: Object.freeze({ contents: "write" }),
+  pr: Object.freeze({ pull_requests: "write" }),
+  checks: Object.freeze({ checks: "read" }),
+} as Record<TokenPurpose, Permissions>);
 
 export async function forgeToken(
   env: Env,
@@ -45,7 +45,7 @@ export async function forgeToken(
       `the hapi-factory App's installation on ${repo} is ${installationId}, but policy/repos.yaml records ${registry.installations.factory}: fix one of them before the factory acts on the repo`,
     );
   }
-  const { token, expiresAt } = await mintInstallationToken({ ...creds, installationId, repositories: [target.name], permissions: PURPOSE_PERMISSIONS[purpose], ...net });
+  const { token, expiresAt } = await mintInstallationToken({ ...creds, installationId, repositories: [target.name], permissions: { ...PURPOSE_PERMISSIONS[purpose] }, ...net });
   let done = false;
   return {
     token,

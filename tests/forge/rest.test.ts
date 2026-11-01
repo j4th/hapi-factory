@@ -1,16 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { GITHUB_API as API, ForgeError, MAX_PAGES, paginate, rest, restOk } from "../../src/forge/github/rest";
-import { fakeFetch } from "./helpers";
+import { caught, fakeFetch } from "./helpers";
 
 const TOKEN = "fake-token-rest-77ab";
-const caught = async (p: Promise<unknown>): Promise<Error> => {
-  try {
-    await p;
-  } catch (e) {
-    return e as Error;
-  }
-  throw new Error("expected a rejection");
-};
 
 describe("rest", () => {
   test("rest sends hapi's headers, refuses redirects, and returns the response headers", async () => {
@@ -81,6 +73,16 @@ describe("rest", () => {
     expect(e2.message).toBe("GitHub: GET /x: socket closed: [redacted]");
     expect((e2 as ForgeError).status).toBe(0);
     expect(e2.message).not.toContain(TOKEN);
+  });
+
+  test("a success reply whose body can't be read is a status-0 ForgeError, with no token in it", async () => {
+    const f = fakeFetch({});
+    const garbled = (async () => new Response("<html>not json " + TOKEN, { status: 200 })) as unknown as typeof fetch;
+    const e = (await caught(restOk(garbled, "GET", "/x?y=1", TOKEN, 200))) as ForgeError;
+    expect(e).toBeInstanceOf(ForgeError);
+    expect(e.status).toBe(0);
+    expect(e.message).toBe("GitHub: GET /x: HTTP 200: the reply body could not be read as JSON");
+    void f;
   });
 
   test("a 429, or a 403 with x-ratelimit-remaining 0, is a rate-limited ForgeError", async () => {

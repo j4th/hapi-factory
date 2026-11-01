@@ -285,6 +285,21 @@ describe("hapi token mint", () => {
     expect(f.calls.some((c) => `${c.method} ${c.url}` === REVOKE)).toBe(true);
   });
 
+  test("a token whose file can't be written and can't be revoked says when it expires, and keeps the cause (H-195)", async () => {
+    capture();
+    const xdg = xdgWithHostEnv({ HAPI_FACTORY_APP_ID: "123456", HAPI_FACTORY_APP_PRIVATE_KEY: PKCS1_PEM });
+    mkdirSync(join(xdg, "hapi", "tokens", "factory.example-owner.odoo-mcp.token", "inside"), { recursive: true, mode: 0o700 });
+    const f = fakeFetch({
+      [`GET ${API}/repos/example-owner/odoo-mcp/installation`]: { status: 200, body: { id: 123, suspended_at: null } },
+      [MINT]: granted({ ...APPS.factory.permissions }),
+      [REVOKE]: { status: 500 },
+    });
+    const e = (await tokenMint(["--app", "factory", "--repo", "example-owner/odoo-mcp"], { fetch: f.fetch, env: { XDG_RUNTIME_DIR: xdg }, now: () => NOW_MS }).catch((x: Error) => x)) as Error;
+    expect(e.message).toMatch(/it could not be revoked, so it stays valid until 2023-11-14T23:13:20Z; suspend the App's installation/);
+    expect(e.message).not.toContain(TOKEN);
+    expect(e.cause).toBeInstanceOf(Error);
+  });
+
   test("each mint deletes token files in hapi/tokens/ older than one hour", async () => {
     capture();
     const xdg = xdgWithHostEnv(planner);

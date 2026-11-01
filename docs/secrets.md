@@ -555,7 +555,7 @@ It mints a 1-hour installation token for **one** repo, with the App's fixed perm
 | `--app` | App | Token permissions |
 |---|---|---|
 | `planner` | `hapi-planner` (Hermes) | `contents: write`, `pull_requests: write`, `issues: read`, `metadata: read` |
-| `factory` | `hapi-factory` (the harvester) | `contents: write`, `pull_requests: write`, `metadata: read` |
+| `factory` | `hapi-factory` (the harvester) | `contents: write`, `pull_requests: write`, `checks: read`, `metadata: read` |
 
 How it works:
 1. It checks `XDG_RUNTIME_DIR` (yours, `0700`), then reads the App's id and key from `$XDG_RUNTIME_DIR/hapi/env/host.env` (`HAPI_<APP>_APP_ID`, `HAPI_<APP>_APP_PRIVATE_KEY`). Run `hapi secrets resolve` first. It checks `tokens/` too (ours, a real directory, `0700`) before it asks GitHub for anything, so a bad `tokens/` stops it before a token is minted.

@@ -377,6 +377,7 @@ export async function tokenMint(args: string[], deps: TokenDeps = {}): Promise<n
         (revoked
           ? "it was revoked"
           : `it could not be revoked, so it stays valid until ${expiresAt}; suspend the App's installation if that is too long (docs/runbooks/github-apps.md)`),
+      { cause: e },
     );
   }
   console.log(`${file} (expires ${expiresAt})`);

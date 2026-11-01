@@ -46,6 +46,16 @@ function toResponse(reply: Reply): Response {
   return new Response(status === 204 || reply.body === undefined ? null : JSON.stringify(reply.body), { status, headers: reply.headers ?? {} });
 }
 
+/** The error a rejected promise holds; fails if it resolves. */
+export const caught = async (p: Promise<unknown>): Promise<Error> => {
+  try {
+    await p;
+  } catch (e) {
+    return e as Error;
+  }
+  throw new Error("expected a rejection");
+};
+
 export const OPERATOR = { id: 1, login: "example-owner", type: "User" };
 export const STRANGER = { id: 2, login: "example-stranger", type: "User" };
 export const FACTORY_BOT = { id: 3, login: "hapi-factory[bot]", type: "Bot" };
@@ -99,7 +109,7 @@ export function fakeForge(o: { repo?: string; private?: boolean; pageSize?: numb
 
   const prJson = (p: PrRec, single: boolean) => ({
     number: p.number,
-    state: p.state,
+    state: p.merged ? "closed" : p.state,
     draft: p.draft,
     title: p.title,
     body: p.body,
@@ -152,6 +162,12 @@ export function fakeForge(o: { repo?: string; private?: boolean; pageSize?: numb
       return page(url, list, (xs) => xs.map((x) => prJson(x, false)));
     }
     if (method === "POST" && rest === "/pulls") {
+      if (!refs.has(body.head)) {
+        return { status: 422, body: { message: "Validation Failed", errors: [{ resource: "PullRequest", field: "head", code: "invalid" }] } };
+      }
+      if ([...prs.values()].some((x) => x.state === "open" && x.headRef === body.head && x.baseRef === (body.base ?? "main"))) {
+        return { status: 422, body: { message: "Validation Failed", errors: [{ resource: "PullRequest", code: "custom", message: `A pull request already exists for ${repo.split("/")[0]}:${body.head}.` }] } };
+      }
       const n = addPr({ head: body.head, base: body.base, draft: body.draft === true, body: body.body, title: body.title });
       return { status: 201, body: prJson(prs.get(n)!, true) };
     }
@@ -168,7 +184,8 @@ export function fakeForge(o: { repo?: string; private?: boolean; pageSize?: numb
       const pr = prs.get(Number(m[1]));
       if (pr === undefined) return { status: 404, body: { message: "Not Found" } };
       for (const l of body.labels as string[]) {
-        if (!pr.labels.includes(l)) pr.labels.push(l);
+        if (pr.labels.includes(l)) continue;
+        pr.labels.push(l);
         addEvent(pr.number, "labeled", l, FACTORY_BOT, true);
       }
       return { status: 200, body: pr.labels.map((name) => ({ name })) };
@@ -288,7 +305,10 @@ export function fakeForge(o: { repo?: string; private?: boolean; pageSize?: numb
     label(n: number, name: string, actor: Actor, a: { viaApp?: boolean; action?: "labeled" | "unlabeled" } = {}): void {
       const action = a.action ?? "labeled";
       const pr = prs.get(n);
-      if (pr !== undefined) pr.labels = action === "labeled" ? [...new Set([...pr.labels, name])] : pr.labels.filter((l) => l !== name);
+      const had = pr?.labels.includes(name) ?? false;
+      // GitHub records no event for a label that is already there, or already gone.
+      if ((action === "labeled") === had) return;
+      if (pr !== undefined) pr.labels = action === "labeled" ? [...pr.labels, name] : pr.labels.filter((l) => l !== name);
       addEvent(n, action, name, actor, a.viaApp ?? false);
     },
     review(n: number, who: Actor, commitId: string): number {

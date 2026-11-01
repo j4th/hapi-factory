@@ -6,7 +6,7 @@ import { PURPOSE_PERMISSIONS, forgeToken, type TokenPurpose } from "../../src/fo
 import { GITHUB_API as API } from "../../src/forge/github/rest";
 import { runCommand } from "../../src/stack/up";
 import { capture, cleanup, hostEnv, tempDir } from "../audit/helpers";
-import { fakeFetch, type Reply } from "./helpers";
+import { caught, fakeFetch, type Reply } from "./helpers";
 
 afterEach(cleanup);
 
@@ -15,14 +15,6 @@ const MINTED = "fake-minted-token-5e5e";
 const registry = { installations: { planner: 11, factory: 12 }, repos: { [REPO]: { registered: "2026-11-01" } } };
 const MINT = `POST ${API}/app/installations/12/access_tokens`;
 const REVOKE = `DELETE ${API}/installation/token`;
-const caught = async (p: Promise<unknown>): Promise<Error> => {
-  try {
-    await p;
-  } catch (e) {
-    return e as Error;
-  }
-  throw new Error("expected a rejection");
-};
 
 function setup(over: Record<string, Reply> = {}, installation = 12) {
   const xdg = tempDir("hapi-forge-token-");
@@ -94,6 +86,27 @@ describe("forgeToken", () => {
   });
 });
 
+describe("forgeToken purposes and registry", () => {
+  test("PURPOSE_PERMISSIONS is frozen, and a mint gets a copy, so nothing can widen a later mint", async () => {
+    expect(Object.isFrozen(PURPOSE_PERMISSIONS)).toBe(true);
+    for (const p of Object.values(PURPOSE_PERMISSIONS)) expect(Object.isFrozen(p)).toBe(true);
+    expect(() => {
+      (PURPOSE_PERMISSIONS.push as Record<string, string>).administration = "write";
+    }).toThrow();
+    const { env, f } = setup();
+    await forgeToken(env, REPO, "push", { registry, fetch: f.fetch });
+    const mint = f.calls.find((c) => `${c.method} ${c.url}` === MINT)!;
+    expect(mint.body).toEqual({ repositories: ["hapi-sandbox"], permissions: { contents: "write" } });
+  });
+
+  test("the default registry is policy/repos.yaml: an unregistered repo is refused with no GitHub call", async () => {
+    const { env, f } = setup();
+    const e = await caught(forgeToken(env, REPO, "push", { fetch: f.fetch }));
+    expect(e.message).toBe(`${REPO} is not registered in policy/repos.yaml: the factory acts only on registered repos`);
+    expect(f.calls).toHaveLength(0);
+  });
+});
+
 describe("authedGit", () => {
   test("authedGit hands git the token as an extraheader in exactly three environment entries", () => {
     expect(authedGit("fake-tok")).toEqual({
@@ -111,6 +124,9 @@ describe("authedGit", () => {
     const r = await runCommand(cmd, { env: { PATH: process.env.PATH ?? "", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", ...entries }, inherit: false });
     expect(r.code).toBe(0);
     expect(r.stdout.trim()).toBe(entries.GIT_CONFIG_VALUE_0!);
-    expect(cmd.join(" ")).not.toContain(T);
+    // git saw the header in its environment only: the spawned argv is the four words above, and the token is in no entry's key.
+    expect(cmd).toEqual(["git", "config", "--get", "http.https://github.com/.extraheader"]);
+    expect(Object.keys(entries).some((k) => k.includes(T))).toBe(false);
+    expect(r.stdout).not.toContain(T);
   });
 });

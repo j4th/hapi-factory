@@ -98,6 +98,8 @@ export async function rest(
     const text = await res.text();
     json = text === "" ? undefined : JSON.parse(text);
   } catch {
+    // An error reply's body is only for its message; a success reply that cannot be read is no answer.
+    if (res.status >= 200 && res.status < 300) throw fail(method, path, `HTTP ${res.status}: the reply body could not be read as JSON`);
     json = undefined;
   }
   return { status: res.status, json, headers: res.headers };
