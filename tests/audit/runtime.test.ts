@@ -57,6 +57,14 @@ describe("runtime.run-container", () => {
     expect(r.detail).toContain("size=64m,uid=1001,gid=1001,mode=0700");
   });
 
+  test("a run definition that drops any host bind fails, naming it: the guard's extensions and settings, the run layer, the git config, the prelude, the run file and the source", async () => {
+    for (const dest of ["/opt/hapi/pi-agent/settings.json", "/opt/hapi/pi-agent/extensions", "/opt/hapi/run-config.yaml", "/home/appuser/.gitconfig", "/opt/hapi/run.sh", "/run/hapi/run.json", "/src/repo.git"]) {
+      const r = await withSpec(without("-v", (v) => v.endsWith(`:${dest}:ro`)));
+      expect([dest, r.status]).toEqual([dest, "fail"]);
+      expect(r.detail).toContain(`nothing is bound at ${dest}`);
+    }
+  });
+
   test("a writable models.json fails, naming the file", async () => {
     const r = await withSpec((argv) => argv.map((a) => (a.endsWith(":/opt/hapi/pi-agent/models.json:ro") ? a.slice(0, -3) : a)));
     expect(r.status).toBe("fail");

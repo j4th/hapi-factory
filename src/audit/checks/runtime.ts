@@ -5,8 +5,9 @@
  * - runtime.run-container: there is no long-lived archon container (a run is a
  *   fresh container the launcher makes, src/run/spec.ts), so the check's subject
  *   is the run definition: `runArgs` for a sample run must give Pi's agent dir
- *   a tmpfs, bind every generated file (and /.archon/.env, empty, and the
- *   workflow pack) read-only, carry every value of `serviceEnvironment("archon")`,
+ *   a tmpfs, bind every host file (build/'s generated ones, /.archon/.env,
+ *   empty, the workflow pack, the prelude, the run file and the source repo)
+ *   read-only, carry every value of `serviceEnvironment("archon")`,
  *   publish no port (H-197), and carry every hardening flag and the stop
  *   timeout. Each live run container, found by its `org.hapi.run` and
  *   `org.hapi.project` labels (never by Compose's), is held to that argv through
@@ -30,7 +31,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import YAML from "yaml";
 import { RUN_PATHS } from "../../generate/archon";
-import { APP_USER, NO_NEW_PRIVILEGES, runArgs, type RunInputs, STOP_GRACE_S } from "../../run/spec";
+import { APP_HOME, APP_USER, NO_NEW_PRIVILEGES, runArgs, type RunInputs, STOP_GRACE_S } from "../../run/spec";
 import { composeServices } from "../../stack/compose";
 import { HERMES_HOME, serviceEnvironment } from "../../stack/env";
 import { currentUserOverride, HAPI_USER, PROJECT, runFilters } from "../../stack/up";
@@ -128,14 +129,26 @@ async function running(run: AuditRun, id: string, service: string): Promise<Cont
 /** The tmpfs options Pi's agent dir gets (design §6a item 3): small, the appuser's, nobody else's. */
 const PI_TMPFS = "size=64m,uid=1001,gid=1001,mode=0700";
 
-/** What the run container must have, by destination: the generated files, /.archon/.env (empty, so Archon loads nothing over the environment) and the pack. */
+/**
+ * What the run container must have bound read-only, by destination: every host file runArgs binds (build/'s generated
+ * files, /.archon/.env (empty, so Archon loads nothing over the environment), the pack, the prelude, the run file and
+ * the source repo). The live check holds a container to runArgs' own output, so only this list catches a bind runArgs
+ * drops (CodeRabbit, on PR #13 and locally).
+ */
 const READ_ONLY_DESTINATIONS = [
   `${RUN_PATHS.piDir}/models.json`,
   `${RUN_PATHS.piDir}/models-store.json`,
   `${RUN_PATHS.piDir}/hapi-guard.json`,
+  `${RUN_PATHS.piDir}/settings.json`,
+  `${RUN_PATHS.piDir}/extensions`,
   "/.archon/config.yaml",
   "/.archon/.env",
   RUN_PATHS.pack,
+  "/opt/hapi/run-config.yaml",
+  `${APP_HOME}/.gitconfig`,
+  "/opt/hapi/run.sh",
+  RUN_PATHS.runFile,
+  RUN_PATHS.source,
 ];
 
 /** What a live container's `Config.Env` says, as problems against `serviceEnvironment("archon")`. */
@@ -297,7 +310,7 @@ export async function runContainer(run: AuditRun): Promise<CheckResult[]> {
     result(
       id,
       "pass",
-      `the run definition (runArgs, src/run/spec.ts) gives ${RUN_PATHS.piDir} a tmpfs (${PI_TMPFS}), binds ${READ_ONLY_DESTINATIONS.length} files (the generated ones, /.archon/.env and the pack ${packDir}) read-only, sets all ${Object.keys(serviceEnvironment("archon")).length} values of serviceEnvironment("archon") (${nonProxy} besides the proxy's), publishes no port, and has every hardening flag and a ${STOP_GRACE_S} s stop timeout; ${checked}`,
+      `the run definition (runArgs, src/run/spec.ts) gives ${RUN_PATHS.piDir} a tmpfs (${PI_TMPFS}), binds all ${READ_ONLY_DESTINATIONS.length} host files (build/'s generated ones, /.archon/.env, the pack ${packDir}, the prelude, the run file and the source repo) read-only, sets all ${Object.keys(serviceEnvironment("archon")).length} values of serviceEnvironment("archon") (${nonProxy} besides the proxy's), publishes no port, and has every hardening flag and a ${STOP_GRACE_S} s stop timeout; ${checked}`,
     ),
   ];
 }

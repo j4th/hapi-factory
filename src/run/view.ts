@@ -121,7 +121,9 @@ async function printEnded(d: RunDeps, rec: RunRecord, print: (text: string) => v
     if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
   }
   if (text === undefined) print("(no transcript.jsonl was copied out)");
-  else for (const line of transcriptLines(text)) print(line);
+  // One text, so redaction sees a key a row holds over several lines, body and all (CodeRabbit, local review);
+  // each line is sanitized first, so an unterminated escape sequence takes only the rest of its own line.
+  else print(transcriptLines(text).map(sanitizeTerminal).join("\n"));
   print(ended(rec));
 }
 

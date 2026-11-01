@@ -6,15 +6,15 @@
   "type": "object",
   "properties": {
     "max_live": {
-      "description": "Runs that may be live (queued or running) at once; the launcher refuses the next one.",
+      "description": "Runs that may be live at once; the launcher refuses the next one (no queue until Plan 03's poller).",
       "$ref": "policy-defs.schema.json#/$defs/count"
     },
     "retention_days": {
-      "description": "Days a finished run's files are kept before the launcher prunes them.",
+      "description": "Days after a run's harvestedAt (set by Plan 03's harvester) that the launcher removes its files; a run with no harvestedAt is never removed, so Plan 02 removes nothing yet (H-206).",
       "$ref": "policy-defs.schema.json#/$defs/count"
     },
     "output_limits_mb": {
-      "description": "The largest size in MB of each file a run may write; the launcher stops a run that exceeds one.",
+      "description": "The largest size in MB of each output file copied out of a run; a larger one is not copied out and the run is recorded failed (the run is not stopped for it).",
       "type": "object",
       "properties": {
         "bundle": {

@@ -235,6 +235,34 @@ describe("hapi run watch", () => {
     expect(f.calls).toEqual([]);
   });
 
+  test("a finished run's transcript redacts a private key a row holds over several lines, body and all, and an unterminated escape takes only its own line", async () => {
+    const { out } = capture();
+    const f = ready();
+    const body = Array.from({ length: 3 }, () => randomBytes(48).toString("base64"));
+    const begin = "-----BEGIN " + "RSA PRIVATE KEY-----";
+    const end = "-----END " + "RSA PRIVATE KEY-----";
+    await seedRun(f, { id: ID, status: "succeeded", objects: false });
+    writeOut(
+      f.deps.stateDir,
+      ID,
+      "transcript.jsonl",
+      [
+        row({ type: "exec_output", step: "cat", exit_code: 0, stdout_tail: [begin, ...body, end].join("\n") }),
+        row({ type: "exec_output", step: "esc", stdout_tail: `x${ESC}]0;unterminated` }),
+        row({ type: "workflow_complete" }),
+        "",
+      ].join("\n"),
+    );
+    expect(await runWatch([ID], f.deps)).toBe(0);
+    expect(out).toEqual([
+      "[cat] exec_output exit 0: [hapi: private-key redacted]",
+      "[esc] exec_output x",
+      "[workflow] workflow_complete",
+      `run ${ID}: succeeded`,
+    ]);
+    for (const line of body) expect(out.join("\n")).not.toContain(line);
+  });
+
   test("a run with no copied transcript says so", async () => {
     const { out } = capture();
     const f = ready();

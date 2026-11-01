@@ -93,9 +93,9 @@ export interface Budgets {
 
 /** The run launcher's limits, from runs.yaml. A repo overlay may only lower them. */
 export interface Runs {
-  /** Runs live (queued or running) at once. */
+  /** Runs live at once. */
   max_live: number;
-  /** Days a finished run's files are kept. */
+  /** Days after a run's harvestedAt that its files are kept (H-206). */
   retention_days: number;
   /** The largest, in MB, each file a run writes may be. */
   output_limits_mb: { bundle: number; transcript: number; decisions: number; result: number };

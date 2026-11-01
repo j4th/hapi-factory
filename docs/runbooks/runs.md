@@ -403,8 +403,8 @@ sudo -u hapi -H -- sh -c 'rm -rf "$HOME/hapi-check-work" "$HOME/hapi-check-repo.
 
 | Symptom | Cause and fix |
 |---|---|
-| `hapi run start: .../archon.env is missing: run `mise run up` first` | The archon zone's env file is written by `hapi secrets resolve`, which `up` runs. Run `mise run up`, then start the run. |
-| `cannot read .../archon.env ... run hapi run as the user that ran `mise run up``  | The file is in another user's runtime directory. Run `hapi run` as hapi, as above. |
+| `` hapi run start: .../archon.env is missing: run `mise run up` first `` | The archon zone's env file is written by `hapi secrets resolve`, which `up` runs. Run `mise run up`, then start the run. |
+| `` cannot read .../archon.env ... run hapi run as the user that ran `mise run up` `` | The file is in another user's runtime directory. Run `hapi run` as hapi, as above. |
 | `the work order's workflow "<name>" is not in hapi's pack` | The work order names a workflow that isn't a file of `archon/workflows/hapi/`, such as one of Archon's bundled ones. A run may use only the pack's workflows. Name one of them. |
 | `hapi's pack has a problem: ... sets pi.enableExtensions: false` | A pack workflow turns Pi's extensions off in a node, which would drop hapi-guard there. Remove the setting. |
 | A gate record's `classifier.error` is `jev: openrouter HTTP 402.` | The OpenRouter account or key is out of credit, so Jev didn't answer and Haiku did (`via haiku`, `fallback true`). Add credit to OpenRouter. |

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { FORGE_DOMAINS, forgeDomain } from "../../src/policy/hosts";
 import { loadPolicy, PolicyError } from "../../src/policy/load";
 import rolesSchema from "../../policy/schemas/policy-roles.schema.json";
+import runsSchema from "../../policy/schemas/policy-runs.schema.json";
 import { ROLES, type Policy, type ZoneName } from "../../src/policy/types";
 
 // Copies of policy/ with one file changed, for the negative tests. Removed after each test.
@@ -436,4 +437,14 @@ test("every object schema sets additionalProperties: false", () => {
   expect(files.length).toBeGreaterThan(0);
   const offenders = files.flatMap((f) => openObjects(JSON.parse(readFileSync(join("policy/schemas", f), "utf8")), f));
   expect(offenders).toEqual([]);
+});
+
+describe("policy-runs.schema.json", () => {
+  test("its descriptions say what the launcher does, as runs.yaml's comments do (final review C-2; CodeRabbit, PR #13)", () => {
+    const p = runsSchema.properties;
+    expect(p.max_live.description).not.toMatch(/queued/);
+    expect(p.retention_days.description).toMatch(/harvestedAt/);
+    expect(p.output_limits_mb.description).toMatch(/not copied out/);
+    expect(p.output_limits_mb.description).not.toMatch(/stops a run/);
+  });
 });

@@ -120,10 +120,13 @@ function configYaml(p: Policy, roster: RosterName, run: boolean): string {
  * The git config the run container's git is held to, as `GIT_CONFIG_COUNT`
  * KEY/VALUE pairs. Env config outranks `.git/config` and `config.worktree` for
  * a single-valued key, so a repo (or a worker) that plants one of these in the
- * clone changes nothing. It closes the program-running keys that are
- * single-valued: hooks, fsmonitor, credential helpers, the askpass program,
- * signing, external transports, background maintenance, submodule recursion
- * and the attributes file. The residual is name-indexed drivers (`filter.<n>.*`,
+ * clone changes nothing. It closes the single-valued program-running keys
+ * that have an inert value: hooks, fsmonitor, credential helpers, the askpass
+ * program, signing, external transports, background maintenance, submodule
+ * recursion and the attributes file. `diff.external` is single-valued but has
+ * none: an empty value makes every `git diff` fail ("cannot run"), so it stays
+ * in the residual, reached by the same `.git/config` write as `diff.<n>.command`
+ * (CodeRabbit, PR #13). The residual is name-indexed drivers (`filter.<n>.*`,
  * `diff.<n>.*`, `merge.<n>.driver`, via a planted `.gitattributes`) and
  * `remote.<n>.uploadpack`, which no fixed key can cover (design §6a item 13;
  * spike 07, finding 10).
