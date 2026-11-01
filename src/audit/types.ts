@@ -8,6 +8,7 @@
  * `ctx.fetch`, so the unit tests run the whole audit with fakes: no Docker,
  * network or secret.
  */
+import type { FsProbe } from "../run/disk";
 import type { SecretsDeps } from "../secrets/cli";
 
 export type Env = Record<string, string | undefined>;
@@ -66,6 +67,8 @@ export interface AuditContext {
   now: () => number;
   /** Passed to the secret provider (tests inject fakes for sops and the checkout boundary). */
   secrets?: SecretsDeps;
+  /** What runtime.run-disk reads the run disk's filesystem with; default: src/run/disk.ts `probeFs` (tests inject a fake). */
+  probeFs?: FsProbe;
 }
 
 /** One audit: its context, and what its checks share, each computed at most once. */

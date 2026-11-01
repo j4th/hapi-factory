@@ -2,15 +2,17 @@
  * The runtime.* checks read the running containers (`docker inspect`):
  * the run container's definition (and any live run's mounts and environment),
  * Hermes's effective approval settings (its argv, its env and the config
- * mounted at $HERMES_HOME), and the labels `hapi stack up` puts on every
- * container (the dev bypass).
+ * mounted at $HERMES_HOME), the labels `hapi stack up` puts on every
+ * container (the dev bypass), and the run disk against `runs.disk` (H-217).
  */
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { readFileSync, writeFileSync } from "node:fs";
+import { cpSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { runAudit } from "../../src/audit/index";
+import { diskProblem, GIB } from "../../src/run/disk";
+import { RUN_DISK } from "../../src/run/locks";
 import * as spec from "../../src/run/spec";
-import { cleanup, cleanWorld, type Container, only, runContainer } from "./helpers";
+import { cleanup, cleanWorld, type Container, DOCKER_ROOT, goodDisks, only, REPO, runContainer, tempDir } from "./helpers";
 
 afterEach(cleanup);
 
@@ -400,5 +402,58 @@ describe("runtime.dev-override", () => {
     const r = await check(w, "runtime.dev-override");
     expect(r.status).toBe("skip");
     expect(r.detail).toContain("the stack is not running");
+  });
+});
+
+describe("runtime.run-disk", () => {
+  test("runtime.run-disk passes a writable run disk of its own within runs.disk.gb, apart from Docker's data root", async () => {
+    const w = await cleanWorld();
+    const r = await check(w, "runtime.run-disk");
+    expect([r.status, r.detail]).toEqual(["pass", "/var/lib/hapi/rundisk: its own filesystem, 19.5 GB of runs.disk.gb's 20, apart from Docker's data root (/home/hapi/.local/share/docker), writable"]);
+    expect(w.calls).toContainEqual(["docker", "info", "--format", "{{.DockerRootDir}}"]);
+  });
+
+  test("runtime.run-disk fails a missing run disk with the launcher's own reason", async () => {
+    const w = await cleanWorld();
+    w.ctx.probeFs = (p) => (p === RUN_DISK ? undefined : goodDisks(p));
+    const r = await check(w, "runtime.run-disk");
+    const why = diskProblem(RUN_DISK, { gb: 20, enforcement: "hard" }, DOCKER_ROOT, w.ctx.probeFs);
+    expect(why).toStartWith("the run disk /var/lib/hapi/rundisk does not exist");
+    expect([r.status, r.detail]).toEqual(["fail", `${why}; runs.disk.enforcement is hard, so \`hapi run start\` refuses every run`]);
+    // Too big, too: the same reason as the launcher's.
+    const v = await cleanWorld();
+    v.ctx.probeFs = (p) => (p === RUN_DISK ? { dev: 2, bytes: 64 * GIB, writable: true } : goodDisks(p));
+    expect((await check(v, "runtime.run-disk")).detail).toStartWith("the run disk /var/lib/hapi/rundisk is 64.0 GB, more than runs.disk.gb (20)");
+  });
+
+  test("with runs.disk.enforcement soft, a failing run disk still fails: runs start without the cap", async () => {
+    const w = await cleanWorld();
+    const policy = join(tempDir("hapi-audit-policy-"), "policy");
+    cpSync(join(REPO, "policy"), policy, { recursive: true });
+    const runs = join(policy, "runs.yaml");
+    writeFileSync(runs, readFileSync(runs, "utf8").replace(/^(disk:.*\n(?: .*\n)*?  enforcement:) hard/m, "$1 soft"));
+    w.ctx.policyDir = policy;
+    w.ctx.probeFs = (p) => (p === RUN_DISK ? { dev: 1, bytes: 19.5 * GIB, writable: true } : goodDisks(p));
+    const r = await check(w, "runtime.run-disk");
+    expect([r.status, r.detail]).toEqual([
+      "fail",
+      "the run disk /var/lib/hapi/rundisk is not its own filesystem (it shares /var/lib/hapi's): mount the run disk there (docs/runbooks/runs.md#the-run-disk); runs.disk.enforcement is soft, so `hapi run start` warns and starts every run anyway",
+    ]);
+  });
+
+  test("runtime.run-disk skips without Docker", async () => {
+    for (const how of ["throws", "daemon down"]) {
+      const w = await cleanWorld();
+      if (how === "throws") {
+        const exec = w.ctx.exec;
+        w.ctx.exec = async (cmd, o) => {
+          if (cmd[0] === "docker") throw new Error("cannot run docker: is it installed and on PATH?");
+          return exec(cmd, o);
+        };
+      } else w.dockerDown = true;
+      const r = await check(w, "runtime.run-disk");
+      expect([how, r.status]).toEqual([how, "skip"]);
+      expect(r.detail).toStartWith("docker info failed");
+    }
   });
 });

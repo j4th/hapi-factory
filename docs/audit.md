@@ -59,6 +59,7 @@ Without the stack and without `--repo`, as on a development machine, most checks
 |---|---|---|---|
 | [`generated.drift`](#generateddrift) | The deployed build/ equals a fresh build of policy/, with no other file or directory in it, and every running container was started from it | §8.1, §11.8 | The deployed build/; Docker for the labels |
 | [`runtime.run-container`](#runtimerun-container) | The run container's definition (tmpfs, read-only binds, environment, no port), and each live run container against it | §9.2, §9.3 | The checkout; Docker for live runs |
+| [`runtime.run-disk`](#runtimerun-disk) | The run disk, where the runs' volumes live: there, a filesystem of its own, apart from Docker's data root, writable, and at most `runs.disk.gb` | design §3.1 (H-217) | Docker; the run disk |
 | [`runtime.hermes-no-yolo`](#runtimehermes-no-yolo) | No yolo, approvals not off, and the Kanban dispatcher off, in Hermes's effective config | §9.1 | Docker, the stack up |
 | [`runtime.dev-override`](#runtimedev-override) | The stack, and each live run, was started as hapi, without the dev bypass | §4.3, §11.3 | Docker, the stack up |
 | [`policy.budget-enforcement`](#policybudget-enforcement) | At least one enforcer of `run_usd` is hard | design §3.5 | policy/ |
@@ -105,6 +106,25 @@ Without the stack and without `--repo`, as on a development machine, most checks
 **Fix.** The run container is `stack/compose.yaml`'s `archon` service as `src/run/spec.ts` translates it: restore both, then `mise run up` builds the image. A live run that differs was not made by the launcher as committed: `hapi run stop <id>`, then fix the cause.
 
 **Skip.** Never: the definition needs only the checkout. With Docker unavailable, or no run live, the detail says no live run container was checked.
+
+### runtime.run-disk
+
+**Verifies.** The run disk at `/var/lib/hapi/rundisk`, where each run's `/work` and `/out` volumes have their dirs ([the runs runbook](runbooks/runs.md#the-run-disk)), as `hapi run start` checks it against `runs.disk` in `policy/runs.yaml`, with the same function (`diskProblem`, `src/run/disk.ts`), so a fail's detail is the launcher's own reason:
+- it is there;
+- it is a filesystem of its own: its device is not its parent's, `/var/lib/hapi`;
+- it is not on the filesystem of Docker's data root, as `docker info --format '{{.DockerRootDir}}'` names it;
+- the user running the audit can write it;
+- it is at most `runs.disk.gb` GiB.
+
+The pass detail gives its size against the cap, and the data root. A fail's detail ends with what that means for runs: under `runs.disk.enforcement: hard`, `hapi run start` refuses every run; under `soft`, it warns and starts every run anyway, without the cap. Either way the check fails.
+
+**Why.** Without it a run's volumes have no size cap, and one run could fill hapi's Docker data root, which every run and the stack share (H-217, design §3.1). The operator ruled (2026-10-30) that Plan 03's poller starts no unattended run until the cap is in place.
+
+**Credential.** None: `docker info`, and `stat` and `statfs` of the paths.
+
+**Fix.** Make the run disk once, with sudo, as [the runs runbook](runbooks/runs.md#making-the-run-disk-the-operator-once-with-sudo) says. Its [troubleshooting](runbooks/runs.md#troubleshooting) gives the fix for each reason: not mounted, on Docker's disk, not hapi's, bigger than the cap. Run the audit as hapi, as documented: the data root and the write check are hapi's.
+
+**Skip.** Docker isn't available: `docker info` fails or can't run, so the data root can't be read and the check can't be made.
 
 ### runtime.hermes-no-yolo
 

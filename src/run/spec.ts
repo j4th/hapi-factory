@@ -27,7 +27,9 @@
  *   and the workflow pack; the run config, the gitconfig, the prelude
  *   (stack/archon/run.sh), the run's `run.json`, and the source repo's git dir;
  * - two per-run volumes, `/work` (the clone) and `/out` (what may leave),
- *   which the launcher makes and chowns first (design §6a item 16);
+ *   which the launcher makes and chowns first (design §6a item 16): each is
+ *   bind-backed, on a dir of its own on the run disk, a filesystem capped at
+ *   `runs.disk.gb` (./disk.ts; design §3.1, H-217);
  * - each secret of the archon zone as `-e NAME`, never its value: the docker
  *   CLI takes the value from its own environment (spike 07 finding 16);
  * - `--stop-timeout STOP_GRACE_S`, so a daemon stop gives the prelude the same
@@ -44,6 +46,7 @@ import { mountable } from "../audit/checks/tools";
 import { RUN_PATHS } from "../generate/archon";
 import type { Runs } from "../policy/types";
 import { ENV_NAME } from "../secrets/files";
+import type { FsProbe } from "./disk";
 import { proxyEnv, reservedEnvRule } from "../stack/env";
 import { buildDigest, currentUserOverride, type Env, PROJECT, PROJECT_LABEL, RUN_LABEL, type Runner } from "../stack/up";
 import type { WorkOrder } from "../workorder/validate";
@@ -67,12 +70,16 @@ export interface RunDeps {
   egress: string;
   /** ${XDG_STATE_HOME:-~/.local/state}/hapi/runs, or a temp dir in tests. */
   stateDir: string;
+  /** The run disk, where each run's volumes have their dirs (./disk.ts): RUN_DISK (./locks.ts), or a temp dir in tests. */
+  diskDir: string;
+  /** What the run disk's filesystem is (./disk.ts `probeFs`); tests give a fake. */
+  probeFs: FsProbe;
   /** The checkout. */
   root: string;
   buildDir: string;
   /** The workflow pack bound at /.archon/workflows/hapi: <root>/archon/workflows/hapi, or a test's fixture pack. */
   packDir: string;
-  /** policy/runs.yaml: the cap on live runs and on each output file. */
+  /** policy/runs.yaml: the caps on live runs, on each output file and on the run disk. */
   runs: Runs;
   /** Starts `hapi run supervise <id>`, detached: settles once it has started, and rejects if it couldn't. */
   spawnDetached: (argv: string[]) => Promise<void>;

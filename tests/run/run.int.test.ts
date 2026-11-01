@@ -21,7 +21,11 @@
  * HAPI_ALLOW_CURRENT_USER=1: the operator's own Docker, as spike 07 ran, not
  * hapi's rootless one (Task 11's paid check runs as hapi). Its supervisor is
  * spawned for real, detached, by the host's `spawnDetached`, as
- * ./int-supervisor.ts with the same `RunDeps`.
+ * ./int-supervisor.ts with the same `RunDeps`. The run disk is a temp dir of
+ * the project's (`<root>/run-disk`), neither capped nor a filesystem of its
+ * own, so `runs.disk.enforcement` is soft here and start warns: the run's
+ * bind-backed volumes, their chown, copy-out and cleanup run for real, and
+ * afterAll checks that the run disk is left empty.
  *
  * What spike 07 showed to expect is not a failure: Archon's SQLite-in-Docker
  * hint and its `workflow.base_branch_auto_detect_failed` warning on stderr
@@ -79,8 +83,11 @@ describe.skipIf(!INT || !ONLINE)("hapi run on a real Docker (a throwaway project
 
   /** The project's `RunDeps`: its name, image, egress container, state dir and build, with `pack` bound. */
   const deps = (pack = CHECKS): Partial<RunDeps> => ({
-    env, project: p.name, image, egress: `${p.name}-egress-archon-1`, stateDir: state, root: REPO, buildDir: p.build, packDir: pack, spawnDetached: spawnSupervisor,
+    env, project: p.name, image, egress: `${p.name}-egress-archon-1`, stateDir: state, diskDir: join(p.root, "run-disk"), root: REPO, buildDir: p.build, packDir: pack, spawnDetached: spawnSupervisor,
+    runs: { ...loadPolicy(join(REPO, "policy")).runs, disk: { gb: 20, enforcement: "soft" } },
   });
+  /** start's warning that the temp run disk fails the check, which soft enforcement lets through. */
+  const softDisk = (l: string) => l.startsWith("hapi run start: warning: the run disk ") && l.endsWith("runs.disk.enforcement is soft, so the run starts anyway");
 
   /** Run `fn` with console.log and console.error captured. */
   async function quietly(fn: () => Promise<number>): Promise<{ code: number; out: string[]; err: string[] }> {
@@ -164,6 +171,7 @@ describe.skipIf(!INT || !ONLINE)("hapi run on a real Docker (a throwaway project
     env = { ...p.env, HAPI_ALLOW_CURRENT_USER: "1" };
     image = `${p.name}-archon:int`;
     state = join(p.root, "state");
+    mkdirSync(join(p.root, "run-disk"), { mode: 0o700 });
     // As `mise run up` does: the generated configs (into the project's own build dir), the zone env files, the archon image, the proxy.
     await buildAll(loadPolicy(join(REPO, "policy")), p.build);
     await resolveSecrets(loadManifest(join(REPO, "stack", "secrets.yaml")), fakeProvider, { outDir: join(p.xdg, "hapi") });
@@ -216,12 +224,14 @@ describe.skipIf(!INT || !ONLINE)("hapi run on a real Docker (a throwaway project
 
     // The supervisor: the host's own detached spawn, of ./int-supervisor.ts with this project's RunDeps.
     const host = (await runDeps({ env, project: p.name, image, stateDir: state, root: REPO })).spawnDetached;
-    const fields = { project: p.name, image, egress: `${p.name}-egress-archon-1`, stateDir: state, root: REPO, buildDir: p.build };
+    const fields = { project: p.name, image, egress: `${p.name}-egress-archon-1`, stateDir: state, diskDir: join(p.root, "run-disk"), root: REPO, buildDir: p.build };
     spawnSupervisor = (argv) => host([process.execPath, join(REPO, "tests", "run", "int-supervisor.ts"), JSON.stringify(fields), ...argv.slice(3)]);
   }, 1_200_000);
 
   afterAll(async () => {
     if (p === undefined) return;
+    // Every run's dirs on the run disk went with its volumes: the helper emptied what uid 1001 wrote, and hapi removed the dirs.
+    expect(readdirSync(join(p.root, "run-disk"))).toEqual([]);
     await p.down();
     // Nothing of the throwaway project is left behind, runs included...
     expect(await p.leftovers()).toEqual([]);
@@ -235,7 +245,8 @@ describe.skipIf(!INT || !ONLINE)("hapi run on a real Docker (a throwaway project
 
     beforeAll(async () => {
       const r = await start(order("0003-check-run"));
-      expect([r.code, r.err.filter((l) => !l.includes("HAPI_ALLOW_CURRENT_USER"))]).toEqual([0, []]);
+      expect([r.code, r.err.filter((l) => !l.includes("HAPI_ALLOW_CURRENT_USER") && !softDisk(l))]).toEqual([0, []]);
+      expect(r.err.filter(softDisk)).toHaveLength(1);
       check = r.id;
       rec = await settle(check);
     }, 300_000);

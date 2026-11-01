@@ -6,6 +6,7 @@ This runbook covers `hapi run`, the launcher that Plan 02 built (design: [the wo
 - [how to run the commands](#how-to-run-the-commands);
 - [`hapi run start`](#hapi-run-start), [`watch`](#hapi-run-watch), [`list`](#hapi-run-list) and [`stop`](#hapi-run-stop);
 - [the outputs](#the-outputs), [retention](#retention) and [the public flag](#the-public-flag);
+- [the run disk](#the-run-disk), which the operator makes once, and the lock it gives `mise run down` and finalize;
 - [the rollout on hapi's checkout](#rollout-on-hapis-checkout), once this branch has landed, and [the paid check](#the-paid-check) after it;
 - [the tests](#the-tests) and [troubleshooting](#troubleshooting).
 
@@ -13,9 +14,9 @@ This runbook covers `hapi run`, the launcher that Plan 02 built (design: [the wo
 
 A run is one work order, run once, in one container that exists only for that run.
 
-- **One container, one network, two volumes.** `hapi run start` makes a hardened Archon container from the `archon` service of `stack/compose.yaml`, on a network of its own (`--internal`) that `egress-archon` joins, and two volumes: `/work` (the clone) and `/out` (what may leave). It returns at once with a 12-digit hex run id.
+- **One container, one network, two volumes.** `hapi run start` makes a hardened Archon container from the `archon` service of `stack/compose.yaml`, on a network of its own (`--internal`) that `egress-archon` joins, and two volumes on [the run disk](#the-run-disk): `/work` (the clone) and `/out` (what may leave). It returns at once with a 12-digit hex run id.
 - **No server.** The container runs one workflow with the Archon CLI in the foreground, then exits. No Archon API, web console or port exists for a worker to reach, so there is nothing to tunnel to ([threat model](../security/threat-model.md), AC-13).
-- **Nothing outlives it but what is copied out.** The container's tmpfs mounts die with it. Its two volumes are read once, by a helper, and removed. What reaches the host is four named files ([the outputs](#the-outputs)).
+- **Nothing outlives it but what is copied out.** The container's tmpfs mounts die with it. Its two volumes are read once, by a helper, and removed, with their dirs on the run disk. What reaches the host is four named files ([the outputs](#the-outputs)).
 - **A failed run starts over.** There is no resume. A run that fails, times out or is stopped is run again from a fresh clone with `--retry-of` ([the flags](#hapi-run-start)). Resume, reconsidered, is registered for the observability profile (H-213).
 - **Liveness is Docker's.** A run is live while a container named for it, with the labels `org.hapi.run` and `org.hapi.project=hapi`, is running. No pid is trusted.
 - **Plan 02 runs no model unless a work order's workflow calls one.** The two check workflows it ships (`hapi-check-run`, `hapi-check-guard`, in `archon/workflows/hapi`) are bash only, except the guard check's Pi node.
@@ -32,8 +33,8 @@ Everything below is made by the launcher (`src/run/spec.ts`), from the `archon` 
 | `$HOME` (`/home/appuser`) | tmpfs, 256 MB. The generated `.gitconfig` is bound into it. | yes, but `noexec` |
 | `/.archon` | tmpfs, 512 MB: Archon's run database, workspaces and logs. `config.yaml`, an empty `.env` and the workflow pack (`/.archon/workflows/hapi`) are bound into it. | yes, but `noexec`; the bound files are not |
 | `/opt/hapi/pi-agent` | Pi's directory: tmpfs, 64 MB. Bound into it: `models.json`, `models-store.json` (`{}`), `hapi-guard.json`, `settings.json` and `extensions/`. | yes (Pi's cache and sessions); the bound files are not |
-| `/work` | volume: the clone, `/work/repo`, which a worker edits. No size cap. | yes |
-| `/out` | volume: `run.bundle`, `result.json`, `transcript.jsonl`, `decisions.jsonl`. No size cap. | yes |
+| `/work` | a bind-backed volume on [the run disk](#the-run-disk): the clone, `/work/repo`, which a worker edits. Capped, with every other run's volumes, by the run disk's size (`runs.disk.gb`). | yes |
+| `/out` | a bind-backed volume on the run disk: `run.bundle`, `result.json`, `transcript.jsonl`, `decisions.jsonl`. Capped as `/work` is. | yes |
 | `/src/repo.git` | the source repository's git dir | no |
 | `/run/hapi/run.json` | the run's input: its id, the work order's id, `traceparent`, the budget, the public flag, the workflow | no |
 | `/opt/hapi/run.sh` | the fixed prelude that clones, runs the workflow and reads the results back | no |
@@ -81,7 +82,7 @@ Expected: it prints the run id (twelve hex digits) and returns. The run is going
 - **`--public`** is [the public flag](#the-public-flag).
 - **`--retry-of <run-id>`** names the last run of the same work order and commit, which ended without succeeding. A run is keyed by the work order's id and the source commit: a key with a live or a succeeded run is refused, and one whose last run ended another way is refused unless `--retry-of` names that run. So a re-fire is safe.
 
-**What it refuses**, in this order, with an error that names the fix: a work order that fails validation or names `egress_extra`; a workflow that isn't in hapi's pack, or a pack with a node that drops hapi-guard; no archon env file (run `mise run up` first); a source that isn't a git repo or has no commit; a key already run; a second live run for the same repo (one per repo, H-090); more live runs than `max_live` in `policy/runs.yaml` (1 by default). A step that fails after that removes everything `start` made. A supervisor that starts and then dies is reaped by the next `hapi run start` or `hapi run stop`; `hapi run stop <id>` is the direct fix. `list` and `watch` never reap.
+**What it refuses**, in this order, with an error that names the fix: a work order that fails validation or names `egress_extra`; a workflow that isn't in hapi's pack, or a pack with a node that drops hapi-guard; a run disk that fails its check ([the run disk](#the-run-disk): with `runs.disk.enforcement: soft` it is a warning instead, and the run starts); no archon env file (run `mise run up` first); a source that isn't a git repo or has no commit; a key already run; a second live run for the same repo (one per repo, H-090); more live runs than `max_live` in `policy/runs.yaml` (1 by default). A step that fails after that removes everything `start` made. A supervisor that starts and then dies is reaped by the next `hapi run start` or `hapi run stop`; `hapi run stop <id>` is the direct fix. `list` and `watch` never reap.
 
 **The deadline** is the work order's `budget.minutes`. A detached `hapi run supervise <id>` waits for the container to end or the deadline, stops it at the deadline, then finalizes the run: copy-out, checks, removal and the record. You never run `supervise` yourself.
 
@@ -118,9 +119,9 @@ sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
   hapi-run stop 0123456789ab
 ```
 
-It records that the run was stopped, runs `docker stop -t 30` on its container, copies the outputs out and removes the container, network and volumes. The grace period is 30 seconds, not Docker's 10, because the prelude passes the stop on to Archon, which marks the run failed and exits, and then reads the run back with the Archon CLI (up to three more `bun` starts). A KILL inside that would leave a stopped run without its outputs. The run's status is `stopped`.
+It records that the run was stopped, runs `docker stop -t 30` on its container, copies the outputs out and removes the container, network and volumes, and the volumes' dirs on the run disk. The grace period is 30 seconds, not Docker's 10, because the prelude passes the stop on to Archon, which marks the run failed and exits, and then reads the run back with the Archon CLI (up to three more `bun` starts). A KILL inside that would leave a stopped run without its outputs. The run's status is `stopped`.
 
-To stop every run at once, use `mise run down` ([the stack runbook](stack.md#4-mise-run-up-and-mise-run-down)) or [kill switch 3](kill-switches.md#3-stop-the-stack): both remove every container labelled `org.hapi.run`. A run removed that way is finalized as failed, with nothing copied out.
+To stop every run at once, use `mise run down` ([the stack runbook](stack.md#4-mise-run-up-and-mise-run-down)) or [kill switch 3](kill-switches.md#3-stop-the-stack): both remove every container labelled `org.hapi.run`. A run removed that way is finalized as failed, with nothing copied out. `down` removes the runs' volumes too, unless a finalize is copying a run out: then it leaves them, and their dirs on the run disk, to that finalize or the next reap ([the lock](#the-run-disk)).
 
 ## The outputs
 
@@ -151,6 +152,93 @@ How the files get out: once the container has stopped, a fresh helper container 
 `--public` is the operator's statement that the repo is public. It goes into `run.json`, and hapi-guard reads it: **Jev**, the typed-decision model behind the level-6 gates, is asked about public repos only (spec §9.5; H-040). Without the flag, the gates use the Haiku classifier instead, which adds no recipient, since the worker's own model calls already go to Anthropic.
 
 In Plan 02 the flag is an assertion, not a check: nothing on the host verifies it against the forge. Plan 03's poller sets it from the forge. A work order can't set it, because a model wrote the work order.
+
+## The run disk
+
+A run's `/work` and `/out` are bind-backed local volumes on one fixed-size filesystem, **the run disk**, mounted at `/var/lib/hapi/rundisk` (design §3.1, H-217). Each volume has a dir of its own there, named for it (`hapi-run-<id>-work`, `hapi-run-<id>-out`), which the launcher makes (0700) and checks before it asks Docker for the volume: Docker would make a volume on a dir that isn't there and fail only at `docker run`, with an exit code that says nothing of why ([spike 09](../spikes/09-run-engine-offline.md), finding 17). A run that fills its volumes fills the run disk and gets `No space left on device`. Docker's data root, under hapi's home, which every run and the stack share, is untouched.
+
+- **Why there.** The path is fixed and made by root, outside hapi's home: root never acts on a path inside hapi's home ([the stack runbook](stack.md#hardening)). The filesystem's root dir is hapi's, so hapi makes and removes the runs' dirs itself.
+- **The cap.** `runs.disk.gb` in `policy/runs.yaml` (20) counts **GiB**, and the run disk may be no bigger. **All runs share it:** the live runs (`runs.max_live`) have `runs.disk.gb` between them, not each.
+- **The check.** `hapi run start` checks the run disk before it takes the start lock, and the audit's [`runtime.run-disk`](../audit.md#runtimerun-disk) makes the same check with the same reason. The run disk must be there, be a filesystem of its own (not its parent's), not be on the filesystem Docker's data root is on (`docker info`), be writable by hapi, and be at most `runs.disk.gb`. Under `runs.disk.enforcement: hard` (the default), a run disk that fails refuses every run. Under `soft`, `start` prints `hapi run start: warning: <the reason>; runs.disk.enforcement is soft, so the run starts anyway` and goes on.
+- **Not `noexec`.** The mount is `nodev,nosuid` but not `noexec`: a run runs the repo's own tools from `/work`, such as `node_modules/.bin`, which a `noexec` mount would refuse (H-208; the tmpfs mounts are already `noexec`).
+- **The cleanup.** Under rootless Docker a run's files belong to a subordinate uid hapi can't delete. So once a run's volumes are removed, a dir that is empty is removed by hapi at once, and one that isn't is emptied first by a helper container of the archon image, run as `1001:1001` with no network, no capabilities and a read-only root (`chmod -R u+rwX`, then `find -mindepth 1 -delete`), under the helpers' 150 s bound. A finalize does this for its own run. Each reap (the start of `hapi run start` and `hapi run stop`) also sweeps the run disk: a run's dir whose run isn't live and whose volume is gone (a start that failed, a `mise run down` that left the volumes, a cleanup that failed) is cleaned the same way. Nothing else on the run disk is touched, `lost+found` included. A dir the reap can't clean fails it, and so every start, until it is cleaned ([below](#a-dir-the-reap-cant-clean)): a run disk filling up with leftovers fails closed.
+- **The lock `down` and finalize share (H-210).** A finalize copies a run out holding the run disk's lock, and `mise run down` removes the runs holding it, so a copy-out never reads a volume `down` is removing. Neither waits for the other: a finalize that finds it held waits for `down`'s few seconds and tries again (a reap leaves the run for the next one), and `down` that finds it held, or can't take it at all (no `XDG_RUNTIME_DIR`), says `hapi stack down: could not take the run disk's lock (<why>): removing the runs but leaving their volumes, which the run's finalize or the next reap removes (H-210)` and does just that. Kill switch 3 still takes seconds.
+
+### Making the run disk (the operator, once, with sudo)
+
+Do this before hapi's checkout gets the run engine (Plan 03): without the run disk, `hapi run start` and the strict audit refuse. Run it **on the host, from your own terminal, as yourself**. It makes a 20 GiB ext4 image at `/var/lib/hapi/rundisk.img`, root's alone, and a systemd mount unit that loop-mounts it at `/var/lib/hapi/rundisk` at every boot, `nodev,nosuid`. `mkfs` makes the filesystem's root dir hapi's (`root_owner`), so root never has to hand hapi a path, and hapi then makes it `0700`:
+
+```bash
+sudo install -d -o root -g root -m 0755 /var/lib/hapi /var/lib/hapi/rundisk
+sudo fallocate -l 20G /var/lib/hapi/rundisk.img
+sudo chmod 0600 /var/lib/hapi/rundisk.img
+sudo mkfs.ext4 -q -m 0 -L hapi-rundisk \
+  -E root_owner="$(id -u hapi):$(id -g hapi)" /var/lib/hapi/rundisk.img
+printf '%s\n' '[Unit]' 'Description=hapi run disk (H-217)' '' \
+  '[Mount]' 'What=/var/lib/hapi/rundisk.img' 'Where=/var/lib/hapi/rundisk' \
+  'Type=ext4' 'Options=loop,nodev,nosuid' '' '[Install]' 'WantedBy=multi-user.target' \
+  | sudo tee /etc/systemd/system/var-lib-hapi-rundisk.mount >/dev/null
+sudo systemctl daemon-reload
+sudo systemctl enable --now var-lib-hapi-rundisk.mount
+sudo -u hapi -H -- chmod 0700 /var/lib/hapi/rundisk
+findmnt -no SOURCE,FSTYPE,SIZE,OPTIONS /var/lib/hapi/rundisk
+sudo -u hapi -H -- df -B1 --output=size,avail /var/lib/hapi/rundisk
+```
+
+Here `$(id -u hapi)` and `$(id -g hapi)` are your own shell looking up hapi's ids for `mkfs`. Expected: the `findmnt` line, a `/dev/loop<N>` `ext4` of about `19.5G` whose options hold `nosuid,nodev` and not `noexec`; and the `df` lines, a size under 21474836480 bytes (20 GiB) with nearly all of it available. Paste back both. To grow or shrink it later, change `runs.disk.gb` in a PR first, then, with no run live, `sudo systemctl disable --now var-lib-hapi-rundisk.mount`, remove the image and make it again at the new size.
+
+### The live check (as hapi)
+
+A throwaway volume on the run disk, `hapi-t20-diskcheck`, chowned as a run's are, then filled past the cap as uid 1001: the write must stop at `No space left on device`, and the Docker data root's free space must not move. It also shows the 1001 delete and hapi's `rmdir` working on hapi's rootless Docker. Run it **from your own terminal, as yourself**, after the run disk is made and `mise run up` has built the archon image. The `dd` writes the whole run disk, about 19.5 GiB, so it takes a minute or two:
+
+```bash
+sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
+  export XDG_RUNTIME_DIR PATH="$HOME/.local/bin:$PATH"; \
+  img=hapi-factory/archon:0.12.1; d=/var/lib/hapi/rundisk/hapi-t20-diskcheck; \
+  root="$(docker info --format "{{.DockerRootDir}}")"; \
+  mkdir -m 0700 "$d" && docker volume create --driver local --opt type=none \
+    --opt o=bind --opt device="$d" hapi-t20-diskcheck >/dev/null && \
+  docker run --rm --pull never --network none --user 0:0 --cap-drop ALL \
+    --cap-add CHOWN -v hapi-t20-diskcheck:/w --entrypoint chown "$img" 1001:1001 /w && \
+  echo "data root avail before: $(df -B1 --output=avail "$root" | tail -1)" && \
+  docker run --rm --pull never --network none --user 1001:1001 -v hapi-t20-diskcheck:/w \
+    --entrypoint sh "$img" -c "dd if=/dev/zero of=/w/fill bs=1M count=25600 2>&1 | tail -2"; \
+  echo "data root avail after: $(df -B1 --output=avail "$root" | tail -1)"; \
+  docker run --rm --pull never --network none --user 1001:1001 -v hapi-t20-diskcheck:/w \
+    --entrypoint sh "$img" -c "rm -f /w/fill"; \
+  docker volume rm hapi-t20-diskcheck >/dev/null; rmdir "$d"; \
+  df -h --output=used,avail /var/lib/hapi/rundisk'
+```
+
+Paste back the whole output. Expected:
+
+- `dd: error writing '/w/fill': No space left on device`, and a records line short of 25600;
+- the two data-root `avail` figures within about 100 MB of each other;
+- the closing `df` showing the run disk nearly empty again, which shows the 1001 delete and hapi's `rmdir` worked.
+
+If any `docker` step fails, the commands after it still try to remove the volume and the dir; run `sudo -u hapi -H -- sh -c 'export XDG_RUNTIME_DIR="/run/user/$(id -u)"; docker volume ls -q --filter name=hapi-t20-diskcheck; ls -la /var/lib/hapi/rundisk'` and paste that back too.
+
+**The live result, design §7 item 1's evidence:**
+
+> **PLACEHOLDER, to be filled by the controller:** the live check above has not been run on hapi's rootless Docker yet. When the operator has run it, the controller records here the date, the host, the `dd` error line, the data root's two `avail` figures and the closing `df`, and whether each expectation held.
+
+### A dir the reap can't clean
+
+A reap that couldn't clean a run's dir names it: `reaping left runs unfinished: run <id>: emptying run <id>'s dirs on the run disk failed (helper exit <n>)`, or `timed out after 150 s`, and every `hapi run start` refuses with it until the dir is gone. The usual causes are the archon image missing (the helper runs it with `--pull never`: run `mise run up`), hapi's Docker down (as hapi: `systemctl --user status docker`), or a tree too big to delete in 150 s. With no run live (`hapi run list`), empty and remove the run's dirs by hand, as the helper does but without its bound, with the run id the error names in place of `0123456789ab`:
+
+```bash
+sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
+  export XDG_RUNTIME_DIR PATH="$HOME/.local/bin:$PATH"; d=/var/lib/hapi/rundisk; \
+  for v in work out; do p="$d/hapi-run-$1-$v"; [ -d "$p" ] || continue; \
+    rmdir "$p" 2>/dev/null && continue; \
+    docker run --rm --pull never --network none --read-only --user 1001:1001 \
+      --cap-drop ALL --security-opt no-new-privileges:true -v "$p:/w" \
+      --entrypoint sh hapi-factory/archon:0.12.1 \
+      -c "chmod -R u+rwX /w && find /w -mindepth 1 -delete" && rmdir "$p"; \
+  done; ls -la "$d"' hapi-rundisk 0123456789ab
+```
+
+Expected: the closing listing without `hapi-run-0123456789ab-work` or `-out`. Then `hapi run start` goes on. A reap that says `<path> on the run disk is not a directory (a symlink or a file)` found something hapi never makes there: look at it (`sudo -u hapi -H -- ls -la /var/lib/hapi/rundisk`), and remove that entry as hapi with `rm`, which removes a symlink itself, never what it points to.
 
 ## Rollout on hapi's checkout
 
@@ -390,7 +478,7 @@ sudo -u hapi -H -- sh -c 'rm -rf "$HOME/hapi-check-work" "$HOME/hapi-check-repo.
   HAPI_INT=1 bun test tests/run/run.int.test.ts
   ```
 
-  Run it from your own checkout, as yourself, on a host with Docker. It runs on your own Docker, not hapi's.
+  Run it from your own checkout, as yourself, on a host with Docker. It runs on your own Docker, not hapi's. Its run disk is a temp dir of the throwaway project's, neither capped nor a filesystem of its own, so it runs with `runs.disk.enforcement: soft` (start warns), and it checks that every run's dirs are gone at the end.
 - **The audit integration test** checks the audit's run-container check and the `assistants` read-back on real Docker:
 
   ```bash
@@ -403,6 +491,13 @@ sudo -u hapi -H -- sh -c 'rm -rf "$HOME/hapi-check-work" "$HOME/hapi-check-repo.
 
 | Symptom | Cause and fix |
 |---|---|
+| `the run disk /var/lib/hapi/rundisk does not exist` | The run disk isn't made yet. Make it as [the run disk](#making-the-run-disk-the-operator-once-with-sudo) says. |
+| `the run disk /var/lib/hapi/rundisk is not its own filesystem (it shares /var/lib/hapi's)` | The run disk isn't mounted, so the dir is just a dir on the parent filesystem. `systemctl status var-lib-hapi-rundisk.mount` says why; `sudo systemctl start var-lib-hapi-rundisk.mount` mounts it. |
+| `the run disk ... is on the same filesystem as Docker's data root` | The run disk is the filesystem Docker keeps its data on (`docker info --format '{{.DockerRootDir}}'`, as hapi), so filling it would fill Docker's disk. Mount the run disk's own image there, as set up. |
+| `the run disk ... is not writable by this user: chown it to hapi` | The run disk's root dir isn't hapi's (made without `root_owner`, or changed since). With no run live: `sudo chown "$(id -u hapi):$(id -g hapi)" /var/lib/hapi/rundisk`, then `sudo -u hapi -H -- chmod 0700 /var/lib/hapi/rundisk`. It is outside hapi's home, so root may. |
+| `the run disk ... is <n> GB, more than runs.disk.gb (20)` | The run disk is bigger than the cap, so one run could grow past it. Make it again at the cap's size ([making the run disk](#making-the-run-disk-the-operator-once-with-sudo), last line), or raise `runs.disk.gb` in a PR. |
+| `cannot read Docker's data root (docker info exited <n>)` | `start` can't make the run disk check without Docker. As hapi, `systemctl --user status docker`. |
+| `reaping left runs unfinished: run <id>: emptying run <id>'s dirs on the run disk failed` | A run's dir on the run disk couldn't be emptied, so starts stop until it is. See [a dir the reap can't clean](#a-dir-the-reap-cant-clean). |
 | `` hapi run start: .../archon.env is missing: run `mise run up` first `` | The archon zone's env file is written by `hapi secrets resolve`, which `up` runs. Run `mise run up`, then start the run. |
 | `` cannot read .../archon.env ... run hapi run as the user that ran `mise run up` `` | The file is in another user's runtime directory. Run `hapi run` as hapi, as above. |
 | `the work order's workflow "<name>" is not in hapi's pack` | The work order names a workflow that isn't a file of `archon/workflows/hapi/`, such as one of Archon's bundled ones. A run may use only the pack's workflows. Name one of them. |
@@ -425,4 +520,4 @@ sudo -u hapi -H -- sh -c 'rm -rf "$HOME/hapi-check-work" "$HOME/hapi-check-repo.
 | `hapi run watch` prints `run <id>'s container has exited, but the run was not finalized within 120 s: ...` | The supervisor is still finalizing (a copy-out of a large bundle can take up to 150 s per helper), or it died. `hapi run list` shows the status. If it is still `live` a few minutes on, the supervisor died: `list` and `watch` don't reap, so run `hapi run stop <id>` (or the next `hapi run start`), which finalizes the run, then `watch <id>` shows how it ended. |
 | `stop` or `start` says a lock is held | Another `hapi run` command holds the launcher's lock. It fails at once and names the holder; run it again when that one ends. |
 | A tool in the run fails with `Permission denied` for a script under `/tmp` or `~` | Docker's tmpfs mounts are `noexec` (H-208). Run the tool through its interpreter (`sh script`, `python script.py`), or ask for it to be in the image. |
-| `docker: Error response from daemon: ... volume is in use` during `mise run down` while a run is finalizing | The copy-out helper and `down` raced for the run's volume. Run `mise run down` again once `hapi run list` shows no `live` run (H-210). |
+| `hapi stack down: could not take the run disk's lock (...): removing the runs but leaving their volumes, ...` | A finalize was copying a run out (the lock's holder is named), or `down` ran with no `XDG_RUNTIME_DIR`. `down` removed the runs' containers and networks and stopped the stack, without waiting (H-210). The run's finalize removes its volumes and their dirs once its copy-out ends; a run with no live supervisor has them removed by the next reap (`hapi run stop <id>`, or the next `start`). `docker volume ls --filter label=org.hapi.run`, as hapi, shows any left. |

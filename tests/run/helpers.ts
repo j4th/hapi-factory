@@ -5,13 +5,16 @@
  * build dir, source repo and work order. No Docker, git, sudo or network: the
  * git calls (the source's HEAD, the bundle's heads) are answered too,
  * `docker logs --follow` streams `logs`, and `docker logs --tail` prints a
- * container's `world.logs`.
+ * container's `world.logs`. The run disk is a temp dir (`deps.diskDir`) whose
+ * filesystem facts come from `deps.probeFs`, never from a real mount; the
+ * cleanup helper empties the host dirs it is given.
  */
-import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import YAML from "yaml";
 import { envFileText } from "../../src/secrets/files";
 import { COPY_SCRIPT, LIST_SCRIPT } from "../../src/run/copyout";
+import { CLEAN_SCRIPT, type FsFacts, type FsProbe, GIB } from "../../src/run/disk";
 import { LOGS_SCRIPT } from "../../src/run/lifecycle";
 import { recordDir, type RunRecord, writeRecord } from "../../src/run/records";
 import type { RunDeps } from "../../src/run/spec";
@@ -54,6 +57,8 @@ export interface World {
 }
 
 export const SHA = "4bf92f3577b34da6a3ce929d0e0e47364bf92f35";
+/** What the fake `docker info --format {{.DockerRootDir}}` prints: Docker's data root, on a filesystem of its own (dev 3). */
+export const DATA_ROOT = "/fake/docker-root";
 export const NOW = new Date("2026-10-29T12:00:00.000Z");
 
 /** The value of `flag` (the argv entry after it), or undefined. */
@@ -123,6 +128,11 @@ export interface FakeOptions {
   now?: Date;
   /** Called before each command is answered. */
   onCall?: (cmd: string[]) => void;
+  /**
+   * What `deps.probeFs` says of the run disk: "missing", or its facts (default: its own filesystem, dev 2, 19.5 GiB,
+   * writable). `ownFs: false` puts it on its parent's filesystem (dev 1), `onDataRoot` on Docker's data root's (dev 3).
+   */
+  disk?: "missing" | (Partial<FsFacts> & { ownFs?: boolean; onDataRoot?: boolean });
 }
 
 /** A fake `RunDeps` and the world behind it. `deps.stateDir`, `xdg` and `buildDir` are fresh temp dirs. */
@@ -139,6 +149,15 @@ export function fakeRun(o: FakeOptions = {}) {
   const calls: Call[] = [];
   const spawned: string[][] = [];
   const project = o.project ?? "hapi";
+  const diskDir = join(tmp, "run-disk");
+  mkdirSync(diskDir, { mode: 0o700 });
+  const probeFs: FsProbe = (path) => {
+    if (path === dirname(diskDir)) return { dev: 1, bytes: 500 * GIB, writable: true };
+    if (path === DATA_ROOT) return { dev: 3, bytes: 500 * GIB, writable: true };
+    if (path !== diskDir || o.disk === "missing") return undefined;
+    const { ownFs, onDataRoot, ...facts } = o.disk ?? {};
+    return { dev: ownFs === false ? 1 : onDataRoot ? 3 : 2, bytes: 19.5 * GIB, writable: true, ...facts };
+  };
 
   const run: RunDeps["run"] = async (full, opts) => {
     calls.push({ cmd: full, env: opts.env, bytes: false });
@@ -166,6 +185,7 @@ export function fakeRun(o: FakeOptions = {}) {
     }
     if (cmd[0] !== "docker") throw new Error(`fake: unexpected command ${joined}`);
     const [, a, b] = cmd;
+    if (a === "info" && after(cmd, "--format") === "{{.DockerRootDir}}") return ok(`${DATA_ROOT}\n`);
     if (a === "ps") {
       const all = cmd.includes("-aq") || cmd.includes("-a");
       const found = [...world.containers.values()].filter((c) => (all || c.running) && matches(cmd, c.labels));
@@ -234,6 +254,14 @@ export function fakeRun(o: FakeOptions = {}) {
         for (const [f, x] of Object.entries(world.outputs)) vol?.files.set(f, x);
         return ok("0123456789abcdef\n");
       }
+      if (cmd.at(-1) === CLEAN_SCRIPT) {
+        // The run disk's cleanup helper: it empties each host dir bound at /w or /o.
+        for (const dest of ["/w", "/o"]) {
+          const dir = volumeAt(cmd, dest);
+          if (dir !== undefined) for (const e of readdirSync(dir)) rmSync(join(dir, e), { recursive: true, force: true });
+        }
+        return ok();
+      }
       if (after(cmd, "--entrypoint") === "chown") {
         for (const dest of ["/w", "/o"]) {
           const v = world.volumes.get(volumeAt(cmd, dest) ?? "");
@@ -287,6 +315,8 @@ export function fakeRun(o: FakeOptions = {}) {
     image: "hapi-factory/archon:0.12.1",
     egress: `${project}-egress-archon-1`,
     stateDir: join(tmp, "state"),
+    diskDir,
+    probeFs,
     root: REPO,
     buildDir,
     packDir: join(REPO, "archon", "workflows", "hapi"),
@@ -356,7 +386,13 @@ export function writeOrder(tmp: string, over: Record<string, unknown> = {}, name
   return path;
 }
 
-/** A run that already exists: its record, and (as asked) its container, network and volumes in the world. */
+/** What a seeded run's volume dirs on the run disk hold, so the cleanup helper has something to empty. */
+export const LEFT_BY_THE_RUN = "left-by-the-run";
+
+/**
+ * A run that already exists: its record, and (as asked) its container, network and volumes in the world, with their
+ * dirs on the run disk, each holding LEFT_BY_THE_RUN.
+ */
 export async function seedRun(
   f: ReturnType<typeof fakeRun>,
   o: { id: string; repo?: string; key?: string; status?: RunRecord["status"]; running?: boolean; startedAt?: string; deadline?: string; outputs?: Record<string, FakeFile>; objects?: boolean } & Partial<RunRecord>,
@@ -390,6 +426,10 @@ export async function seedRun(
     world.networks.set(name, { labels, internal: true, endpoints: new Set([deps.egress]) });
     world.volumes.set(`${name}-work`, { labels, owner: "1001:1001", files: new Map() });
     world.volumes.set(`${name}-out`, { labels, owner: "1001:1001", files: new Map(Object.entries(o.outputs ?? {})) });
+    for (const v of [`${name}-work`, `${name}-out`]) {
+      mkdirSync(join(deps.diskDir, v), { mode: 0o700 });
+      writeFileSync(join(deps.diskDir, v, LEFT_BY_THE_RUN), "a run's file\n");
+    }
   }
   return rec;
 }

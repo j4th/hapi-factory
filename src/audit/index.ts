@@ -29,7 +29,7 @@ import { mcpToolHashes } from "./checks/mcp";
 import { pinsVersions } from "./checks/pins";
 import { budgetEnforcement } from "./checks/policy";
 import { repoPrivateUntracked } from "./checks/repo";
-import { devOverride, hermesNoYolo, runContainer } from "./checks/runtime";
+import { devOverride, hermesNoYolo, runContainer, runDisk } from "./checks/runtime";
 import { secretsCheck, secretsProvider } from "./checks/secrets";
 import { archonValidate, hermesValidate } from "./checks/tools";
 import { type AuditContext, type Check, type CheckResult, type Exec, newRun, type RepoRef, result } from "./types";
@@ -38,6 +38,7 @@ import { type AuditContext, type Check, type CheckResult, type Exec, newRun, typ
 const CHECKS: readonly (readonly [id: string, check: Check])[] = [
   ["generated.drift", generatedDrift],
   ["runtime.run-container", runContainer],
+  ["runtime.run-disk", runDisk],
   ["runtime.hermes-no-yolo", hermesNoYolo],
   ["runtime.dev-override", devOverride],
   ["policy.budget-enforcement", budgetEnforcement],
@@ -157,6 +158,7 @@ export async function auditCommand(args: string[], deps: Partial<AuditContext> =
     fetch: deps.fetch ?? fetch,
     now: deps.now ?? Date.now,
     ...(deps.secrets !== undefined ? { secrets: deps.secrets } : {}),
+    ...(deps.probeFs !== undefined ? { probeFs: deps.probeFs } : {}),
   };
   const results = await runAudit(ctx);
   const width = Math.max(...CHECK_IDS.map((id) => id.length));

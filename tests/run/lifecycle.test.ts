@@ -11,9 +11,11 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSyn
 import { isAbsolute, join, relative } from "node:path";
 import { main } from "../../src/cli";
 import { runDeps, START_USAGE } from "../../src/run/cli";
-import { COPY_SCRIPT, HELPER_HOST_TIMEOUT_S, HELPER_KILL_AFTER_S, HELPER_TIMEOUT_S, LIST_SCRIPT } from "../../src/run/copyout";
+import { COPY_SCRIPT, HELPER_HOST_TIMEOUT_S, HELPER_KILL_AFTER_S, HELPER_TIMEOUT_S, LIST_SCRIPT, OUTPUT_FILES } from "../../src/run/copyout";
+import { CLEAN_SCRIPT, GIB } from "../../src/run/disk";
 import { bundleProblem, FINALIZE_WAIT_S, finalizeRun, guardProblems, LOGS_SCRIPT, reapRuns, runStart, runStop, runSupervise } from "../../src/run/lifecycle";
-import { readRecord, RUN_ID, runKey } from "../../src/run/records";
+import { lockHeld, withStackLock } from "../../src/run/locks";
+import { listRecords, readRecord, RUN_ID, runKey } from "../../src/run/records";
 import { STOP_GRACE_S } from "../../src/run/spec";
 import { reexecScript, runCommand } from "../../src/stack/up";
 import { loadWorkOrder } from "../../src/workorder/validate";
@@ -36,11 +38,11 @@ function ready(o: Parameters<typeof fakeRun>[0] = {}) {
   return { ...f, secret, repo: fakeRepo(f.tmp), order: writeOrder(f.tmp) };
 }
 
-/** The calls that create, connect or run something (not listings, inspects or git), a helper with its host bound. */
+/** The calls that create, connect or run something (not listings, inspects, `docker info` or git), a helper with its host bound. */
 const changes = (calls: Call[]) =>
   calls.filter((c) => {
     const d = unbounded(c.cmd);
-    return d[0] === "docker" && !["ps", "inspect", "ls"].includes(d[1] === "network" || d[1] === "volume" ? d[2]! : d[1]!);
+    return d[0] === "docker" && !["ps", "inspect", "ls", "info"].includes(d[1] === "network" || d[1] === "volume" ? d[2]! : d[1]!);
   });
 const locksIn = (xdg: string) => (existsSync(join(xdg, "hapi", "locks")) ? readdirSync(join(xdg, "hapi", "locks")).filter((n) => n.endsWith(".lock")) : []);
 
@@ -186,6 +188,38 @@ describe("hapi run start: refusals", () => {
     expect(err).toEqual(["hapi run start: --budget-usd 3.5 is above the work order's budget.usd (3): it may only lower it", START_USAGE]);
     expect(changes(f.calls)).toEqual([]);
   });
+
+  test("start refuses a run when the run disk fails its check and runs.disk.enforcement is hard (H-217)", async () => {
+    const { err } = capture();
+    const f = ready({ disk: "missing" });
+    expect(await runStart(["--repo", f.repo, "--work-order", f.order], f.deps)).toBe(1);
+    expect(err).toEqual([`hapi run start: the run disk ${f.deps.diskDir} does not exist: set it up as docs/runbooks/runs.md#the-run-disk says (H-217)`]);
+    expect(changes(f.calls)).toEqual([]);
+    expect(await listRecords(f.deps.stateDir)).toEqual([]);
+    // Any problem refuses, Docker's data root's filesystem among them.
+    const g = ready({ disk: { onDataRoot: true } });
+    expect(await runStart(["--repo", g.repo, "--work-order", g.order], g.deps)).toBe(1);
+    expect(err.at(-1)).toBe(`hapi run start: the run disk ${g.deps.diskDir} is on the same filesystem as Docker's data root (/fake/docker-root): a run that filled it would fill Docker's disk`);
+    expect(changes(g.calls)).toEqual([]);
+  });
+
+  test("with runs.disk.enforcement soft, start warns and starts the run", async () => {
+    const { out, err } = capture();
+    const f = ready({ disk: { bytes: 64 * GIB }, runs: { disk: { gb: 20, enforcement: "soft" } } });
+    expect(await runStart(["--repo", f.repo, "--work-order", f.order], f.deps)).toBe(0);
+    expect(err).toEqual([
+      `hapi run start: warning: the run disk ${f.deps.diskDir} is 64.0 GB, more than runs.disk.gb (20): it would let a run grow past its cap; runs.disk.enforcement is soft, so the run starts anyway`,
+    ]);
+    expect(out).toEqual([expect.stringMatching(RUN_ID)]);
+  });
+
+  test("a docker info that fails refuses the run: the check can't be made without Docker's data root", async () => {
+    const { err } = capture();
+    const f = ready({ failing: ["docker info"], runs: { disk: { gb: 20, enforcement: "soft" } } });
+    expect(await runStart(["--repo", f.repo, "--work-order", f.order], f.deps)).toBe(1);
+    expect(err).toEqual(["hapi run start: cannot read Docker's data root (docker info exited 1): boom"]);
+    expect(changes(f.calls)).toEqual([]);
+  });
 });
 
 describe("hapi run start: the order of steps", () => {
@@ -195,6 +229,11 @@ describe("hapi run start: the order of steps", () => {
     let f!: ReturnType<typeof ready>;
     f = ready({
       onCall: (cmd) => {
+        if (cmd[1] === "volume" && cmd[2] === "create") {
+          // The volume's bind dir is there, the run's alone (0700), before Docker is asked to make the volume on it.
+          const dir = join(f.deps.diskDir, cmd.at(-1)!);
+          seen.push(`${cmd.at(-1)!.split("-").at(-1)} dir ${existsSync(dir) ? (statSync(dir).mode & 0o777).toString(8) : "missing"}`);
+        }
         if (cmd[1] !== "network" || cmd[2] !== "create") return;
         const id = cmd.at(-1)!.replace("hapi-run-", "");
         const dir = join(f.deps.stateDir, id);
@@ -208,11 +247,12 @@ describe("hapi run start: the order of steps", () => {
     const N = `hapi-run-${id}`;
     const labels = ["--label", `org.hapi.run=${id}`, "--label", "org.hapi.project=hapi"];
     const made = changes(f.calls).map((c) => c.cmd);
+    const bindTo = (v: string) => ["--driver", "local", "--opt", "type=none", "--opt", "o=bind", "--opt", `device=${join(f.deps.diskDir, v)}`];
     expect(made.slice(0, 5)).toEqual([
       ["docker", "network", "create", "--internal", ...labels, N],
       ["docker", "network", "connect", "--alias", "egress-archon", N, "hapi-egress-archon-1"],
-      ["docker", "volume", "create", ...labels, `${N}-work`],
-      ["docker", "volume", "create", ...labels, `${N}-out`],
+      ["docker", "volume", "create", ...bindTo(`${N}-work`), ...labels, `${N}-work`],
+      ["docker", "volume", "create", ...bindTo(`${N}-out`), ...labels, `${N}-out`],
       [
         "timeout", "-k", String(HELPER_KILL_AFTER_S), String(HELPER_HOST_TIMEOUT_S),
         "docker", "run", "--rm", "--pull", "never", "--network", "none", "--read-only", "--user", "0:0", "--cap-drop", "ALL", "--cap-add", "CHOWN", "--security-opt", "no-new-privileges:true",
@@ -226,7 +266,7 @@ describe("hapi run start: the order of steps", () => {
     expect(at((c) => c[2] === "inspect")).toBe(at((c) => c[2] === "create" && c[1] === "network") + 1);
     expect(f.spawned).toEqual([["hapi", "run", "supervise", id]]);
     // Step 1 happened, under the lock, before anything was created; the lock is released after.
-    expect(seen).toEqual(["record true", "run.json true", "locks 1"]);
+    expect(seen).toEqual(["record true", "run.json true", "locks 1", "work dir 700", "out dir 700"]);
     expect(locksIn(f.xdg)).toEqual([]);
 
     const dir = join(f.deps.stateDir, id);
@@ -427,12 +467,14 @@ describe("finalizeRun", () => {
       at((c) => c[2] === "disconnect"),
       at((c) => c[2] === "rm" && c[1] === "network"),
       at((c) => c[2] === "rm" && c[1] === "volume"),
+      at((c) => unbounded(c).at(-1) === CLEAN_SCRIPT), // the run disk's cleanup, once the volumes are gone
     ];
     expect(order.every((i) => i >= 0)).toBe(true);
     expect(order).toEqual([...order].sort((a, b) => a - b));
     expect(cmds[order[2]!]).toEqual(["docker", "rm", "-f", N]);
     expect(cmds[order[3]!]).toEqual(["docker", "network", "disconnect", "-f", N, "hapi-egress-archon-1"]);
     expect(f.world.containers.size + f.world.networks.size + f.world.volumes.size).toBe(0);
+    expect(readdirSync(f.deps.diskDir)).toEqual([]);
 
     // A paused run exits 0 (spike 07 finding 5), so the status comes from Archon, and paused is failed.
     const g = fakeRun();
@@ -494,10 +536,18 @@ describe("finalizeRun", () => {
     const done = await finalizeRun(rec, f.deps);
     const REMOVED = "the run's container was removed before the run was finalized (`mise run down`, or a cleanup): nothing was copied out";
     expect([done.status, done.reason]).toEqual(["failed", REMOVED]);
-    // No volume is inspected or mounted, and nothing is copied; what is left is removed.
-    expect(f.calls.filter((c) => unbounded(c.cmd)[1] === "run" || c.cmd.join(" ").startsWith("docker volume inspect"))).toEqual([]);
+    // The copy-out half: no volume is inspected or mounted, and nothing is copied.
+    const helpers = f.calls.filter((c) => unbounded(c.cmd)[1] === "run" && unbounded(c.cmd).at(-1) !== CLEAN_SCRIPT);
+    expect(helpers.concat(f.calls.filter((c) => c.cmd.join(" ").startsWith("docker volume inspect")))).toEqual([]);
+    expect(f.calls.some((c) => c.cmd.includes(LIST_SCRIPT) || c.cmd.includes(COPY_SCRIPT))).toBe(false);
     expect(existsSync(join(f.deps.stateDir, ID, "out"))).toBe(false);
+    // The cleanup half follows the volumes: removeRuns removed both here, so their dirs go after them, through the helper.
     expect(f.world.networks.size + f.world.volumes.size).toBe(0);
+    const cmds = f.calls.map((c) => unbounded(c.cmd));
+    const cleans = cmds.flatMap((c, i) => (c.at(-1) === CLEAN_SCRIPT ? [i] : []));
+    expect(cleans).toHaveLength(1);
+    expect(cleans[0]).toBeGreaterThan(cmds.findIndex((c) => c.join(" ") === `docker volume rm ${N}-work ${N}-out`));
+    expect(readdirSync(f.deps.diskDir)).toEqual([]);
     // A stop asked for first still says how the run ended.
     const g = fakeRun();
     const stopped = await seedRun(g, { id: ID, running: false, stopRequested: "stopped", outputs: completedOutputs() });
@@ -537,10 +587,47 @@ describe("finalizeRun", () => {
   });
 });
 
-test("a finalize waits on another long enough for that one's stop and every bounded call, the container's log among them", () => {
-  // The stop's grace, then the listing, four reads and the log, each at its host bound and KILL.
-  expect(FINALIZE_WAIT_S).toBeGreaterThanOrEqual(STOP_GRACE_S + 6 * (HELPER_HOST_TIMEOUT_S + HELPER_KILL_AFTER_S));
-  expect(FINALIZE_WAIT_S).toBe(1090);
+test("a finalize waits on another long enough for that one's stop and every bounded call, the container's log among them, and the run disk's cleanup", () => {
+  // The stop's grace, then the three fixed calls (the listing, the container's log, the cleanup helper) and a read per output, each at its host bound and KILL.
+  expect(FINALIZE_WAIT_S).toBeGreaterThanOrEqual(STOP_GRACE_S + (3 + OUTPUT_FILES.length) * (HELPER_HOST_TIMEOUT_S + HELPER_KILL_AFTER_S));
+  expect(FINALIZE_WAIT_S).toBe(1250);
+});
+
+test("finalize copies out holding the run disk's lock, and while down holds it a reap leaves the run to the next one (H-210)", async () => {
+  capture();
+  const f = fakeRun();
+  let during: unknown;
+  const run = f.deps.run;
+  f.deps.run = async (cmd, o) => {
+    if (cmd.includes(LIST_SCRIPT)) during = await withStackLock(f.deps, "stack-down", async () => {}).catch((e: unknown) => e);
+    return run(cmd, o);
+  };
+  expect((await finalizeRun(await seedRun(f, { id: ID, running: false, outputs: completedOutputs() }), f.deps)).status).toBe("succeeded");
+  expect(lockHeld(during)).toBe(true);
+  // The lock is let go once the copy-out is done: down can take it again.
+  await withStackLock(f.deps, "stack-down", async () => {});
+
+  // While `down` holds it, a reap leaves the exited run live, for the next reap, and runs no helper on it.
+  const g = fakeRun();
+  await seedRun(g, { id: ID, running: false, outputs: completedOutputs() });
+  let release!: () => void;
+  const held = new Promise<void>((r) => (release = r));
+  let entered!: () => void;
+  const inside = new Promise<void>((r) => (entered = r));
+  const down = withStackLock(g.deps, "stack-down", () => (entered(), held));
+  await inside;
+  try {
+    await reapRuns(g.deps);
+    expect((await readRecord(g.deps.stateDir, ID))!.status).toBe("live");
+    expect(g.calls.filter((c) => unbounded(c.cmd)[1] === "run")).toEqual([]);
+    expect(readdirSync(g.deps.diskDir).sort()).toEqual([`${N}-out`, `${N}-work`]);
+  } finally {
+    release();
+    await down;
+  }
+  // The next reap finalizes it.
+  await reapRuns(g.deps);
+  expect((await readRecord(g.deps.stateDir, ID))!.status).toBe("succeeded");
 });
 
 describe("the container's log, when no result.json came out (final review C-1)", () => {
@@ -723,6 +810,47 @@ describe("reapRuns", () => {
     const e = await caught(reapRuns(f.deps));
     expect(e.message).toMatch(/^reaping left runs unfinished: run aaaaaaaaaaaa: docker ps .* failed \(exit 1\): boom$/);
     expect((await readRecord(f.deps.stateDir, "aaaaaaaaaaaa"))!.status).toBe("live");
+  });
+
+  test("reap empties and removes a run disk dir whose volume is gone and whose run isn't live, and keeps the rest", async () => {
+    const { err } = capture();
+    const f = fakeRun();
+    const [A, B, C] = ["aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"];
+    const disk = (name: string, file = true) => {
+      mkdirSync(join(f.deps.diskDir, name), { mode: 0o700 });
+      if (file) writeFileSync(join(f.deps.diskDir, name, "f"), "x");
+    };
+    // A: no volume and no record (a start rolled back, or a down that left it). B: its volume is still there.
+    disk(`hapi-run-${A}-work`);
+    disk(`hapi-run-${B}-out`);
+    f.world.volumes.set(`hapi-run-${B}-out`, { labels: { "org.hapi.run": B, "org.hapi.project": "hapi" }, owner: "1001:1001", files: new Map() });
+    // C: a live run (its record says so), whose volumes another process may be removing: never swept.
+    await seedRun(f, { id: C, running: true });
+    for (const v of ["work", "out"]) f.world.volumes.delete(`hapi-run-${C}-${v}`);
+    // Neither a run's dir of another project nor the filesystem's own lost+found.
+    disk(`other-run-${A}-work`);
+    disk("lost+found", false);
+    await reapRuns(f.deps);
+    expect(readdirSync(f.deps.diskDir).sort()).toEqual(["hapi-run-bbbbbbbbbbbb-out", "hapi-run-cccccccccccc-out", "hapi-run-cccccccccccc-work", "lost+found", "other-run-aaaaaaaaaaaa-work"]);
+    expect(err).toEqual([`hapi run: removed run ${A}'s dirs on the run disk: their volumes were gone`]);
+    // The listing is the project's labelled volumes.
+    expect(f.calls.filter((c) => c.cmd[1] === "volume").map((c) => c.cmd)).toEqual([["docker", "volume", "ls", "-q", "--filter", "label=org.hapi.run", "--filter", "label=org.hapi.project=hapi"]]);
+  });
+
+  test("a run disk dir the reap can't empty is a failure: the run disk stops new starts until it is cleaned (fail-closed); with nothing to sweep, nothing is listed", async () => {
+    capture();
+    const f = fakeRun({ failing: ["docker run --rm"] });
+    mkdirSync(join(f.deps.diskDir, "hapi-run-aaaaaaaaaaaa-out"), { mode: 0o700 });
+    writeFileSync(join(f.deps.diskDir, "hapi-run-aaaaaaaaaaaa-out", "f"), "x");
+    expect((await caught(reapRuns(f.deps))).message).toBe("reaping left runs unfinished: run aaaaaaaaaaaa: emptying run aaaaaaaaaaaa's dirs on the run disk failed (helper exit 1)");
+    const g = fakeRun({ failing: ["docker volume ls"] });
+    mkdirSync(join(g.deps.diskDir, "hapi-run-aaaaaaaaaaaa-out"), { mode: 0o700 });
+    expect((await caught(reapRuns(g.deps))).message).toMatch(/^reaping left runs unfinished: the run disk's sweep: docker volume ls -q .* failed \(exit 1\): boom$/);
+    // No run's dir, or no run disk at all: no listing.
+    const h = fakeRun();
+    await reapRuns(h.deps);
+    await reapRuns({ ...h.deps, diskDir: join(h.tmp, "no-run-disk") });
+    expect(h.calls).toEqual([]);
   });
 });
 

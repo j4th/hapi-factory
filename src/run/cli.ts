@@ -1,7 +1,8 @@
 /**
  * The `hapi run` command line (design §3.1, §3.2): its usage lines and argument
  * parsers, and the host-side defaults of `RunDeps` (./spec.ts): the real
- * docker runners, the run state dir, and the detached supervisor. The commands
+ * docker runners, the run state dir, the run disk and its probe, and the
+ * detached supervisor. The commands
  * themselves are ./lifecycle.ts's and ./view.ts's.
  */
 import { spawn } from "node:child_process";
@@ -12,6 +13,8 @@ import { REPO_ROOT } from "../generate/header";
 import { loadPolicy } from "../policy/load";
 import { composeServices } from "../stack/compose";
 import { definedEnv, type Env, PROJECT, runCommand } from "../stack/up";
+import { probeFs } from "./disk";
+import { RUN_DISK } from "./locks";
 import { RUN_ID } from "./records";
 import type { RunDeps } from "./spec";
 
@@ -155,7 +158,7 @@ function spawnDetached(root: string, stateDir: string, env: Env): RunDeps["spawn
   };
 }
 
-/** `p`, with every field it leaves out set to the host's: hapi's project, image, state dir, checkout and policy. */
+/** `p`, with every field it leaves out set to the host's: hapi's project, image, state dir, run disk, checkout and policy. */
 export async function runDeps(p: Partial<RunDeps>): Promise<RunDeps> {
   const env = p.env ?? process.env;
   const root = p.root ?? REPO_ROOT;
@@ -174,6 +177,8 @@ export async function runDeps(p: Partial<RunDeps>): Promise<RunDeps> {
     image,
     egress: p.egress ?? `${project}-egress-archon-1`,
     stateDir,
+    diskDir: p.diskDir ?? RUN_DISK,
+    probeFs: p.probeFs ?? probeFs,
     root,
     buildDir: p.buildDir ?? join(root, "build"),
     packDir: p.packDir ?? join(root, "archon", "workflows", "hapi"),

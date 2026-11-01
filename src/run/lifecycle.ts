@@ -12,18 +12,23 @@
  *    `egress_extra` is refused until a per-run proxy exists, H-088), its
  *    workflow (one of hapi's pack, `packNodes`, which must parse, name each
  *    workflow by its file's stem and keep `pi.enableExtensions` on), the
- *    budget (`--budget-usd` only lowers it), the archon zone's env file
- *    (missing: run `mise run up`), the source repo and its HEAD (host git with
- *    no config), and the run container's whole argv (`runArgs`);
+ *    budget (`--budget-usd` only lowers it), the run disk against `runs.disk`
+ *    (`diskProblem`, ./disk.ts: refused under `hard`, a warning under `soft`;
+ *    H-217), the archon zone's env file (missing: run `mise run up`), the
+ *    source repo and its HEAD (host git with no config), and the run
+ *    container's whole argv (`runArgs`);
  * 2. under the launcher's lock: admission (the key, one live run per repo,
  *    `runs.max_live`; ./records.ts), then the run's dir with record.json and
  *    run.json;
  * 3. the run's own network, `--internal`, checked with `networkProblem`;
  * 4. `egress-archon` joined to it under the alias the proxy variables name
  *    (spike 07 finding 13);
- * 5. the two volumes, chowned to 1001 by a one-shot helper with CAP_CHOWN
- *    alone: a fresh volume's root is root's (spike 07 finding 12). Like every
- *    helper, it runs under the host's `timeout` (./copyout.ts `bounded`);
+ * 5. the two volumes, each bind-backed on a dir of its own on the run disk
+ *    (`volumeDir`, made 0700 and checked before the volume: Docker would make
+ *    a volume on a missing dir and fail only at `docker run`, spike 09 finding
+ *    17), chowned to 1001 by a one-shot helper with CAP_CHOWN alone: a fresh
+ *    volume's root is root's (spike 07 finding 12). Like every helper, it runs
+ *    under the host's `timeout` (./copyout.ts `bounded`);
  * 6. the run container, its secrets passed by name, their values in the docker
  *    CLI's env only;
  * 7. a detached `hapi run supervise <id>`, awaited until its process has
@@ -40,22 +45,29 @@
  * process finalizes records it. The stop grace is `STOP_GRACE_S`.
  *
  * `finalizeRun`, under the run's own lock and once only: stop the container if
- * it still runs (no volume a live worker can write is ever read), copy the
- * outputs out (./copyout.ts), check the bundle (exactly one head, `HEAD`,
+ * it still runs (no volume a live worker can write is ever read), then, under
+ * the run disk's lock (./locks.ts; H-210), which `down` holds while it removes
+ * runs, copy the outputs out (./copyout.ts), check the bundle (exactly one head, `HEAD`,
  * read by host git with hardened flags in an empty dir: spike 07 finding 19),
  * read Archon's status from result.json (a paused run exits 0, so the exit code
  * is never the status: spike 07 finding 5), check that the guard ran in every
  * Pi attempt (design §6a item 7; spike 08 finding 10), keep the tail of the
- * container's log when no result.json came out (`keepContainerLog`), remove
- * every object of the run, and write the record. A run whose container is gone was removed
+ * container's log when no result.json came out (`keepContainerLog`); then
+ * remove every object of the run, empty and remove its volumes' dirs on the run
+ * disk (`removeVolumeDirs`), and write the record. A run whose container is gone was removed
  * around hapi (`mise run down`, a cleanup), which is removing its volumes too,
  * so nothing is copied and it fails: a copy-out helper would race that removal
- * (`volume is in use`).
+ * (`volume is in use`). A held run disk lock (`down` is removing runs) makes
+ * the finalize wait (`finalizeRun`), or a reap leave the run for the next one.
  *
  * `reapRuns` runs first in `start` and `stop` (`supervise` is spawned by a
  * start that has just reaped): it finalizes a live record whose container has
  * exited, and stops and finalizes one past its deadline, so a supervisor that
- * died leaves nothing behind for long. Then retention, fail-closed: it deletes
+ * died leaves nothing behind for long. Then the run disk's sweep: a run's dir
+ * there whose run isn't live and whose volume is gone (a start rolled back, a
+ * `down` that left the volumes, a cleanup that failed) is emptied and removed;
+ * one it can't clean fails the reap, and so every start, until it is cleaned.
+ * Then retention, fail-closed: it deletes
  * a finished run's dir only once record.json's `harvestedAt` (Plan 03's
  * harvester sets it) is more than `runs.retention_days` ago, so an output no
  * harvester has read is never lost.
@@ -64,17 +76,19 @@
  * never executed, never read by git with its own config, never printed raw.
  */
 import { randomUUID } from "node:crypto";
-import { mkdtemp, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { packNodes } from "../audit/checks/tools";
 import type { RunFile } from "../generate/archon";
 import { ENV_DIR, parseEnvFile, runtimeDir } from "../secrets/files";
 import { composeServices } from "../stack/compose";
-import { currentUserOverride, definedEnv, HAPI_USER, networkProblem, reexec, removeRuns, runCommand } from "../stack/up";
+import { currentUserOverride, definedEnv, HAPI_USER, listed, networkProblem, reexec, removeRuns, runCommand, runFilters } from "../stack/up";
 import { loadWorkOrder } from "../workorder/validate";
 import { parseRunId, parseStart, runDeps, START_USAGE, STOP_USAGE, SUPERVISE_USAGE } from "./cli";
-import { bounded, copyOut, HELPER_HOST_TIMEOUT_S, HELPER_KILL_AFTER_S, timedOut } from "./copyout";
+import { bounded, copyOut, HELPER_HOST_TIMEOUT_S, HELPER_KILL_AFTER_S, OUTPUT_FILES, timedOut } from "./copyout";
+import { diskProblem, dockerDataRoot, removeVolumeDirs, volumeDir } from "./disk";
+import { withStackLock } from "./locks";
 import {
   capacityProblem,
   containerExists,
@@ -100,10 +114,12 @@ import { APP_USER, PROXY_ALIAS, runArgs, type RunDeps, type RunInputs, runLabels
 
 /**
  * How long `finalizeRun` waits for another process finalizing the same run: its stop's grace (STOP_GRACE_S, 30 s),
- * its six bounded helper calls each at its host bound and KILL (the listing, four reads and the container's log:
- * 6 × (150 + 10) = 960 s), and 100 s for the rest: 1090 s in all.
+ * then its bounded helper calls, each at its host bound and KILL: three fixed ones (the listing, the container's log
+ * and the run disk's cleanup helper) and a read per output file (OUTPUT_FILES, four): 7 × (150 + 10) = 1120 s, and
+ * 100 s for the rest: 1250 s in all. The wait covers a finalize that finds the run disk's lock held, too: `down`
+ * holds it only while it removes the runs, seconds.
  */
-export const FINALIZE_WAIT_S = STOP_GRACE_S + 6 * (HELPER_HOST_TIMEOUT_S + HELPER_KILL_AFTER_S) + 100;
+export const FINALIZE_WAIT_S = STOP_GRACE_S + (3 + OUTPUT_FILES.length) * (HELPER_HOST_TIMEOUT_S + HELPER_KILL_AFTER_S) + 100;
 
 const firstLine = (s: string | undefined) => (s ?? "").trim().split("\n")[0]?.slice(0, 300) || "(no error output)";
 /** Printable ASCII only, and short: for a name a run made (a node path, an attempt id, a ref). */
@@ -221,7 +237,15 @@ async function createRunObjects(d: RunDeps, rec: RunRecord, argv: string[], secr
   const problem = networkProblem(Array.isArray(parsed) ? parsed[0] : undefined);
   if (problem !== undefined) throw new Error(problem);
   await must(`docker network connect ${rec.network} ${d.egress}`, ["docker", "network", "connect", "--alias", PROXY_ALIAS, rec.network, d.egress]);
-  for (const v of [rec.volumes.work, rec.volumes.out]) await must(`docker volume create ${v}`, ["docker", "volume", "create", ...labels, v]);
+  for (const v of [rec.volumes.work, rec.volumes.out]) {
+    const dir = volumeDir(d.diskDir, v);
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    // Docker makes a bind-backed volume on a dir that isn't there without a word, and only `docker run` fails, with
+    // an exit code that says nothing of why (spike 09 finding 17): so the dir is checked here, before the volume.
+    const made = await lstat(dir).catch(() => undefined);
+    if (made === undefined || !made.isDirectory()) throw new Error(`${dir}, the dir of volume ${v} on the run disk, is not a directory hapi made (a symlink?): no volume was made on it`);
+    await must(`docker volume create ${v}`, ["docker", "volume", "create", "--driver", "local", "--opt", "type=none", "--opt", "o=bind", "--opt", `device=${dir}`, ...labels, v]);
+  }
   await must("the volume chown helper", bounded([
     "docker", "run", "--rm", "--pull", "never", "--network", "none", "--read-only", "--user", "0:0", "--cap-drop", "ALL", "--cap-add", "CHOWN", "--security-opt", "no-new-privileges:true",
     ...labels, "-v", `${rec.volumes.work}:/w`, "-v", `${rec.volumes.out}:/o`, "--entrypoint", "chown", d.image, APP_USER, "/w", "/o",
@@ -239,6 +263,14 @@ async function absent(p: string): Promise<boolean> {
     const code = (e as NodeJS.ErrnoException).code;
     return code === "ENOENT" || code === "ENOTDIR";
   }
+}
+
+/** The run disk against `runs.disk` (H-217): under `hard` a problem refuses the run; under `soft` it is a warning, and the run starts. */
+async function checkRunDisk(d: RunDeps): Promise<void> {
+  const problem = diskProblem(d.diskDir, d.runs.disk, await dockerDataRoot(d), d.probeFs);
+  if (problem === undefined) return;
+  if (d.runs.disk.enforcement === "hard") throw new Error(problem);
+  console.error(`hapi run start: warning: ${problem}; runs.disk.enforcement is soft, so the run starts anyway`);
 }
 
 /** `hapi run start --repo <path> --work-order <file> [--public] [--budget-usd <n>] [--retry-of <run-id>]`: see the module comment. */
@@ -276,6 +308,7 @@ export async function runStart(args: string[], deps: Partial<RunDeps> = {}): Pro
       console.error(START_USAGE);
       return 2;
     }
+    await checkRunDisk(d);
     const secrets = await archonSecrets(d.env);
     const repo = await sourceGitDir(opts.repo);
     const sha = await headOf(repo, d);
@@ -309,6 +342,8 @@ export async function runStart(args: string[], deps: Partial<RunDeps> = {}): Pro
       } catch (e) {
         let cleanup = "What start had created was removed.";
         try {
+          // The volumes go here, and their dirs on the run disk go with them at the next reap: its sweep removes a
+          // run's dir whose volume is gone and whose run has no live record, as this run has none after removeRunDir.
           await removeRuns(d.project, d.run, d.env, { runId, egress: d.egress });
         } catch (x) {
           cleanup = `Removing what start had created failed too (${(x as Error).message}): \`mise run down\` removes it.`;
@@ -478,13 +513,18 @@ async function finalizeLocked(rec: RunRecord, d: RunDeps): Promise<RunRecord> {
   if (disk.stopRequested === "stopped") reasons.push("stopped by `hapi run stop`");
 
   const problems: string[] = [];
-  let archon: Awaited<ReturnType<typeof archonStatus>> = { problem: "nothing was copied out" };
-  if (!(await containerExists(d, disk.runId))) {
-    // Removed around hapi (`mise run down`, a cleanup: `docker wait` returns as `rm -f` kills it), and its volumes
-    // are going too: a helper would race that removal for them, and its `-v` of one just removed would make an
-    // unlabelled volume that nothing removes.
-    problems.push("the run's container was removed before the run was finalized (`mise run down`, or a cleanup): nothing was copied out");
-  } else {
+  // Set inside the lock's closure below, so typed as the whole union: TypeScript doesn't see a closure's assignment.
+  let archon = { problem: "nothing was copied out" } as Awaited<ReturnType<typeof archonStatus>>;
+  // Under the run disk's lock, which `down` holds while it removes runs (H-210): held, it throws `lockHeld`, so
+  // finalizeRun waits and a reap leaves the run for the next one, and no copy-out reads a volume `down` is removing.
+  await withStackLock(d, "run-copyout", async () => {
+    if (!(await containerExists(d, disk.runId))) {
+      // Removed around hapi (`mise run down`, a cleanup: `docker wait` returns as `rm -f` kills it), and its volumes
+      // are going too: a helper would race that removal for them, and its `-v` of one just removed would make an
+      // unlabelled volume that nothing removes.
+      problems.push("the run's container was removed before the run was finalized (`mise run down`, or a cleanup): nothing was copied out");
+      return;
+    }
     const copy = await copyOut(disk.volumes.out, out, d.runs.output_limits_mb, d);
     problems.push(...copy.problems);
     if (copy.copied.includes("run.bundle")) {
@@ -499,7 +539,7 @@ async function finalizeLocked(rec: RunRecord, d: RunDeps): Promise<RunRecord> {
       const log = await keepContainerLog(d, disk, out);
       if (log !== undefined) problems.push(log);
     }
-  }
+  });
 
   let status: RunStatus;
   if (disk.stopRequested !== undefined) status = disk.stopRequested;
@@ -511,8 +551,18 @@ async function finalizeLocked(rec: RunRecord, d: RunDeps): Promise<RunRecord> {
   }
   reasons.push(...problems);
 
+  // Whether the run's volumes go: always here. Task 7's H-209 keeps them (false) for a run whose container was gone.
+  // A kept volume keeps its dirs on the run disk: the cleanup helper runs only for volumes removeRuns removed.
+  const volumes = true;
   try {
-    await removeRuns(d.project, d.run, d.env, { runId: disk.runId, egress: d.egress });
+    await removeRuns(d.project, d.run, d.env, { runId: disk.runId, egress: d.egress, volumes });
+    if (volumes) {
+      try {
+        await removeVolumeDirs(d, disk.runId);
+      } catch (e) {
+        reasons.push(`cleanup left the run's dirs on the run disk: ${(e as Error).message}; the next reap tries again`);
+      }
+    }
   } catch (e) {
     reasons.push(`cleanup left run objects behind: ${(e as Error).message}; \`mise run down\` removes them`);
   }
@@ -537,11 +587,53 @@ export async function finalizeRun(rec: RunRecord, deps: RunDeps): Promise<RunRec
 }
 
 /**
+ * The run disk's sweep, part of a reap (under the launcher's lock, so no start is making dirs meanwhile): each dir
+ * named for a run of `d.project` (`<project>-run-<id>-work` or `-out`; nothing else, `lost+found` included, is
+ * touched) whose run has no live record, and none of whose run's volumes is still listed, is emptied and removed
+ * (`removeVolumeDirs`). A live run's dirs are its finalize's to remove. Returns what it couldn't do; a missing run
+ * disk is nothing to sweep.
+ */
+async function sweepRunDisk(d: RunDeps, live: Set<string>): Promise<string[]> {
+  let names: string[];
+  try {
+    names = await readdir(d.diskDir);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return [];
+    return [`the run disk ${d.diskDir} can't be listed (${code ?? (e as Error).message})`];
+  }
+  const stem = `${d.project}-run-`;
+  const ids = new Set<string>();
+  for (const n of names) {
+    const m = n.startsWith(stem) ? /^([0-9a-f]{12})-(work|out)$/.exec(n.slice(stem.length)) : null;
+    if (m !== null && !live.has(m[1]!)) ids.add(m[1]!);
+  }
+  if (ids.size === 0) return [];
+  let volumes: string[];
+  try {
+    volumes = await listed(d.run, d.env, ["docker", "volume", "ls", "-q", ...runFilters(d.project)]);
+  } catch (e) {
+    return [`the run disk's sweep: ${(e as Error).message}`];
+  }
+  const failures: string[] = [];
+  for (const id of [...ids].sort()) {
+    if (["work", "out"].some((v) => volumes.includes(`${runName(d.project, id)}-${v}`))) continue;
+    try {
+      await removeVolumeDirs(d, id);
+      console.error(`hapi run: removed run ${id}'s dirs on the run disk: their volumes were gone`);
+    } catch (e) {
+      failures.push(`run ${id}: ${(e as Error).message}`);
+    }
+  }
+  return failures;
+}
+
+/**
  * Repair what a dead supervisor left, under the launcher's lock: every live record whose container has
  * exited is finalized, and every one past its deadline is stopped (timed-out) and finalized. A run another
- * process is finalizing is left to it. Then retention (see the module comment): a finished run harvested
- * more than `runs.retention_days` ago loses its dir. Throws after trying every run, naming those it couldn't
- * finish.
+ * process is finalizing, or one `down` holds the run disk's lock over, is left to it. Then the run disk's sweep
+ * (`sweepRunDisk`) and retention (see the module comment): a finished run harvested more than
+ * `runs.retention_days` ago loses its dir. Throws after trying every run, naming those it couldn't finish.
  */
 export async function reapRuns(deps: RunDeps): Promise<void> {
   await withStartLock(deps, async () => {
@@ -558,8 +650,10 @@ export async function reapRuns(deps: RunDeps): Promise<void> {
         if (!lockHeld(e)) failures.push(`run ${rec.runId}: ${(e as Error).message}`);
       }
     }
+    const records = await listRecords(deps.stateDir);
+    failures.push(...(await sweepRunDisk(deps, new Set(records.filter((r) => r.status === "live").map((r) => r.runId)))));
     const keep = deps.runs.retention_days * 86_400_000;
-    for (const rec of await listRecords(deps.stateDir)) {
+    for (const rec of records) {
       // Only a time hapi's harvester wrote: anything else, or none, keeps the run.
       const harvested = typeof rec.harvestedAt === "string" ? Date.parse(rec.harvestedAt) : Number.NaN;
       if (rec.status === "live" || !Number.isFinite(harvested) || deps.now().getTime() - harvested <= keep) continue;

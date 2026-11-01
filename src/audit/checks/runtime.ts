@@ -18,6 +18,12 @@
  *   $HERMES_HOME/config.yaml, approvals.mode not off and no unattended mode
  *   that approves. The config is read as YAML 1.1, as Hermes reads it, where a
  *   bare `off` or `no` is false.
+ * - runtime.run-disk: the run disk (`RUN_DISK`, src/run/disk.ts; H-217) as
+ *   `hapi run start` checks it against `runs.disk` (`diskProblem`, the same
+ *   reason): there, its own filesystem, apart from Docker's data root (from
+ *   `docker info`), writable, and at most `runs.disk.gb`. It fails under either
+ *   enforcement: under `hard` every start refuses, under `soft` runs start
+ *   without the cap.
  * - runtime.dev-override: the labels `hapi stack up` (and the launcher, for a
  *   run) puts on every container (H-147). `1` is the dev bypass (HAPI_ALLOW_CURRENT_USER=1); `unknown` or
  *   empty means a stack not started through `hapi stack up`, never "no
@@ -31,6 +37,9 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import YAML from "yaml";
 import { RUN_PATHS } from "../../generate/archon";
+import { loadPolicy } from "../../policy/load";
+import { dataRootOf, diskProblem, GIB, probeFs } from "../../run/disk";
+import { RUN_DISK } from "../../run/locks";
 import { APP_HOME, APP_USER, NO_NEW_PRIVILEGES, runArgs, type RunInputs, STOP_GRACE_S } from "../../run/spec";
 import { composeServices } from "../../stack/compose";
 import { HERMES_HOME, serviceEnvironment } from "../../stack/env";
@@ -313,6 +322,29 @@ export async function runContainer(run: AuditRun): Promise<CheckResult[]> {
       `the run definition (runArgs, src/run/spec.ts) gives ${RUN_PATHS.piDir} a tmpfs (${PI_TMPFS}), binds all ${READ_ONLY_DESTINATIONS.length} host files (build/'s generated ones, /.archon/.env, the pack ${packDir}, the prelude, the run file and the source repo) read-only, sets all ${Object.keys(serviceEnvironment("archon")).length} values of serviceEnvironment("archon") (${nonProxy} besides the proxy's), publishes no port, and has every hardening flag and a ${STOP_GRACE_S} s stop timeout; ${checked}`,
     ),
   ];
+}
+
+/** runtime.run-disk */
+export async function runDisk(run: AuditRun): Promise<CheckResult[]> {
+  const id = "runtime.run-disk";
+  const { ctx } = run;
+  let info;
+  try {
+    info = await ctx.exec(["docker", "info", "--format", "{{.DockerRootDir}}"]);
+  } catch (e) {
+    return [result(id, "skip", `docker info failed: ${(e as Error).message}`)];
+  }
+  if (info.code !== 0) return [result(id, "skip", `docker info failed (exit ${info.code}): ${firstLine(info.stderr) || "no error output"}`)];
+  const root = dataRootOf(info.code, info.stdout, info.stderr);
+  const limits = loadPolicy(ctx.policyDir).runs.disk;
+  const probe = ctx.probeFs ?? probeFs;
+  const problem = diskProblem(RUN_DISK, limits, root, probe);
+  if (problem !== undefined) {
+    const then = limits.enforcement === "hard" ? "refuses every run" : "warns and starts every run anyway";
+    return [result(id, "fail", `${problem}; runs.disk.enforcement is ${limits.enforcement}, so \`hapi run start\` ${then}`)];
+  }
+  const size = ((probe(RUN_DISK)?.bytes ?? 0) / GIB).toFixed(1);
+  return [result(id, "pass", `${RUN_DISK}: its own filesystem, ${size} GB of runs.disk.gb's ${limits.gb}, apart from Docker's data root (${root}), writable`)];
 }
 
 /** A yolo variable's value that turns yolo on: anything but empty, 0, false, no or off. */

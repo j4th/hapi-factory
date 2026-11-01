@@ -13,11 +13,13 @@ import { spyOn } from "bun:test";
 import { generateKeyPairSync } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import YAML from "yaml";
 import type { AuditContext, ExecResult } from "../../src/audit/types";
 import { buildAll } from "../../src/generate/index";
 import { loadPolicy } from "../../src/policy/load";
+import { type FsProbe, GIB } from "../../src/run/disk";
+import { RUN_DISK } from "../../src/run/locks";
 import { envFileText } from "../../src/secrets/files";
 import { serviceEnvironment } from "../../src/stack/env";
 import { buildDigest } from "../../src/stack/up";
@@ -216,6 +218,17 @@ export function appOf(c: FetchCall): "planner" | "factory" {
 /** The token the fake GitHub mints for the audit (never to be printed). */
 export const MINTED_TOKEN = "fake-installation-token-audit";
 
+/** Docker's data root as `docker info --format {{.DockerRootDir}}` prints it for hapi's rootless Docker. */
+export const DOCKER_ROOT = "/home/hapi/.local/share/docker";
+
+/** The filesystems a clean world's run disk check sees: the run disk on its own (dev 2), its parent (dev 1) and Docker's data root (dev 3). */
+export const goodDisks: FsProbe = (path) => {
+  if (path === RUN_DISK) return { dev: 2, bytes: 19.5 * GIB, writable: true };
+  if (path === dirname(RUN_DISK)) return { dev: 1, bytes: 500 * GIB, writable: true };
+  if (path === DOCKER_ROOT) return { dev: 3, bytes: 500 * GIB, writable: true };
+  return undefined;
+};
+
 /** The routes of a GitHub repo set up as the runbook says, read with a token file or with an App. */
 export function githubRoutes(
   o: { rulesets?: Record<string, any>[]; workflows?: Record<string, string>; appPermissions?: Record<string, Record<string, string>>; defaultBranch?: string | null } = {},
@@ -354,6 +367,7 @@ export async function cleanWorld(o: { repos?: boolean; workflows?: Record<string
     env,
     user: "hapi",
     exec: async (cmd) => fakeExec(world, cmd),
+    probeFs: goodDisks,
     fetch: (async (input: string | URL | Request, init: RequestInit = {}) => {
       const call: FetchCall = { method: init.method ?? "GET", url: String(input), headers: Object.fromEntries(new Headers(init.headers).entries()) };
       world.requests.push(call);
@@ -449,6 +463,7 @@ function fakeExec(w: World, cmd: string[]): ExecResult {
   if (cmd[0] === "env" && cmd.includes("git")) return fakeGit(w, cmd.slice(cmd.indexOf("git") + 1));
   if (cmd[0] !== "docker") return { code: 127, stdout: "", stderr: `${cmd[0]}: not found` };
   if (w.dockerDown) return { code: 1, stdout: "", stderr: "Cannot connect to the Docker daemon at unix:///run/user/1001/docker.sock. Is the docker daemon running?" };
+  if (cmd[1] === "info" && cmd[2] === "--format" && cmd[3] === "{{.DockerRootDir}}") return ok(`${DOCKER_ROOT}\n`);
   if (cmd[1] === "ps") {
     // `--filter label=k` or `label=k=v`, all of which must match.
     const wanted = cmd.flatMap((a, i) => (cmd[i - 1] === "--filter" && a.startsWith("label=") ? [a.slice(6)] : []));

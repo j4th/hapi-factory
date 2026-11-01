@@ -7,6 +7,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { lockHeld, RUN_DISK, withStackLock } from "../../src/run/locks";
 import { SecretError } from "../../src/secrets/provider";
 import { secretsResolve } from "../../src/secrets/cli";
 import { resolveAgeDir } from "../../src/secrets/providers/sops";
@@ -554,6 +555,16 @@ describe("removeRuns", () => {
     expect(g.calls.find((c) => c.cmd[2] === "disconnect")!.cmd).toEqual(["docker", "network", "disconnect", "-f", "p-run-ab12cd34ef56", "p-egress-archon-1"]);
   });
 
+  test("removeRuns with volumes: false neither lists nor removes a volume", async () => {
+    const f = fakes({ runs: { containers: ["c1"], networks: ["hapi-run-1"], volumes: ["hapi-run-1-work", "hapi-run-1-out"] } });
+    await removeRuns("hapi", f.deps.run!, f.deps.env!, { volumes: false });
+    expect(f.calls.map((c) => c.cmd.slice(0, 3).join(" "))).toEqual(["docker ps -aq", "docker rm -f", "docker network ls", "docker network disconnect", "docker network rm"]);
+    // The default is true: the volumes are listed and removed.
+    const g = fakes({ runs: { volumes: ["hapi-run-1-out"] } });
+    await removeRuns("hapi", g.deps.run!, g.deps.env!, {});
+    expect(g.steps.at(-1)).toBe("docker volume rm hapi-run-1-out");
+  });
+
   test("with no runs it lists and removes nothing", async () => {
     const f = fakes();
     await removeRuns("hapi", f.deps.run!, f.deps.env!);
@@ -603,9 +614,12 @@ describe("removeRuns", () => {
 });
 
 describe("hapi stack down", () => {
-  test("as hapi: run objects first, then compose down by project name, keeping the volumes, with no compose file or XDG_RUNTIME_DIR needed", async () => {
+  /** hapi's env, with a runtime dir of its own for the run disk's lock. */
+  const hapiEnv = () => ({ HOME: "/home/hapi", XDG_RUNTIME_DIR: tempDir("hapi-stack-xdg-") });
+
+  test("as hapi: run objects first, then compose down by project name, keeping the volumes, with no compose file needed", async () => {
     capture();
-    const f = fakes({ env: { HOME: "/home/hapi" } });
+    const f = fakes({ env: hapiEnv() });
     expect(await stackDown([], f.deps)).toBe(0);
     expect(f.calls.at(-1)).toMatchObject({ cmd: ["docker", "compose", "-p", "hapi", "down"], inherit: true });
     expect(f.calls.map((c) => c.cmd.slice(0, 3).join(" "))).toEqual(["docker ps -aq", "docker network ls", "docker volume ls", "docker compose -p"]);
@@ -613,7 +627,7 @@ describe("hapi stack down", () => {
 
   test("down removes run containers, disconnects egress-archon from each run network, removes the run networks and volumes, then runs compose down", async () => {
     capture();
-    const f = fakes({ env: { HOME: "/home/hapi" }, runs: { containers: ["c1"], networks: ["hapi-run-1"], volumes: ["hapi-run-1-out"] } });
+    const f = fakes({ env: hapiEnv(), runs: { containers: ["c1"], networks: ["hapi-run-1"], volumes: ["hapi-run-1-out"] } });
     expect(await stackDown([], f.deps)).toBe(0);
     expect(f.calls.map((c) => c.cmd)).toEqual([
       ["docker", "ps", "-aq", ...LABELS("hapi")],
@@ -625,6 +639,49 @@ describe("hapi stack down", () => {
       ["docker", "volume", "rm", "hapi-run-1-out"],
       ["docker", "compose", "-p", "hapi", "down"],
     ]);
+  });
+
+  test("down holds the run disk's lock while it removes the runs (H-210)", async () => {
+    capture();
+    const env = hapiEnv();
+    const f = fakes({ env, runs: { containers: ["c1"], volumes: ["hapi-run-1-out"] } });
+    const run = f.deps.run!;
+    let during: unknown;
+    f.deps.run = async (cmd, o) => {
+      if (cmd.slice(0, 3).join(" ") === "docker ps -aq") during = await withStackLock({ diskDir: RUN_DISK, env }, "run-copyout", async () => {}).catch((e: unknown) => e);
+      return run(cmd, o);
+    };
+    expect(await stackDown([], f.deps)).toBe(0);
+    expect(lockHeld(during)).toBe(true);
+    expect(f.steps).toContain("docker volume rm hapi-run-1-out");
+    // Let go once the runs are removed: a finalize can take it again.
+    await withStackLock({ diskDir: RUN_DISK, env }, "run-copyout", async () => {});
+  });
+
+  test("down never waits for the run disk's lock: held, or with no XDG_RUNTIME_DIR, it removes the runs but leaves their volumes, and says so (H-210)", async () => {
+    const LINE = /^hapi stack down: could not take the run disk's lock \(.+\): removing the runs but leaving their volumes, which the run's finalize or the next reap removes \(H-210\)$/;
+    // Held by a finalize copying a run out: down doesn't wait for it.
+    const env = hapiEnv();
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let entered!: () => void;
+    const inside = new Promise<void>((r) => (entered = r));
+    const copying = withStackLock({ diskDir: RUN_DISK, env }, "run-copyout", () => (entered(), held));
+    await inside;
+    const { err } = capture();
+    try {
+      for (const e of [env, { HOME: "/home/hapi" }]) {
+        err.length = 0;
+        const f = fakes({ env: e });
+        expect(await stackDown([], f.deps)).toBe(0);
+        expect(f.calls.map((c) => c.cmd.slice(0, 3).join(" "))).toEqual(["docker ps -aq", "docker network ls", "docker compose -p"]);
+        expect(err).toHaveLength(1);
+        expect(err[0]).toMatch(LINE);
+      }
+    } finally {
+      release();
+      await copying;
+    }
   });
 
   test("when removing the runs fails, compose down still runs (the kill switch stops what it can), and down then fails naming the leftovers", async () => {
@@ -644,7 +701,7 @@ describe("hapi stack down", () => {
 
   test("with HAPI_ALLOW_CURRENT_USER=1: stops the dev-bypass stack on the Docker this shell's CLI reaches, without claiming which one that is, and says how to stop hapi's", async () => {
     const { err } = capture();
-    const f = fakes({ user: "dev", env: { HOME: "/home/dev", HAPI_ALLOW_CURRENT_USER: "1" } });
+    const f = fakes({ user: "dev", env: { HOME: "/home/dev", HAPI_ALLOW_CURRENT_USER: "1", XDG_RUNTIME_DIR: tempDir("hapi-stack-xdg-") } });
     expect(await stackDown([], f.deps)).toBe(0);
     expect(f.calls.at(-1)!.cmd).toEqual(["docker", "compose", "-p", "hapi", "down"]);
     expect(f.calls.map((c) => c.cmd[1])).toEqual(["ps", "network", "volume", "compose"]);

@@ -46,8 +46,15 @@
  *
  * `down` is `removeRuns` (the run containers, then egress-archon's hold on each
  * run network, then the run networks and volumes), then `docker compose -p hapi
- * down`, by project name, so it needs no compose file, build/ or
- * XDG_RUNTIME_DIR: it is kill switch 3 (spec §11.8).
+ * down`, by project name, so it needs no compose file or build/: it is kill
+ * switch 3 (spec §11.8). It removes the runs holding the run disk's lock
+ * (`withStackLock`, src/run/locks.ts; H-210), which a finalize holds while it
+ * copies a run out, so no copy-out reads a volume `down` is removing. `down`
+ * never waits for that lock: if it is held, or can't be taken at all (no
+ * XDG_RUNTIME_DIR, whose tmpfs holds it), `down` says so and removes the runs'
+ * containers and networks but leaves their volumes, which the run's finalize
+ * or the next reap removes, with their dirs on the run disk. Either way it
+ * goes on to `compose down`, and kill switch 3 still takes seconds.
  * It does load the whole CLI (`bun run src/cli.ts`), so it needs a checkout
  * that loads (src/ parses, node_modules installed) and a working mise;
  * without them, use kill switch 3b (docs/runbooks/kill-switches.md). Volumes
@@ -63,6 +70,7 @@ import { CLIENT_RANGES } from "../generate/egress";
 import { buildAll, ROSTERS } from "../generate/index";
 import { loadPolicy } from "../policy/load";
 import type { RosterName } from "../policy/types";
+import { RUN_DISK, withStackLock } from "../run/locks";
 import { secretsResolve } from "../secrets/cli";
 import { cidrContains } from "./cidr";
 
@@ -198,6 +206,8 @@ export interface StackDeps {
   build?: (roster: RosterName) => Promise<string[]>;
   /** Step 3, given resolve's args (`--config <file>` or none). Default: `hapi secrets resolve`. */
   resolve?: (args: string[]) => Promise<number>;
+  /** The run disk, whose lock `down` takes (src/run/locks.ts). Default: RUN_DISK. */
+  diskDir?: string;
 }
 
 /** The real `Runner`: `Bun.spawn`, stdin closed. `hapi run` uses it too (src/run/cli.ts). */
@@ -288,9 +298,11 @@ async function liveRuns(run: Runner, env: Env, project: string): Promise<string[
  * finalizing its run removes the same objects, and may have got there first (`not found`).
  *
  * With `o.runId`, only that run's objects (`org.hapi.run=<id>`): `hapi run` finalizes one run, or rolls back a
- * start, this way, disconnecting `o.egress` (its `RunDeps.egress`) when given.
+ * start, this way, disconnecting `o.egress` (its `RunDeps.egress`) when given. With `o.volumes` false (the default
+ * is true), the volumes are neither listed nor removed: the one way to keep them, for `down` without the run disk's
+ * lock, and for a finalize whose volumes must stay.
  */
-export async function removeRuns(project: string, run: Runner, env: Env, o: { runId?: string; egress?: string } = {}): Promise<void> {
+export async function removeRuns(project: string, run: Runner, env: Env, o: { runId?: string; egress?: string; volumes?: boolean } = {}): Promise<void> {
   const failures: string[] = [];
   /** Remove `names` with `cmd`; a failure counts while `list` (their listing) still shows one of them, or can't say. */
   const remove = async (cmd: string[], names: string[], list: string[]) => {
@@ -311,9 +323,11 @@ export async function removeRuns(project: string, run: Runner, env: Env, o: { ru
   const networks = await listed(run, env, nets);
   for (const n of networks) await run(["docker", "network", "disconnect", "-f", n, egress], { env: definedEnv(env), inherit: false });
   if (networks.length > 0) await remove(["docker", "network", "rm", ...networks], networks, nets);
-  const vols = ["docker", "volume", "ls", "-q", ...filters];
-  const volumes = await listed(run, env, vols);
-  if (volumes.length > 0) await remove(["docker", "volume", "rm", ...volumes], volumes, vols);
+  if (o.volumes !== false) {
+    const vols = ["docker", "volume", "ls", "-q", ...filters];
+    const volumes = await listed(run, env, vols);
+    if (volumes.length > 0) await remove(["docker", "volume", "rm", ...volumes], volumes, vols);
+  }
   if (failures.length > 0) throw new Error(`removing the runs of ${project} left something behind: ${failures.join("; ")}`);
 }
 
@@ -416,10 +430,26 @@ export async function stackDown(args: string[], deps: StackDeps = {}): Promise<n
   // The runs first: Docker won't remove a network with an endpoint attached. A failure here must not stop
   // `compose down` (this is kill switch 3), so it is reported after.
   let leftover: Error | undefined;
+  let locked = false;
   try {
-    await removeRuns(PROJECT, run, env);
+    await withStackLock({ diskDir: deps.diskDir ?? RUN_DISK, env }, "stack-down", async () => {
+      locked = true;
+      await removeRuns(PROJECT, run, env);
+    });
   } catch (e) {
-    leftover = e as Error;
+    if (locked) leftover = e as Error;
+    else {
+      // Never wait: a finalize copying a run out holds the lock for minutes, and kill switch 3 takes seconds.
+      const why = env.XDG_RUNTIME_DIR ? (e as Error).message.replace(/\s+/g, " ").trim() : "XDG_RUNTIME_DIR is not set, and the lock is on its tmpfs";
+      console.error(
+        `hapi stack down: could not take the run disk's lock (${why}): removing the runs but leaving their volumes, which the run's finalize or the next reap removes (H-210)`,
+      );
+      try {
+        await removeRuns(PROJECT, run, env, { volumes: false });
+      } catch (x) {
+        leftover = x as Error;
+      }
+    }
   }
   const r = await run(["docker", "compose", "-p", PROJECT, "down"], { env: definedEnv(env), inherit: true });
   if (r.code !== 0) throw new Error(`docker compose -p ${PROJECT} down failed (exit ${r.code})${leftover === undefined ? "" : `; also ${leftover.message}`}`);

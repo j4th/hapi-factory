@@ -20,17 +20,20 @@
  *
  * Liveness is Docker's, never a pid that could be reused: a run is live while
  * a container named `runName` with both its labels is running (`isLive`,
- * `liveRuns`). A helper container (the volume chown, copy-out) carries the
- * labels too, so `down` finds it, but not a run's name, so it never counts.
+ * `liveRuns`). A helper container (the volume chown, copy-out, the run disk's
+ * cleanup) carries the labels too, so `down` finds it, but not a run's name,
+ * so it never counts.
  */
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { chmod, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { RunFile } from "../generate/archon";
-import { SecretError } from "../secrets/provider";
 import { withStoreLock } from "../secrets/store-files";
 import { definedEnv, listed, runFilters } from "../stack/up";
 import { type RunDeps, runName } from "./spec";
+
+/** Whether an error is a held lock: defined in ./locks.ts, which src/stack/up.ts can import too, and re-exported here for the launcher's locks. */
+export { lockHeld } from "./locks";
 
 export type RunStatus = "live" | "succeeded" | "failed" | "timed-out" | "stopped";
 
@@ -218,6 +221,3 @@ export function withStartLock<T>(d: Pick<RunDeps, "stateDir" | "env">, fn: () =>
 export function withRunLock<T>(d: Pick<RunDeps, "stateDir" | "env">, runId: string, fn: () => Promise<T>): Promise<T> {
   return withStoreLock(recordDir(d.stateDir, runId), "run-finalize", fn, { env: definedEnv(d.env) });
 }
-
-/** Whether `e` is `withStoreLock` refusing a lock another live process holds. */
-export const lockHeld = (e: unknown): boolean => e instanceof SecretError && e.message.includes("hapi never takes the lock");
