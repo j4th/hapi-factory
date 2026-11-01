@@ -10,12 +10,14 @@
 # Three jobs. The caller's job is `ci`, so GitHub reports them as `ci / scan`, `ci / check` and `ci / gates`, and the
 # repo's main-protect requires only `ci / gates` (CONTRACT_CHECK in src/forge/index.ts), from GitHub Actions:
 #
-# - `scan` runs no PR code, and ignores the PR's scanner configs and git attributes. On its own fresh runner and
-#   checkout, with no mise, it runs the mise-file scan, makes git diff every path as text, refuses a PR's gitleaks
-#   files, installs gitleaks, OSV-Scanner and zizmor from release URLs whose sha256 is pinned below (the same versions
-#   as the template's mise.toml), and runs them, and the factory-commit trailer check (H-113's factory half), by
-#   absolute path under `env -i` with GIT_NO_REPLACE_OBJECTS=1, each with the gates' own config. The PR's files are
-#   only data to it. A PR's code runs only in `check`, on another runner, so it can't touch a scan.
+# - `scan` runs no PR code. It ignores the PR's scanner configs, its .gitattributes (GIT_ATTR_SOURCE, the empty
+#   tree, and `* diff` in .git/info/attributes) and its .mailmap. On its own fresh runner and checkout, with no mise,
+#   it runs the mise-file scan, refuses a PR's gitleaks files, installs gitleaks, OSV-Scanner and zizmor from release
+#   URLs whose sha256 is pinned below (the same versions as the template's mise.toml), and runs them, and the
+#   factory-commit trailer check (H-113's factory half), by absolute path under `env -i` with
+#   GIT_NO_REPLACE_OBJECTS=1, each with the gates' own config. gitleaks walks every commit on every fetched ref,
+#   merges' diffs (`-m`) and type changes included, and any error it logs, or a scan of 0 commits, fails the step.
+#   Known residual: gitleaks's default path allowlist (H-240). A PR's code runs only in `check`, on another runner.
 # - `check` runs the caller's own `mise install --locked && mise run check` (its `setup` installs with
 #   `--ignore-scripts`), after ci.yml's two mise steps.
 # - `gates` passes only when both succeeded. It runs even when one failed (`if: always()`): GitHub reports a job
@@ -85,7 +87,10 @@ jobs:
       # commits `* -diff` or `* binary` (at the root, or in any directory over the files below it), or a file with a
       # NUL byte, turns its diffs into "Binary files differ", and gitleaks never sees them. .git/info/attributes
       # outranks every .gitattributes, and `diff` set on a path makes git diff it as text, NUL bytes and all. So
-      # every path is scanned as text; a real binary that looks like a secret fails the scan, closed.
+      # every path is scanned as text, and a real binary that looks like a secret fails the scan, closed, unless it
+      # sits in a path gitleaks's default allowlist skips (*.png, *.pdf, node_modules/, package-lock.json, ...:
+      # H-240). The gitleaks step also reads no in-tree .gitattributes at all (GIT_ATTR_SOURCE); this stays as a
+      # second net.
       - name: Git diffs every path as text, whatever the PR's .gitattributes say
         run: |
           mkdir -p .git/info
@@ -126,10 +131,48 @@ jobs:
 
       # The whole history, not just the diff: a secret in any commit stays public even after a later
       # commit removes it. Inline gitleaks:allow comments are ignored.
+      # GIT_ATTR_SOURCE (below) is honoured from git 2.40 and silently ignored before it.
+      - name: git is 2.40 or later
+        run: |
+          v="$(env -i PATH=/usr/bin:/bin /usr/bin/git --version)"
+          major=0
+          minor=0
+          if [[ "$v" =~ ^git\ version\ ([0-9]+)\.([0-9]+) ]]; then
+            major="${BASH_REMATCH[1]}"
+            minor="${BASH_REMATCH[2]}"
+          fi
+          if (( 10#$major < 2 || (10#$major == 2 && 10#$minor < 40) )); then
+            echo "::error::the history scan needs git 2.40 or later, which honours GIT_ATTR_SOURCE; /usr/bin/git says: $v"
+            exit 1
+          fi
+          echo "$v"
+
+      # gitleaks 8.30.1 fails open three ways, so the step closes each:
+      # - git's stderr: on any unexpected line from git (a PR's .gitattributes with a nested macro, a negative
+      #   pattern or a line over 2048 bytes, or a symlinked .gitattributes or .mailmap), gitleaks logs an ERR, scans
+      #   0 commits and exits 0. GIT_ATTR_SOURCE, git's empty tree, makes git read no .gitattributes from the
+      #   checkout (.git/info/attributes still applies), --no-mailmap no .mailmap, and any ERR line or "0 commits
+      #   scanned" fails the step.
+      # - type changes: its default `log --diff-filter=tuxdb` skips them (a symlink later turned into a file holding
+      #   a token). --log-opts replaces its log options, filter included.
+      # - merges: `log -p` shows no diff for a merge, so an evil merge's own content went unseen; -m shows it.
+      # Inline gitleaks:allow comments are ignored. A finding (exit 1) fails the step.
       - name: Scan the whole history for secrets (gitleaks)
         run: |
-          env -i PATH=/usr/bin:/bin HOME="$RUNNER_TEMP" GIT_NO_REPLACE_OBJECTS=1 \
-            "$RUNNER_TEMP/bin/gitleaks" git --config "$RUNNER_TEMP/gitleaks.toml" --ignore-gitleaks-allow --redact --no-banner --no-color -v .
+          log="$RUNNER_TEMP/gitleaks.log"
+          code=0
+          env -i PATH=/usr/bin:/bin HOME="$RUNNER_TEMP" GIT_NO_REPLACE_OBJECTS=1 GIT_ATTR_SOURCE=4b825dc642cb6eb9a060e54bf8d69288fbee4904 \
+            "$RUNNER_TEMP/bin/gitleaks" git --config "$RUNNER_TEMP/gitleaks.toml" --log-opts="--full-history --all -m --no-mailmap" \
+            --ignore-gitleaks-allow --redact --no-banner --no-color -v . 2>&1 | tee "$log" || code=$?
+          if grep -Eq '(^|[[:space:]])ERR([[:space:]]|$)' "$log"; then
+            echo "::error::gitleaks logged an error, so its scan can't be trusted: the history scan fails closed"
+            exit 1
+          fi
+          if grep -Eq '(^|[[:space:]])0 commits scanned' "$log"; then
+            echo "::error::gitleaks scanned 0 commits: the history scan fails closed"
+            exit 1
+          fi
+          exit "$code"
 
       - name: Known vulnerabilities in bun.lock (OSV-Scanner)
         run: |

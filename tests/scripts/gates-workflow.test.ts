@@ -1,9 +1,9 @@
 /**
  * .github/workflows/gates.yml, the reusable gates workflow every repo made from templates/repo-contract calls. Its
  * shape: a workflow_call with no permissions and three jobs, `scan`, `check` and the aggregator `gates`, whose check
- * (`ci / gates`) is the required one. `scan` runs no PR code and ignores the PR's scanner configs and git
- * attributes: no mise, no action but checkout, every path diffed as text, scanners installed from sha256-pinned
- * release URLs and run by absolute path under `env -i` with the gates' own config. Its steps run for real here, as
+ * (`ci / gates`) is the required one. `scan` runs no PR code and ignores the PR's scanner configs, .gitattributes
+ * and .mailmap: no mise, no action but checkout, every path diffed as text, scanners installed from sha256-pinned
+ * release URLs and run by absolute path under `env -i` with the gates' own config, and gitleaks failing closed. Its steps run for real here, as
  * Actions runs them under `defaults.run.shell: bash` (`bash --noprofile --norc -eo pipefail`), on throwaway repos:
  * the config refusals, a checksum mismatch, the scanners' argv and environment (stubs), gitleaks itself (the pin
  * mise.toml holds) against every way a PR could hide history from it, the trailer check, and the aggregator.
@@ -43,6 +43,7 @@ const MISE_CHECK = "mise loads no config or tasks but the root mise.toml";
 const ATTRS = "Git diffs every path as text, whatever the PR's .gitattributes say";
 const CONFIGS = "The scanners' configs are the gates' own";
 const INSTALL = "Install the scanners, each checked against its pinned sha256";
+const GITVER = "git is 2.40 or later";
 const SECRETS = "Scan the whole history for secrets (gitleaks)";
 const OSV = "Known vulnerabilities in bun.lock (OSV-Scanner)";
 const ZIZMOR = "Workflow security (zizmor)";
@@ -50,6 +51,10 @@ const TRAILERS = "Factory commits carry their trailers";
 const step = (job: Job, name: string) => job.steps.find((s) => s.name === name)!;
 /** The clean environment every scanner, and the trailer check's git, runs in. */
 const CLEAN = 'env -i PATH=/usr/bin:/bin HOME="$RUNNER_TEMP" GIT_NO_REPLACE_OBJECTS=1';
+/** git's empty tree: as GIT_ATTR_SOURCE, git reads no .gitattributes from the checkout. */
+const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+/** The gitleaks command as gates.yml ran it before fix round 3 (bcb3cbc): the controls show each hole it left. */
+const OLD_GITLEAKS = `${CLEAN} "$RUNNER_TEMP/bin/gitleaks" git --config "$RUNNER_TEMP/gitleaks.toml" --ignore-gitleaks-allow --redact --no-banner --no-color -v .`;
 
 const temps: string[] = [];
 afterAll(() => {
@@ -72,6 +77,11 @@ test("gates.yml is a workflow_call with no permissions, and three jobs: scan, ch
   // Named, so Actions adds pipefail: with no shell, a run step is `bash -e {0}`.
   expect((doc as unknown as { defaults: unknown }).defaults).toEqual({ run: { shell: "bash" } });
   for (const job of [scan, check, gates]) for (const st of job.steps) expect([st.name, (st as { shell?: string }).shell]).toEqual([st.name, undefined]);
+  // No job sets a shell of its own but bash either.
+  for (const [id, job] of Object.entries(doc.jobs)) {
+    const shell = (job.defaults as { run?: { shell?: unknown } } | undefined)?.run?.shell;
+    expect([id, shell === undefined || shell === "bash"]).toEqual([id, true]);
+  }
   expect(Object.keys(doc.jobs)).toEqual(["scan", "check", "gates"]);
   for (const [id, job] of Object.entries(doc.jobs)) {
     expect([id, job.name, job["runs-on"]]).toEqual([id, id, "ubuntu-latest"]);
@@ -79,7 +89,7 @@ test("gates.yml is a workflow_call with no permissions, and three jobs: scan, ch
   }
   expect(scan.permissions).toEqual({ contents: "read" });
   expect(check.permissions).toEqual({ contents: "read" });
-  expect(scan.steps.map((s) => s.uses?.replace(/@.*$/, "") ?? s.name)).toEqual(["actions/checkout", MISE_SCAN, ATTRS, CONFIGS, INSTALL, SECRETS, OSV, ZIZMOR, TRAILERS]);
+  expect(scan.steps.map((s) => s.uses?.replace(/@.*$/, "") ?? s.name)).toEqual(["actions/checkout", MISE_SCAN, ATTRS, CONFIGS, INSTALL, GITVER, SECRETS, OSV, ZIZMOR, TRAILERS]);
   expect(check.steps.map((s) => s.uses?.replace(/@.*$/, "") ?? s.name)).toEqual(["actions/checkout", MISE_SCAN, "jdx/mise-action", MISE_CHECK, "check"]);
   expect(scan.steps[0]!.with).toEqual({ "persist-credentials": false, "fetch-depth": 0 });
   expect(check.steps[0]!.with).toEqual({ "persist-credentials": false });
@@ -129,7 +139,7 @@ test("its mise-file scan, in both jobs, and its mise-config check are ci.yml's, 
   expect(check.steps.findIndex((s) => s.name === MISE_SCAN)).toBeLessThan(check.steps.findIndex((s) => s.uses?.startsWith("jdx/mise-action@") === true));
 });
 
-describe("the scan job runs no PR code, and ignores the PR's scanner configs and git attributes", () => {
+describe("the scan job runs no PR code, and ignores the PR's scanner configs, .gitattributes and .mailmap", () => {
   test("no run in scan names mise at all, but ci.yml's find-only file scan, and its only action is the pinned checkout", () => {
     expect(scan.steps.filter((s) => s.uses !== undefined).map((s) => s.uses)).toEqual(["actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"]);
     for (const s of scan.steps.filter((x) => x.run !== undefined)) {
@@ -152,7 +162,9 @@ describe("the scan job runs no PR code, and ignores the PR's scanner configs and
   });
 
   test("every scanner runs by absolute path under env -i with GIT_NO_REPLACE_OBJECTS=1 and the gates' own config", () => {
-    expect(step(scan, SECRETS).run).toContain(`${CLEAN} \\\n  "$RUNNER_TEMP/bin/gitleaks" git --config "$RUNNER_TEMP/gitleaks.toml" --ignore-gitleaks-allow --redact --no-banner --no-color -v .`);
+    expect(step(scan, SECRETS).run).toContain(
+      `${CLEAN} GIT_ATTR_SOURCE=${EMPTY_TREE} \\\n  "$RUNNER_TEMP/bin/gitleaks" git --config "$RUNNER_TEMP/gitleaks.toml" --log-opts="--full-history --all -m --no-mailmap" \\\n  --ignore-gitleaks-allow --redact --no-banner --no-color -v . 2>&1 | tee "$log" || code=$?`,
+    );
     expect(step(scan, OSV).run).toContain(`${CLEAN} \\\n  "$RUNNER_TEMP/bin/osv-scanner" scan source --config "$RUNNER_TEMP/osv-scanner.toml" --lockfile bun.lock`);
     expect(step(scan, ZIZMOR).run).toContain(`${CLEAN} GH_TOKEN="$GH_TOKEN" \\\n  "$RUNNER_TEMP/bin/zizmor" --no-config --no-ignores --format=github .github/workflows`);
     // zizmor runs online (impostor-commit, ref-confusion) on the job's read-only token, passed by name.
@@ -250,7 +262,7 @@ describe("each scanner gets exactly its flags and a clean environment", () => {
   // What a PR could try to set, or what a runner might carry: none of it may reach a scanner.
   const polluted = { GITLEAKS_CONFIG: "/tmp/x.toml", GITLEAKS_CONFIG_TOML: "[allowlist]\npaths = ['''.*''']", ZIZMOR_CONFIG: "/tmp/z.yml", OSV_SCANNER_CONFIG: "/tmp/o.toml", GIT_DIR: "/tmp/elsewhere" };
   const cases = [
-    [SECRETS, "gitleaks", ["git", "--config", "RT/gitleaks.toml", "--ignore-gitleaks-allow", "--redact", "--no-banner", "--no-color", "-v", "."], []],
+    [SECRETS, "gitleaks", ["git", "--config", "RT/gitleaks.toml", "--log-opts=--full-history --all -m --no-mailmap", "--ignore-gitleaks-allow", "--redact", "--no-banner", "--no-color", "-v", "."], [`GIT_ATTR_SOURCE=${EMPTY_TREE}`]],
     [OSV, "osv-scanner", ["scan", "source", "--config", "RT/osv-scanner.toml", "--lockfile", "bun.lock"], []],
     [ZIZMOR, "zizmor", ["--no-config", "--no-ignores", "--format=github", ".github/workflows"], ["GH_TOKEN=fake-actions-token"]],
   ] as const;
@@ -267,6 +279,78 @@ describe("each scanner gets exactly its flags and a clean environment", () => {
   }
 });
 
+describe("the gitleaks step fails closed on what gitleaks 8.30.1 would let pass", () => {
+  /** A stub gitleaks that prints `out` and exits `code`; the step's exit code and output. */
+  const withStub = (out: string, code: number) => {
+    const runnerTemp = tempDir("hapi-gates-glstub-");
+    mkdirSync(join(runnerTemp, "bin"));
+    writeFileSync(join(runnerTemp, "out.txt"), out);
+    writeFileSync(join(runnerTemp, "bin", "gitleaks"), `#!/bin/sh\ncat "$HOME/out.txt"\nexit ${code}\n`);
+    chmodSync(join(runnerTemp, "bin", "gitleaks"), 0o755);
+    return runStep(step(scan, SECRETS).run!, tempDir("hapi-gates-glcwd-"), { PATH: process.env.PATH!, RUNNER_TEMP: runnerTemp });
+  };
+  const CLEAN_RUN = "10:07AM INF 3 commits scanned.\n10:07AM INF scanned ~120 bytes in 116ms\n10:07AM INF no leaks found\n";
+
+  test("a clean scan with no ERR passes, and its log is shown", () => {
+    const r = withStub(CLEAN_RUN, 0);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("INF 3 commits scanned.");
+  });
+
+  test("a finding (exit 1) fails", () => {
+    const r = withStub("10:07AM INF 1 commits scanned.\n10:07AM WRN leaks found: 1\n", 1);
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("WRN leaks found: 1");
+  });
+
+  test("any ERR line fails, even when gitleaks exits 0 and scanned commits", () => {
+    const r = withStub(`10:07AM ERR failed to scan Git repository error="stderr is not empty"\n${CLEAN_RUN}`, 0);
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("::error::gitleaks logged an error, so its scan can't be trusted");
+  });
+
+  test('"0 commits scanned" fails, even with no ERR and exit 0', () => {
+    const r = withStub("10:07AM INF 0 commits scanned.\n10:07AM INF no leaks found\n", 0);
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("::error::gitleaks scanned 0 commits");
+    // "10 commits scanned" is no "0 commits scanned".
+    expect(withStub("10:07AM INF 10 commits scanned.\n", 0).code).toBe(0);
+  });
+
+  test("the version gate runs before gitleaks, with the absolute /usr/bin/git, and passes only git 2.40 or later", () => {
+    const at = (name: string) => scan.steps.findIndex((x) => x.name === name);
+    expect(at(GITVER)).toBeLessThan(at(SECRETS));
+    const script = step(scan, GITVER).run!;
+    expect(script).toContain("env -i PATH=/usr/bin:/bin /usr/bin/git --version");
+    const cwd = tempDir("hapi-gates-gv-");
+    for (const [says, code] of [
+      ["git version 2.39.5", 1],
+      ["git version 1.9.0", 1],
+      ["git version 2.40.0", 0],
+      ["git version 2.43.0", 0],
+      ["git version 2.51.0.windows.1", 0],
+      ["git version 3.0.0", 0],
+      ["not git at all", 1],
+      ["", 1],
+    ] as const) {
+      // A fake git in place of /usr/bin/git, which only the test swaps.
+      const fake = join(cwd, `git-${code}-${says.replace(/\W/g, "_")}`);
+      writeFileSync(fake, `#!/bin/sh\nprintf '%s\\n' '${says}'\n`);
+      chmodSync(fake, 0o755);
+      const r = runStep(script.replaceAll("/usr/bin/git", fake), cwd, { PATH: process.env.PATH! });
+      expect([says, r.code]).toEqual([says, code]);
+      if (code === 1) expect(r.out).toContain("::error::the history scan needs git 2.40 or later");
+    }
+  });
+});
+
+test("every path is diffed as text before gitleaks runs: the attributes step comes first, and writes `* diff`", () => {
+  const at = (name: string) => scan.steps.findIndex((x) => x.name === name);
+  expect(at(ATTRS)).toBeGreaterThan(0);
+  expect(at(ATTRS)).toBeLessThan(at(SECRETS));
+  expect(step(scan, ATTRS).run).toBe("mkdir -p .git/info\nprintf '* diff\\n' > .git/info/attributes\n");
+});
+
 /** The gitleaks mise.toml pins, or undefined when mise can't say (the real-scan tests then skip). */
 const gitleaks = (() => {
   const r = Bun.spawnSync(["mise", "which", "gitleaks"], { cwd: REPO, stdout: "pipe", stderr: "ignore" });
@@ -280,37 +364,82 @@ describe.skipIf(gitleaks === undefined)("the real gitleaks, run as the scan job 
     const alnum = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     return `ghp_${[...randomBytes(36)].map((b) => alnum[b % alnum.length]).join("")}`;
   };
-  /**
-   * A repo whose one commit holds `files`; then the scan job's steps, in the job's order, from the first after checkout
-   * through gitleaks, but the install (the network's: gitleaks is linked in instead), with `env` added to the runner's.
-   * `skip` leaves a step out (the control).
-   */
-  const scanRepo = (files: Record<string, string>, env: Record<string, string> = {}, skip: string[] = []) => {
+  /** A history-building helper: write a file (making its dirs), make a symlink, run git. */
+  interface Repo {
+    root: string;
+    write(path: string, text: string): void;
+    link(path: string, target: string): void;
+    git(...args: string[]): void;
+    commit(message: string): void;
+  }
+  /** A fresh repo on `main`, built by `build`, with gitleaks linked into a fresh RUNNER_TEMP/bin. */
+  const makeRepo = (build: (r: Repo) => void) => {
     const root = tempDir("hapi-gates-gl-");
     const runnerTemp = tempDir("hapi-gates-glrt-");
     mkdirSync(join(runnerTemp, "bin"));
     symlinkSync(gitleaks!, join(runnerTemp, "bin", "gitleaks"));
     const genv = { PATH: process.env.PATH!, HOME: root, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.invalid", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.invalid" };
-    for (const [path, text] of Object.entries(files)) {
-      mkdirSync(join(root, path, ".."), { recursive: true });
-      writeFileSync(join(root, path), text);
-    }
-    for (const args of [["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "add files"]]) {
-      expect(Bun.spawnSync(["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", ...args], { cwd: root, env: genv, stdout: "ignore", stderr: "ignore" }).exitCode).toBe(0);
-    }
+    const git = (...args: string[]) => {
+      const r = Bun.spawnSync(["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", ...args], { cwd: root, env: genv, stdout: "pipe", stderr: "pipe" });
+      expect([args.join(" "), r.exitCode]).toEqual([args.join(" "), 0]);
+    };
+    git("init", "-q", "-b", "main");
+    const repo: Repo = {
+      root,
+      write(path, text) {
+        mkdirSync(join(root, path, ".."), { recursive: true });
+        rmSync(join(root, path), { force: true });
+        writeFileSync(join(root, path), text);
+      },
+      link(path, target) {
+        mkdirSync(join(root, path, ".."), { recursive: true });
+        rmSync(join(root, path), { force: true });
+        symlinkSync(target, join(root, path));
+      },
+      git,
+      commit(message) {
+        git("add", "-A");
+        git("commit", "-q", "--allow-empty", "-m", message);
+      },
+    };
+    build(repo);
+    return { root, runnerTemp };
+  };
+  /**
+   * The scan job's steps on a repo `build` makes, in the job's order, from the first after checkout through gitleaks,
+   * but the install (the network's: gitleaks is linked in instead), with `env` added to the runner's.
+   */
+  const scanHistory = (build: (r: Repo) => void, env: Record<string, string> = {}) => {
+    const { root, runnerTemp } = makeRepo(build);
     const runner = { PATH: process.env.PATH!, RUNNER_TEMP: runnerTemp, ...env };
     const upTo = scan.steps.findIndex((x) => x.name === SECRETS);
     let last = { code: 0, out: "" };
     for (const x of scan.steps.slice(1, upTo + 1)) {
-      if (x.name === INSTALL || skip.includes(x.name!)) continue;
+      if (x.name === INSTALL) continue;
       last = runStep(x.run!, root, runner);
       if (last.code !== 0) return last;
     }
     return last;
   };
+  /** The control: the same repo, scanned with the gitleaks command as gates.yml ran it before fix round 3, with or without the attributes step. */
+  const scanOld = (build: (r: Repo) => void, o: { attrs: boolean }) => {
+    const { root, runnerTemp } = makeRepo(build);
+    const runner = { PATH: process.env.PATH!, RUNNER_TEMP: runnerTemp };
+    for (const name of [...(o.attrs ? [ATTRS] : []), CONFIGS]) expect(runStep(step(scan, name).run!, root, runner).code).toBe(0);
+    return runStep(OLD_GITLEAKS, root, runner);
+  };
+  /** A repo whose one commit holds `files`. */
+  const oneCommit = (files: Record<string, string>) => (r: Repo) => {
+    for (const [path, text] of Object.entries(files)) r.write(path, text);
+    r.commit("add files");
+  };
+  const scanRepo = (files: Record<string, string>, env: Record<string, string> = {}) => scanHistory(oneCommit(files), env);
 
-  test("passes on a clean history, and finds a token", () => {
-    expect(scanRepo({ "README.md": "# A project\n" }).code).toBe(0);
+  test("passes on a clean history with no ERR line, and finds a token", () => {
+    const clean = scanRepo({ "README.md": "# A project\n" });
+    expect(clean.code).toBe(0);
+    expect(clean.out).not.toMatch(/(^|\s)ERR(\s|$)/m);
+    expect(clean.out).toMatch(/\s1 commits scanned/);
     expect(scanRepo({ "config.env": `GITHUB_TOKEN=${token()}\n` }).code).toBe(1);
   });
 
@@ -326,27 +455,100 @@ describe.skipIf(gitleaks === undefined)("the real gitleaks, run as the scan job 
     expect(r.code).toBe(1);
   });
 
-  test("every path is diffed as text before gitleaks runs: the attributes step comes first, and writes `* diff`", () => {
-    const at = (name: string) => scan.steps.findIndex((x) => x.name === name);
-    expect(at(ATTRS)).toBeGreaterThan(0);
-    expect(at(ATTRS)).toBeLessThan(at(SECRETS));
-    expect(step(scan, ATTRS).run).toBe("mkdir -p .git/info\nprintf '* diff\\n' > .git/info/attributes\n");
-  });
-
-  // The ways a commit can turn its own diffs into "Binary files differ", which gitleaks skips.
-  const hiding: [what: string, files: (secret: string) => Record<string, string>][] = [
-    ["a root .gitattributes with * -diff", (t) => ({ ".gitattributes": "* -diff\n", "config.env": `GITHUB_TOKEN=${t}\n` })],
-    ["a root .gitattributes with * binary", (t) => ({ ".gitattributes": "* binary\n", "config.env": `GITHUB_TOKEN=${t}\n` })],
-    ["a nested sub/.gitattributes with * -diff over the secret", (t) => ({ "sub/.gitattributes": "* -diff\n", "sub/config.env": `GITHUB_TOKEN=${t}\n` })],
-    ["a NUL byte in the secret's file", (t) => ({ "config.env": `GITHUB_TOKEN=${t}\n\0\n` })],
+  // Every way found for a commit to hide a token from gitleaks 8.30.1, each with its control: the step as it was before
+  // fix round 3 (bcb3cbc), with or without the attributes step, lets the token through (exit 0), so the test
+  // exercises the hole the step now closes.
+  const secret = (t: string) => `GITHUB_TOKEN=${t}\n`;
+  const cases: [what: string, build: (t: string) => (r: Repo) => void, control: { attrs: boolean }][] = [
+    // Turned into "Binary files differ", which gitleaks skips (fix round 2: `* diff`).
+    ["a root .gitattributes with * -diff", (t) => oneCommit({ ".gitattributes": "* -diff\n", "config.env": secret(t) }), { attrs: false }],
+    ["a root .gitattributes with * binary", (t) => oneCommit({ ".gitattributes": "* binary\n", "config.env": secret(t) }), { attrs: false }],
+    ["a nested sub/.gitattributes with * -diff over the secret", (t) => oneCommit({ "sub/.gitattributes": "* -diff\n", "sub/config.env": secret(t) }), { attrs: false }],
+    ["a NUL byte in the secret's file", (t) => oneCommit({ "config.env": `${secret(t)}\0\n` }), { attrs: false }],
+    // git writes to stderr, and gitleaks logs an ERR, scans 0 commits or fewer, and exits 0.
+    ["a nested [attr] macro, which git refuses outside the root", (t) => oneCommit({ "sub/.gitattributes": "[attr]h -diff\n", "config.env": secret(t) }), { attrs: true }],
+    ["a negative pattern in .gitattributes", (t) => oneCommit({ ".gitattributes": "!x diff\n", "config.env": secret(t) }), { attrs: true }],
+    ["a .gitattributes line over 2048 bytes", (t) => oneCommit({ ".gitattributes": `${"a".repeat(3000)} -diff\n`, "config.env": secret(t) }), { attrs: true }],
+    [
+      "a symlinked .gitattributes",
+      (t) => (r) => {
+        r.write("attrs", "* -diff\n");
+        r.link(".gitattributes", "attrs");
+        r.write("config.env", secret(t));
+        r.commit("a");
+      },
+      { attrs: true },
+    ],
+    [
+      "a symlinked .mailmap",
+      (t) => (r) => {
+        r.write("mm", "x <x@example.invalid>\n");
+        r.link(".mailmap", "mm");
+        r.write("config.env", secret(t));
+        r.commit("a");
+      },
+      { attrs: true },
+    ],
+    // Skipped by gitleaks's default `--diff-filter=tuxdb`: a type change.
+    [
+      "a type change: a symlink later replaced by a file holding the token",
+      (t) => (r) => {
+        r.link("config.env", "nowhere");
+        r.commit("a link");
+        r.write("config.env", secret(t));
+        r.commit("now a file");
+      },
+      { attrs: true },
+    ],
+    // Not shown by `log -p` without -m: an evil merge, whose token is in neither parent.
+    [
+      "an evil merge",
+      (t) => (r) => {
+        r.write("a", "base\n");
+        r.commit("base");
+        r.git("checkout", "-q", "-b", "side");
+        r.write("s", "side\n");
+        r.commit("side");
+        r.git("checkout", "-q", "main");
+        r.write("m", "main\n");
+        r.commit("main");
+        r.git("merge", "-q", "--no-commit", "--no-ff", "side");
+        r.write("config.env", secret(t));
+        r.commit("merge side");
+      },
+      { attrs: true },
+    ],
   ];
-  for (const [what, files] of hiding) {
-    test(`${what} doesn't hide a secret`, () => {
-      expect(scanRepo(files(token())).code).toBe(1);
-      // The control: without the attributes step, the same commit hides it, so this test exercises the hole.
-      expect(scanRepo(files(token()), {}, [ATTRS]).code).toBe(0);
+  for (const [what, build, control] of cases) {
+    test(`${what} doesn't hide a token`, () => {
+      const r = scanHistory(build(token()));
+      expect([what, r.code]).toEqual([what, 1]);
+      expect(r.out).toContain("leaks found");
+      expect([what, scanOld(build(token()), control).code]).toEqual([what, 0]);
     });
   }
+
+  test("GIT_ATTR_SOURCE alone ignores a committed * -diff, and only `* diff` finds a NUL-byte token beside other commits", () => {
+    // The step without the attributes step: in-tree attributes are ignored, but a NUL byte still reads as binary.
+    const without = (build: (r: Repo) => void) => {
+      const { root, runnerTemp } = makeRepo(build);
+      const runner = { PATH: process.env.PATH!, RUNNER_TEMP: runnerTemp };
+      expect(runStep(step(scan, CONFIGS).run!, root, runner).code).toBe(0);
+      return runStep(step(scan, SECRETS).run!, root, runner);
+    };
+    expect(without(oneCommit({ ".gitattributes": "* -diff\n", "config.env": secret(token()) })).code).toBe(1);
+    // A history of one NUL-byte commit trips the "0 commits scanned" guard on its own; beside a text commit it doesn't
+    // ("1 commits scanned"), and only `* diff` finds the token.
+    expect(without(oneCommit({ "config.env": `${secret(token())}\0\n` })).out).toContain("::error::gitleaks scanned 0 commits");
+    const beside = (r: Repo) => {
+      r.write("README.md", "# A project\n");
+      r.commit("readme");
+      r.write("config.env", `${secret(token())}\0\n`);
+      r.commit("the secret, with a NUL byte");
+    };
+    expect(without(beside).code).toBe(0);
+    expect(scanHistory(beside).code).toBe(1);
+  });
 
   test("a .gitleaks.toml or .gitleaksignore in the commit fails the scan before gitleaks runs", () => {
     for (const file of [".gitleaks.toml", ".gitleaksignore"]) {
