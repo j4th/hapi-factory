@@ -88,6 +88,7 @@ import { loadWorkOrder } from "../workorder/validate";
 import { parseRunId, parseStart, runDeps, START_USAGE, STOP_USAGE, SUPERVISE_USAGE } from "./cli";
 import { bounded, copyOut, HELPER_HOST_TIMEOUT_S, HELPER_KILL_AFTER_S, OUTPUT_FILES, timedOut } from "./copyout";
 import { diskProblem, dockerDataRoot, removeVolumeDirs, volumeDir } from "./disk";
+import { hardenedGit } from "./git";
 import { withStackLock } from "./locks";
 import {
   capacityProblem,
@@ -183,18 +184,6 @@ async function sourceGitDir(repo: string): Promise<string> {
   else if ((await kind(join(abs, "HEAD"))) === "file" && (await kind(join(abs, "objects"))) === "dir" && (await kind(join(abs, "refs"))) === "dir") dir = abs;
   if (dir === undefined) throw new Error(`${abs} is not a git repository with a .git dir, nor a bare one: name a checkout (not a linked worktree) or a bare repo`);
   return realpath(dir);
-}
-
-/**
- * Host git with an empty environment but PATH (and `o.env`), no system or global config, no hooks and no
- * fsmonitor: the start of every git command the launcher runs. `o.git` goes before the `-c` options.
- */
-function hardenedGit(d: Pick<RunDeps, "env">, o: { env?: string[]; git?: string[] } = {}): { cmd: string[]; env: Record<string, string> } {
-  const PATH = d.env.PATH ?? "/usr/bin:/bin";
-  return {
-    cmd: ["env", "-i", `PATH=${PATH}`, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", ...(o.env ?? []), "git", ...(o.git ?? []), "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"],
-    env: { PATH },
-  };
 }
 
 /**

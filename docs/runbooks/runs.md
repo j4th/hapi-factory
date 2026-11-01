@@ -6,6 +6,7 @@ This runbook covers `hapi run`, the launcher that Plan 02 built (design: [the wo
 - [how to run the commands](#how-to-run-the-commands);
 - [`hapi run start`](#hapi-run-start), [`watch`](#hapi-run-watch), [`list`](#hapi-run-list) and [`stop`](#hapi-run-stop);
 - [the outputs](#the-outputs), [retention](#retention) and [the public flag](#the-public-flag);
+- [the mirror](#the-mirror) the poller keeps of each registered repo, and how it [discovers work orders](#discovery) there;
 - [the run disk](#the-run-disk), which the operator makes once, and the lock it gives `mise run down` and finalize;
 - [the rollout on hapi's checkout](#rollout-on-hapis-checkout), once this branch has landed, and [the paid check](#the-paid-check) after it;
 - [the tests](#the-tests) and [troubleshooting](#troubleshooting).
@@ -76,7 +77,7 @@ sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
 
 Expected: it prints the run id (twelve hex digits) and returns. The run is going; `watch` follows it.
 
-- **`--repo`** is where the run's clone comes from. Pass a **bare clone**, not a working checkout. The launcher binds the source's git dir into the container read-only, and a working checkout's `.git/config` is then readable by the run: an `http.extraheader`, or a token in a remote URL, would be visible to a worker. A bare clone of the repo has none. Make one as hapi: `git clone --bare <url> "$HOME/repos/example.git"`, with a URL that needs no credential. The run starts from the source's `HEAD`, so that is the commit the work is cut from (H-211 tracks the mirror that replaces this in Plan 03). The source must be world-readable (made under `umask 022`), because the container reads it as another uid.
+- **`--repo`** is where the run's clone comes from. Pass a **bare clone**, not a working checkout. The launcher binds the source's git dir into the container read-only, and a working checkout's `.git/config` is then readable by the run: an `http.extraheader`, or a token in a remote URL, would be visible to a worker. A bare clone of the repo has none. Make one as hapi: `git clone --bare <url> "$HOME/repos/example.git"`, with a URL that needs no credential. The run starts from the source's `HEAD`, so that is the commit the work is cut from. The poller's own runs start from the repo's mirror, which it keeps ([the mirror](#the-mirror)). A hand run still takes a bare clone of your own: the mirror's HEAD is main's tip, not a work order's merge commit, and the poller never picks up a hand run. The source must be world-readable (made under `umask 022`), because the container reads it as another uid.
 - **`--work-order`** is a work order file (`order.yaml`), validated on the host before anything starts ([docs/policy.md](../policy.md#work-orders)). A work order with a non-empty `egress_extra` is refused: a per-run proxy for it doesn't exist yet (H-088, H-207). Its `workflow` must be one of hapi's pack (`archon/workflows/hapi/`): Archon also finds its own bundled workflows by name, which hapi doesn't review, so `start` refuses any other name, and refuses a pack with a node that sets `pi.enableExtensions: false`, which would drop hapi-guard.
 - **`--budget-usd`** only lowers the work order's `budget.usd`. A value above it is a usage error.
 - **`--public`** is [the public flag](#the-public-flag).
@@ -152,6 +153,50 @@ How the files get out: once the container has stopped, a fresh helper container 
 `--public` is the operator's statement that the repo is public. It goes into `run.json`, and hapi-guard reads it: **Jev**, the typed-decision model behind the level-6 gates, is asked about public repos only (spec §9.5; H-040). Without the flag, the gates use the Haiku classifier instead, which adds no recipient, since the worker's own model calls already go to Anthropic.
 
 In Plan 02 the flag is an assertion, not a check: nothing on the host verifies it against the forge. Plan 03's poller sets it from the forge. A work order can't set it, because a model wrote the work order.
+
+## The mirror
+
+Plan 03's poller keeps a mirror of each registered repo (`policy/repos.yaml`), as hapi, on the host (`src/engine/mirror.ts`; design §3.4). It discovers merged work orders there ([below](#discovery)), and its own runs start from it. Each mirror is a bare repo at:
+
+```text
+${XDG_STATE_HOME:-~/.local/state}/hapi/engine/mirrors/<owner>/<name>.git
+```
+
+with hapi's home as `~`.
+
+- **Only `main` and `factory/*`.** Each tick fetches exactly `+refs/heads/main:refs/heads/main` and `+refs/heads/factory/*:refs/heads/factory/*`, pruned, with no tags and no `FETCH_HEAD`. Nothing else of the repo's reaches the mirror. Both refspecs are forced, so a rewritten main is taken as it is ([the key](#discovery) keeps that from re-running anything).
+- **No credential on disk.** The mirror's config names origin's URL, `https://github.com/<owner>/<name>.git`, and nothing else: no fetch refspec, no `http.extraheader` and no credential helper. The fetch's App token reaches git only in the fetch process's environment (`GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_0` and `GIT_CONFIG_VALUE_0`, from `authedHostGit` in `src/run/git.ts`), never its argv or the mirror's config. A failed fetch's error quotes git's first line with the token and its header as `[redacted]`. So a run that reads the mirror reads no token.
+- **World-readable.** The poller makes it with `git init --bare --shared=0644`, so its files are 0644 and its dirs 0755, and git keeps them so on every fetch (`core.sharedRepository`). The run container's uid can read it that way. The dir above it, `mirrors/<owner>`, is 0700 and hapi's alone. `--shared` also sets `receive.denyNonFastforwards`, which only a push would meet, and nothing pushes to a mirror.
+- **Read as data.** Every other git call on the mirror is host git with no system or global config, no hooks and no fsmonitor (`hardenedGit`, the launcher's own), with literal pathspecs. Files are read as blobs (`git cat-file blob`), never with `git show`, so no textconv, attribute or pager applies.
+- **Safe to delete.** A mirror holds nothing that isn't on GitHub, so the next tick makes it again and fetches it. Delete one that is broken, or one whose origin is wrong: the poller refuses it with `<path>'s origin is <url>, not https://github.com/<owner>/<name>.git: remove the mirror; the next tick makes it again`. Do it as hapi, from your own terminal, when no run of that repo is live (`hapi run list`), with the owner and name filled in:
+
+  ```bash
+  sudo -u hapi -H -- sh -c \
+    'rm -rf -- "${XDG_STATE_HOME:-$HOME/.local/state}/hapi/engine/mirrors/example-owner/example-repo.git"'
+  ```
+
+  Expected: no output. The next tick makes the mirror again.
+
+### Discovery
+
+After each fetch, the poller discovers the work orders on the mirror's main: every `.factory/work/<id>/order.yaml` (`src/engine/discover.ts`).
+
+- **The key is `<merge-sha>:<id>`.** A work order is keyed by the commit on main's first-parent line that first added its `order.yaml`: its planning PR's merge commit. Everything about it is read at that commit, never at main's head: the order, the `task.md` beside it, and the repo's overlay, `.factory/config.yaml`. A later edit on main changes nothing about a merged work order, and one deleted from main later is still rebuilt at its merge while the poller has state for it.
+- **Never re-keyed.** The poller skips each id it already has state for before it looks for a key. A force-pushed main gives the merge a new sha, but a work order the poller has already taken up is never run again for it.
+- **Its planning PR** is read from the merge commit's subject, GitHub's classic merge message, `Merge pull request #<n> from <owner>/<branch>`. `hapi new-repo` sets each repo to merge commits with that message, and the audit's [`github.repo-settings`](../audit.md#githubrepo-settings) holds it there. A key commit with any other subject has no planning PR, so its status goes only to the events and `hapi status`.
+- **Problems.** A work order that can't run is never run. Discovery hands it to the poller as a problem, never as a work order, by its `order.yaml` path, for the tick's report and the status comment's "Can't run" table. The reasons:
+
+  | Reason | What is wrong |
+  |---|---|
+  | `invalid YAML: <first line>` | `order.yaml` doesn't parse. |
+  | `<path>: <message>` | The order fails its schema ([work orders](../policy.md#work-orders)). |
+  | `its id is <id>, not its directory's name <dir>` | The order's `id` isn't the name of the directory it is in. |
+  | `no task.md beside it at <sha12>` | There is no `task.md` beside the order. |
+  | `<path> at <sha12> is not a regular file` | The order, its `task.md` or the overlay is a symlink, a directory or a submodule. |
+  | `.factory/config.yaml at <sha12>: <path>: <message>` | The overlay fails its schema, or loosens the central policy, when an overlay may only tighten it ([repo overlays](../policy.md#repo-overlays-factoryconfigyaml)). |
+  | `no commit on main's first-parent line adds it` | Git found no commit that adds the order, which shouldn't happen: a defensive check. |
+
+  Because a work order is read at its merge, a fix on main doesn't change it. Plan the work again as a new work order, with a new id.
 
 ## The run disk
 
@@ -481,7 +526,7 @@ sudo -u hapi -H -- sh -c 'rm -rf "$HOME/hapi-check-work" "$HOME/hapi-check-repo.
 
 ## The tests
 
-- **Unit tests** (`mise run test`) cover the launcher, the run records, copy-out, the prelude, the check workflows and the views, with Docker replaced by fakes: `tests/run/`.
+- **Unit tests** (`mise run test`) cover the launcher, the run records, copy-out, the prelude, the check workflows and the views, with Docker replaced by fakes: `tests/run/`. The mirror and discovery tests (`tests/engine/`) run real git in temp dirs, with mirrors that fetch from a local path, never GitHub.
 - **The run-container integration test** starts a real run of a bash-only workflow, no model and no real secret, in a throwaway Compose project. It needs the internet (a run reaches `api.anthropic.com` through the proxy) and builds the archon image, which can take up to 15 minutes:
 
   ```bash

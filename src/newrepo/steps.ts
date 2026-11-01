@@ -14,7 +14,7 @@
  *  3. create: the repo, public and empty, issues on.
  *  4. push: the first commit, by the operator's noreply identity, to main, before any ruleset exists (afterwards
  *     main-review's Restrict updates and main-protect's required check refuse even the operator's direct push). The
- *     token reaches git only in the push's environment (`authedGit`), never argv.
+ *     token reaches git only in the push's environment (`authedHostGit`, src/run/git.ts), never argv.
  *  5. settings: `contractSettings`, private vulnerability reporting, CodeQL's default setup, and with
  *     --collaborators-only an interaction limit.
  *  6. rulesets: the four in policy/github/rulesets, main-protect requiring CONTRACT_CHECK and agent-branch-scope
@@ -36,10 +36,10 @@ import { dirname, join } from "node:path";
 import { parseDocument } from "yaml";
 import { defaultExec, type runAudit } from "../audit/index";
 import { parseOwnerRepo } from "../forge/github/app-token";
-import { authedGit } from "../forge/github/git";
 import { asRecord, ghMessage, oneLine, paginate, rest } from "../forge/github/rest";
 import { CONTRACT_CHECK, contractSettings, LABELS } from "../forge/index";
 import { loadPolicy } from "../policy/load";
+import { authedHostGit } from "../run/git";
 import { definedEnv, type Env, type Runner } from "../stack/up";
 import { contractProblems, renderTemplate, TEMPLATE_DIR } from "./render";
 
@@ -118,12 +118,19 @@ async function gh(c: Ctx, method: string, path: string, want: readonly number[],
   return r.json;
 }
 
-/** git with no system or global config, no hooks, no fsmonitor, no prompt and https only: every git call but the clone. */
+/**
+ * git with no system or global config, no hooks, no fsmonitor, no prompt and https only: every git call but the
+ * clone. The push alone adds the token, through `authedHostGit` (src/run/git.ts), which has the same flags.
+ */
 function gitEnv(d: NewRepoDeps): Record<string, string> {
   return { PATH: d.env.PATH ?? "/usr/bin:/bin", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0", GIT_ALLOW_PROTOCOL: "https" };
 }
-async function git(c: Ctx, dir: string, args: string[], extra: Record<string, string> = {}): Promise<string> {
-  const r = await c.d.run(["git", "-C", dir, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", ...args], { env: { ...gitEnv(c.d), ...extra }, inherit: false });
+async function git(c: Ctx, dir: string, args: string[]): Promise<string> {
+  return gitIn(c, { cmd: ["git", "-C", dir, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"], env: gitEnv(c.d) }, args);
+}
+/** `args` after `base.cmd`, with exactly `base.env`. */
+async function gitIn(c: Ctx, base: { cmd: string[]; env: Record<string, string> }, args: string[]): Promise<string> {
+  const r = await c.d.run([...base.cmd, ...args], { env: base.env, inherit: false });
   if (r.code !== 0) throw new Error(`git ${args.find((a) => !a.startsWith("-") && !a.includes("=")) ?? args[0]} exited ${r.code}${r.stderr?.trim() ? `: ${r.stderr.trim()}` : ""}`);
   return r.stdout;
 }
@@ -233,7 +240,8 @@ async function push(c: Ctx): Promise<StepResult> {
     const tree = (await git(c, dir, ["ls-tree", "-r", "-z", "--name-only", "HEAD"])).split("\0").filter((p) => p !== "");
     const want = [...c.files.keys()].sort();
     if (JSON.stringify(tree.sort()) !== JSON.stringify(want)) throw new Error(`the first commit holds ${tree.length} files, not exactly the ${want.length} rendered: nothing was pushed`);
-    await git(c, dir, ["push", "--quiet", `https://github.com/${c.full}.git`, "HEAD:refs/heads/main"], authedGit(c.token));
+    // Only the push gets the token, in its environment: init, add and commit above stay token-free.
+    await gitIn(c, authedHostGit(c.d, c.token, { git: ["-C", dir] }), ["push", "--quiet", `https://github.com/${c.full}.git`, "HEAD:refs/heads/main"]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
