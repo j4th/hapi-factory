@@ -79,7 +79,7 @@ Every file under `templates/repo-contract/` ends in `.tmpl`, which the render st
 
 [`.github/workflows/gates.yml`](../../.github/workflows/gates.yml) is a `workflow_call` with `permissions: {}` and three jobs. The caller's job is `ci`, so GitHub shows them as `ci / scan`, `ci / check` and `ci / gates`:
 
-- **`scan`** (`contents: read`) never runs anything the PR controls. On a fresh runner and a fresh checkout (no persisted credentials, the whole history), with no mise at all, it runs ci.yml's mise-file scan, word for word; refuses a root `.gitleaks.toml` or `.gitleaksignore` (gitleaks reads a root `.gitleaksignore` whatever its flags say, and either could allowlist a PR's own secret); installs gitleaks, OSV-Scanner and zizmor from release URLs written in `gates.yml`, each checked against the sha256 written beside it (the template's `mise.toml` versions; a test holds them equal); and runs them by absolute path under `env -i PATH=/usr/bin:/bin HOME=$RUNNER_TEMP GIT_NO_REPLACE_OBJECTS=1`, each with the gates' own config: gitleaks with `--config` (its default rules) and inline allows ignored, OSV-Scanner with an empty `--config` over `bun.lock`, zizmor with `--no-config --no-ignores`, online, on the job's read-only token. Last, on a pull request from a `factory/**` branch, it checks that every commit carries `Work-Order`, `Hapi-Run`, `Trace-Id`, `Agent` and `Model` trailers and `Hapi-Lane: factory` (H-113's factory half), with git run the same clean way.
+- **`scan`** (`contents: read`) runs no PR code, and ignores the PR's scanner configs and git attributes: the PR's files are only data to it. On a fresh runner and a fresh checkout (no persisted credentials, the whole history), with no mise at all, it runs ci.yml's mise-file scan, word for word; writes `* diff` to `.git/info/attributes`, so git diffs every path as text whatever a committed `.gitattributes` (`* -diff`, `* binary`, at any depth) or a NUL byte would say, and gitleaks sees the whole history; refuses a root `.gitleaks.toml` or `.gitleaksignore`, even as a dangling symlink (gitleaks reads a root `.gitleaksignore` whatever its flags say, and either could allowlist a PR's own secret); installs gitleaks, OSV-Scanner and zizmor from release URLs written in `gates.yml`, each checked against the sha256 written beside it (the template's `mise.toml` versions; a test holds them equal); and runs them by absolute path under `env -i PATH=/usr/bin:/bin HOME=$RUNNER_TEMP GIT_NO_REPLACE_OBJECTS=1`, each with the gates' own config: gitleaks with `--config` (its default rules) and inline allows ignored, OSV-Scanner with an empty `--config` over `bun.lock`, zizmor with `--no-config --no-ignores`, online, on the job's read-only token. Last, on a pull request from a `factory/**` branch, it checks that every commit carries `Work-Order`, `Hapi-Run`, `Trace-Id`, `Agent` and `Model` trailers and `Hapi-Lane: factory` (H-113's factory half), with git run the same clean way.
 - **`check`** (`contents: read`) runs the PR's code: ci.yml's mise-file scan, mise-action (pinned), ci.yml's mise-config check, then `mise install --locked && mise run check`. It runs on its own runner, so nothing it does reaches `scan`. No step installs packages itself, and the caller's `setup` runs no install script.
 - **`gates`** (`permissions: {}`, no checkout) passes only when `scan` and `check` both succeeded. It runs even when one failed (`if: always()`), since GitHub reports a job skipped for a failed need as a success.
 
@@ -99,16 +99,19 @@ Step 11 runs the strict audit for the new repo, with your `gh` login held in mem
 sudo -iu hapi
 ```
 
-Then, as hapi, edit the `OWNER` line once (your GitHub login), and paste the rest. The `read` line asks for your own token for the repo, a fine-grained one with Administration and Contents read-only ([GitHub credentials](../audit.md#github-credentials)); it goes into a `0600` file without being echoed, and the last line deletes the file.
+Then, as hapi, run this one line on its own (pasted with other lines, its `read` would take the next line as the token). It asks for your own token for the repo, a fine-grained one with Administration and Contents read-only ([GitHub credentials](../audit.md#github-credentials)), and writes it to a `0600` file without echoing it:
+
+```bash
+(umask 077; mkdir -p ~/.config/hapi; rm -f ~/.config/hapi/audit-token; IFS= read -rsp 'token: ' t && printf '%s\n' "$t" > ~/.config/hapi/audit-token)
+```
+
+Then edit the `OWNER` line once (your GitHub login), and paste the rest. The last line deletes the token file.
 
 ```bash
 OWNER=<your GitHub login>
 REPO=hapi-sandbox-fortune
 export XDG_RUNTIME_DIR=/run/user/$(id -u)
 cd ~/hapi-factory
-mkdir -p ~/.config/hapi
-(umask 077; rm -f ~/.config/hapi/audit-token; IFS= read -rsp 'token: ' t \
-  && printf '%s\n' "$t" > ~/.config/hapi/audit-token)
 mise run audit -- --strict --repo "$OWNER/$REPO" --github-token-file ~/.config/hapi/audit-token
 rm -f ~/.config/hapi/audit-token
 ```

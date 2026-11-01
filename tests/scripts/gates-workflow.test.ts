@@ -1,11 +1,12 @@
 /**
  * .github/workflows/gates.yml, the reusable gates workflow every repo made from templates/repo-contract calls. Its
  * shape: a workflow_call with no permissions and three jobs, `scan`, `check` and the aggregator `gates`, whose check
- * (`ci / gates`) is the required one. `scan` never runs anything the PR controls: no mise, no action but checkout,
- * scanners installed from sha256-pinned release URLs and run by absolute path under `env -i` with the gates' own
- * config. Its steps run for real here, under `bash -e -o pipefail` as Actions runs them, on throwaway repos: the
- * config refusals, a checksum mismatch, the scanners' argv and environment (stubs), gitleaks itself (the pin
- * mise.toml holds), the trailer check, and the aggregator.
+ * (`ci / gates`) is the required one. `scan` runs no PR code and ignores the PR's scanner configs and git
+ * attributes: no mise, no action but checkout, every path diffed as text, scanners installed from sha256-pinned
+ * release URLs and run by absolute path under `env -i` with the gates' own config. Its steps run for real here, as
+ * Actions runs them under `defaults.run.shell: bash` (`bash --noprofile --norc -eo pipefail`), on throwaway repos:
+ * the config refusals, a checksum mismatch, the scanners' argv and environment (stubs), gitleaks itself (the pin
+ * mise.toml holds) against every way a PR could hide history from it, the trailer check, and the aggregator.
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { randomBytes } from "node:crypto";
@@ -39,6 +40,7 @@ const { scan, check, gates } = doc.jobs as { scan: Job; check: Job; gates: Job }
 const ci: Step[] = YAML.parse(await Bun.file(join(REPO, ".github", "workflows", "ci.yml")).text()).jobs.ci.steps;
 const MISE_SCAN = "Only the root mise.toml configures mise";
 const MISE_CHECK = "mise loads no config or tasks but the root mise.toml";
+const ATTRS = "Git diffs every path as text, whatever the PR's .gitattributes say";
 const CONFIGS = "The scanners' configs are the gates' own";
 const INSTALL = "Install the scanners, each checked against its pinned sha256";
 const SECRETS = "Scan the whole history for secrets (gitleaks)";
@@ -58,7 +60,7 @@ const tempDir = (prefix: string) => {
   temps.push(d);
   return d;
 };
-/** Run one step's script as Actions does (`bash -e -o pipefail`), in `cwd`, with exactly `env`. */
+/** Run one step's script as Actions does with `shell: bash` (`bash --noprofile --norc -eo pipefail`), in `cwd`, with exactly `env`. */
 const runStep = (script: string, cwd: string, env: Record<string, string>) => {
   const r = Bun.spawnSync(["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script], { cwd, env, stdout: "pipe", stderr: "pipe" });
   return { code: r.exitCode, out: r.stdout.toString() + r.stderr.toString() };
@@ -67,6 +69,9 @@ const runStep = (script: string, cwd: string, env: Record<string, string>) => {
 test("gates.yml is a workflow_call with no permissions, and three jobs: scan, check and the aggregator gates", () => {
   expect(Object.keys(doc.on)).toEqual(["workflow_call"]);
   expect(doc.permissions).toEqual({});
+  // Named, so Actions adds pipefail: with no shell, a run step is `bash -e {0}`.
+  expect((doc as unknown as { defaults: unknown }).defaults).toEqual({ run: { shell: "bash" } });
+  for (const job of [scan, check, gates]) for (const st of job.steps) expect([st.name, (st as { shell?: string }).shell]).toEqual([st.name, undefined]);
   expect(Object.keys(doc.jobs)).toEqual(["scan", "check", "gates"]);
   for (const [id, job] of Object.entries(doc.jobs)) {
     expect([id, job.name, job["runs-on"]]).toEqual([id, id, "ubuntu-latest"]);
@@ -74,7 +79,7 @@ test("gates.yml is a workflow_call with no permissions, and three jobs: scan, ch
   }
   expect(scan.permissions).toEqual({ contents: "read" });
   expect(check.permissions).toEqual({ contents: "read" });
-  expect(scan.steps.map((s) => s.uses?.replace(/@.*$/, "") ?? s.name)).toEqual(["actions/checkout", MISE_SCAN, CONFIGS, INSTALL, SECRETS, OSV, ZIZMOR, TRAILERS]);
+  expect(scan.steps.map((s) => s.uses?.replace(/@.*$/, "") ?? s.name)).toEqual(["actions/checkout", MISE_SCAN, ATTRS, CONFIGS, INSTALL, SECRETS, OSV, ZIZMOR, TRAILERS]);
   expect(check.steps.map((s) => s.uses?.replace(/@.*$/, "") ?? s.name)).toEqual(["actions/checkout", MISE_SCAN, "jdx/mise-action", MISE_CHECK, "check"]);
   expect(scan.steps[0]!.with).toEqual({ "persist-credentials": false, "fetch-depth": 0 });
   expect(check.steps[0]!.with).toEqual({ "persist-credentials": false });
@@ -124,13 +129,24 @@ test("its mise-file scan, in both jobs, and its mise-config check are ci.yml's, 
   expect(check.steps.findIndex((s) => s.name === MISE_SCAN)).toBeLessThan(check.steps.findIndex((s) => s.uses?.startsWith("jdx/mise-action@") === true));
 });
 
-describe("the scan job never runs anything the PR controls", () => {
-  test("no step in scan uses mise (the action, the binary or a task), and its only action is checkout", () => {
-    for (const s of scan.steps) {
-      if (s.uses !== undefined) expect(s.uses).toStartWith("actions/checkout@");
-      expect([s.name, /(^|[\s;&|(])mise\s+(exec|run|install|x|use|trust|tasks|config|which|where|activate|env|ls)\b/m.test(s.run ?? "")]).toEqual([s.name, false]);
-      expect([s.name, /\bmise-action\b/.test(s.uses ?? "")]).toEqual([s.name, false]);
+describe("the scan job runs no PR code, and ignores the PR's scanner configs and git attributes", () => {
+  test("no run in scan names mise at all, but ci.yml's find-only file scan, and its only action is the pinned checkout", () => {
+    expect(scan.steps.filter((s) => s.uses !== undefined).map((s) => s.uses)).toEqual(["actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"]);
+    for (const s of scan.steps.filter((x) => x.run !== undefined)) {
+      // The one exception is ci.yml's mise-file scan, word for word: it only *looks for* mise's file names, with find.
+      if (s.name === MISE_SCAN) continue;
+      const code = s.run!.split("\n").filter((l) => !l.trimStart().startsWith("#")).join("\n");
+      expect([s.name, /\bmise\b/i.test(code)]).toEqual([s.name, false]);
     }
+    expect(step(scan, MISE_SCAN).run).toBe(ci.find((x) => x.name === MISE_SCAN)!.run!);
+    // And that scan needs nothing but find: with only find on PATH, it runs and passes on a clean checkout.
+    const root = tempDir("hapi-gates-findonly-");
+    writeFileSync(join(root, "mise.toml"), "");
+    mkdirSync(join(root, ".git"));
+    const bin = tempDir("hapi-gates-findbin-");
+    symlinkSync(Bun.which("find")!, join(bin, "find"));
+    const r = Bun.spawnSync([Bun.which("bash")!, "-e", "-c", step(scan, MISE_SCAN).run!], { cwd: root, env: { PATH: bin }, stdout: "pipe", stderr: "pipe" });
+    expect([r.exitCode, r.stdout.toString() + r.stderr.toString()]).toEqual([0, ""]);
     // Nothing at the job level a PR could use either: the env holds only the pinned URLs and checksums.
     expect(Object.keys(scan.env ?? {}).sort()).toEqual(["GITLEAKS_SHA256", "GITLEAKS_URL", "OSV_SCANNER_SHA256", "OSV_SCANNER_URL", "ZIZMOR_SHA256", "ZIZMOR_URL"]);
   });
@@ -189,11 +205,21 @@ describe("the scanners' configs are the gates' own", () => {
   });
 
   for (const file of [".gitleaks.toml", ".gitleaksignore"]) {
-    test(`a root ${file} fails the step, saying so`, () => {
-      const r = configs({ [file]: "x\n" });
-      expect(r.code).toBe(1);
-      expect(r.out).toContain("::error::a root .gitleaks.toml or .gitleaksignore would change what gitleaks finds");
-      expect(existsSync(join(r.runnerTemp, "gitleaks.toml"))).toBe(false);
+    test(`a root ${file} fails the step, saying so, and so does a symlink by that name, even a dangling one`, () => {
+      for (const make of ["file", "dangling symlink", "symlink"] as const) {
+        const root = tempDir("hapi-gates-cfgl-");
+        const runnerTemp = tempDir("hapi-gates-rtl-");
+        if (make === "file") writeFileSync(join(root, file), "x\n");
+        else if (make === "dangling symlink") symlinkSync(join(root, "not-yet"), join(root, file));
+        else {
+          writeFileSync(join(root, "real.toml"), "x\n");
+          symlinkSync(join(root, "real.toml"), join(root, file));
+        }
+        const r = runStep(step(scan, CONFIGS).run!, root, { PATH: process.env.PATH!, RUNNER_TEMP: runnerTemp });
+        expect([file, make, r.code]).toEqual([file, make, 1]);
+        expect(r.out).toContain("::error::a root .gitleaks.toml or .gitleaksignore would change what gitleaks finds");
+        expect(existsSync(join(runnerTemp, "gitleaks.toml"))).toBe(false);
+      }
     });
   }
 });
@@ -254,21 +280,33 @@ describe.skipIf(gitleaks === undefined)("the real gitleaks, run as the scan job 
     const alnum = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     return `ghp_${[...randomBytes(36)].map((b) => alnum[b % alnum.length]).join("")}`;
   };
-  /** A repo whose one commit holds `files`; the configs step then the secrets step, with `env` added to the runner's. */
-  const scanRepo = (files: Record<string, string>, env: Record<string, string> = {}) => {
+  /**
+   * A repo whose one commit holds `files`; then the scan job's steps, in the job's order, from the first after checkout
+   * through gitleaks, but the install (the network's: gitleaks is linked in instead), with `env` added to the runner's.
+   * `skip` leaves a step out (the control).
+   */
+  const scanRepo = (files: Record<string, string>, env: Record<string, string> = {}, skip: string[] = []) => {
     const root = tempDir("hapi-gates-gl-");
     const runnerTemp = tempDir("hapi-gates-glrt-");
     mkdirSync(join(runnerTemp, "bin"));
     symlinkSync(gitleaks!, join(runnerTemp, "bin", "gitleaks"));
     const genv = { PATH: process.env.PATH!, HOME: root, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.invalid", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.invalid" };
-    for (const [path, text] of Object.entries(files)) writeFileSync(join(root, path), text);
+    for (const [path, text] of Object.entries(files)) {
+      mkdirSync(join(root, path, ".."), { recursive: true });
+      writeFileSync(join(root, path), text);
+    }
     for (const args of [["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "add files"]]) {
       expect(Bun.spawnSync(["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", ...args], { cwd: root, env: genv, stdout: "ignore", stderr: "ignore" }).exitCode).toBe(0);
     }
     const runner = { PATH: process.env.PATH!, RUNNER_TEMP: runnerTemp, ...env };
-    const c = runStep(step(scan, CONFIGS).run!, root, runner);
-    if (c.code !== 0) return c;
-    return runStep(step(scan, SECRETS).run!, root, runner);
+    const upTo = scan.steps.findIndex((x) => x.name === SECRETS);
+    let last = { code: 0, out: "" };
+    for (const x of scan.steps.slice(1, upTo + 1)) {
+      if (x.name === INSTALL || skip.includes(x.name!)) continue;
+      last = runStep(x.run!, root, runner);
+      if (last.code !== 0) return last;
+    }
+    return last;
   };
 
   test("passes on a clean history, and finds a token", () => {
@@ -287,6 +325,28 @@ describe.skipIf(gitleaks === undefined)("the real gitleaks, run as the scan job 
     const r = scanRepo({ "config.env": `GITHUB_TOKEN=${token()}\n` }, { GITLEAKS_CONFIG_TOML: allowAll, GITLEAKS_CONFIG: join(dir, "allow.toml") });
     expect(r.code).toBe(1);
   });
+
+  test("every path is diffed as text before gitleaks runs: the attributes step comes first, and writes `* diff`", () => {
+    const at = (name: string) => scan.steps.findIndex((x) => x.name === name);
+    expect(at(ATTRS)).toBeGreaterThan(0);
+    expect(at(ATTRS)).toBeLessThan(at(SECRETS));
+    expect(step(scan, ATTRS).run).toBe("mkdir -p .git/info\nprintf '* diff\\n' > .git/info/attributes\n");
+  });
+
+  // The ways a commit can turn its own diffs into "Binary files differ", which gitleaks skips.
+  const hiding: [what: string, files: (secret: string) => Record<string, string>][] = [
+    ["a root .gitattributes with * -diff", (t) => ({ ".gitattributes": "* -diff\n", "config.env": `GITHUB_TOKEN=${t}\n` })],
+    ["a root .gitattributes with * binary", (t) => ({ ".gitattributes": "* binary\n", "config.env": `GITHUB_TOKEN=${t}\n` })],
+    ["a nested sub/.gitattributes with * -diff over the secret", (t) => ({ "sub/.gitattributes": "* -diff\n", "sub/config.env": `GITHUB_TOKEN=${t}\n` })],
+    ["a NUL byte in the secret's file", (t) => ({ "config.env": `GITHUB_TOKEN=${t}\n\0\n` })],
+  ];
+  for (const [what, files] of hiding) {
+    test(`${what} doesn't hide a secret`, () => {
+      expect(scanRepo(files(token())).code).toBe(1);
+      // The control: without the attributes step, the same commit hides it, so this test exercises the hole.
+      expect(scanRepo(files(token()), {}, [ATTRS]).code).toBe(0);
+    });
+  }
 
   test("a .gitleaks.toml or .gitleaksignore in the commit fails the scan before gitleaks runs", () => {
     for (const file of [".gitleaks.toml", ".gitleaksignore"]) {

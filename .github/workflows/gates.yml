@@ -10,11 +10,12 @@
 # Three jobs. The caller's job is `ci`, so GitHub reports them as `ci / scan`, `ci / check` and `ci / gates`, and the
 # repo's main-protect requires only `ci / gates` (CONTRACT_CHECK in src/forge/index.ts), from GitHub Actions:
 #
-# - `scan` never runs anything the PR controls. On its own fresh runner and checkout, with no mise, it runs the
-#   mise-file scan, refuses a PR's scanner config, installs gitleaks, OSV-Scanner and zizmor from release URLs whose
-#   sha256 is pinned below (the same versions as the template's mise.toml), and runs them, and the factory-commit
-#   trailer check (H-113's factory half), by absolute path under `env -i` with GIT_NO_REPLACE_OBJECTS=1, each with
-#   the gates' own config. A PR's code runs only in `check`, on another runner, so it can't touch a scan.
+# - `scan` runs no PR code, and ignores the PR's scanner configs and git attributes. On its own fresh runner and
+#   checkout, with no mise, it runs the mise-file scan, makes git diff every path as text, refuses a PR's gitleaks
+#   files, installs gitleaks, OSV-Scanner and zizmor from release URLs whose sha256 is pinned below (the same versions
+#   as the template's mise.toml), and runs them, and the factory-commit trailer check (H-113's factory half), by
+#   absolute path under `env -i` with GIT_NO_REPLACE_OBJECTS=1, each with the gates' own config. The PR's files are
+#   only data to it. A PR's code runs only in `check`, on another runner, so it can't touch a scan.
 # - `check` runs the caller's own `mise install --locked && mise run check` (its `setup` installs with
 #   `--ignore-scripts`), after ci.yml's two mise steps.
 # - `gates` passes only when both succeeded. It runs even when one failed (`if: always()`): GitHub reports a job
@@ -31,6 +32,11 @@ on:
   workflow_call: {}
 
 permissions: {}
+
+# `bash --noprofile --norc -eo pipefail {0}`: without a shell named, Actions runs `bash -e {0}`, with no pipefail.
+defaults:
+  run:
+    shell: bash
 
 jobs:
   scan:
@@ -75,14 +81,25 @@ jobs:
             exit 1
           fi
 
+      # gitleaks reads the history through `git log -p`, which honours the checkout's .gitattributes: a PR that
+      # commits `* -diff` or `* binary` (at the root, or in any directory over the files below it), or a file with a
+      # NUL byte, turns its diffs into "Binary files differ", and gitleaks never sees them. .git/info/attributes
+      # outranks every .gitattributes, and `diff` set on a path makes git diff it as text, NUL bytes and all. So
+      # every path is scanned as text; a real binary that looks like a secret fails the scan, closed.
+      - name: Git diffs every path as text, whatever the PR's .gitattributes say
+        run: |
+          mkdir -p .git/info
+          printf '* diff\n' > .git/info/attributes
+
       # The scanners' configs are the gates' own. gitleaks gets an explicit --config (its default rules), and
       # always reads a root .gitleaksignore whatever --gitleaks-ignore-path says (checked with 8.30.1), so a root
       # .gitleaks.toml or .gitleaksignore, either of which could allowlist a PR's own secret, is refused. OSV-Scanner
       # gets an empty --config, which replaces any osv-scanner.toml it would find. zizmor runs with --no-config
-      # --no-ignores. Under env -i, no GITLEAKS_CONFIG, GITLEAKS_CONFIG_TOML or ZIZMOR_CONFIG reaches a scanner.
+      # --no-ignores. Under env -i, no GITLEAKS_CONFIG, GITLEAKS_CONFIG_TOML or ZIZMOR_CONFIG reaches a scanner. A
+      # symlink counts even when it dangles: gitleaks could follow it once the target exists.
       - name: The scanners' configs are the gates' own
         run: |
-          if [[ -e .gitleaks.toml || -e .gitleaksignore ]]; then
+          if [[ -e .gitleaks.toml || -L .gitleaks.toml || -e .gitleaksignore || -L .gitleaksignore ]]; then
             echo "::error::a root .gitleaks.toml or .gitleaksignore would change what gitleaks finds. Remove it; the gates scan with gitleaks's own rules."
             exit 1
           fi
