@@ -254,6 +254,35 @@ describe("runtime.hermes-no-yolo", () => {
     }
   });
 
+  test("HERMES_KANBAN_DISPATCH_IN_GATEWAY set in its env fails, since it turns the Kanban dispatcher back on over the config; set to 0 it doesn't", async () => {
+    for (const [value, status] of [["1", "fail"], ["true", "fail"], ["0", "pass"], ["", "pass"]] as const) {
+      const w = await cleanWorld();
+      setEnv(svc(w, "hermes"), "HERMES_KANBAN_DISPATCH_IN_GATEWAY", value);
+      const r = await check(w, "runtime.hermes-no-yolo");
+      expect([value, r.status]).toEqual([value, status]);
+      if (status === "fail") expect(r.detail).toContain("HERMES_KANBAN_DISPATCH_IN_GATEWAY");
+    }
+  });
+
+  test("a mounted config that leaves the Kanban dispatcher on fails: no kanban block, dispatch in the gateway, or dispatch_profiles not an empty list", async () => {
+    const edits: [string, (text: string) => string, string][] = [
+      ["no kanban block", (s) => s.replace(/^kanban:\n(?:  .*\n)+/m, ""), "kanban.dispatch_in_gateway"],
+      ["dispatch_in_gateway: true", (s) => s.replace("dispatch_in_gateway: false", "dispatch_in_gateway: true"), "kanban.dispatch_in_gateway"],
+      ["dispatch_profiles omitted", (s) => s.replace(/^  dispatch_profiles: \[\]\n/m, ""), "kanban.dispatch_profiles"],
+      ["auto_decompose: true", (s) => s.replace("auto_decompose: false", "auto_decompose: true"), "kanban.auto_decompose"],
+    ];
+    for (const [what, edit, named] of edits) {
+      const w = await cleanWorld();
+      const file = join(w.build, "hermes", "config.yaml");
+      const before = readFileSync(file, "utf8");
+      writeFileSync(file, edit(before));
+      expect([what, readFileSync(file, "utf8") !== before]).toEqual([what, true]);
+      const r = await check(w, "runtime.hermes-no-yolo");
+      expect([what, r.status]).toEqual([what, "fail"]);
+      expect(r.detail).toContain(named);
+    }
+  });
+
   test("approvals.mode off fails, however YAML spells it (Hermes reads YAML 1.1, where a bare off or no is false)", async () => {
     for (const spelling of ["off", '"off"', "OFF", "no", "false"]) {
       const w = await cleanWorld();

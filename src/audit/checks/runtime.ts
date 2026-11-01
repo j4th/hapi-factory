@@ -333,6 +333,8 @@ export async function hermesNoYolo(run: AuditRun): Promise<CheckResult[]> {
   for (const v of ["HERMES_YOLO_MODE", "HERMES_YOLO"]) {
     if (env.has(v) && truthy(env.get(v)!)) problems.push(`${v} is set in its env (every approval skipped)`);
   }
+  const dispatchVar = "HERMES_KANBAN_DISPATCH_IN_GATEWAY";
+  if (env.has(dispatchVar) && truthy(env.get(dispatchVar)!)) problems.push(`${dispatchVar} is set in its env (the Kanban dispatcher runs over the config)`);
   const home = env.get("HERMES_HOME") ?? HERMES_HOME;
   if (home !== HERMES_HOME) problems.push(`HERMES_HOME is not ${HERMES_HOME}, so Hermes doesn't read the generated config`);
   const dest = `${home}/config.yaml`;
@@ -358,12 +360,18 @@ export async function hermesNoYolo(run: AuditRun): Promise<CheckResult[]> {
     for (const k of ["cron_mode", "unattended_mode", "single_query_mode"]) {
       if (approvals[k] !== undefined && approves(approvals[k])) problems.push(`approvals.${k} approves, where policy says deny`);
     }
-    summary = `approvals.mode ${mode === undefined ? "(Hermes's default, manual)" : String(mode)}, no unattended mode that approves`;
+    // The dispatcher spawns a worker per ready card with full terminal access and no approval step (kanban.md).
+    const kanban = ((cfg as Record<string, unknown> | null)?.kanban ?? {}) as Record<string, unknown>;
+    if (kanban.dispatch_in_gateway !== false) problems.push("kanban.dispatch_in_gateway is not false (Hermes's default runs the dispatcher)");
+    if (!Array.isArray(kanban.dispatch_profiles) || kanban.dispatch_profiles.length > 0) problems.push("kanban.dispatch_profiles is not an empty list (an omitted key lets this home claim cards for any profile)");
+    if (kanban.auto_decompose !== false) problems.push("kanban.auto_decompose is not false");
+    if (kanban.review_dispatch !== false) problems.push("kanban.review_dispatch is not false");
+    summary = `approvals.mode ${mode === undefined ? "(Hermes's default, manual)" : String(mode)}, no unattended mode that approves, and the Kanban dispatcher off`;
   }
   if (problems.length > 0) {
-    return [result(id, "fail", `${name}: ${problems.join("; ")}. Yolo and approvals.mode: off are forbidden (spec §9.1): restore build/ with \`mise run up\` and remove the flag or variable`)];
+    return [result(id, "fail", `${name}: ${problems.join("; ")}. Yolo, approvals.mode: off and the Kanban dispatcher are forbidden (spec §9.1): restore build/ with \`mise run up\` and remove the flag or variable`)];
   }
-  return [result(id, "pass", `${name}: no --yolo, no HERMES_YOLO_MODE or HERMES_YOLO, HERMES_HOME ${home}, and its read-only ${dest} (${mount!.Source}) has ${summary}`)];
+  return [result(id, "pass", `${name}: no --yolo, no HERMES_YOLO_MODE, HERMES_YOLO or HERMES_KANBAN_DISPATCH_IN_GATEWAY, HERMES_HOME ${home}, and its read-only ${dest} (${mount!.Source}) has ${summary}`)];
 }
 
 /** runtime.dev-override */

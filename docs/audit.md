@@ -59,7 +59,7 @@ Without the stack and without `--repo`, as on a development machine, most checks
 |---|---|---|---|
 | [`generated.drift`](#generateddrift) | The deployed build/ equals a fresh build of policy/, with no other file or directory in it, and every running container was started from it | §8.1, §11.8 | The deployed build/; Docker for the labels |
 | [`runtime.run-container`](#runtimerun-container) | The run container's definition (tmpfs, read-only binds, environment, no port), and each live run container against it | §9.2, §9.3 | The checkout; Docker for live runs |
-| [`runtime.hermes-no-yolo`](#runtimehermes-no-yolo) | No yolo, and approvals not off, in Hermes's effective config | §9.1 | Docker, the stack up |
+| [`runtime.hermes-no-yolo`](#runtimehermes-no-yolo) | No yolo, approvals not off, and the Kanban dispatcher off, in Hermes's effective config | §9.1 | Docker, the stack up |
 | [`runtime.dev-override`](#runtimedev-override) | The stack, and each live run, was started as hapi, without the dev bypass | §4.3, §11.3 | Docker, the stack up |
 | [`policy.budget-enforcement`](#policybudget-enforcement) | At least one enforcer of `run_usd` is hard | design §3.5 | policy/ |
 | [`pins.versions`](#pinsversions) | Every tool, image and installed package pinned exactly | §11.6 | The checkout |
@@ -108,13 +108,13 @@ Without the stack and without `--repo`, as on a development machine, most checks
 
 ### runtime.hermes-no-yolo
 
-**Verifies.** Hermes's effective approval settings, from the running `hermes` container: no `--yolo` in its command line; no `HERMES_YOLO_MODE` or `HERMES_YOLO` set (to anything but empty, `0`, `false`, `no` or `off`) in its env; `HERMES_HOME` is `/opt/data`; and the config mounted read-only at `$HERMES_HOME/config.yaml` has `approvals.mode` not off, and no `cron_mode`, `unattended_mode` or `single_query_mode` that approves. The config is read as YAML 1.1, as Hermes reads it, where a bare `off` or `no` is `false`, which Hermes treats as `mode: off`.
+**Verifies.** Hermes's effective approval settings, from the running `hermes` container: no `--yolo` in its command line; no `HERMES_YOLO_MODE`, `HERMES_YOLO` or `HERMES_KANBAN_DISPATCH_IN_GATEWAY` set (to anything but empty, `0`, `false`, `no` or `off`) in its env; `HERMES_HOME` is `/opt/data`; and the config mounted read-only at `$HERMES_HOME/config.yaml` has `approvals.mode` not off, and no `cron_mode`, `unattended_mode` or `single_query_mode` that approves; and its `kanban` block has `dispatch_in_gateway: false`, `dispatch_profiles: []`, `auto_decompose: false` and `review_dispatch: false`, since Hermes's default dispatcher spawns a worker with full terminal access and no approval step for each ready card. The config is read as YAML 1.1, as Hermes reads it, where a bare `off` or `no` is `false`, which Hermes treats as `mode: off`.
 
-**Why.** Spec §9.1: yolo and `approvals.mode: off` are forbidden by policy, and an audit check enforces it.
+**Why.** Spec §9.1: yolo and `approvals.mode: off` are forbidden by policy, and an audit check enforces it. The Kanban dispatcher would start workers no approval gates.
 
 **Credential.** None: `docker inspect`, and the mounted config's file on the host.
 
-**Fix.** Remove the flag or variable, and restore build/ with `mise run up`. It can come from a changed `stack/compose.yaml` (no secret may use a `HERMES_` name), but this check reads only the container's command line, its environment and the mounted `config.yaml`, never `$HERMES_HOME/.env` (`/opt/data/.env`, on the writable `hermes-data` volume), which Hermes v0.22.5 loads at startup over its environment. A `HERMES_YOLO_MODE` planted there passes this check (H-190), so if you suspect one, read that file's variable names too, never its values: it may hold `API_SERVER_KEY`, which the image's boot hook writes there.
+**Fix.** Remove the flag or variable, and restore build/ with `mise run up`. It can come from a changed `stack/compose.yaml` (no secret may use a `HERMES_` name), but this check reads only the container's command line, its environment and the mounted `config.yaml`, never `$HERMES_HOME/.env` (`/opt/data/.env`, on the writable `hermes-data` volume), which Hermes v0.22.5 loads at startup over its environment. A `HERMES_YOLO_MODE` or `HERMES_KANBAN_DISPATCH_IN_GATEWAY` planted there passes this check (H-190), so if you suspect one, read that file's variable names too, never its values: it may hold `API_SERVER_KEY`, which the image's boot hook writes there.
 
 **Skip.** The stack or hermes isn't running, Docker isn't available, or the mounted config can't be read (run the audit as hapi).
 

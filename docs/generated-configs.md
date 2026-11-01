@@ -89,6 +89,7 @@ Hermes runs as the coordinator (spec §9.1). These are the "defaults to flip on 
 | `delegation.provider`, `delegation.model` | `anthropic`, `claude-haiku-5-5` | Subagents run on Haiku 5.5 (spec §9.1). |
 | `delegation.subagent_auto_approve` | `false` | A subagent's dangerous command is denied, never auto-approved (a child could otherwise write AGENTS.md with no human; `hermes_plugins.md`, issue #120000). Hermes's default, pinned. |
 | `cron.model_provider`, `cron.model` | `anthropic`, `claude-haiku-5-5` | Cron jobs run on Haiku 5.5 (spec §9.1). |
+| `kanban.dispatch_in_gateway`, `kanban.dispatch_profiles`, `kanban.auto_decompose`, `kanban.review_dispatch` | `false`, `[]`, `false`, `false` | Hermes's Kanban dispatcher stays off. By default it runs in the gateway and, every 60 s, spawns `hermes -p <assignee>` for each ready card: a worker with full file and terminal access and no approval step. It also decomposes triage cards and spawns a review profile. `dispatch_profiles: []` claims no card; only an omitted key means any profile. The board's notifications stay on, so a card can still wake the thread it came from (`website/docs/user-guide/features/kanban.md` at v0.22.5). The audit's `runtime.hermes-no-yolo` checks all four, and `HERMES_KANBAN_DISPATCH_IN_GATEWAY` in the env. |
 | `hooks_auto_accept` | `false` | A new shell hook needs a one-time consent prompt; nothing registers silently (spec §9.1). |
 
 ### MCP servers (`mcp_servers`)
