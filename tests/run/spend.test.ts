@@ -21,10 +21,19 @@ function outDir(files: Record<string, string>): string {
 const spend = (cost: unknown, rule = "spend", extra: Record<string, unknown> = {}) => JSON.stringify({ event: "budget", decision: "allow", rule, reason: "the run's spend so far", cost_usd: cost, ...extra });
 const result = (total: unknown) => JSON.stringify({ run: { status: "completed", metadata: { total_cost_usd: total } } });
 
-test("spendOfRun takes the guard's last spend record, then Archon's total_cost_usd, and otherwise counts the run at its full budget, unknown (H-229)", () => {
-  // The guard's last spend record wins over Archon's total, and a line that isn't JSON is skipped.
+test("spendOfRun takes the higher of the guard's last total and Archon's total_cost_usd, is unknown when the guard's ledger falls, and otherwise counts the run at its full budget, unknown (H-229)", () => {
+  // Both: the higher, since each misses costs the other sees; a line that isn't JSON is skipped.
   const both = outDir({ "decisions.jsonl": [spend(0.1), spend(0.25), "{not json", ""].join("\n"), "result.json": result(0.5) });
-  expect(spendOfRun(both, 3)).toEqual({ usd: 0.25, known: true });
+  expect(spendOfRun(both, 3)).toEqual({ usd: 0.5, known: true });
+  expect(spendOfRun(outDir({ "decisions.jsonl": spend(0.75), "result.json": result(0.5) }), 3)).toEqual({ usd: 0.75, known: true });
+  // The guard's alone: the paid check's Run B, where Archon recorded no cost.
+  expect(spendOfRun(outDir({ "decisions.jsonl": `${spend(0.0002)}\n${spend(0.0005)}\n`, "result.json": JSON.stringify({ run: { metadata: {} } }) }), 3)).toEqual({ usd: 0.0005, known: true });
+  // A ledger that falls has a line the run wrote: an honest ledger is cumulative. One low line appended to a ledger
+  // of 2.75, beside Archon's 2.90, would have undercounted the run; the spend is unknown, at the whole budget.
+  const forged = outDir({ "decisions.jsonl": [spend(1.5), spend(2.75), spend(0.01)].join("\n"), "result.json": result(2.9) });
+  expect(spendOfRun(forged, 3)).toEqual({ usd: 3, known: false });
+  // A total that only repeats (a hard stop's run-budget record after its spend record) doesn't fall.
+  expect(spendOfRun(outDir({ "decisions.jsonl": [spend(1), spend(1, "run-budget")].join("\n") }), 3)).toEqual({ usd: 1, known: true });
   // A hard stop's run-budget record carries the run's total too.
   const stopped = outDir({ "decisions.jsonl": [spend(0.9), JSON.stringify({ event: "budget", decision: "fail", rule: "run-budget", cost_usd: 1 })].join("\n") });
   expect(spendOfRun(stopped, 3)).toEqual({ usd: 1, known: true });

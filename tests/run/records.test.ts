@@ -87,6 +87,20 @@ describe("readRecord", () => {
     }
     expect((await readRecord(written({ ...base, retry: 0 }), "aaaaaaaaaaaa"))!.retry).toBe(0);
   });
+
+  test("a record whose budget or spend isn't a finite number of at least 0, or whose round or turns isn't a whole number of at least 0, is not one hapi wrote", async () => {
+    // JSON has no NaN or Infinity: JSON.stringify writes them as null.
+    const bad: [string, unknown][] = [
+      ["budgetUsd", -1], ["budgetUsd", Number.NaN], ["budgetUsd", "3"], ["spendUsd", -0.1], ["spendUsd", Number.POSITIVE_INFINITY],
+      ["round", -1], ["round", 1.5], ["turns", -1], ["turns", 2.5], ["turns", "2"],
+    ];
+    for (const [field, value] of bad) {
+      const e = await caught(readRecord(written({ ...base, [field]: value }), "aaaaaaaaaaaa"));
+      expect([field, value, e.message]).toEqual([field, value, expect.stringContaining("is not a run record hapi wrote")]);
+    }
+    const good = { ...base, budgetUsd: 0, spendUsd: 0.42, round: 1, turns: 0 };
+    expect(await readRecord(written(good), "aaaaaaaaaaaa")).toEqual(good as RunRecord);
+  });
 });
 
 describe("keyProblem", () => {

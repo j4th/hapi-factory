@@ -6,7 +6,7 @@ workflow: hapi-check-guard
 risk: low
 roles:
   implement: small
-  review: medium   # a claude tier: startRun refuses a review on a pi tier (ruling m16)
+  review: small
 budget: { usd: 0.01, turns: 5, minutes: 5 }
 pieces:
   - id: check-guard

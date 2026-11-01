@@ -442,7 +442,7 @@ export async function stackDown(args: string[], deps: StackDeps = {}): Promise<n
       // Never wait: a finalize copying a run out holds the lock for minutes, and kill switch 3 takes seconds.
       const why = env.XDG_RUNTIME_DIR ? (e as Error).message.replace(/\s+/g, " ").trim() : "XDG_RUNTIME_DIR is not set, and the lock is on its tmpfs";
       console.error(
-        `hapi stack down: could not take the run disk's lock (${why}): removing the runs but leaving their volumes, which the run's finalize or the next reap removes (H-210)`,
+        `hapi stack down: could not take the run disk's lock (${why}): removing the runs but leaving their volumes, and their dirs on the run disk: a finalize copying its run out removes that run's own, and the rest stay until a \`mise run down\` that takes the lock, so run it again once the lock is free (H-209, H-210)`,
       );
       try {
         await removeRuns(PROJECT, run, env, { volumes: false });

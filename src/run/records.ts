@@ -81,7 +81,7 @@ export interface RunRecord {
   policyHash?: string;
   /** The engine's pass of the work order: 0 on the first, n after the n-th `hapi retry`. A hand run has none (its `--retry-of` is `retryOf`). */
   retry?: number;
-  /** The turns the run took, its guard's count (./spend.ts `turnsOfRun`), written at finalize when known. */
+  /** The turns the run took (its guard's count, ./spend.ts `turnsOfRun`), written at finalize when known. Not run.json's `turns`, which is the run's turn budget. */
   turns?: number;
   /** The model the run's alias names in its roster: `@implement`'s for a worker or fix, `@review`'s for a review; none for a verify, which runs no model. */
   model?: string;
@@ -122,12 +122,20 @@ export function keyPart(kind: RunKind, round: number, retry?: number): string | 
 
 export const recordDir = (stateDir: string, runId: string): string => join(stateDir, runId);
 
-/** `x` as a record of run `runId`, or undefined if it isn't one: a kind that is no run kind, or a retry that isn't a whole number of at least 0, isn't. */
+/** An optional amount: absent, or a finite number of at least 0. */
+const amount = (v: unknown) => v === undefined || (typeof v === "number" && Number.isFinite(v) && v >= 0);
+/** An optional count: absent, or a whole number of at least 0. */
+const count = (v: unknown) => v === undefined || (typeof v === "number" && Number.isInteger(v) && v >= 0);
+
+/**
+ * `x` as a record of run `runId`, or undefined if it isn't one: a kind that is no run kind, a budget or spend that
+ * isn't a finite number of at least 0, or a round, turns or retry that isn't a whole number of at least 0, isn't.
+ */
 function asRecord(x: unknown, runId: string): RunRecord | undefined {
   const r = x as Partial<RunRecord> | null;
   if (r === null || typeof r !== "object" || r.runId !== runId || !STATUSES.includes(r.status as RunStatus)) return undefined;
   if (r.kind !== undefined && !RUN_KINDS.includes(r.kind)) return undefined;
-  if (r.retry !== undefined && !(Number.isInteger(r.retry) && r.retry >= 0)) return undefined;
+  if (![r.budgetUsd, r.spendUsd].every(amount) || ![r.round, r.turns, r.retry].every(count)) return undefined;
   const text = [r.key, r.project, r.repo, r.sha, r.workOrder, r.workflow, r.container, r.network, r.startedAt, r.deadline, r.volumes?.work, r.volumes?.out];
   return text.every((t) => typeof t === "string") ? (r as RunRecord) : undefined;
 }

@@ -73,7 +73,7 @@ export interface RunFile {
   kind?: RunKind;
   /** The run's round: 0 for the worker, n for the n-th fix round. */
   round?: number;
-  /** The run's turn budget: the work order's budget.turns, at most `runs.phases.round_turns` for a fix. */
+  /** The run's turn budget, what the guard holds it to: the work order's budget.turns, at most `runs.phases.round_turns` for a fix. Not the record's `turns`, which are the turns the run took. */
   turns?: number;
   /** The work order's base commit, the one its worker run started from (Task 11's CodeRabbit node: `jq -r .base /run/hapi/run.json`). */
   base?: string;

@@ -15,11 +15,11 @@ import { main } from "../../src/cli";
 import { emitPi } from "../../src/generate/pi";
 import { loadPolicy } from "../../src/policy/load";
 import { applyOverlay } from "../../src/policy/overlay";
-import type { Policy, RepoOverlay, Roster } from "../../src/policy/types";
+import type { Policy, RepoOverlay, Tier } from "../../src/policy/types";
 import { runDeps, START_USAGE } from "../../src/run/cli";
 import { COPY_SCRIPT, HELPER_HOST_TIMEOUT_S, HELPER_KILL_AFTER_S, HELPER_TIMEOUT_S, LIST_SCRIPT, OUTPUT_FILES } from "../../src/run/copyout";
 import { CLEAN_SCRIPT, GIB, volumeDir } from "../../src/run/disk";
-import { CODERABBIT_CLI_TIMEOUT_S, type RunKind } from "../../src/run/kinds";
+import type { RunKind } from "../../src/run/kinds";
 import {
   bundleProblem, FINALIZE_WAIT_S, finalizeRun, guardProblems, LOGS_SCRIPT, reapRuns, rolesProblem, runStart, runStop, runSupervise, type StartOptions, startRun,
 } from "../../src/run/lifecycle";
@@ -494,19 +494,37 @@ describe("startRun", () => {
     }
   });
 
-  test("startRun also refuses a role on the wrong provider for its roster (m16), a bad round, kind or budget, a parent it can't take, and an inputs dir, naming each, before anything is made", async () => {
+  test("startRun also refuses a role its kind can't run on the roster (m16), a bad round, kind or budget, a parent it can't take, and an inputs dir, naming each, before anything is made", async () => {
     capture();
     const seeded = (o: Partial<Parameters<typeof seedRun>[1]> = {}) => (a: Api) => seedRun(a.f, { id: P, status: "succeeded", objects: false, ...o });
+    const onRoster = (roster: string) => async (a: Api) => {
+      await seeded()(a);
+      writeFileSync(join(a.f.deps.buildDir, "roster"), `${roster}\n`);
+    };
+    const roles = (a: Api, implement: Tier, review: Tier) => ({ workOrder: { ...a.order, roles: { implement, review } } });
     const cases: [what: string, over: (a: Api) => Partial<StartOptions>, text: string, setup?: (a: Api) => unknown][] = [
       [
-        "implement on a claude tier",
-        (a) => ({ workOrder: { ...a.order, roles: { implement: "medium", review: "medium" } } }),
+        "a worker's implement on a claude tier",
+        (a) => roles(a, "medium", "medium"),
         "the work order's roles.implement is medium, a claude tier in the anthropic roster: implement runs on Pi, so it must name a pi tier",
       ],
       [
-        "review on a pi tier",
-        (a) => ({ workOrder: { ...a.order, roles: { implement: "small", review: "small" } } }),
+        "a review on a pi tier",
+        (a) => ({ ...roles(a, "small", "small"), kind: "review", parent: P }),
         "the work order's roles.review is small, a pi tier in the anthropic roster: the review runs in Claude Code, so it must name a claude tier",
+        seeded(),
+      ],
+      [
+        "a review on the portable roster, which has no claude tier",
+        (a) => ({ ...roles(a, "large", "medium"), kind: "review", parent: P }),
+        "the work order's roles.review is medium, a pi tier in the portable roster: the review runs in Claude Code, so it must name a claude tier",
+        onRoster("portable"),
+      ],
+      [
+        "a review on the budget roster, whose claude tier runs implement's model",
+        (a) => ({ ...roles(a, "small", "medium"), kind: "review", parent: P }),
+        "the work order's roles.review is medium, whose model in the budget roster, claude-haiku-5-5, is roles.implement's (small) too: a review must run on another model than the work it reviews",
+        onRoster("budget"),
       ],
       ["a round of -1", () => ({ round: -1 }), "the run's round -1 is not a whole number of at least 0"],
       ["a round of 0.5", () => ({ round: 0.5 }), "the run's round 0.5 is not a whole number of at least 0"],
@@ -523,7 +541,7 @@ describe("startRun", () => {
       ["a parent that isn't a run id", () => ({ kind: "fix", parent: "../x" }), 'the parent run "../x" is not a run id: twelve lower-case hex digits'],
       [
         "a parent of another work order",
-        () => ({ kind: "review", parent: P }),
+        () => ({ kind: "fix", parent: P }),
         `the parent run ${P} is a run of work order 0099-other, not of 0003-check-run`,
         seeded({ workOrder: "0099-other" }),
       ],
@@ -547,15 +565,51 @@ describe("startRun", () => {
     }
   });
 
-  test("rolesProblem holds implement to a pi tier and review to a claude one, in the run's roster (m16)", () => {
-    const r: Roster = POLICY.rosters.anthropic;
-    expect(rolesProblem({ implement: "small", review: "medium" }, r, "anthropic")).toBeUndefined();
-    expect(rolesProblem({ implement: "large", review: "medium" }, r, "anthropic")).toBeUndefined();
-    expect(rolesProblem({ implement: "large", review: "large" }, r, "anthropic")).toBe(
+  test("rolesProblem, per kind (m16): a worker's implement on a pi tier; a review's on a claude tier whose model isn't implement's; no check for verify or fix", () => {
+    const { anthropic, budget, portable } = POLICY.rosters;
+    // A worker is checked for implement alone: review: small (a pi tier) passes, and so does every roster's pi tier.
+    expect(rolesProblem("worker", { implement: "small", review: "small" }, anthropic, "anthropic")).toBeUndefined();
+    for (const [roster, name] of [[anthropic, "anthropic"], [budget, "budget"], [portable, "portable"]] as const) {
+      expect([name, rolesProblem("worker", { implement: "large", review: "small" }, roster, name)]).toEqual([name, undefined]);
+    }
+    expect(rolesProblem("worker", { implement: "medium", review: "small" }, anthropic, "anthropic")).toContain("roles.implement is medium, a claude tier");
+    // A review: a claude tier, on another model than implement's (the vendor dropped: anthropic/claude-haiku-5-5 is claude-haiku-5-5).
+    expect(rolesProblem("review", { implement: "small", review: "medium" }, anthropic, "anthropic")).toBeUndefined();
+    expect(rolesProblem("review", { implement: "large", review: "medium" }, anthropic, "anthropic")).toBeUndefined();
+    expect(rolesProblem("review", { implement: "large", review: "large" }, anthropic, "anthropic")).toBe(
       "the work order's roles.review is large, a pi tier in the anthropic roster: the review runs in Claude Code, so it must name a claude tier",
     );
-    // The portable roster runs every tier on Pi, so no work order can name a claude tier for its review there.
-    for (const review of ["small", "medium", "large"] as const) expect(rolesProblem({ implement: "large", review }, POLICY.rosters.portable, "portable")).toContain("a pi tier in the portable roster");
+    expect(rolesProblem("review", { implement: "large", review: "medium" }, budget, "budget")).toBe(
+      "the work order's roles.review is medium, whose model in the budget roster, claude-haiku-5-5, is roles.implement's (large) too: a review must run on another model than the work it reviews",
+    );
+    // So no review runs on portable (no claude tier) or budget (Haiku on every tier) yet (H-249).
+    for (const review of ["small", "medium", "large"] as const) expect(rolesProblem("review", { implement: "large", review }, portable, "portable")).toContain("a pi tier in the portable roster");
+    for (const implement of ["small", "large"] as const) expect(rolesProblem("review", { implement, review: "medium" }, budget, "budget")).toContain("is roles.implement's");
+    // A verify runs no model, and a fix runs implement's, which its worker was checked for.
+    for (const kind of ["verify", "fix"] as const) expect([kind, rolesProblem(kind, { implement: "medium", review: "small" }, portable, "portable")]).toEqual([kind, undefined]);
+  });
+
+  test("a worker starts on the portable roster, whatever its review tier: only a review needs a claude tier", async () => {
+    capture();
+    const { f, base } = api();
+    writeFileSync(join(f.deps.buildDir, "roster"), "portable\n");
+    const rec = await startRun(f.deps, base());
+    expect([rec.roster, rec.model]).toEqual(["portable", POLICY.rosters.portable.small.model]);
+  });
+
+  test("under a soft run disk, startRun returns the warning on its result and prints nothing; the record holds no warning", async () => {
+    const { out, err } = capture();
+    const { f, base } = api({ disk: { bytes: 64 * GIB }, runs: { disk: { gb: 20, enforcement: "soft" } } });
+    const rec = await startRun(f.deps, base());
+    expect(rec.warnings).toEqual([
+      `the run disk ${f.deps.diskDir} is 64.0 GB, more than runs.disk.gb (20): it would let a run grow past its cap; runs.disk.enforcement is soft, so the run starts anyway`,
+    ]);
+    expect([out, err]).toEqual([[], []]);
+    const { warnings: _, ...written } = rec;
+    expect(await readRecord(f.deps.stateDir, rec.runId)).toEqual(written);
+    // With no warning there is no `warnings` key at all.
+    const g = api();
+    expect(Object.hasOwn(await startRun(g.f.deps, g.base()), "warnings")).toBe(false);
   });
 
   test("a held start lock throws an error lockHeld recognizes, so the poller tries again next tick", async () => {
@@ -613,7 +667,7 @@ describe("startRun", () => {
     expect(runJson(f, rec.runId)).toMatchObject({ kind: "fix", round: 1, turns: Math.min(long.budget.turns, ph.round_turns), base: SHA2, budget_usd: Math.min(3, ph.round_usd) });
   });
 
-  test("a verify run takes a budget of 0 and names no model; a review run names review's, and its deadline covers the CodeRabbit CLI when phases.coderabbit is on (m17, m18, m20)", async () => {
+  test("a verify run takes a budget of 0 and names no model; a review run names review's; every kind's deadline is its work order's budget.minutes, CodeRabbit on or not (m18, m20)", async () => {
     capture();
     const minutes = (m: number) => new Date(NOW.getTime() + m * 60_000).toISOString();
     const v = api();
@@ -621,20 +675,14 @@ describe("startRun", () => {
     const verify = await startRun(v.f.deps, v.base({ kind: "verify", parent: P, budgetUsd: 0 }));
     expect([verify.budgetUsd, verify.model, verify.key, verify.deadline]).toEqual([0, undefined, runKey("0003-check-run", SHA, "verify:0"), minutes(30)]);
     expect(runJson(v.f, verify.runId)).toMatchObject({ kind: "verify", budget_usd: 0, turns: 10 });
-    // A review with phases.coderabbit off (the central default) has the work order's minutes.
-    const r = api();
-    await seedRun(r.f, { id: P, status: "succeeded", objects: false });
-    const review = await startRun(r.f.deps, r.base({ kind: "review", parent: P }));
-    expect([review.model, review.deadline]).toEqual([POLICY.rosters.anthropic[r.order.roles.review].model, minutes(30)]);
-    // Switched on by the overlay, the review's deadline adds the CLI's own timeout, so the supervisor never stops the CLI's step.
-    const c = api();
-    await seedRun(c.f, { id: P, status: "succeeded", objects: false });
-    const on = await startRun(c.f.deps, c.base({ kind: "review", parent: P, overlay: { runs: { phases: { coderabbit: true } } } }));
-    expect(CODERABBIT_CLI_TIMEOUT_S).toBe(1800);
-    expect(on.deadline).toBe(minutes(30 + CODERABBIT_CLI_TIMEOUT_S / 60));
-    // A worker's deadline is its minutes either way.
-    const w = api();
-    expect((await startRun(w.f.deps, w.base({ overlay: { runs: { phases: { coderabbit: true } } } }))).deadline).toBe(minutes(30));
+    // A review, on a claude tier with another model than implement's: with phases.coderabbit on too, its deadline is still the work order's minutes.
+    for (const overlay of [undefined, { runs: { phases: { coderabbit: true } } }]) {
+      const r = api();
+      await seedRun(r.f, { id: P, status: "succeeded", objects: false });
+      const reviewed = { ...r.order, roles: { implement: "small" as const, review: "medium" as const } };
+      const review = await startRun(r.f.deps, r.base({ workOrder: reviewed, kind: "review", parent: P, ...(overlay === undefined ? {} : { overlay }) }));
+      expect([review.model, review.deadline]).toEqual([POLICY.rosters.anthropic.medium.model, minutes(30)]);
+    }
   });
 
   test("an engine pass never meets a hand run's key, and a retry's worker starts beside a succeeded worker of the same commit", async () => {
@@ -759,6 +807,17 @@ describe("hapi run supervise", () => {
     expect((await readRecord(f.deps.stateDir, ID))!.status).toBe("timed-out");
   });
 
+  test("a supervisor at the deadline of a run whose container was removed around hapi still records timed-out: the no-container refusal is `stop`'s alone (H-218)", async () => {
+    capture();
+    const f = fakeRun();
+    await seedRun(f, { id: ID, deadline: new Date(NOW.getTime() - 1000).toISOString(), outputs: completedOutputs() });
+    f.world.containers.delete(N);
+    expect(await runSupervise([ID], f.deps)).toBe(0);
+    const rec = (await readRecord(f.deps.stateDir, ID))!;
+    expect([rec.status, rec.stopRequested]).toEqual(["timed-out", "timed-out"]);
+    expect(rec.reason).toContain("the run's container was removed before the run was finalized");
+  });
+
   test("supervise of a run that has ended does nothing", async () => {
     capture();
     const f = fakeRun();
@@ -855,7 +914,7 @@ describe("finalizeRun", () => {
     f.world.containers.delete(N);
     const done = await finalizeRun(rec, f.deps);
     const REMOVED = "the run's container was removed before the run was finalized (`mise run down`, or a cleanup): nothing was copied out";
-    const KEPT = `the run's volumes ${N}-work and ${N}-out were kept, since nothing was copied out (H-209)`;
+    const KEPT = `the finalize left the run's volumes ${N}-work and ${N}-out in place, since nothing was copied out (H-209)`;
     expect([done.status, done.reason]).toEqual(["failed", `${REMOVED}; ${KEPT}`]);
     // The copy-out half: no volume is inspected or mounted, and nothing is copied.
     const helpers = f.calls.filter((c) => unbounded(c.cmd)[1] === "run");
@@ -888,10 +947,19 @@ describe("finalizeRun", () => {
     });
     const done = await finalizeRun(await seedRun(f, { id: ID, running: false, outputs: completedOutputs() }), f.deps);
     expect([done.status, atRemoval]).toEqual(["succeeded", "succeeded"]);
-    // A removal that fails writes the record again, with the cleanup's reason.
-    const g = fakeRun({ failing: [`docker network rm ${N}`] });
+    // A removal that fails adds the cleanup's reason to the record as it then is: a write made meanwhile (a harvester's harvestedAt, say) stays.
+    let g!: ReturnType<typeof fakeRun>;
+    const HARVESTED = "2026-10-29T12:05:00.000Z";
+    g = fakeRun({
+      failing: [`docker network rm ${N}`],
+      onCall: (cmd) => {
+        if (cmd.join(" ") !== `docker network rm ${N}`) return;
+        const file = join(g.deps.stateDir, ID, "record.json");
+        writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, "utf8")), harvestedAt: HARVESTED }));
+      },
+    });
     const left = await finalizeRun(await seedRun(g, { id: ID, running: false, outputs: completedOutputs() }), g.deps);
-    expect([left.status, left.reason?.startsWith("cleanup left run objects behind: ")]).toEqual(["succeeded", true]);
+    expect([left.status, left.harvestedAt, left.reason?.startsWith("cleanup left run objects behind: ")]).toEqual(["succeeded", HARVESTED, true]);
     expect(await readRecord(g.deps.stateDir, ID)).toEqual(left);
   });
 

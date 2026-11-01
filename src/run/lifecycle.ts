@@ -21,14 +21,16 @@
  * 4. the run's kind, round, budget (it may only lower the work order's
  *    budget.usd) and retry, each in range;
  * 5. the run disk against `runs.disk` (`diskProblem`, ./disk.ts: refused under
- *    `hard`, a warning under `soft`; H-217);
+ *    `hard`; under `soft` a warning, which startRun returns on its result for
+ *    the caller to show; H-217);
  * 6. the archon zone's env file (missing: run `mise run up`);
  * 7. the source (`sourceGitDir`);
  * 8. the commit: a commit id, which the source holds (host git with no config);
  * 9. the roster `build/roster` names (`readRoster`, ./spec.ts);
  * 10. the policy, with the repo's overlay applied (H-172): the work order's roles
- *     against the roster (`rolesProblem`: implement on a pi tier, review on a
- *     claude one; ruling m16), and the budget against its kind's cap
+ *     against the roster, for the run's kind (`rolesProblem`, ruling m16: a
+ *     worker's implement on a pi tier; a review's on a claude tier, with
+ *     another model than implement's), and the budget against its kind's cap
  *     (`runs.phases.round_usd` for every kind but `worker`);
  * 11. the parent, for every kind but `worker`: the work order's worker run, whose
  *     sha is the run's base commit (`RunFile.base`);
@@ -63,15 +65,15 @@
  * the source's HEAD, the task.md beside the work order and the repo's overlay
  * at that commit (`.factory/config.yaml`, design §3.5), then calls `startRun`
  * as a worker with no retry, a hand run: Plan 02's two-part key, which the
- * poller never takes as its own. It prints the run id and returns at once.
+ * poller never takes as its own. It prints startRun's warnings, then the run
+ * id, and returns at once.
  *
  * `supervise` waits for the container (`docker wait` under a host `timeout` to
- * the run's deadline: the work order's budget.minutes, plus the CodeRabbit
- * CLI's own bound for a review with `runs.phases.coderabbit` on, ruling m17),
- * stops it at the deadline, then finalizes. `stop` stops one run. Either
- * records why it is stopping before it stops the container (`stopRequested`),
- * so whichever process finalizes records it, and neither stops a run that has
- * no container yet (H-218: its start may still be making it). The operator's
+ * the run's deadline, the work order's budget.minutes from its start, for
+ * every kind), stops it at the deadline, then finalizes. `stop` stops one run,
+ * but not one that has no container yet (H-218: its start may still be making
+ * it). Either records why it is stopping before it stops the container
+ * (`stopRequested`), so whichever process finalizes records it. The operator's
  * stop outranks the deadline: "stopped" replaces an earlier "timed-out" while
  * the run is live, never the reverse. The stop grace is `STOP_GRACE_S`.
  *
@@ -87,14 +89,16 @@
  * write the record, with the run's spend and turns when they are known
  * (./spend.ts), before anything is removed, so a finalizer that dies next
  * leaves the outcome (H-219); then remove every object of the run, empty and
- * remove its volumes' dirs on the run disk (`removeVolumeDirs`), and write the
- * record again only if that cleanup fails, with its reason. A run whose
+ * remove its volumes' dirs on the run disk (`removeVolumeDirs`), and, only if
+ * that cleanup fails, add its reason to the record as it then is. A run whose
  * container is gone was removed around hapi (`mise run down`, a cleanup, a
  * prune), so nothing is copied and it fails: a copy-out helper would race a
- * removal of its volumes (`volume is in use`). Its volumes, and their dirs on
- * the run disk, are kept, since nothing was copied out of them (H-209): `mise
- * run down` removes them. A held run disk lock (`down` is removing runs) makes
- * the finalize wait (`finalizeRun`), or a reap leave the run for the next one.
+ * removal of its volumes (`volume is in use`). The finalize leaves its volumes,
+ * and their dirs on the run disk, in place, since nothing was copied out of
+ * them (H-209): a `mise run down` that takes the run disk's lock removes the
+ * volumes, and the next reap their dirs. A held run disk lock (`down` is
+ * removing runs) makes the finalize wait (`finalizeRun`), or a reap leave the
+ * run for the next one.
  *
  * `reapRuns` runs first in `start` and `stop` (`supervise` is spawned by a
  * start that has just reaped): it finalizes a live record whose container has
@@ -122,7 +126,7 @@ import { emitArchon, type RunFile } from "../generate/archon";
 import { emitPi } from "../generate/pi";
 import { loadPolicy, PolicyError } from "../policy/load";
 import { applyOverlay, overlayFromText, PolicyLoosenError } from "../policy/overlay";
-import type { Policy, Provider, RepoOverlay, Roster, RosterName } from "../policy/types";
+import type { Policy, RepoOverlay, Roster, RosterName } from "../policy/types";
 import { ENV_DIR, parseEnvFile, runtimeDir } from "../secrets/files";
 import { composeServices } from "../stack/compose";
 import { currentUserOverride, definedEnv, HAPI_USER, listed, networkProblem, reexec, removeRuns, runCommand, runFilters } from "../stack/up";
@@ -131,7 +135,7 @@ import { parseRunId, parseStart, runDeps, START_USAGE, STOP_USAGE, SUPERVISE_USA
 import { bounded, copyOut, HELPER_HOST_TIMEOUT_S, HELPER_KILL_AFTER_S, OUTPUT_FILES, timedOut } from "./copyout";
 import { diskProblem, dockerDataRoot, removeVolumeDirs, volumeDir } from "./disk";
 import { hardenedGit } from "./git";
-import { CODERABBIT_CLI_TIMEOUT_S, RUN_KINDS, type RunKind } from "./kinds";
+import { RUN_KINDS, type RunKind } from "./kinds";
 import { withStackLock } from "./locks";
 import {
   capacityProblem,
@@ -304,12 +308,12 @@ async function absent(p: string): Promise<boolean> {
   }
 }
 
-/** The run disk against `runs.disk` (H-217): under `hard` a problem refuses the run; under `soft` it is a warning, and the run starts. */
-async function checkRunDisk(d: RunDeps): Promise<void> {
+/** The run disk against `runs.disk` (H-217): under `hard` a problem refuses the run; under `soft` it is the warning returned, and the run starts. */
+async function checkRunDisk(d: RunDeps): Promise<string | undefined> {
   const problem = diskProblem(d.diskDir, d.runs.disk, await dockerDataRoot(d), d.probeFs);
-  if (problem === undefined) return;
+  if (problem === undefined) return undefined;
   if (d.runs.disk.enforcement === "hard") throw new Error(problem);
-  console.error(`hapi run start: warning: ${problem}; runs.disk.enforcement is soft, so the run starts anyway`);
+  return `${problem}; runs.disk.enforcement is soft, so the run starts anyway`;
 }
 
 /** The launcher API's options (`startRun`). */
@@ -346,20 +350,30 @@ const OVERLAY_FILE = ".factory/config.yaml";
 const OVERLAY_LABEL = `the repo's ${OVERLAY_FILE}`;
 const wholeFrom0 = (n: number) => Number.isInteger(n) && n >= 0;
 
+/** A model id without its vendor: a Pi ref's part after its last "/" (`anthropic/claude-haiku-5-5`), or a claude-provider id as it is. */
+const modelName = (model: string) => model.slice(model.lastIndexOf("/") + 1);
+
 /**
- * Why a work order's roles can't run on `roster` (`name`), or undefined (ruling m16): implement runs in the
- * workflows' Pi nodes, so its tier must be a pi one, and the review runs in Claude Code, so its tier must be a claude
- * one. The portable roster runs every tier on Pi, so no work order passes on it.
+ * Why a run of `kind` can't run the work order's roles on `roster` (`name`), or undefined (ruling m16):
+ * - a worker runs implement in the workflows' Pi nodes, so `roles.implement` must name a pi tier;
+ * - a review runs in Claude Code, so `roles.review` must name a claude tier, and one whose model isn't
+ *   implement's (compared without the vendor): a model reviewing its own work is no second opinion;
+ * - a verify runs no model, and a fix runs implement's, which its worker was checked for.
+ * So no review runs on the portable roster (every tier is Pi) or the budget one (every tier is Haiku): H-249.
  */
-export function rolesProblem(roles: WorkOrder["roles"], roster: Roster, name: RosterName): string | undefined {
-  const want: [role: "implement" | "review", provider: Provider, why: string][] = [
-    ["implement", "pi", "implement runs on Pi, so it must name a pi tier"],
-    ["review", "claude", "the review runs in Claude Code, so it must name a claude tier"],
-  ];
-  for (const [role, provider, why] of want) {
-    const tier = roles[role];
-    const has = roster[tier].provider;
-    if (has !== provider) return `the work order's roles.${role} is ${tier}, a ${has} tier in the ${name} roster: ${why}`;
+export function rolesProblem(kind: RunKind, roles: WorkOrder["roles"], roster: Roster, name: RosterName): string | undefined {
+  if (kind === "worker") {
+    const has = roster[roles.implement].provider;
+    return has === "pi" ? undefined : `the work order's roles.implement is ${roles.implement}, a ${has} tier in the ${name} roster: implement runs on Pi, so it must name a pi tier`;
+  }
+  if (kind !== "review") return undefined;
+  const review = roster[roles.review];
+  if (review.provider !== "claude") {
+    return `the work order's roles.review is ${roles.review}, a ${review.provider} tier in the ${name} roster: the review runs in Claude Code, so it must name a claude tier`;
+  }
+  const model = modelName(review.model);
+  if (model === modelName(roster[roles.implement].model)) {
+    return `the work order's roles.review is ${roles.review}, whose model in the ${name} roster, ${model}, is roles.implement's (${roles.implement}) too: a review must run on another model than the work it reviews`;
   }
   return undefined;
 }
@@ -397,11 +411,15 @@ async function parentOf(d: RunDeps, o: StartOptions): Promise<RunRecord> {
   return rec;
 }
 
+/** What startRun returns: the record it wrote, with `warnings` (never written to the record) when the start warned. */
+export type StartedRun = RunRecord & { warnings?: string[] };
+
 /**
- * Start a run: see the module comment for its steps. Returns the record it wrote; throws the refusal's text, or a
- * held lock's error unwrapped (`lockHeld` recognizes it: the poller tries again next tick). Prints nothing.
+ * Start a run: see the module comment for its steps. Returns the record it wrote, with the start's warnings (a soft
+ * run disk's) when there are any; throws the refusal's text, or a held lock's error unwrapped (`lockHeld` recognizes
+ * it: the poller tries again next tick). Prints nothing of its own; its reap says what it reaped, on stderr.
  */
-export async function startRun(d: RunDeps, o: StartOptions): Promise<RunRecord> {
+export async function startRun(d: RunDeps, o: StartOptions): Promise<StartedRun> {
   await reapRuns(d);
   const order = o.workOrder;
   if (order.egress_extra.length > 0) throw new Error("egress_extra isn't supported yet (design §3.1, H-088); remove it or wait for the per-run proxy");
@@ -421,14 +439,14 @@ export async function startRun(d: RunDeps, o: StartOptions): Promise<RunRecord> 
   if (o.retry !== undefined && !wholeFrom0(o.retry)) throw new Error(`the run's retry ${o.retry} is not a whole number of at least 0`);
   if (o.inputsDir !== undefined) throw new Error("a run's inputsDir isn't bound yet: no run kind takes an inputs dir");
   if (o.kind === "worker" && o.parent !== undefined) throw new Error("a worker run takes no parent: it is the work order's first run, and its own base");
-  await checkRunDisk(d);
+  const disk = await checkRunDisk(d);
   const secrets = await archonSecrets(d.env);
   const repo = await sourceGitDir(o.repoGitDir);
   await commitIn(d, repo, o.sha);
   const roster = readRoster(d.buildDir);
   const central = loadPolicy(join(d.root, "policy"));
   const applied = o.overlay === undefined ? central : overlaid(central, o.overlay);
-  const roles = rolesProblem(order.roles, applied.rosters[roster], roster);
+  const roles = rolesProblem(o.kind, order.roles, applied.rosters[roster], roster);
   if (roles !== undefined) throw new Error(roles);
   const phases = applied.runs.phases;
   // A worker may spend the work order's budget; every later kind one round's, at most (design §3.9).
@@ -455,14 +473,12 @@ export async function startRun(d: RunDeps, o: StartOptions): Promise<RunRecord> 
   const inputs: RunInputs = { runId, repo, sha: o.sha, workOrder: order, public: o.public, budgetUsd, packDir: d.packDir };
   const argv = runArgs(service, inputs, d, Object.keys(secrets));
   const started = d.now();
-  // A review's CodeRabbit step has a bound of its own, after the review node's: the deadline covers both (ruling m17).
-  const allowedMs = order.budget.minutes * 60_000 + (o.kind === "review" && phases.coderabbit ? CODERABBIT_CLI_TIMEOUT_S * 1000 : 0);
   const name = runName(d.project, runId);
   const alias = o.kind === "verify" ? undefined : o.kind === "review" ? order.roles.review : order.roles.implement;
   const rec: RunRecord = {
     runId, key: runKey(order.id, o.sha, keyPart(o.kind, round, o.retry)), project: d.project, repo, sha: o.sha, workOrder: order.id, workflow: order.workflow,
     container: name, network: name, volumes: { work: `${name}-work`, out: `${name}-out` },
-    startedAt: started.toISOString(), deadline: new Date(started.getTime() + allowedMs).toISOString(), status: "live",
+    startedAt: started.toISOString(), deadline: new Date(started.getTime() + order.budget.minutes * 60_000).toISOString(), status: "live",
     ...(o.retryOf === undefined ? {} : { retryOf: o.retryOf }),
     kind: o.kind,
     ...(o.parent === undefined ? {} : { parent: o.parent }),
@@ -498,7 +514,7 @@ export async function startRun(d: RunDeps, o: StartOptions): Promise<RunRecord> 
       throw new Error(`${(e as Error).message}. ${cleanup}`);
     }
   });
-  return rec;
+  return disk === undefined ? rec : { ...rec, warnings: [disk] };
 }
 
 /** The task.md beside the work-order file `orderFile`, or undefined when there is none. */
@@ -574,6 +590,7 @@ export async function runStart(args: string[], deps: Partial<RunDeps> = {}): Pro
       ...(opts.retryOf === undefined ? {} : { retryOf: opts.retryOf }),
       ...(overlay === undefined ? {} : { overlay }),
     });
+    for (const w of rec.warnings ?? []) console.error(`hapi run start: warning: ${w}`);
     console.log(rec.runId);
     return 0;
   });
@@ -582,14 +599,9 @@ export async function runStart(args: string[], deps: Partial<RunDeps> = {}): Pro
 /**
  * Record why run `rec` is being stopped, then stop its container with `STOP_GRACE_S`. The first reason stays, but
  * the operator's stop outranks the deadline: "stopped" replaces "timed-out" while the run is live, and "timed-out"
- * never replaces "stopped". A run with no container yet is refused before its lock is taken (H-218): its start may
- * still be making it, and a stop recorded there would leave start's container running. A stop that fails is an error
- * only if the container still runs.
+ * never replaces "stopped". A stop that fails is an error only if the container still runs.
  */
 async function requestStop(d: RunDeps, rec: RunRecord, why: NonNullable<RunRecord["stopRequested"]>): Promise<void> {
-  if (!(await containerExists(d, rec.runId))) {
-    throw new Error(`run ${rec.runId} has no container yet: its start may still be making it, so wait and stop it again; a container removed around hapi is reaped by the next \`hapi run\` command`);
-  }
   await withRunLock(d, rec.runId, async () => {
     const disk = await readRecord(d.stateDir, rec.runId);
     if (disk?.status === "live" && (disk.stopRequested === undefined || (why === "stopped" && disk.stopRequested === "timed-out"))) {
@@ -782,8 +794,9 @@ async function finalizeLocked(rec: RunRecord, d: RunDeps): Promise<RunRecord> {
   }
   reasons.push(...problems);
   // Nothing was copied out of a run whose container was gone, and an exited run's outputs may still be in its volumes,
-  // so they stay, with their dirs on the run disk (H-209): `mise run down` removes them.
-  if (gone) reasons.push(`the run's volumes ${disk.volumes.work} and ${disk.volumes.out} were kept, since nothing was copied out (H-209)`);
+  // so the finalize leaves them, with their dirs on the run disk (H-209): a `mise run down` that takes the run disk's
+  // lock removes the volumes, and the next reap their dirs.
+  if (gone) reasons.push(`the finalize left the run's volumes ${disk.volumes.work} and ${disk.volumes.out} in place, since nothing was copied out (H-209)`);
   const spend = spendOfRun(out, disk.budgetUsd ?? 0);
   const turns = await turnsOfRun(out);
   const done: RunRecord = {
@@ -812,7 +825,9 @@ async function finalizeLocked(rec: RunRecord, d: RunDeps): Promise<RunRecord> {
     cleanup.push(`cleanup left run objects behind: ${(e as Error).message}; \`mise run down\` removes them`);
   }
   if (cleanup.length === 0) return done;
-  const left: RunRecord = { ...done, reason: [...reasons, ...cleanup].join("; ") };
+  // The record as it is now, which another writer may have changed since the outcome was written, with the cleanup's reason added.
+  const now = (await readRecord(d.stateDir, disk.runId)) ?? done;
+  const left: RunRecord = { ...now, reason: [...(now.reason === undefined ? [] : [now.reason]), ...cleanup].join("; ") };
   await writeRecord(d.stateDir, left);
   return left;
 }
@@ -968,6 +983,12 @@ export async function runStop(args: string[], deps: Partial<RunDeps> = {}): Prom
     if (rec.status !== "live") {
       console.log(`run ${id} has already ended: ${rec.status}`);
       return 0;
+    }
+    // A live record with no container is a start between its record and its `docker run` (H-218): the reap above
+    // couldn't take start's lock, and a stop recorded now would leave start's container running. The deadline's
+    // stops (the supervisor's, the reap's) don't come here: theirs is a container that exists, or one that was removed.
+    if (!(await containerExists(d, id))) {
+      throw new Error(`run ${id} has no container yet: its start may still be making it, so wait and stop it again; a container removed around hapi is reaped by the next \`hapi run\` command`);
     }
     await requestStop(d, rec, "stopped");
     console.log(ended(await finalizeRun(rec, d)));

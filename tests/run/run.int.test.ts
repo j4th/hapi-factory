@@ -430,7 +430,7 @@ describe.skipIf(!INT || !ONLINE)("hapi run on a real Docker (a throwaway project
     const N = runName(p.name, r.id);
     expect([done.status, done.reason]).toEqual([
       "failed",
-      `the run's container was removed before the run was finalized (\`mise run down\`, or a cleanup): nothing was copied out; the run's volumes ${N}-work and ${N}-out were kept, since nothing was copied out (H-209)`,
+      `the run's container was removed before the run was finalized (\`mise run down\`, or a cleanup): nothing was copied out; the finalize left the run's volumes ${N}-work and ${N}-out in place, since nothing was copied out (H-209)`,
     ]);
     expect(await objectsOf(r.id)).toEqual([]);
     // The finalize removed neither the volumes nor their dirs (H-209); the cleanup had removed the volumes, so the next reap's sweep removes the dirs.

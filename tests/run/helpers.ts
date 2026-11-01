@@ -388,8 +388,7 @@ export function writeOrder(tmp: string, over: Record<string, unknown> = {}, name
     lane: "direct",
     workflow: "hapi-check-run",
     risk: "low",
-    // On the anthropic and budget rosters: small is a pi tier (implement runs on Pi), medium a claude one (the review runs in Claude Code).
-    roles: { implement: "small", review: "medium" },
+    roles: { implement: "small", review: "small" },
     budget: { usd: 3, turns: 10, minutes: 30 },
     pieces: [{ id: "check", files: ["README.md"], size: "small" }],
     verify: { smoke: false },

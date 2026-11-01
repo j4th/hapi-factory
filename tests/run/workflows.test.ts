@@ -139,12 +139,12 @@ describe("the check work orders", () => {
     expect(c.budget).toEqual(a.budget);
   });
 
-  test("each check work order, and the run integration test's, names a pi tier for implement and a claude tier for review on the anthropic and budget rosters, so a hand run of it starts (ruling m16)", () => {
+  test("each check work order, and the run integration test's, runs as a worker on every roster: its implement names a pi tier (ruling m16)", () => {
     const p = loadPolicy(join(REPO, "policy"));
     const files = ["archon/checks/work-order.yaml", "archon/checks/work-order-budget.yaml", "archon/checks/work-order-private.yaml", "tests/fixtures/order-0003-check.yaml"];
     for (const file of files) {
       const o = loadWorkOrder(join(REPO, file));
-      for (const roster of ["anthropic", "budget"] as const) expect([file, roster, rolesProblem(o.roles, p.rosters[roster], roster)]).toEqual([file, roster, undefined]);
+      for (const roster of ["anthropic", "budget", "portable"] as const) expect([file, roster, rolesProblem("worker", o.roles, p.rosters[roster], roster)]).toEqual([file, roster, undefined]);
     }
   });
 });

@@ -359,7 +359,7 @@ describe("hapi run list", () => {
     expect(f.calls).toEqual([]);
   });
 
-  test("list's SPEND is the guard's last spend record, else Archon's total_cost_usd, else - (H-229)", async () => {
+  test("list's SPEND is the higher of the guard's ledger and Archon's total_cost_usd; unknown if the ledger falls; else - (H-229)", async () => {
     const { out } = capture();
     const f = fakeRun();
     const at = (min: number) => new Date(NOW.getTime() + min * 60_000).toISOString();
@@ -369,17 +369,21 @@ describe("hapi run list", () => {
     await seedRun(f, { id: "aaaaaaaaaaaa", status: "failed", startedAt: at(-10), objects: false, budgetUsd: 0.0001 });
     writeOut(f.deps.stateDir, "aaaaaaaaaaaa", "decisions.jsonl", `${spend(0.0002)}\n${spend(0.0005)}\n`);
     writeOut(f.deps.stateDir, "aaaaaaaaaaaa", "result.json", JSON.stringify({ run: { status: "failed", metadata: {} } }));
-    // Both: the guard's wins.
+    // Both: the higher.
     await seedRun(f, { id: "bbbbbbbbbbbb", status: "succeeded", startedAt: at(-20), objects: false });
     writeOut(f.deps.stateDir, "bbbbbbbbbbbb", "decisions.jsonl", `${spend(0.25)}\n`);
     writeOut(f.deps.stateDir, "bbbbbbbbbbbb", "result.json", archon(0.5));
+    // A ledger that falls: unknown, whatever Archon says.
+    await seedRun(f, { id: "eeeeeeeeeeee", status: "succeeded", startedAt: at(-50), objects: false });
+    writeOut(f.deps.stateDir, "eeeeeeeeeeee", "decisions.jsonl", `${spend(2.75)}\n${spend(0.01)}\n`);
+    writeOut(f.deps.stateDir, "eeeeeeeeeeee", "result.json", archon(2.9));
     // Archon's alone.
     await seedRun(f, { id: "cccccccccccc", status: "succeeded", startedAt: at(-30), objects: false });
     writeOut(f.deps.stateDir, "cccccccccccc", "result.json", archon(0.125));
     // Neither: -, not the budget a cap would count it at.
     await seedRun(f, { id: "dddddddddddd", status: "failed", startedAt: at(-40), objects: false, budgetUsd: 3 });
     expect(await runList([], f.deps)).toBe(0);
-    expect(out[0]!.split("\n").map((l) => l.split(/\s+/).at(-1))).toEqual(["SPEND", "$0.0005", "$0.2500", "$0.1250", "-"]);
+    expect(out[0]!.split("\n").map((l) => l.split(/\s+/).at(-1))).toEqual(["SPEND", "$0.0005", "$0.5000", "$0.1250", "-", "-"]);
   });
 
   test("an empty state dir lists no runs; list takes no arguments", async () => {

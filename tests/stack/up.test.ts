@@ -659,7 +659,9 @@ describe("hapi stack down", () => {
   });
 
   test("down never waits for the run disk's lock: held, or with no XDG_RUNTIME_DIR, it removes the runs but leaves their volumes, and says so (H-210)", async () => {
-    const LINE = /^hapi stack down: could not take the run disk's lock \(.+\): removing the runs but leaving their volumes, which the run's finalize or the next reap removes \(H-210\)$/;
+    // A run whose container down removed is finalized as gone, which leaves its volumes in place (H-209), and no reap removes a volume.
+    const LINE =
+      /^hapi stack down: could not take the run disk's lock \(.+\): removing the runs but leaving their volumes, and their dirs on the run disk: a finalize copying its run out removes that run's own, and the rest stay until a `mise run down` that takes the lock, so run it again once the lock is free \(H-209, H-210\)$/;
     // Held by a finalize copying a run out: down doesn't wait for it.
     const env = hapiEnv();
     let release!: () => void;

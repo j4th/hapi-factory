@@ -25,8 +25,9 @@
  * boundary.
  *
  * `list`: every run's record, newest first, with its spend from the run's
- * copied `out/`: the guard's last spend record, else Archon's
- * `total_cost_usd`, else `-` (./spend.ts `spendOfRun`; H-229).
+ * copied `out/`: the higher of the guard's ledger and Archon's
+ * `total_cost_usd`, or `-` when neither says it or the ledger falls
+ * (./spend.ts `spendOfRun`; H-229).
  */
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -175,7 +176,7 @@ export async function runList(args: string[], deps: Partial<RunDeps> = {}): Prom
     }
     const rows = [["RUN", "STATUS", "REPO", "WORK ORDER", "STARTED", "SPEND"]];
     for (const r of records) {
-      // The guard's ledger, else Archon's; a spend neither recorded shows as "-", never as the budget a cap counts it at.
+      // The higher of the guard's ledger and Archon's; an unknown spend shows as "-", never as the budget a cap counts it at.
       const spend = spendOfRun(join(recordDir(d.stateDir, r.runId), "out"), r.budgetUsd ?? 0);
       rows.push([r.runId, r.status, r.repo, r.workOrder, r.startedAt, spend.known ? `$${spend.usd.toFixed(4)}` : "-"]);
     }
