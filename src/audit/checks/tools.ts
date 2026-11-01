@@ -156,10 +156,11 @@ function bindingProblems(kind: "alias" | "tier", generated: Record<string, unkno
 const packOf = (root: string) => join(root, "archon", "workflows", "hapi");
 
 /**
- * The pack's workflows (each file and its `name`, the file's stem if it has none) and every node of them that sets
- * `pi.enableExtensions: false`, which would drop hapi-guard from that step.
+ * The pack's workflows (each file and its `name`, the file's stem if it has none), every workflow whose `name` isn't
+ * its file's stem, and every node that sets `pi.enableExtensions: false`, which would drop hapi-guard from that step.
+ * `hapi run start` reads it too: a work order may name only these workflows.
  */
-async function packNodes(pack: string): Promise<{ workflows: { file: string; name: string }[]; problems: string[] } | { missing: string }> {
+export async function packNodes(pack: string): Promise<{ workflows: { file: string; name: string }[]; problems: string[] } | { missing: string }> {
   let names: string[];
   try {
     names = (await readdir(pack)).filter((n) => /\.ya?ml$/.test(n)).sort();
@@ -177,7 +178,10 @@ async function packNodes(pack: string): Promise<{ workflows: { file: string; nam
       continue;
     }
     const named = asRecord(doc)?.name;
-    workflows.push({ file: name, name: typeof named === "string" ? named : name.replace(/\.ya?ml$/, "") });
+    const stem = name.replace(/\.ya?ml$/, "");
+    // Archon overrides a workflow by file name; whether `workflow run` looks one up by name or stem is unknown, so both must agree.
+    if (named !== stem) problems.push(`${name}: its name is ${named === undefined ? "missing" : JSON.stringify(named)}, not its file's stem ${JSON.stringify(stem)}, which Archon may look it up by`);
+    workflows.push({ file: name, name: typeof named === "string" ? named : stem });
     for (const node of Array.isArray(asRecord(doc)?.nodes) ? (asRecord(doc)!.nodes as unknown[]) : []) {
       const n = asRecord(node);
       if (asRecord(n?.pi)?.enableExtensions === false) problems.push(`${name}: node ${String(n?.id ?? "(no id)")} sets pi.enableExtensions: false, so hapi-guard would not load in it`);

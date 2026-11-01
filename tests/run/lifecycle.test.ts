@@ -62,6 +62,70 @@ describe("hapi run start: refusals", () => {
     expect(changes(f.calls)).toEqual([]);
   });
 
+  test("start refuses a work order whose workflow isn't in hapi's pack, such as one of Archon's bundled workflows", async () => {
+    const { err } = capture();
+    const f = ready();
+    const order = writeOrder(f.tmp, { workflow: "archon-assist" });
+    expect(await runStart(["--repo", f.repo, "--work-order", order], f.deps)).toBe(1);
+    expect(err).toEqual([
+      `hapi run start: the work order's workflow "archon-assist" is not in hapi's pack (${f.deps.packDir}): a run may use only the pack's workflows, never one of Archon's bundled ones, which hapi doesn't review`,
+    ]);
+    expect(changes(f.calls)).toEqual([]);
+    expect(existsSync(f.deps.stateDir) ? readdirSync(f.deps.stateDir) : []).toEqual([]);
+  });
+
+  test("start refuses when hapi's pack has a node that would drop hapi-guard", async () => {
+    const { err } = capture();
+    const f = ready();
+    const pack = join(f.tmp, "pack");
+    mkdirSync(pack);
+    writeFileSync(join(pack, "hapi-check-run.yaml"), "name: hapi-check-run\nnodes:\n  - id: work\n    provider: pi\n    pi: { enableExtensions: false }\n");
+    expect(await runStart(["--repo", f.repo, "--work-order", f.order], { ...f.deps, packDir: pack })).toBe(1);
+    expect(err).toEqual([
+      "hapi run start: hapi's pack has a problem: hapi-check-run.yaml: node work sets pi.enableExtensions: false, so hapi-guard would not load in it",
+    ]);
+    expect(changes(f.calls)).toEqual([]);
+    expect(existsSync(f.deps.stateDir) ? readdirSync(f.deps.stateDir) : []).toEqual([]);
+  });
+
+  test("start refuses when hapi's pack is missing", async () => {
+    const { err } = capture();
+    const f = ready();
+    const pack = join(f.tmp, "no-pack");
+    expect(await runStart(["--repo", f.repo, "--work-order", f.order], { ...f.deps, packDir: pack })).toBe(1);
+    expect(err).toEqual([`hapi run start: no workflow pack at ${pack} (ENOENT): a run binds it at /.archon/workflows/hapi`]);
+    expect(changes(f.calls)).toEqual([]);
+    expect(existsSync(f.deps.stateDir) ? readdirSync(f.deps.stateDir) : []).toEqual([]);
+  });
+
+  test("start refuses when a pack file doesn't parse as YAML", async () => {
+    const { err } = capture();
+    const f = ready();
+    const pack = join(f.tmp, "pack");
+    mkdirSync(pack);
+    writeFileSync(join(pack, "hapi-check-run.yaml"), "name: hapi-check-run\nnodes: [\n");
+    expect(await runStart(["--repo", f.repo, "--work-order", f.order], { ...f.deps, packDir: pack })).toBe(1);
+    expect(err).toEqual(["hapi run start: hapi's pack has a problem: hapi-check-run.yaml: does not parse as YAML"]);
+    expect(changes(f.calls)).toEqual([]);
+  });
+
+  test("start refuses a pack workflow whose name isn't its file's stem, so hapi's check and Archon's lookup can't name different workflows", async () => {
+    const { err } = capture();
+    const f = ready();
+    const pack = join(f.tmp, "pack");
+    mkdirSync(pack);
+    writeFileSync(join(pack, "hapi-check-run.yaml"), "name: hapi-check-run\nnodes:\n  - id: work\n    bash: 'true'\n");
+    writeFileSync(join(pack, "hapi-other.yaml"), "name: archon-assist\nnodes:\n  - id: work\n    bash: 'true'\n");
+    writeFileSync(join(pack, "hapi-unnamed.yaml"), "nodes:\n  - id: work\n    bash: 'true'\n");
+    expect(await runStart(["--repo", f.repo, "--work-order", f.order], { ...f.deps, packDir: pack })).toBe(1);
+    expect(err).toEqual([
+      "hapi run start: hapi's pack has a problem: " +
+        'hapi-other.yaml: its name is "archon-assist", not its file\'s stem "hapi-other", which Archon may look it up by; ' +
+        'hapi-unnamed.yaml: its name is missing, not its file\'s stem "hapi-unnamed", which Archon may look it up by',
+    ]);
+    expect(changes(f.calls)).toEqual([]);
+  });
+
   test("start refuses a bad work order with validateWorkOrder's messages", async () => {
     const { err } = capture();
     const f = ready();

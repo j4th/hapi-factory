@@ -9,7 +9,9 @@
  *
  * `start`, in order, refusing at the first failure:
  * 1. reap (`reapRuns`), then validate: the work order (`validateWorkOrder`;
- *    `egress_extra` is refused until a per-run proxy exists, H-088), the
+ *    `egress_extra` is refused until a per-run proxy exists, H-088), its
+ *    workflow (one of hapi's pack, `packNodes`, which must parse, name each
+ *    workflow by its file's stem and keep `pi.enableExtensions` on), the
  *    budget (`--budget-usd` only lowers it), the archon zone's env file
  *    (missing: run `mise run up`), the source repo and its HEAD (host git with
  *    no config), and the run container's whole argv (`runArgs`);
@@ -65,6 +67,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { packNodes } from "../audit/checks/tools";
 import type { RunFile } from "../generate/archon";
 import { ENV_DIR, parseEnvFile, runtimeDir } from "../secrets/files";
 import { composeServices } from "../stack/compose";
@@ -261,6 +264,13 @@ export async function runStart(args: string[], deps: Partial<RunDeps> = {}): Pro
     await reapRuns(d);
     const order = loadWorkOrder(opts.workOrder);
     if (order.egress_extra.length > 0) throw new Error("egress_extra isn't supported yet (design §3.1, H-088); remove it or wait for the per-run proxy");
+    // Archon also resolves its bundled workflows by name, and hapi reviews only its own pack's (paid check, 2026-10-31).
+    const pack = await packNodes(d.packDir);
+    if ("missing" in pack) throw new Error(pack.missing);
+    if (pack.problems.length > 0) throw new Error(`hapi's pack has a problem: ${pack.problems.join("; ")}`);
+    if (!pack.workflows.some((w) => w.name === order.workflow)) {
+      throw new Error(`the work order's workflow ${JSON.stringify(order.workflow)} is not in hapi's pack (${d.packDir}): a run may use only the pack's workflows, never one of Archon's bundled ones, which hapi doesn't review`);
+    }
     if (opts.budgetUsd !== undefined && opts.budgetUsd > order.budget.usd) {
       console.error(`hapi run start: --budget-usd ${opts.budgetUsd} is above the work order's budget.usd (${order.budget.usd}): it may only lower it`);
       console.error(START_USAGE);
