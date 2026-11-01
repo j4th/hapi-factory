@@ -1,12 +1,14 @@
 /**
  * .github/workflows/gates.yml, the reusable gates workflow every repo made from templates/repo-contract calls. Its
  * shape: a workflow_call with no permissions and three jobs, `scan`, `check` and the aggregator `gates`, whose check
- * (`ci / gates`) is the required one. `scan` runs no PR code and ignores the PR's scanner configs, .gitattributes
- * and .mailmap: no mise, no action but checkout, every path diffed as text, scanners installed from sha256-pinned
- * release URLs and run by absolute path under `env -i` with the gates' own config, and gitleaks failing closed. Its steps run for real here, as
- * Actions runs them under `defaults.run.shell: bash` (`bash --noprofile --norc -eo pipefail`), on throwaway repos:
- * the config refusals, a checksum mismatch, the scanners' argv and environment (stubs), gitleaks itself (the pin
- * mise.toml holds) against every way a PR could hide history from it, the trailer check, and the aggregator.
+ * (`ci / gates`) is the required one. `scan` runs no PR code and ignores the PR's scanner configs, .gitattributes,
+ * .mailmap and .gitmodules: no mise, no action but checkout, every path diffed as text, scanners installed from
+ * sha256-pinned release URLs and run by absolute path under `env -i` with the gates' own config, gitleaks's own git
+ * command run first as a dry run, and gitleaks failing closed. Its steps run for real here, as Actions runs them under
+ * `defaults.run.shell: bash` (`bash --noprofile --norc -eo pipefail`), on throwaway repos: the config refusals, a
+ * checksum mismatch, the scanners' argv and environment (stubs), the dry run (fake gits and the real one), gitleaks
+ * itself (the pin mise.toml holds) against every way a PR could hide history from it, the trailer check, and the
+ * aggregator.
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { randomBytes } from "node:crypto";
@@ -44,6 +46,7 @@ const ATTRS = "Git diffs every path as text, whatever the PR's .gitattributes sa
 const CONFIGS = "The scanners' configs are the gates' own";
 const INSTALL = "Install the scanners, each checked against its pinned sha256";
 const GITVER = "git is 2.40 or later";
+const DRYRUN = "git log runs clean, exactly as gitleaks will run it";
 const SECRETS = "Scan the whole history for secrets (gitleaks)";
 const OSV = "Known vulnerabilities in bun.lock (OSV-Scanner)";
 const ZIZMOR = "Workflow security (zizmor)";
@@ -53,8 +56,30 @@ const step = (job: Job, name: string) => job.steps.find((s) => s.name === name)!
 const CLEAN = 'env -i PATH=/usr/bin:/bin HOME="$RUNNER_TEMP" GIT_NO_REPLACE_OBJECTS=1';
 /** git's empty tree: as GIT_ATTR_SOURCE, git reads no .gitattributes from the checkout. */
 const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+/** The environment of the history scan's git, the dry run's and gitleaks's alike: no in-tree .gitattributes, no /etc/gitconfig. */
+const GIT_ENV = `${CLEAN} GIT_ATTR_SOURCE=${EMPTY_TREE} GIT_CONFIG_NOSYSTEM=1`;
+/** The log options gitleaks gets (--log-opts) and the dry run passes to git after gitleaks's own `-C . log -p -U0`. */
+const LOG_OPTS = "--full-history --all -m --no-mailmap --no-renames --ignore-submodules=none --no-ext-diff --no-textconv";
 /** The gitleaks command as gates.yml ran it before fix round 3 (bcb3cbc): the controls show each hole it left. */
 const OLD_GITLEAKS = `${CLEAN} "$RUNNER_TEMP/bin/gitleaks" git --config "$RUNNER_TEMP/gitleaks.toml" --ignore-gitleaks-allow --redact --no-banner --no-color -v .`;
+/** The gitleaks step as gates.yml ran it before fix round 4 (1e8c81a), with no dry run before it: the controls show each hole it left. */
+const ROUND3_GITLEAKS = String.raw`log="$RUNNER_TEMP/gitleaks.log"
+code=0
+env -i PATH=/usr/bin:/bin HOME="$RUNNER_TEMP" GIT_NO_REPLACE_OBJECTS=1 GIT_ATTR_SOURCE=4b825dc642cb6eb9a060e54bf8d69288fbee4904 \
+  "$RUNNER_TEMP/bin/gitleaks" git --config "$RUNNER_TEMP/gitleaks.toml" --log-opts="--full-history --all -m --no-mailmap" \
+  --ignore-gitleaks-allow --redact --no-banner --no-color -v . 2>&1 | tee "$log" || code=$?
+if grep -Eq '(^|[[:space:]])ERR([[:space:]]|$)' "$log"; then
+  echo "::error::gitleaks logged an error, so its scan can't be trusted: the history scan fails closed"
+  exit 1
+fi
+if grep -Eq '(^|[[:space:]])0 commits scanned' "$log"; then
+  echo "::error::gitleaks scanned 0 commits: the history scan fails closed"
+  exit 1
+fi
+exit "$code"
+`;
+/** gitleaks's own findings line; `INF no leaks found` doesn't match. */
+const FOUND = /WRN leaks found: [1-9]/;
 
 const temps: string[] = [];
 afterAll(() => {
@@ -89,7 +114,7 @@ test("gates.yml is a workflow_call with no permissions, and three jobs: scan, ch
   }
   expect(scan.permissions).toEqual({ contents: "read" });
   expect(check.permissions).toEqual({ contents: "read" });
-  expect(scan.steps.map((s) => s.uses?.replace(/@.*$/, "") ?? s.name)).toEqual(["actions/checkout", MISE_SCAN, ATTRS, CONFIGS, INSTALL, GITVER, SECRETS, OSV, ZIZMOR, TRAILERS]);
+  expect(scan.steps.map((s) => s.uses?.replace(/@.*$/, "") ?? s.name)).toEqual(["actions/checkout", MISE_SCAN, ATTRS, CONFIGS, INSTALL, GITVER, DRYRUN, SECRETS, OSV, ZIZMOR, TRAILERS]);
   expect(check.steps.map((s) => s.uses?.replace(/@.*$/, "") ?? s.name)).toEqual(["actions/checkout", MISE_SCAN, "jdx/mise-action", MISE_CHECK, "check"]);
   expect(scan.steps[0]!.with).toEqual({ "persist-credentials": false, "fetch-depth": 0 });
   expect(check.steps[0]!.with).toEqual({ "persist-credentials": false });
@@ -163,8 +188,11 @@ describe("the scan job runs no PR code, and ignores the PR's scanner configs, .g
 
   test("every scanner runs by absolute path under env -i with GIT_NO_REPLACE_OBJECTS=1 and the gates' own config", () => {
     expect(step(scan, SECRETS).run).toContain(
-      `${CLEAN} GIT_ATTR_SOURCE=${EMPTY_TREE} \\\n  "$RUNNER_TEMP/bin/gitleaks" git --config "$RUNNER_TEMP/gitleaks.toml" --log-opts="--full-history --all -m --no-mailmap" \\\n  --ignore-gitleaks-allow --redact --no-banner --no-color -v . 2>&1 | tee "$log" || code=$?`,
+      `${GIT_ENV} \\\n  "$RUNNER_TEMP/bin/gitleaks" git --config "$RUNNER_TEMP/gitleaks.toml" \\\n  --log-opts="${LOG_OPTS}" \\\n  --ignore-gitleaks-allow --redact --no-banner --no-color -v . 2>&1 | tee "$log" || code=$?`,
     );
+    // The dry run: gitleaks's own git command (captured: `git -C . log -p -U0` and the --log-opts words, git found
+    // first on PATH=/usr/bin:/bin), with the same environment, its patches discarded and its stderr kept.
+    expect(step(scan, DRYRUN).run).toContain(`${GIT_ENV} \\\n  /usr/bin/git -C . log -p -U0 ${LOG_OPTS} \\\n  > /dev/null 2> "$err" || code=$?`);
     expect(step(scan, OSV).run).toContain(`${CLEAN} \\\n  "$RUNNER_TEMP/bin/osv-scanner" scan source --config "$RUNNER_TEMP/osv-scanner.toml" --lockfile bun.lock`);
     expect(step(scan, ZIZMOR).run).toContain(`${CLEAN} GH_TOKEN="$GH_TOKEN" \\\n  "$RUNNER_TEMP/bin/zizmor" --no-config --no-ignores --format=github .github/workflows`);
     // zizmor runs online (impostor-commit, ref-confusion) on the job's read-only token, passed by name.
@@ -174,7 +202,7 @@ describe("the scan job runs no PR code, and ignores the PR's scanner configs, .g
     const trailers = step(scan, TRAILERS).run!;
     expect(trailers).toContain(`git() { ${CLEAN} /usr/bin/git "$@"; }`);
     expect(trailers.split("\n").filter((l) => /(^|\$\()\s*git /.test(l.trim())).length).toBeGreaterThan(0);
-    for (const s of [SECRETS, OSV, ZIZMOR]) expect([s, step(scan, s).run!.split(CLEAN).length - 1]).toEqual([s, 1]);
+    for (const s of [DRYRUN, SECRETS, OSV, ZIZMOR]) expect([s, step(scan, s).run!.split(CLEAN).length - 1]).toEqual([s, 1]);
   });
 
   test("the scanners are the template's pins, from release URLs with a 64-hex sha256 each", async () => {
@@ -253,23 +281,37 @@ describe("each scanner gets exactly its flags and a clean environment", () => {
   const stubs = () => {
     const runnerTemp = tempDir("hapi-gates-stub-");
     mkdirSync(join(runnerTemp, "bin"));
-    for (const tool of ["gitleaks", "osv-scanner", "zizmor"]) {
+    for (const tool of ["gitleaks", "osv-scanner", "zizmor", "git"]) {
       writeFileSync(join(runnerTemp, "bin", tool), `#!/bin/sh\nprintf '%s\\n' "$@" > "$HOME/${tool}.argv"\ntr '\\0' '\\n' < /proc/$$/environ | sort > "$HOME/${tool}.env"\n`);
       chmodSync(join(runnerTemp, "bin", tool), 0o755);
     }
     return runnerTemp;
   };
   // What a PR could try to set, or what a runner might carry: none of it may reach a scanner.
-  const polluted = { GITLEAKS_CONFIG: "/tmp/x.toml", GITLEAKS_CONFIG_TOML: "[allowlist]\npaths = ['''.*''']", ZIZMOR_CONFIG: "/tmp/z.yml", OSV_SCANNER_CONFIG: "/tmp/o.toml", GIT_DIR: "/tmp/elsewhere" };
+  const polluted = {
+    GITLEAKS_CONFIG: "/tmp/x.toml",
+    GITLEAKS_CONFIG_TOML: "[allowlist]\npaths = ['''.*''']",
+    ZIZMOR_CONFIG: "/tmp/z.yml",
+    OSV_SCANNER_CONFIG: "/tmp/o.toml",
+    GIT_DIR: "/tmp/elsewhere",
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "log.diffMerges",
+    GIT_CONFIG_VALUE_0: "off",
+    GIT_EXTERNAL_DIFF: "/tmp/differ",
+  };
+  const historyEnv = [`GIT_ATTR_SOURCE=${EMPTY_TREE}`, "GIT_CONFIG_NOSYSTEM=1"];
   const cases = [
-    [SECRETS, "gitleaks", ["git", "--config", "RT/gitleaks.toml", "--log-opts=--full-history --all -m --no-mailmap", "--ignore-gitleaks-allow", "--redact", "--no-banner", "--no-color", "-v", "."], [`GIT_ATTR_SOURCE=${EMPTY_TREE}`]],
+    [SECRETS, "gitleaks", ["git", "--config", "RT/gitleaks.toml", `--log-opts=${LOG_OPTS}`, "--ignore-gitleaks-allow", "--redact", "--no-banner", "--no-color", "-v", "."], historyEnv],
+    // The dry run's /usr/bin/git, swapped for the stub.
+    [DRYRUN, "git", ["-C", ".", "log", "-p", "-U0", ...LOG_OPTS.split(" ")], historyEnv],
     [OSV, "osv-scanner", ["scan", "source", "--config", "RT/osv-scanner.toml", "--lockfile", "bun.lock"], []],
     [ZIZMOR, "zizmor", ["--no-config", "--no-ignores", "--format=github", ".github/workflows"], ["GH_TOKEN=fake-actions-token"]],
   ] as const;
   for (const [name, tool, argv, extra] of cases) {
     test(`${tool}: ${argv.join(" ")}`, () => {
       const runnerTemp = stubs();
-      const r = runStep(step(scan, name).run!, tempDir("hapi-gates-co-"), { PATH: process.env.PATH!, RUNNER_TEMP: runnerTemp, GH_TOKEN: "fake-actions-token", ...polluted });
+      const script = step(scan, name).run!.replaceAll("/usr/bin/git", join(runnerTemp, "bin", "git"));
+      const r = runStep(script, tempDir("hapi-gates-co-"), { PATH: process.env.PATH!, RUNNER_TEMP: runnerTemp, GH_TOKEN: "fake-actions-token", ...polluted });
       expect(r.code).toBe(0);
       expect(readFileSync(join(runnerTemp, `${tool}.argv`), "utf8").trim().split("\n")).toEqual(argv.map((a) => a.replace("RT/", `${runnerTemp}/`)));
       expect(readFileSync(join(runnerTemp, `${tool}.env`), "utf8").trim().split("\n")).toEqual(
@@ -297,10 +339,30 @@ describe("the gitleaks step fails closed on what gitleaks 8.30.1 would let pass"
     expect(r.out).toContain("INF 3 commits scanned.");
   });
 
-  test("a finding (exit 1) fails", () => {
-    const r = withStub("10:07AM INF 1 commits scanned.\n10:07AM WRN leaks found: 1\n", 1);
-    expect(r.code).toBe(1);
-    expect(r.out).toContain("WRN leaks found: 1");
+  test("a finding (exit 1) fails, as a finding: its `WRN leaks found: N` line is no warning to the guard", () => {
+    for (const n of [1, 2]) {
+      const r = withStub(`10:07AM INF 1 commits scanned.\n10:07AM WRN leaks found: ${n}\n`, 1);
+      expect([n, r.code]).toEqual([n, 1]);
+      expect(r.out).toContain(`WRN leaks found: ${n}`);
+      expect(r.out).not.toContain("::error::");
+    }
+  });
+
+  test("any other WRN line fails, even when gitleaks exits 0, found nothing and scanned commits", () => {
+    const demoted = "10:07AM WRN fatal: bad boolean config value 'you may want to set your diff.renameLimit variable' for 'submodule.sub.shallow'\n";
+    for (const out of [
+      // What gitleaks 8.30.1 logs when git dies quoting a PR's .gitmodules: a WRN, then a clean-looking scan.
+      `${demoted}${CLEAN_RUN}`,
+      // A line that only ends like the findings count is still a warning.
+      `10:07AM WRN you may want to set your diff.renameLimit WRN leaks found: 3\n${CLEAN_RUN}`,
+      // So many that a `grep -q` at the end of the pipe would exit early, SIGPIPE the grep before it, and turn the
+      // pipeline's status into "no warning".
+      `${demoted.repeat(100_000)}${CLEAN_RUN}`,
+    ]) {
+      const r = withStub(out, 0);
+      expect([out.slice(0, 60), r.code]).toEqual([out.slice(0, 60), 1]);
+      expect(r.out).toContain("::error::gitleaks logged a warning other than its findings count");
+    }
   });
 
   test("any ERR line fails, even when gitleaks exits 0 and scanned commits", () => {
@@ -344,29 +406,83 @@ describe("the gitleaks step fails closed on what gitleaks 8.30.1 would let pass"
   });
 });
 
+describe("the dry run fails the scan on anything git does that gitleaks 8.30.1 would scan on through", () => {
+  /** The dry run with its /usr/bin/git swapped for a fake (the test's only change), or the real one when `fake` is undefined. */
+  const dryRun = (cwd: string, fake?: string) => {
+    const runnerTemp = tempDir("hapi-gates-dryrt-");
+    let script = step(scan, DRYRUN).run!;
+    if (fake !== undefined) {
+      writeFileSync(join(runnerTemp, "git"), `#!/bin/sh\n${fake}\n`);
+      chmodSync(join(runnerTemp, "git"), 0o755);
+      script = script.replaceAll("/usr/bin/git", join(runnerTemp, "git"));
+    }
+    return runStep(script, cwd, { PATH: process.env.PATH!, RUNNER_TEMP: runnerTemp });
+  };
+
+  test("it runs after the version gate and before gitleaks", () => {
+    const at = (name: string) => scan.steps.findIndex((x) => x.name === name);
+    expect(at(GITVER)).toBeLessThan(at(DRYRUN));
+    expect(at(DRYRUN)).toBe(at(SECRETS) - 1);
+  });
+
+  test("a git that exits 128 with no stderr fails it", () => {
+    const r = dryRun(tempDir("hapi-gates-dry1-"), "exit 128");
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("::error::git log, run as gitleaks runs it, exited 128 or wrote to stderr");
+  });
+
+  test("a git that writes one stderr line and exits 0 fails it, and the line is shown behind a prefix, never as a workflow command", () => {
+    const r = dryRun(tempDir("hapi-gates-dry2-"), "echo '::warning::text from the PR' >&2\nexit 0");
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("::error::git log, run as gitleaks runs it, exited 0 or wrote to stderr");
+    expect(r.out).toContain("git: ::warning::text from the PR");
+    expect(r.out.split("\n").filter((l) => l.trimStart().startsWith("::warning::"))).toEqual([]);
+  });
+
+  test("the real git on a clean repo passes, silently", () => {
+    const root = tempDir("hapi-gates-dry3-");
+    const env = { PATH: process.env.PATH!, HOME: root, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.invalid", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.invalid" };
+    writeFileSync(join(root, "README.md"), "# A project\n");
+    for (const a of [["init", "-q", "-b", "main"], ["add", "-A"], ["-c", "commit.gpgSign=false", "commit", "-q", "-m", "readme"]]) {
+      expect(Bun.spawnSync(["git", ...a], { cwd: root, env, stdout: "ignore", stderr: "ignore" }).exitCode).toBe(0);
+    }
+    expect(dryRun(root)).toEqual({ code: 0, out: "" });
+  });
+});
+
 test("every path is diffed as text before gitleaks runs: the attributes step comes first, and writes `* diff`", () => {
   const at = (name: string) => scan.steps.findIndex((x) => x.name === name);
   expect(at(ATTRS)).toBeGreaterThan(0);
+  expect(at(ATTRS)).toBeLessThan(at(DRYRUN));
   expect(at(ATTRS)).toBeLessThan(at(SECRETS));
   expect(step(scan, ATTRS).run).toBe("mkdir -p .git/info\nprintf '* diff\\n' > .git/info/attributes\n");
 });
 
-/** The gitleaks mise.toml pins, or undefined when mise can't say (the real-scan tests then skip). */
+/** The gitleaks mise.toml pins, or undefined when mise can't say (the real-scan tests then skip, but never in CI). */
 const gitleaks = (() => {
   const r = Bun.spawnSync(["mise", "which", "gitleaks"], { cwd: REPO, stdout: "pipe", stderr: "ignore" });
   const path = r.stdout.toString().trim();
   return r.exitCode === 0 && path !== "" ? path : undefined;
 })();
+const inCI = (process.env.CI ?? "") !== "";
 
-describe.skipIf(gitleaks === undefined)("the real gitleaks, run as the scan job runs it, on a throwaway repo", () => {
+test.if(inCI)("in CI, mise has the pinned gitleaks, so the real-gitleaks tests run rather than skip", () => {
+  expect(gitleaks).toBeDefined();
+});
+
+// In CI a missing gitleaks fails these tests (and the one above) instead of skipping them.
+describe.skipIf(gitleaks === undefined && !inCI)("the real gitleaks, run as the scan job runs it, on a throwaway repo", () => {
+  /** Each test builds and scans up to four repos, about a second alone and more under the whole suite's load. */
+  const SLOW = 30_000;
   /** A GitHub token shape, built at run time so no scan of this repo flags this file. */
   const token = () => {
     const alnum = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     return `ghp_${[...randomBytes(36)].map((b) => alnum[b % alnum.length]).join("")}`;
   };
-  /** A history-building helper: write a file (making its dirs), make a symlink, run git. */
+  /** A history-building helper: make a dir, write a file (making its dirs), make a symlink, run git. */
   interface Repo {
     root: string;
+    mkdir(path: string): void;
     write(path: string, text: string): void;
     link(path: string, target: string): void;
     git(...args: string[]): void;
@@ -386,6 +502,9 @@ describe.skipIf(gitleaks === undefined)("the real gitleaks, run as the scan job 
     git("init", "-q", "-b", "main");
     const repo: Repo = {
       root,
+      mkdir(path) {
+        mkdirSync(join(root, path), { recursive: true });
+      },
       write(path, text) {
         mkdirSync(join(root, path, ".."), { recursive: true });
         rmSync(join(root, path), { force: true });
@@ -405,47 +524,104 @@ describe.skipIf(gitleaks === undefined)("the real gitleaks, run as the scan job 
     build(repo);
     return { root, runnerTemp };
   };
+  /** How a scan differs from the job's: env added to the runner's, steps left out or replaced, and an edit to each step's script. */
+  interface Variant {
+    env?: Record<string, string>;
+    skip?: string[];
+    replace?: Record<string, string>;
+    edit?: (script: string) => string;
+  }
   /**
    * The scan job's steps on a repo `build` makes, in the job's order, from the first after checkout through gitleaks,
-   * but the install (the network's: gitleaks is linked in instead), with `env` added to the runner's.
+   * but the install (the network's: gitleaks is linked in instead), as `v` varies them.
    */
-  const scanHistory = (build: (r: Repo) => void, env: Record<string, string> = {}) => {
+  const scanHistory = (build: (r: Repo) => void, v: Variant = {}) => {
     const { root, runnerTemp } = makeRepo(build);
-    const runner = { PATH: process.env.PATH!, RUNNER_TEMP: runnerTemp, ...env };
+    const runner = { PATH: process.env.PATH!, RUNNER_TEMP: runnerTemp, ...v.env };
     const upTo = scan.steps.findIndex((x) => x.name === SECRETS);
     let last = { code: 0, out: "" };
     for (const x of scan.steps.slice(1, upTo + 1)) {
-      if (x.name === INSTALL) continue;
-      last = runStep(x.run!, root, runner);
+      if (x.name === INSTALL || v.skip?.includes(x.name!)) continue;
+      const script = v.replace?.[x.name!] ?? x.run!;
+      last = runStep(v.edit?.(script) ?? script, root, runner);
       if (last.code !== 0) return last;
     }
     return last;
   };
-  /** The control: the same repo, scanned with the gitleaks command as gates.yml ran it before fix round 3, with or without the attributes step. */
-  const scanOld = (build: (r: Repo) => void, o: { attrs: boolean }) => {
-    const { root, runnerTemp } = makeRepo(build);
-    const runner = { PATH: process.env.PATH!, RUNNER_TEMP: runnerTemp };
-    for (const name of [...(o.attrs ? [ATTRS] : []), CONFIGS]) expect(runStep(step(scan, name).run!, root, runner).code).toBe(0);
-    return runStep(OLD_GITLEAKS, root, runner);
-  };
+  // The controls: the scan as gates.yml ran it before fix round 3 (bcb3cbc: no version gate, no dry run), with or
+  // without the attributes step; before fix round 4 (1e8c81a: no dry run, round 3's gitleaks step); and today's with
+  // rename detection back on.
+  const before3 = (attrs: boolean): Variant => ({ skip: [GITVER, DRYRUN, ...(attrs ? [] : [ATTRS])], replace: { [SECRETS]: OLD_GITLEAKS } });
+  const before4: Variant = { skip: [DRYRUN], replace: { [SECRETS]: ROUND3_GITLEAKS } };
+  const renamesOn: Variant = { edit: (s) => s.replaceAll(" --no-renames", "") };
   /** A repo whose one commit holds `files`. */
   const oneCommit = (files: Record<string, string>) => (r: Repo) => {
     for (const [path, text] of Object.entries(files)) r.write(path, text);
     r.commit("add files");
   };
-  const scanRepo = (files: Record<string, string>, env: Record<string, string> = {}) => scanHistory(oneCommit(files), env);
+  const scanRepo = (files: Record<string, string>, env: Record<string, string> = {}) => scanHistory(oneCommit(files), { env });
 
-  test("passes on a clean history with no ERR line, and finds a token", () => {
+  test("passes on a clean history, and on one with a rename, with no ERR or WRN line; and finds a token", () => {
     const clean = scanRepo({ "README.md": "# A project\n" });
     expect(clean.code).toBe(0);
-    expect(clean.out).not.toMatch(/(^|\s)ERR(\s|$)/m);
+    expect(clean.out).not.toMatch(/(^|\s)(ERR|WRN)(\s|$)/m);
     expect(clean.out).toMatch(/\s1 commits scanned/);
-    expect(scanRepo({ "config.env": `GITHUB_TOKEN=${token()}\n` }).code).toBe(1);
-  });
+    const renamed = scanHistory((r) => {
+      r.write("README.md", "# A project\n");
+      r.write("docs/a.md", "a line\n".repeat(30));
+      r.commit("docs");
+      r.git("mv", "docs/a.md", "docs/b.md");
+      r.commit("rename");
+    });
+    expect(renamed.code).toBe(0);
+    expect(renamed.out).not.toMatch(/(^|\s)(ERR|WRN)(\s|$)/m);
+    const found = scanRepo({ "config.env": `GITHUB_TOKEN=${token()}\n` });
+    expect(found.code).toBe(1);
+    expect(found.out).toMatch(FOUND);
+  }, SLOW);
+
+  test("the dry run runs exactly the git command, in exactly the environment, that the real gitleaks runs", () => {
+    const { root, runnerTemp } = makeRepo(oneCommit({ "README.md": "# A project\n" }));
+    /** A git in `dir` that records its argv and environment there, then runs /usr/bin/git. */
+    const recorder = (dir: string) => {
+      mkdirSync(dir);
+      writeFileSync(join(dir, "git"), `#!/bin/sh\nprintf '%s\\n' "$@" > "${dir}/$$.argv"\ntr '\\0' '\\n' < /proc/$$/environ | sort > "${dir}/$$.env"\nexec /usr/bin/git "$@"\n`);
+      chmodSync(join(dir, "git"), 0o755);
+      return dir;
+    };
+    /** The one recorded `git … log …` call. */
+    const logCall = (dir: string) => {
+      const calls = readdirSync(dir)
+        .filter((f) => f.endsWith(".argv"))
+        .map((f) => ({ argv: readFileSync(join(dir, f), "utf8").trim().split("\n"), env: readFileSync(join(dir, f.replace(/\.argv$/, ".env")), "utf8").trim().split("\n") }))
+        .filter((c) => c.argv.includes("log"));
+      expect(calls.length).toBe(1);
+      return calls[0]!;
+    };
+    const runner = { PATH: process.env.PATH!, RUNNER_TEMP: runnerTemp };
+    expect(runStep(step(scan, CONFIGS).run!, root, runner).code).toBe(0);
+    const dry = recorder(join(runnerTemp, "dry"));
+    expect(runStep(step(scan, DRYRUN).run!.replaceAll("/usr/bin/git", join(dry, "git")), root, runner).code).toBe(0);
+    // gitleaks finds git on its PATH: the recorder first, everything else as the step sets it.
+    const real = recorder(join(runnerTemp, "real"));
+    const script = step(scan, SECRETS).run!;
+    expect(script.split("env -i PATH=/usr/bin:/bin ").length).toBe(2);
+    expect(runStep(script.replace("env -i PATH=/usr/bin:/bin ", `env -i PATH=${real}:/usr/bin:/bin `), root, runner).code).toBe(0);
+    const [a, b] = [logCall(dry), logCall(real)];
+    expect(b.argv).toEqual(["-C", ".", "log", "-p", "-U0", ...LOG_OPTS.split(" ")]);
+    expect(a.argv).toEqual(b.argv);
+    const path = (env: string[]) => env.filter((l) => l.startsWith("PATH="));
+    const rest = (env: string[]) => env.filter((l) => !l.startsWith("PATH="));
+    expect(rest(a.env)).toEqual(rest(b.env));
+    expect(rest(b.env)).toEqual([`GIT_ATTR_SOURCE=${EMPTY_TREE}`, "GIT_CONFIG_NOSYSTEM=1", "GIT_NO_REPLACE_OBJECTS=1", `HOME=${runnerTemp}`]);
+    // The dry run's git is /usr/bin/git, which is what gitleaks's PATH=/usr/bin:/bin finds first.
+    expect([path(a.env), path(b.env)]).toEqual([["PATH=/usr/bin:/bin"], [`PATH=${real}:/usr/bin:/bin`]]);
+    expect(Bun.which("git", { PATH: "/usr/bin:/bin" })).toBe("/usr/bin/git");
+  }, SLOW);
 
   test("an inline gitleaks:allow comment doesn't hide a token", () => {
     expect(scanRepo({ "config.env": `GITHUB_TOKEN=${token()} # gitleaks:allow\n` }).code).toBe(1);
-  });
+  }, SLOW);
 
   test("a config in the runner's environment never reaches gitleaks (env -i): GITLEAKS_CONFIG_TOML allowlisting everything changes nothing", () => {
     const allowAll = "[extend]\nuseDefault = true\n[allowlist]\npaths = ['''.*''']\n";
@@ -453,22 +629,53 @@ describe.skipIf(gitleaks === undefined)("the real gitleaks, run as the scan job 
     writeFileSync(join(dir, "allow.toml"), allowAll);
     const r = scanRepo({ "config.env": `GITHUB_TOKEN=${token()}\n` }, { GITLEAKS_CONFIG_TOML: allowAll, GITLEAKS_CONFIG: join(dir, "allow.toml") });
     expect(r.code).toBe(1);
-  });
+  }, SLOW);
 
-  // Every way found for a commit to hide a token from gitleaks 8.30.1, each with its control: the step as it was before
-  // fix round 3 (bcb3cbc), with or without the attributes step, lets the token through (exit 0), so the test
-  // exercises the hole the step now closes.
+  // Every way found for a commit to hide a token from gitleaks 8.30.1. Each test asserts the token is *found*
+  // (gitleaks's `WRN leaks found: N`), not just that the step failed, so a guard failing the step (the dry run, ERR,
+  // WRN or 0 commits) can't stand in for the fix the name gives. And each has its control: the scan as it was before
+  // that fix lets the token through (exit 0), so the test exercises the hole the fix closes.
   const secret = (t: string) => `GITHUB_TOKEN=${t}\n`;
-  const cases: [what: string, build: (t: string) => (r: Repo) => void, control: { attrs: boolean }][] = [
-    // Turned into "Binary files differ", which gitleaks skips (fix round 2: `* diff`).
-    ["a root .gitattributes with * -diff", (t) => oneCommit({ ".gitattributes": "* -diff\n", "config.env": secret(t) }), { attrs: false }],
-    ["a root .gitattributes with * binary", (t) => oneCommit({ ".gitattributes": "* binary\n", "config.env": secret(t) }), { attrs: false }],
-    ["a nested sub/.gitattributes with * -diff over the secret", (t) => oneCommit({ "sub/.gitattributes": "* -diff\n", "sub/config.env": secret(t) }), { attrs: false }],
-    ["a NUL byte in the secret's file", (t) => oneCommit({ "config.env": `${secret(t)}\0\n` }), { attrs: false }],
-    // git writes to stderr, and gitleaks logs an ERR, scans 0 commits or fewer, and exits 0.
-    ["a nested [attr] macro, which git refuses outside the root", (t) => oneCommit({ "sub/.gitattributes": "[attr]h -diff\n", "config.env": secret(t) }), { attrs: true }],
-    ["a negative pattern in .gitattributes", (t) => oneCommit({ ".gitattributes": "!x diff\n", "config.env": secret(t) }), { attrs: true }],
-    ["a .gitattributes line over 2048 bytes", (t) => oneCommit({ ".gitattributes": `${"a".repeat(3000)} -diff\n`, "config.env": secret(t) }), { attrs: true }],
+  /** The fix round 4 case: git dies quoting a .gitmodules value while diffing a gitlink, after a merge gitleaks has already scanned. */
+  const gitmodules = (t: string) => (r: Repo) => {
+    r.write("a", "base\n");
+    r.commit("base");
+    r.git("checkout", "-q", "-b", "side");
+    r.write("config.env", secret(t));
+    r.commit("A: the token");
+    r.git("rm", "-q", "config.env");
+    r.write(".gitmodules", '[submodule "sub"]\n\tpath = sub\n\turl = https://example.invalid/sub.git\n\tshallow = you may want to set your diff.renameLimit variable\n');
+    r.git("add", ".gitmodules");
+    r.git("update-index", "--add", "--cacheinfo", `160000,${"1".repeat(40)},sub`);
+    r.git("commit", "-q", "-m", "B: the token gone, a .gitmodules and a gitlink");
+    r.git("rm", "-q", "--cached", "sub");
+    r.git("commit", "-q", "-m", "C: the gitlink gone");
+    r.git("checkout", "-q", "main");
+    r.git("merge", "-q", "--no-ff", "-m", "merge side", "side");
+  };
+  /** A token committed in `from`, then moved to `to` (`git mv`), with one line edited when `edit` is set. */
+  const moved = (from: string, to: string, edit: boolean) => (t: string) => (r: Repo) => {
+    const body = (last: string) => `${"x\n".repeat(20)}${secret(t)}${"y\n".repeat(19)}${last}`;
+    r.write("README.md", "# A project\n");
+    r.commit("readme");
+    r.write(from, body("y\n"));
+    r.commit(`add ${from}`);
+    r.mkdir(join(to, ".."));
+    r.git("mv", from, to);
+    if (edit) r.write(to, body("z\n"));
+    r.commit(`move it to ${to}`);
+  };
+  const cases: [what: string, build: (t: string) => (r: Repo) => void, foundBy: string, control: Variant][] = [
+    // Turned into "Binary files differ", which gitleaks skips. `* diff` (round 2) and GIT_ATTR_SOURCE (round 3) each close these alone.
+    ["a root .gitattributes with * -diff", (t) => oneCommit({ ".gitattributes": "* -diff\n", "config.env": secret(t) }), "`* diff` or GIT_ATTR_SOURCE", before3(false)],
+    ["a root .gitattributes with * binary", (t) => oneCommit({ ".gitattributes": "* binary\n", "config.env": secret(t) }), "`* diff` or GIT_ATTR_SOURCE", before3(false)],
+    ["a nested sub/.gitattributes with * -diff over the secret", (t) => oneCommit({ "sub/.gitattributes": "* -diff\n", "sub/config.env": secret(t) }), "`* diff` or GIT_ATTR_SOURCE", before3(false)],
+    ["a NUL byte in the secret's file", (t) => oneCommit({ "config.env": `${secret(t)}\0\n` }), "`* diff`", before3(false)],
+    // git writes to stderr, and gitleaks logs an ERR, stops reading, reports the commits it got through and exits 0.
+    // Without GIT_ATTR_SOURCE (or --no-mailmap) git warns, and the dry run fails the step with no finding.
+    ["a nested [attr] macro, which git refuses outside the root", (t) => oneCommit({ "sub/.gitattributes": "[attr]h -diff\n", "config.env": secret(t) }), "GIT_ATTR_SOURCE", before3(true)],
+    ["a negative pattern in .gitattributes", (t) => oneCommit({ ".gitattributes": "!x diff\n", "config.env": secret(t) }), "GIT_ATTR_SOURCE", before3(true)],
+    ["a .gitattributes line over 2048 bytes", (t) => oneCommit({ ".gitattributes": `${"a".repeat(3000)} -diff\n`, "config.env": secret(t) }), "GIT_ATTR_SOURCE", before3(true)],
     [
       "a symlinked .gitattributes",
       (t) => (r) => {
@@ -477,7 +684,8 @@ describe.skipIf(gitleaks === undefined)("the real gitleaks, run as the scan job 
         r.write("config.env", secret(t));
         r.commit("a");
       },
-      { attrs: true },
+      "GIT_ATTR_SOURCE",
+      before3(true),
     ],
     [
       "a symlinked .mailmap",
@@ -487,9 +695,10 @@ describe.skipIf(gitleaks === undefined)("the real gitleaks, run as the scan job 
         r.write("config.env", secret(t));
         r.commit("a");
       },
-      { attrs: true },
+      "--no-mailmap",
+      before3(true),
     ],
-    // Skipped by gitleaks's default `--diff-filter=tuxdb`: a type change.
+    // Skipped by gitleaks's default `--diff-filter=tuxdb`: a type change, from a symlink or from a gitlink.
     [
       "a type change: a symlink later replaced by a file holding the token",
       (t) => (r) => {
@@ -498,7 +707,22 @@ describe.skipIf(gitleaks === undefined)("the real gitleaks, run as the scan job 
         r.write("config.env", secret(t));
         r.commit("now a file");
       },
-      { attrs: true },
+      "--log-opts, which drops the default --diff-filter",
+      before3(true),
+    ],
+    [
+      "a type change: a gitlink later replaced by a file holding the token",
+      (t) => (r) => {
+        r.write("README.md", "# A project\n");
+        r.commit("readme");
+        r.git("update-index", "--add", "--cacheinfo", `160000,${"1".repeat(40)},sub`);
+        r.git("commit", "-q", "-m", "a gitlink");
+        r.git("rm", "-q", "--cached", "sub");
+        r.write("sub", secret(t));
+        r.commit("now a file");
+      },
+      "--log-opts, which drops the default --diff-filter",
+      before3(true),
     ],
     // Not shown by `log -p` without -m: an evil merge, whose token is in neither parent.
     [
@@ -516,30 +740,55 @@ describe.skipIf(gitleaks === undefined)("the real gitleaks, run as the scan job 
         r.write("config.env", secret(t));
         r.commit("merge side");
       },
-      { attrs: true },
+      "-m",
+      before3(true),
     ],
+    // git dies quoting the PR's text, and gitleaks logs it as a WRN and passes on what it scanned before (round 4).
+    ["a .gitmodules value git dies on, quoting it, behind a merge", gitmodules, "--ignore-submodules=none", before4],
+    // A token first committed in a path gitleaks's default allowlist skips (H-240), then moved: with rename detection
+    // the move shows only the edited lines, so the token is never scanned anywhere (round 4).
+    ["a token moved from node_modules/pkg/index.js to src/app.js", moved("node_modules/pkg/index.js", "src/app.js", false), "--no-renames", renamesOn],
+    ["a token moved from logo.png to src/app.ts with a one-line edit", moved("logo.png", "src/app.ts", true), "--no-renames", renamesOn],
+    ["a token moved from package-lock.json to config.json", moved("package-lock.json", "config.json", false), "--no-renames", renamesOn],
   ];
-  for (const [what, build, control] of cases) {
-    test(`${what} doesn't hide a token`, () => {
+  for (const [what, build, foundBy, control] of cases) {
+    test(`${what} doesn't hide a token: ${foundBy} finds it`, () => {
       const r = scanHistory(build(token()));
       expect([what, r.code]).toEqual([what, 1]);
-      expect(r.out).toContain("leaks found");
-      expect([what, scanOld(build(token()), control).code]).toEqual([what, 0]);
-    });
+      expect([what, r.out]).toEqual([what, expect.stringMatching(FOUND)]);
+      expect([what, scanHistory(build(token()), control).code]).toEqual([what, 0]);
+    }, SLOW);
   }
 
-  test("GIT_ATTR_SOURCE alone ignores a committed * -diff, and only `* diff` finds a NUL-byte token beside other commits", () => {
-    // The step without the attributes step: in-tree attributes are ignored, but a NUL byte still reads as binary.
-    const without = (build: (r: Repo) => void) => {
-      const { root, runnerTemp } = makeRepo(build);
-      const runner = { PATH: process.env.PATH!, RUNNER_TEMP: runnerTemp };
-      expect(runStep(step(scan, CONFIGS).run!, root, runner).code).toBe(0);
-      return runStep(step(scan, SECRETS).run!, root, runner);
-    };
-    expect(without(oneCommit({ ".gitattributes": "* -diff\n", "config.env": secret(token()) })).code).toBe(1);
-    // A history of one NUL-byte commit trips the "0 commits scanned" guard on its own; beside a text commit it doesn't
+  test("the .gitmodules case is closed three times over: without --ignore-submodules=none the dry run fails it, and without the dry run too the WRN guard does", () => {
+    const flagOff: Variant = { edit: (s) => s.replaceAll(" --ignore-submodules=none", "") };
+    const dry = scanHistory(gitmodules(token()), flagOff);
+    expect(dry.code).toBe(1);
+    expect(dry.out).toContain("::error::git log, run as gitleaks runs it, exited 128 or wrote to stderr");
+    expect(dry.out).toContain("git: fatal: bad boolean config value 'you may want to set your diff.renameLimit variable' for 'submodule.sub.shallow'");
+    const wrn = scanHistory(gitmodules(token()), { ...flagOff, skip: [DRYRUN] });
+    expect(wrn.code).toBe(1);
+    expect(wrn.out).toContain("WRN fatal: bad boolean config value");
+    expect(wrn.out).toContain("::error::gitleaks logged a warning other than its findings count");
+    expect(wrn.out).not.toMatch(FOUND);
+    // What the control let through: the WRN, the merge's commit scanned (so no "0 commits scanned"), "no leaks found", exit 0.
+    const before = scanHistory(gitmodules(token()), before4);
+    expect(before.code).toBe(0);
+    expect(before.out).toMatch(/WRN fatal: bad boolean config value[^\n]*\n[^\n]* INF [1-9]\d* commits scanned\.\n[^]* INF no leaks found/);
+  }, SLOW);
+
+  test("GIT_ATTR_SOURCE alone finds a token under a committed * -diff, and only `* diff` finds a NUL-byte token beside other commits", () => {
+    // The scan without the attributes step: in-tree attributes are ignored, but a NUL byte still reads as binary.
+    const without = (build: (r: Repo) => void) => scanHistory(build, { skip: [ATTRS] });
+    // Found, not just failed: a lone binary-looking commit would also trip the "0 commits scanned" guard.
+    const attrs = without(oneCommit({ ".gitattributes": "* -diff\n", "config.env": secret(token()) }));
+    expect(attrs.code).toBe(1);
+    expect(attrs.out).toMatch(FOUND);
+    // A history of one NUL-byte commit trips that guard on its own, with no finding; beside a text commit it doesn't
     // ("1 commits scanned"), and only `* diff` finds the token.
-    expect(without(oneCommit({ "config.env": `${secret(token())}\0\n` })).out).toContain("::error::gitleaks scanned 0 commits");
+    const lone = without(oneCommit({ "config.env": `${secret(token())}\0\n` }));
+    expect(lone.out).toContain("::error::gitleaks scanned 0 commits");
+    expect(lone.out).not.toMatch(FOUND);
     const beside = (r: Repo) => {
       r.write("README.md", "# A project\n");
       r.commit("readme");
@@ -547,8 +796,10 @@ describe.skipIf(gitleaks === undefined)("the real gitleaks, run as the scan job 
       r.commit("the secret, with a NUL byte");
     };
     expect(without(beside).code).toBe(0);
-    expect(scanHistory(beside).code).toBe(1);
-  });
+    const full = scanHistory(beside);
+    expect(full.code).toBe(1);
+    expect(full.out).toMatch(FOUND);
+  }, SLOW);
 
   test("a .gitleaks.toml or .gitleaksignore in the commit fails the scan before gitleaks runs", () => {
     for (const file of [".gitleaks.toml", ".gitleaksignore"]) {
@@ -556,7 +807,7 @@ describe.skipIf(gitleaks === undefined)("the real gitleaks, run as the scan job 
       expect([file, r.code]).toEqual([file, 1]);
       expect(r.out).toContain("would change what gitleaks finds");
     }
-  });
+  }, SLOW);
 });
 
 describe("with real git: the trailer step passes factory commits with all six trailers and fails one without Model", () => {
