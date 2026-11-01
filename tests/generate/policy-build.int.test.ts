@@ -17,21 +17,28 @@ describe.skipIf(!process.env.HAPI_INT)("mise run policy:build", () => {
   });
   afterAll(() => rmSync(out, { recursive: true, force: true }));
 
-  test("-- --roster budget --out <dir>: writes the ten generated files there, with the budget roster", () => {
+  test("-- --roster budget --out <dir>: writes the seventeen generated files there, with the budget roster", () => {
     const r = Bun.spawnSync(["mise", "run", "policy:build", "--", "--roster", "budget", "--out", out], { cwd: REPO, stdout: "pipe", stderr: "pipe" });
     expect([r.exitCode, r.stderr.toString().includes("ERROR")]).toEqual([0, false]);
     const written = r.stdout.toString().trim().split("\n");
     expect(written.map((p) => p.slice(out.length + 1)).sort()).toEqual([
       "archon/archon.env",
       "archon/config.yaml",
+      "archon/empty.env",
+      "archon/gitconfig",
+      "archon/run-config.yaml",
+      "decide/hapi-decide.js",
       "egress/archon.squid.conf",
       "egress/hermes.squid.conf",
       "egress/research.squid.conf",
       "hermes/config.yaml",
       "mcp/hermes.mcp.json",
       "mcp/research.mcp.json",
+      "pi/extensions/hapi-guard.js",
       "pi/hapi-guard.json",
+      "pi/models-store.json",
       "pi/models.json",
+      "pi/settings.json",
     ]);
     // The budget roster: Haiku 5.5 on every Archon tier.
     const archon = readFileSync(join(out, "archon", "config.yaml"), "utf8");

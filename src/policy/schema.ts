@@ -17,6 +17,8 @@ import protectedPaths from "../../policy/schemas/policy-protected-paths.schema.j
 import commands from "../../policy/schemas/policy-commands.schema.json";
 import trustedSources from "../../policy/schemas/policy-trusted-sources.schema.json";
 import budgets from "../../policy/schemas/policy-budgets.schema.json";
+import runs from "../../policy/schemas/policy-runs.schema.json";
+import gates from "../../policy/schemas/policy-gates.schema.json";
 import approvals from "../../policy/schemas/policy-approvals.schema.json";
 import roles from "../../policy/schemas/policy-roles.schema.json";
 import roster from "../../policy/schemas/policy-roster.schema.json";
@@ -42,6 +44,8 @@ const schemas = {
   "policy-commands": commands,
   "policy-trusted-sources": trustedSources,
   "policy-budgets": budgets,
+  "policy-runs": runs,
+  "policy-gates": gates,
   "policy-approvals": approvals,
   "policy-roles": roles,
   "policy-roster": roster,

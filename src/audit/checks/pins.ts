@@ -19,23 +19,9 @@
 import type { Dirent } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import YAML from "yaml";
+import { type ComposeService, composeServices } from "../../stack/compose";
 import { COMPOSE_FILE } from "../../stack/up";
 import { type AuditRun, type CheckResult, result } from "../types";
-
-/** A compose service, the fields the audit reads. */
-export interface ComposeService {
-  image?: string;
-  build?: string | { context?: string; dockerfile?: string };
-  pull_policy?: string;
-  user?: string;
-}
-
-/** stack/compose.yaml's services, merge keys resolved. */
-export async function composeServices(root: string): Promise<Record<string, ComposeService>> {
-  const doc = YAML.parse(await readFile(join(root, COMPOSE_FILE), "utf8"), { merge: true }) as { services?: Record<string, ComposeService> };
-  return doc.services ?? {};
-}
 
 /** The Dockerfile a built service uses, relative to the checkout. */
 export function dockerfileOf(s: ComposeService): string | undefined {

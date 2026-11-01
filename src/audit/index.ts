@@ -1,7 +1,8 @@
 /**
  * `hapi audit` (`mise run audit`, spec §11.8): the deployed config, the pins,
- * the running stack's settings, the secrets setup and each `--repo`'s GitHub
- * settings, checked against policy. docs/audit.md describes every check: what
+ * the budget policy, the run container's definition, the running stack's
+ * settings, the secrets setup and each `--repo`'s GitHub settings, checked
+ * against policy. docs/audit.md describes every check: what
  * it verifies, why, the credential it uses, how to fix a failure and what its
  * skip means.
  *
@@ -26,8 +27,9 @@ import { generatedDrift } from "./checks/generated";
 import { githubAppPerms, githubRulesets, repoAiWorkflows } from "./checks/github";
 import { mcpToolHashes } from "./checks/mcp";
 import { pinsVersions } from "./checks/pins";
+import { budgetEnforcement } from "./checks/policy";
 import { repoPrivateUntracked } from "./checks/repo";
-import { archonEnv, devOverride, hermesNoYolo } from "./checks/runtime";
+import { devOverride, hermesNoYolo, runContainer } from "./checks/runtime";
 import { secretsCheck, secretsProvider } from "./checks/secrets";
 import { archonValidate, hermesValidate } from "./checks/tools";
 import { type AuditContext, type Check, type CheckResult, type Exec, newRun, type RepoRef, result } from "./types";
@@ -35,9 +37,10 @@ import { type AuditContext, type Check, type CheckResult, type Exec, newRun, typ
 /** Every check, in the order it runs and prints. */
 const CHECKS: readonly (readonly [id: string, check: Check])[] = [
   ["generated.drift", generatedDrift],
-  ["runtime.archon-env", archonEnv],
+  ["runtime.run-container", runContainer],
   ["runtime.hermes-no-yolo", hermesNoYolo],
   ["runtime.dev-override", devOverride],
+  ["policy.budget-enforcement", budgetEnforcement],
   ["pins.versions", pinsVersions],
   ["tools.archon-validate", archonValidate],
   ["tools.hermes-validate", hermesValidate],

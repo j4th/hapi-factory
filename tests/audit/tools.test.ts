@@ -6,11 +6,11 @@
  * pinned images printed when run that way (tests/audit/fixtures/).
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import YAML from "yaml";
 import { runAudit } from "../../src/audit/index";
-import { ARCHON_IMAGE, cleanup, cleanWorld, hermesMerge, HERMES_IMAGE, only, readJson } from "./helpers";
+import { ARCHON_IMAGE, cleanup, cleanWorld, hermesMerge, HERMES_IMAGE, only, readJson, rootCopy } from "./helpers";
 
 afterEach(cleanup);
 
@@ -22,8 +22,20 @@ describe("tools.archon-validate", () => {
   test("no errors, no parse warnings and every alias and tier read as generated passes (H-030)", async () => {
     const r = await check(await cleanWorld(), "tools.archon-validate");
     expect(r.status).toBe("pass");
-    expect(r.detail).toContain("24 workflows");
+    // Archon's 24 and the shipped pack's 2, as 0.12.1 printed them with the pack bound (re-captured 2026-10-30).
+    expect(r.detail).toContain("26 workflows");
     expect(r.detail).toContain("8 aliases and 3 tiers");
+  });
+
+  test("a pack workflow that Archon's validate results don't name fails: an image that stopped scanning the pack must not pass it unvalidated (final review B-7)", async () => {
+    const w = await cleanWorld();
+    const out = readJson("archon-validate-v0.12.1.json") as { results: { workflowName: string }[] };
+    out.results = out.results.filter((x) => x.workflowName !== "hapi-check-guard");
+    w.archonValidate = { code: 0, out };
+    const r = await check(w, "tools.archon-validate");
+    expect(r.status).toBe("fail");
+    expect(r.detail).toContain("the pack's workflow hapi-check-guard (hapi-check-guard.yaml) is not among archon validate workflows' results, so it was not validated");
+    expect(r.detail).not.toContain("hapi-check-run (");
   });
 
   test("runs the stack's Archon image offline, read-only, with no secret: only the deployed config and Pi dir, read-only", async () => {
@@ -33,9 +45,59 @@ describe("tools.archon-validate", () => {
     for (const flag of ["--rm", "--read-only", "--network", "none", "--pull", "never", "--cap-drop", "ALL"]) expect(cmd).toContain(flag);
     expect(cmd).toContain(`${join(w.build, "archon", "config.yaml")}:/.archon/config.yaml:ro`);
     expect(cmd).toContain(`${join(w.build, "pi")}:/opt/hapi/pi-agent:ro`);
+    // The shipped pack, as the run container binds it.
+    expect(cmd).toContain(`${join(w.ctx.root, "archon", "workflows", "hapi")}:/.archon/workflows/hapi:ro`);
     expect(cmd.join(" ")).not.toContain("env-file");
     expect(cmd.join(" ")).not.toContain(".env");
     expect(cmd).toContain("PI_OFFLINE=1");
+  });
+
+  test("it reads assistants.pi.enableExtensions back through Archon's loadConfig, and it must be true (H-152)", async () => {
+    const w = await cleanWorld();
+    const r = await check(w, "tools.archon-validate");
+    expect(r.status).toBe("pass");
+    expect(r.detail).toContain("assistants.pi.enableExtensions is true");
+    const script = runOf(w, ARCHON_IMAGE)!.at(-1)!;
+    expect(script).toContain("/app/packages/core/src/config/config-loader.ts");
+    expect(script).toContain("loadConfig");
+    // Without the platform policies set first, loadConfig throws on the real image (task 9 review).
+    expect(script.indexOf("setPlatformPolicies([])")).toBeGreaterThan(-1);
+    expect(script.indexOf("setPlatformPolicies([])")).toBeLessThan(script.indexOf("await loadConfig"));
+    expect(script).toContain("/app/packages/core/src/platforms/registry.ts");
+    expect(runOf(w, ARCHON_IMAGE)).toContain("ARCHON_DOCKER=true");
+    expect(script).toContain("enableExtensions");
+  });
+
+  test("an enableExtensions read-back of false, of nothing, or from a failed command fails, naming it", async () => {
+    for (const [code, out] of [[0, "false"], [0, ""], [0, "undefined"], [1, "true"]] as const) {
+      const w = await cleanWorld();
+      w.enableExtensions = { code, out };
+      const r = await check(w, "tools.archon-validate");
+      expect([code, out, r.status]).toEqual([code, out, "fail"]);
+      expect(r.detail).toContain(code === 0 ? "assistants.pi.enableExtensions reads back as" : "exited 1");
+    }
+  });
+
+  test("a pack workflow with a node that turns Pi's extensions off fails, naming workflow and node (the guard would not load)", async () => {
+    const w = await cleanWorld();
+    const root = rootCopy();
+    const pack = join(root, "archon", "workflows", "hapi");
+    mkdirSync(pack, { recursive: true });
+    writeFileSync(join(pack, "ok.yaml"), "name: ok\ndescription: x\nnodes:\n  - id: a\n    bash: 'true'\n    pi:\n      enableExtensions: true\n");
+    writeFileSync(join(pack, "bad.yaml"), "name: bad\ndescription: x\nnodes:\n  - id: a\n    bash: 'true'\n  - id: off\n    prompt: hi\n    pi:\n      enableExtensions: false\n");
+    w.ctx.root = root;
+    w.archonValidate = { code: 0, out: { results: ["ok", "bad"].map((workflowName) => ({ workflowName, valid: true, issues: [] })) } };
+    const r = await check(w, "tools.archon-validate");
+    expect(r.status).toBe("fail");
+    expect(r.detail).toContain("bad.yaml: node off sets pi.enableExtensions: false");
+    expect(r.detail).not.toContain("ok.yaml");
+    expect(runOf(w, ARCHON_IMAGE)).toContain(`${pack}:/.archon/workflows/hapi:ro`);
+  });
+
+  test("the shipped pack passes the node check", async () => {
+    const r = await check(await cleanWorld(), "tools.archon-validate");
+    expect(r.status).toBe("pass");
+    expect(r.detail).toContain("pack");
   });
 
   test("Archon v0.12.1's own parse warnings (unknown keys it drops) fail, quoting them", async () => {

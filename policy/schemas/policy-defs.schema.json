@@ -19,6 +19,10 @@
       "required": ["interactive", "unattended", "workers"],
       "additionalProperties": false
     },
+    "enforcement": {
+      "description": "How an enforcer treats a spend limit. hard stops the run when the limit is crossed; soft lets it finish and flags it (spec §13.3). Tightening order: soft < hard.",
+      "enum": ["hard", "soft"]
+    },
     "risk": {
       "description": "A work order's risk: drives review depth and thresholds.",
       "enum": ["low", "medium", "high"]

@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "policy-gates.schema.json",
+  "title": "policy/gates.yaml",
+  "description": "The level-6 gate settings (Plan 02): the bash gate, the result screen and the classifiers behind them. Every key is required: the loader fills no defaults. A gate may be on only while flags.jev has a classifier (checked by loadPolicy).",
+  "type": "object",
+  "properties": {
+    "bash_gate": {
+      "description": "Screens each bash call a worker makes before it runs.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "false turns the gate off.",
+          "type": "boolean"
+        },
+        "skip_commands": {
+          "description": "Commands that skip the screen, as argv prefixes (git status). Empty screens every call.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "enabled",
+        "skip_commands"
+      ],
+      "additionalProperties": false
+    },
+    "result_screen": {
+      "description": "Screens what a tool returns before the worker reads it.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "false turns the screen off.",
+          "type": "boolean"
+        },
+        "tools": {
+          "description": "The tools whose results are screened.",
+          "type": "array",
+          "items": {
+            "enum": [
+              "bash",
+              "read"
+            ]
+          },
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "enabled",
+        "tools"
+      ],
+      "additionalProperties": false
+    },
+    "max_state_chars": {
+      "description": "The most characters of run state a classifier is shown.",
+      "$ref": "policy-defs.schema.json#/$defs/count"
+    },
+    "classifiers": {
+      "description": "The models that screen, and what a call to them costs.",
+      "type": "object",
+      "properties": {
+        "jev": {
+          "description": "Jev, through OpenRouter.",
+          "type": "object",
+          "properties": {
+            "model": {
+              "description": "The OpenRouter model id.",
+              "type": "string",
+              "minLength": 1
+            },
+            "unknown_call_usd": {
+              "description": "The cost charged to the run for a Jev call whose usage is unknown.",
+              "$ref": "policy-defs.schema.json#/$defs/usd"
+            }
+          },
+          "required": [
+            "model",
+            "unknown_call_usd"
+          ],
+          "additionalProperties": false
+        },
+        "haiku": {
+          "description": "The fallback when flags.jev.fallback is haiku.",
+          "type": "object",
+          "properties": {
+            "model": {
+              "description": "The Anthropic model id.",
+              "const": "claude-haiku-5-5"
+            },
+            "input_per_mtok": {
+              "description": "USD per million input tokens.",
+              "$ref": "policy-defs.schema.json#/$defs/usd"
+            },
+            "output_per_mtok": {
+              "description": "USD per million output tokens.",
+              "$ref": "policy-defs.schema.json#/$defs/usd"
+            }
+          },
+          "required": [
+            "model",
+            "input_per_mtok",
+            "output_per_mtok"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "jev",
+        "haiku"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "bash_gate",
+    "result_screen",
+    "max_state_chars",
+    "classifiers"
+  ],
+  "additionalProperties": false
+}

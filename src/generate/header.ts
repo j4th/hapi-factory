@@ -2,10 +2,15 @@
  * The notice at the top of every generated file. It names the policy files the
  * file comes from, so a reader knows where to make a change. YAML, env and
  * Squid files carry it as `#` comments; JSON has no comments, so a JSON file
- * carries it as a `$comment` string, its first key. It holds no timestamp or
+ * carries it as a `$comment` string, its first key. A bundled `.js` file carries
+ * it as `//` comments on its first lines. It holds no timestamp or
  * version: a fresh build must be byte-identical to the deployed one, which is
  * how Task 6's audit detects drift.
  */
+import { resolve } from "node:path";
+
+/** The checkout's root, where src/, stack/ and policy/ live; the bundles are built from it. */
+export const REPO_ROOT = resolve(import.meta.dir, "../..");
 
 /** Word-wrap one line of text to `width` columns. A word longer than that gets a line of its own. */
 export function wrap(text: string, width = 88): string[] {
@@ -34,4 +39,9 @@ export function notice(what: string, sources: string[]): string[] {
 /** Lines as `#` comments (YAML, env files, squid.conf). */
 export function hashComment(lines: string[]): string {
   return lines.map((l) => (l === "" ? "#" : `# ${l}`)).join("\n");
+}
+
+/** Lines as `//` comments (a bundled .js file). */
+export function slashComment(lines: string[]): string {
+  return lines.map((l) => (l === "" ? "//" : `// ${l}`)).join("\n");
 }

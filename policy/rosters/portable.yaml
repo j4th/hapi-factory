@@ -9,4 +9,4 @@
 # claude provider serves only Anthropic models.
 small:  { provider: pi, model: opencode-go/glm-5.3-flash, effort: low }
 medium: { provider: pi, model: opencode-go/glm-5.3, effort: medium }          # review: GLM, a different family from implement
-large:  { provider: pi, model: opencode-go/kimi-k3.1-pro, effort: low, retry_effort: high }  # implement
+large:  { provider: pi, model: opencode-go/kimi-k3, effort: low, retry_effort: high }  # implement

@@ -1,5 +1,6 @@
-import { NON_ASCII_FOLDS } from "../../src/generate/hermes";
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { NON_ASCII_FOLDS } from "../../src/generate/hermes";
 import { loadPolicy } from "../../src/policy/load";
 import { effectiveModes, globMatches } from "../../src/policy/paths";
 import { check } from "../../src/policy/schema";
@@ -10,121 +11,51 @@ const ALLOW: PathModes = { interactive: "allow", unattended: "allow", workers: "
 const ASK: PathModes = { interactive: "ask", unattended: "deny", workers: "deny" };
 const DENY: PathModes = { interactive: "deny", unattended: "deny", workers: "deny" };
 
-describe("globMatches", () => {
-  // [glob, path, matches]
-  const cases: [string, string, boolean][] = [
-    // A glob is anchored at the repo root and matched against the whole path.
-    ["AGENTS.md", "AGENTS.md", true],
-    ["AGENTS.md", "src/AGENTS.md", false],
-    ["AGENTS.md", "AGENTS.md.bak", false],
-    ["AGENTS.md", "xAGENTS.md", false],
-    // Matching ignores case: Pi loads AGENTS.MD, and on macOS or Windows Agents.md is AGENTS.md.
-    ["AGENTS.md", "agents.md", true],
-    ["**/AGENTS.md", "pkg/Agents.MD", true],
-    [".github/**", ".GitHub/workflows/ci.yml", true],
-    // Case folding is Unicode's: the long s (U+017F) folds to "s", so it matches too.
-    ["**/SOUL.md", "\u017FOUL.md", true],
-    ["keys/**", "\u212Aeys/a.pem", true], // the Kelvin sign folds to "k"
-    // Every other character is literal: "." is not a regex wildcard.
-    ["mise.toml", "misextoml", false],
-    // "dir/**" covers the directory itself and everything under it, dotfiles included.
-    [".github/**", ".github", true],
-    [".github/**", ".github/workflows/ci.yml", true],
-    [".github/**", ".github/.hidden", true],
-    [".github/**", ".githubx/ci.yml", false],
-    [".github/**", "src/.github/ci.yml", false],
-    // "**" as a leading or middle segment matches zero or more segments.
-    ["**/AGENTS.md", "AGENTS.md", true],
-    ["**/AGENTS.md", "a/b/AGENTS.md", true],
-    ["**/AGENTS.md", "a/b/AGENTS.mdx", false],
-    ["a/**/b", "a/b", true],
-    ["a/**/b", "a/x/y/b", true],
-    ["a/**/b", "a/xb", false],
-    ["**", "anything/at/all", true],
-    ["**/**", "a", true],
-    // "*" and "?" never cross a "/".
-    ["*.md", "README.md", true],
-    ["*.md", ".md", true],
-    ["*.md", "docs/README.md", false],
-    ["docs/*", "docs/a", true],
-    ["docs/*", "docs/a/b", false],
-    ["docs/?.md", "docs/a.md", true],
-    ["docs/?.md", "docs/ab.md", false],
-    ["docs/?.md", "docs//.md", false],
-  ];
-  for (const [glob, path, want] of cases) {
-    test(`${JSON.stringify(glob)} ${want ? "matches" : "does not match"} ${JSON.stringify(path)}`, () => {
-      expect(globMatches(glob, path)).toBe(want);
+/**
+ * The shared vectors, tests/fixtures/path-vectors.json, in the shape of
+ * command-vectors.json: hapi-guard runs the same file (tests/guard/paths.test.ts
+ * and bundle.test.ts), and Plan 04's hapi-path-guard must too (H-087, H-093).
+ */
+interface GlobVector {
+  glob: string;
+  path: string;
+  matches: boolean;
+}
+interface PathVector extends PathModes {
+  path: string;
+  /** effectiveModes throws an error containing this, and every enforcer denies the path. */
+  reason?: string;
+}
+const vectors = JSON.parse(readFileSync("tests/fixtures/path-vectors.json", "utf8")) as { globs: GlobVector[]; paths: PathVector[] };
+
+describe("globMatches (shared vectors)", () => {
+  for (const { glob, path, matches } of vectors.globs) {
+    test(`${JSON.stringify(glob)} ${matches ? "matches" : "does not match"} ${JSON.stringify(path)}`, () => {
+      expect(globMatches(glob, path)).toBe(matches);
     });
   }
 });
 
 describe("effectiveModes", () => {
-  test("the base policy, per file", () => {
-    expect(effectiveModes(p, "AGENTS.md")).toEqual(ASK);
-    expect(effectiveModes(p, ".github/workflows/ci.yml")).toEqual(ASK);
-    expect(effectiveModes(p, ".pi/settings.json")).toEqual(DENY);
-    expect(effectiveModes(p, "mise.toml")).toEqual(ASK);
-    // Agent instruction files are protected at any depth ("**/AGENTS.md" matches the root too).
-    expect(effectiveModes(p, "src/AGENTS.md")).toEqual(ASK);
-    expect(effectiveModes(p, "pkg/web/CLAUDE.md")).toEqual(ASK);
-    expect(effectiveModes(p, "pkg/web/.claude/settings.json")).toEqual(ASK);
-    // Other globs are anchored at the root: only the root .coderabbit.yaml is CodeRabbit's config.
-    expect(effectiveModes(p, "src/.coderabbit.yaml")).toEqual(ALLOW);
-    expect(effectiveModes(p, "src/cli.ts")).toEqual(ALLOW);
-  });
-
-  test("git's own files are deny in every session: a .git dir at any depth, all of it, and a worktree's .git file", () => {
-    // git runs commands that .git/config names (core.fsmonitor, diff.external) from argv commands.yaml allows.
-    for (const path of [".git", ".git/config", ".git/hooks/pre-commit", "sub/.git/config", "sub/.git", ".GIT/Config", "a/b/.git/worktrees/x/gitdir"]) {
-      expect([path, effectiveModes(p, path)]).toEqual([path, DENY]);
+  test("every shared path vector: the base policy's modes, or an error naming the problem (and deny)", () => {
+    for (const { path, reason, ...modes } of vectors.paths) {
+      if (reason === undefined) expect([path, effectiveModes(p, path)]).toEqual([path, modes]);
+      else {
+        expect(() => effectiveModes(p, path)).toThrow(reason);
+        expect([path, modes]).toEqual([path, DENY]);
+      }
     }
-    // Names that only start with ".git" are not git's own.
-    for (const path of [".gitignore", ".gitattributes", "docs/.gitkeep", "src/.github/x.yml"]) expect([path, effectiveModes(p, path)]).toEqual([path, ALLOW]);
-    expect(effectiveModes(p, ".github/workflows/ci.yml")).toEqual(ASK);
   });
 
-  test("every other file mise reads config, tasks or locked tools from is protected like mise.toml, at any depth", () => {
-    // From the pinned mise's `mise config ls` and task dirs; a later file overrides mise.toml's tasks. A lockfile
-    // (mise.lock, mise.<env>.lock, mise.local.lock) names the URL and checksum mise installs each tool from.
-    for (const path of [
-      ".mise.toml",
-      "mise.local.toml",
-      ".mise.local.toml",
-      "mise.ci.toml",
-      ".mise.ci.toml",
-      "mise/config.toml",
-      "mise/conf.d/a.toml",
-      "mise/tasks/test",
-      ".mise/config.toml",
-      ".mise/tasks/test",
-      ".config/mise.toml",
-      ".config/mise.local.toml",
-      ".config/mise.ci.toml",
-      ".config/mise/config.toml",
-      ".config/mise/conf.d/a.toml",
-      ".config/mise/tasks/test",
-      "mise-tasks/test",
-      ".mise-tasks/test",
-      ".tool-versions",
-      "pkg/.mise.toml",
-      "pkg/.tool-versions",
-      "pkg/mise.toml",
-      "a/b/MISE.toml",
-      "mise.lock",
-      "mise.ci.lock",
-      "mise.local.lock",
-      "mise.ci.local.lock",
-      "pkg/mise.lock",
-      ".config/mise/mise.lock",
-    ]) {
-      expect([path, effectiveModes(p, path)]).toEqual([path, ASK]);
+  test("the vectors keep every kind of case: case folding, git's files, mise, aliases and each error", () => {
+    const paths = new Set(vectors.paths.map((v) => v.path));
+    for (const path of ["AGENTS.MD", "README.md", ".git/config", "sub/.git", ".GIT/Config", ".config/mise/mise.lock", "pkg/.GitleaksIgnore"]) {
+      expect([path, paths.has(path)]).toEqual([path, true]);
     }
-    for (const path of ["src/mise.ts", "docs/mise.md", "misery.toml", ".config/other.toml", "mise-notes/a.md", "docs/mise.lockfile.md"]) expect([path, effectiveModes(p, path)]).toEqual([path, ALLOW]);
-  });
-
-  test("gitleaks's config and ignore file are protected at any depth: one could turn the secret scans off", () => {
-    for (const path of [".gitleaks.toml", ".gitleaksignore", "pkg/.gitleaks.toml", "pkg/.GitleaksIgnore"]) expect([path, effectiveModes(p, path)]).toEqual([path, ASK]);
+    for (const path of ["docs/../AGENTS.md", ".github/", "src/../.pi/x", "", "../AGENTS.md", "AGENTS.md\u0000.txt", "a\u0085b", "AGENTS.md\\", "docs/café.md"]) {
+      expect([path, paths.has(path)]).toEqual([path, true]);
+    }
+    expect(new Set(vectors.paths.filter((v) => v.reason !== undefined).map((v) => v.reason)).size).toBe(7);
   });
 
   test("the strictest mode across every matching glob wins, per session, whatever the order", () => {
@@ -147,33 +78,8 @@ describe("effectiveModes", () => {
     expect(effectiveModes({ protectedPaths: {} }, "AGENTS.md")).toEqual(ALLOW);
   });
 
-  test("the path is normalized first, so an alias can't dodge a glob", () => {
-    for (const alias of ["./AGENTS.md", "docs/../AGENTS.md", "././AGENTS.md"]) {
-      expect(effectiveModes(p, alias)).toEqual(ASK);
-    }
-    expect(effectiveModes(p, ".github//workflows/ci.yml")).toEqual(ASK);
-    expect(effectiveModes(p, ".github/")).toEqual(ASK);
-    expect(effectiveModes(p, "src/../.pi/x")).toEqual(DENY);
-  });
-
-  test("a path that isn't inside the repo is an error, not allow", () => {
-    for (const bad of ["", ".", "./", "/etc/passwd", "/AGENTS.md", "..", "../AGENTS.md", "a/../../AGENTS.md"]) {
-      expect(() => effectiveModes(p, bad)).toThrow(/repo-relative/);
-    }
-  });
-
-  test("a path with NUL, a control character or a backslash is an error that names the problem", () => {
-    expect(() => effectiveModes(p, "AGENTS.md\u0000.txt")).toThrow(/contains NUL \(U\+0000\)/);
-    expect(() => effectiveModes(p, "AGENTS.md\n")).toThrow(/contains a control character \(U\+000A\)/);
-    expect(() => effectiveModes(p, "a\u001b[31m")).toThrow(/control character \(U\+001B\)/);
-    expect(() => effectiveModes(p, "a\u007fb")).toThrow(/control character \(U\+007F\)/);
-    expect(() => effectiveModes(p, "a\u0085b")).toThrow(/control character \(U\+0085\)/); // C1 controls too
-    expect(() => effectiveModes(p, ".github\\workflows\\ci.yml")).toThrow(/contains a backslash/);
-    expect(() => effectiveModes(p, "AGENTS.md\\")).toThrow(/contains a backslash/);
-    // The message shows the path escaped, so it prints safely.
+  test("an error shows the path JSON-escaped, so it prints safely", () => {
     expect(() => effectiveModes(p, "a\u001bb")).toThrow('"a\\u001bb"');
-    // Other non-ASCII characters are ordinary.
-    expect(effectiveModes(p, "docs/café.md")).toEqual(ALLOW);
   });
 
   test("the result is a fresh object", () => {

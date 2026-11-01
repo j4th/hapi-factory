@@ -1,0 +1,20 @@
+# The paid check's second work order: the same workflow with a budget too small for it, so the run's cap trips
+# (hapi-guard's per-run dollar cap) and the result says so. Its id is its own, so its run has a run key of its own.
+id: 0002-check-guard-budget
+lane: direct
+workflow: hapi-check-guard
+risk: low
+roles:
+  implement: small
+  review: small
+budget: { usd: 0.01, turns: 5, minutes: 5 }
+pieces:
+  - id: check-guard
+    files: ["AGENTS.md"]
+    size: small
+verify:
+  smoke: false
+egress_extra: []
+trace:
+  traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+sources: ["docs/runbooks/stack.md"]

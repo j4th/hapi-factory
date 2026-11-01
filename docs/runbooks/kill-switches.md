@@ -6,7 +6,7 @@ These are spec §11.8's four kill switches, **fastest first**. The operator runs
 |---|---|---|---|---|
 | [1](#1-zero-or-revoke-the-provider-keys) | Disable or revoke the provider keys | Every model and search call on those keys, from running containers too | The containers, local edits, GitHub tokens, a key already copied out | When the provider applies it |
 | [2](#2-suspend-the-github-app-installations) | Suspend both GitHub App installations | New App tokens, and the Apps' access to your repos | A token minted before it, up to its hour (revoke it) | At once for new tokens |
-| [3](#3-stop-the-stack) | Stop the stack | Every container: the agents and their proxies | Keys or tokens already out; what is already on GitHub | Seconds |
+| [3](#3-stop-the-stack) | Stop the stack | Every container: the agents, any run containers and their proxies | Keys or tokens already out; what is already on GitHub | Seconds |
 | [4](#4-firewall-drop-the-hapi-user) | Firewall-drop the `hapi` user | Every packet hapi's processes send, the containers' included | The containers' local work; a dev-bypass stack | The next packet |
 
 Two marks on this page:
@@ -74,17 +74,20 @@ Three ways, gentlest first. `compose down` removes the containers and their logs
 mise run down
 ```
 
-As anyone but hapi, `hapi stack down` re-execs `mise run down` as hapi with `sudo -u hapi -H -- sh -c '<fixed script>' hapi-stack`, the same fixed script as `up` (`reexecScript` in `src/stack/up.ts`): no login shell, and none of your words in the script. In hapi's checkout, hapi's mise runs `docker compose -p hapi down` on hapi's rootless Docker. It goes by project name, so it needs no compose file, `build/` or env file, but it does need a working checkout and mise on both sides (yours to start it, hapi's to run it). Spec §11.8 says "`mise run down` as host admin": that is still where you run it, but it now re-execs as hapi (H-083).
+As anyone but hapi, `hapi stack down` re-execs `mise run down` as hapi with `sudo -u hapi -H -- sh -c '<fixed script>' hapi-stack`, the same fixed script as `up` (`reexecScript` in `src/stack/up.ts`): no login shell, and none of your words in the script. In hapi's checkout, hapi's mise stops the runs first (it force-removes every container labelled `org.hapi.run` and `org.hapi.project=hapi`, disconnects `egress-archon` from each run network, then removes the run networks and volumes with those labels), then runs `docker compose -p hapi down` on hapi's rootless Docker. If removing a run fails, `compose down` still runs, and `down` exits non-zero naming what is left. It goes by project name, so it needs no compose file, `build/` or env file, but it does need a working checkout and mise on both sides (yours to start it, hapi's to run it). Spec §11.8 says "`mise run down` as host admin": that is still where you run it, but it now re-execs as hapi (H-083).
 
 ### 3b. Without a checkout or mise
 
 When either checkout or either mise is broken, run Compose as hapi directly, with the rootless socket's environment set explicitly **[verify in stage b]**:
 
 ```bash
-sudo -u hapi -H -- sh -c 'export XDG_RUNTIME_DIR="/run/user/$(id -u)" DOCKER_HOST="unix:///run/user/$(id -u)/docker.sock"; exec docker compose -p hapi down'
+sudo -u hapi -H -- sh -c 'export XDG_RUNTIME_DIR="/run/user/$(id -u)" \
+  DOCKER_HOST="unix:///run/user/$(id -u)/docker.sock"; \
+  docker ps -q --filter label=org.hapi.run | xargs -r docker rm -f; \
+  exec docker compose -p hapi down'
 ```
 
-The script is fixed text: hapi's `sh` evaluates `$(id -u)` as hapi, and nothing of yours is in it. sudo clears `XDG_RUNTIME_DIR` (lingering keeps the directory), so the script sets it, and `DOCKER_HOST` points the CLI at hapi's rootless daemon whatever Docker context hapi has.
+The script is fixed text: hapi's `sh` evaluates `$(id -u)` as hapi, and nothing of yours is in it. sudo clears `XDG_RUNTIME_DIR` (lingering keeps the directory), so the script sets it, and `DOCKER_HOST` points the CLI at hapi's rootless daemon whatever Docker context hapi has. The `docker ps` line removes the run containers first. Their networks and volumes (labelled `org.hapi.run` too) are empty afterwards and can wait: `mise run down` removes them next time, or list them with `docker network ls --filter label=org.hapi.run` and `docker volume ls --filter label=org.hapi.run`, as hapi.
 
 ### 3c. Hard stop: hapi's Docker daemon, or everything hapi runs
 
@@ -105,12 +108,14 @@ Here `$(id -u hapi)` is your own shell looking up hapi's uid for root's `systemc
 
 What to check the first time you run it (H-160(c)): after the first command, `pgrep -a -u hapi -f 'rootlesskit|dockerd|containerd|slirp4netns|pasta'` prints nothing, and the CGroup tree in `systemctl status --no-pager -l "user@$(id -u hapi).service"` has no `docker-<id>.scope`, the scope each container runs in. pgrep never lists itself, and `-u hapi` leaves out a rootful Docker's own `dockerd` and `containerd`, which run as root (the stage b host has one). The containers run as hapi's subordinate uids, so a search by user misses them, but the cgroup tree holds them whatever uid they run as. After the second, the same `systemctl status` says inactive and the same `pgrep` prints nothing. Also check what comes back on the undo (below).
 
-- **Stops:** every container: Hermes, Archon with Pi, and the three proxies, so every agent action and all egress from the zones. 3c also stops hapi's other user services: later, the poller and harvester timers (Plan 03).
-- **Doesn't stop:** keys or tokens already copied out (switches 1 and 2), anything already on GitHub, or your own processes. The volumes (`hermes-data`, `archon-data`, `archon-home`) are kept, so the state is there to inspect, and `mise run up` starts from it. A dev-bypass stack (`HAPI_ALLOW_CURRENT_USER=1`) runs on your own Docker, not hapi's: stop it with `HAPI_ALLOW_CURRENT_USER=1 mise run down`; 3b and 3c don't touch it. The other way round, a `mise run down` with the bypass set doesn't go through hapi: it stops project `hapi` on whichever Docker your shell's docker CLI reaches (its `DOCKER_HOST`, `DOCKER_CONTEXT` or current context; normally your own, not hapi's), and warns so (`hapi stack down: warning: HAPI_ALLOW_CURRENT_USER=1: stopping the dev-bypass stack (Compose project hapi) on the Docker daemon this shell's docker CLI reaches ...`): stop hapi's from a shell without it, or with 3b.
-- **Confirm:** after 3a or 3b, this prints only the header line:
+- **Stops:** every container: Hermes, any run container (Archon with Pi), and the three proxies, so every agent action and all egress from the zones. 3c also stops hapi's other user services: later, the poller and harvester timers (Plan 03).
+- **Doesn't stop:** keys or tokens already copied out (switches 1 and 2), anything already on GitHub, or your own processes. The volume `hermes-data` is kept, so the state is there to inspect, and `mise run up` starts from it. A run's own state goes with its container: a run that was live is stopped mid-way, and its outputs, if it had not finished, are gone. A dev-bypass stack (`HAPI_ALLOW_CURRENT_USER=1`) runs on your own Docker, not hapi's: stop it with `HAPI_ALLOW_CURRENT_USER=1 mise run down`; 3b and 3c don't touch it. The other way round, a `mise run down` with the bypass set doesn't go through hapi: it stops project `hapi` on whichever Docker your shell's docker CLI reaches (its `DOCKER_HOST`, `DOCKER_CONTEXT` or current context; normally your own, not hapi's), and warns so (`hapi stack down: warning: HAPI_ALLOW_CURRENT_USER=1: stopping the dev-bypass stack (Compose project hapi) on the Docker daemon this shell's docker CLI reaches ...`): stop hapi's from a shell without it, or with 3b.
+- **Confirm:** after 3a or 3b, this prints only the header line, run containers included:
 
   ```bash
-  sudo -u hapi -H -- sh -c 'export XDG_RUNTIME_DIR="/run/user/$(id -u)" DOCKER_HOST="unix:///run/user/$(id -u)/docker.sock"; exec docker compose -p hapi ps --all'
+  sudo -u hapi -H -- sh -c 'export XDG_RUNTIME_DIR="/run/user/$(id -u)" \
+    DOCKER_HOST="unix:///run/user/$(id -u)/docker.sock"; \
+    exec docker ps --all --filter label=org.hapi.stack=hapi-factory'
   ```
 
   After 3c, see what to check, above.

@@ -31,8 +31,24 @@
     "hermes_max_turns": {
       "description": "Hermes agent.max_turns.",
       "$ref": "policy-defs.schema.json#/$defs/count"
+    },
+    "enforcement": {
+      "description": "How each enforcer treats run_usd: hard stops the run, soft flags it and lets it finish. One setting per enforcement point.",
+      "type": "object",
+      "properties": {
+        "hapi_guard": {
+          "description": "Pi's hapi-guard extension, which sums the run's spend per turn.",
+          "$ref": "policy-defs.schema.json#/$defs/enforcement"
+        },
+        "archon": {
+          "description": "Archon's budget on the factory-task workflow's children.",
+          "$ref": "policy-defs.schema.json#/$defs/enforcement"
+        }
+      },
+      "required": ["hapi_guard", "archon"],
+      "additionalProperties": false
     }
   },
-  "required": ["workspaces", "openrouter_monthly_usd", "jev_monthly_usd", "run_usd", "hermes_max_turns"],
+  "required": ["workspaces", "openrouter_monthly_usd", "jev_monthly_usd", "run_usd", "hermes_max_turns", "enforcement"],
   "additionalProperties": false
 }

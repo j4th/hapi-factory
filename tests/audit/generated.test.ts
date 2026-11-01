@@ -13,7 +13,7 @@ import { runAudit } from "../../src/audit/index";
 import { buildAll } from "../../src/generate/index";
 import { loadPolicy } from "../../src/policy/load";
 import { buildDigest } from "../../src/stack/up";
-import { cleanup, cleanWorld, files, only, REPO, tempDir } from "./helpers";
+import { cleanup, cleanWorld, files, only, REPO, runContainer, tempDir } from "./helpers";
 
 afterEach(cleanup);
 
@@ -31,7 +31,7 @@ describe("generated.drift", () => {
     const r = await drift(w);
     expect(r.status).toBe("pass");
     expect(r.detail).toContain("roster anthropic");
-    expect(r.detail).toContain("5 running containers");
+    expect(r.detail).toContain("4 running containers");
   });
 
   test("it finds the roster the stack was built with (`up --roster budget`)", async () => {
@@ -58,13 +58,13 @@ describe("generated.drift", () => {
     expect(r.detail).not.toContain("128000");
   });
 
-  test("HOST=0.0.0.0 in archon.env fails, naming HOST (Review Focus 4)", async () => {
+  test("PI_OFFLINE=0 in archon.env fails, naming PI_OFFLINE (Review Focus 4)", async () => {
     const w = await cleanWorld();
-    edit(join(w.build, "archon", "archon.env"), "HOST=127.0.0.1", "HOST=0.0.0.0");
+    edit(join(w.build, "archon", "archon.env"), "PI_OFFLINE=1", "PI_OFFLINE=0");
     const r = await drift(w);
     expect(r.status).toBe("fail");
-    expect(r.detail).toContain("archon/archon.env: HOST");
-    expect(r.detail).not.toContain("0.0.0.0");
+    expect(r.detail).toContain("archon/archon.env: PI_OFFLINE");
+    expect(r.detail).not.toContain("PI_OFFLINE=0");
   });
 
   test("an edited squid.conf fails, naming the file and the line", async () => {
@@ -88,8 +88,9 @@ describe("generated.drift", () => {
 
   test("a path a fresh build doesn't have fails, naming it: archon reads build/pi wholesale as Pi's agent dir", async () => {
     const w = await cleanWorld();
-    // Pi inside Archon would read each of these: a planted settings.json or auth.json, an extensions/ dir.
-    writeFileSync(join(w.build, "pi", "settings.json"), '{"secret-planted-value": true}\n');
+    // Pi inside Archon would read each of these: a planted keybindings.json or auth.json, an extra extension.
+    // (settings.json, models-store.json and extensions/hapi-guard.js are generated since Plan 02 Task 4.)
+    writeFileSync(join(w.build, "pi", "keybindings.json"), '{"secret-planted-value": true}\n');
     writeFileSync(join(w.build, "pi", "auth.json"), "{}\n");
     mkdirSync(join(w.build, "pi", "extensions", "deep"), { recursive: true });
     writeFileSync(join(w.build, "pi", "extensions", "deep", "evil.ts"), "export default {}\n");
@@ -99,7 +100,7 @@ describe("generated.drift", () => {
     mkdirSync(join(w.build, "leftover"));
     const r = await drift(w);
     expect(r.status).toBe("fail");
-    for (const p of ["pi/settings.json", "pi/auth.json", "pi/extensions/", "pi/empty-dir/", "mcp/old.mcp.json", "leftover/"]) expect(r.detail).toContain(`${p}: not in a fresh build`);
+    for (const p of ["pi/keybindings.json", "pi/auth.json", "pi/extensions/deep/", "pi/empty-dir/", "mcp/old.mcp.json", "leftover/"]) expect(r.detail).toContain(`${p}: not in a fresh build`);
     // A directory is named once, not every file under it; and nothing is read from an unexpected path.
     expect(r.detail).not.toContain("evil.ts");
     expect(r.detail).not.toContain("secret-planted-value");
@@ -109,10 +110,10 @@ describe("generated.drift", () => {
 
   test("an extra file alone fails even when every generated file matches and every label is right", async () => {
     const w = await cleanWorld();
-    writeFileSync(join(w.build, "pi", "models-store.json"), "{}\n");
+    writeFileSync(join(w.build, "pi", "prompts.json"), "{}\n");
     const r = await drift(w);
     expect(r.status).toBe("fail");
-    expect(r.detail).toContain("pi/models-store.json: not in a fresh build");
+    expect(r.detail).toContain("pi/prompts.json: not in a fresh build");
     expect(r.detail).not.toContain("was started from another build");
   });
 
@@ -135,13 +136,26 @@ describe("generated.drift", () => {
 
   test("a container started from another build fails, naming it; one with no build label too", async () => {
     const w = await cleanWorld();
-    w.containers.find((c) => c.Name === "/hapi-archon-1")!.Config.Labels["org.hapi.build-sha256"] = "0".repeat(64);
+    w.containers.find((c) => c.Name === "/hapi-hermes-1")!.Config.Labels["org.hapi.build-sha256"] = "0".repeat(64);
     w.containers.find((c) => c.Name === "/hapi-egress-hermes-1")!.Config.Labels["org.hapi.build-sha256"] = "";
     const r = await drift(w);
     expect(r.status).toBe("fail");
-    expect(r.detail).toContain("hapi-archon-1 was started from another build");
+    expect(r.detail).toContain("hapi-hermes-1 was started from another build");
     expect(r.detail).toContain("hapi-egress-hermes-1 has no org.hapi.build-sha256 label");
     expect(r.detail).toContain("mise run up");
+  });
+
+  test("a run container with another build's digest fails, naming it; one from this build passes and is counted", async () => {
+    const w = await cleanWorld();
+    w.containers.push(runContainer(w, "aaaaaaaaaaaa"));
+    let r = await drift(w);
+    expect(r.status).toBe("pass");
+    expect(r.detail).toContain("5 running containers");
+    w.containers.push(runContainer(w, "bbbbbbbbbbbb", { labels: { "org.hapi.build-sha256": "0".repeat(64) } }));
+    r = await drift(w);
+    expect(r.status).toBe("fail");
+    expect(r.detail).toContain("hapi-run-bbbbbbbbbbbb was started from another build");
+    expect(r.detail).not.toContain("hapi-run-aaaaaaaaaaaa");
   });
 
   test("with the stack down it still compares the files, and says the labels were not checked", async () => {

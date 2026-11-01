@@ -225,6 +225,8 @@ A **lightweight lane** exists for tiny changes: a `lane:planning` doc-only PR wi
 - Inside a run, each step starts with a fresh context and passes its own gates. Each piece produces its own commit, so the PR can be reviewed one commit at a time.
 - A failed run **resumes** from the failed step [verified: Archon resume replays completed nodes].
 
+> **As built (noted 2026-10-30, H-213):** there is no resume. Each run is one container, removed with the run, and Archon's run database dies with it, so a failed, timed-out or stopped run has nothing to resume from. It starts over from a fresh clone as a new run, `hapi run start --retry-of <run-id>`; a Pi node is an idempotent unit of work, and the cost of starting over is the repeated spend, bounded by the run's budget ([Plan 02's design](2026-10-29-hapi-factory-02-worker-design.md), §3.1 and §6a items 1 and 14; [the runs runbook](../../runbooks/runs.md)). Resume, reconsidered, comes with the observability profile (Phase 3, H-213).
+
 ### 5.4 Fan-out inside a run [call]
 
 - **Hermes proposes** the pieces in the work order: each piece's files and a rough size.
@@ -464,6 +466,7 @@ protected_paths:
    - `resume` re-drives a run that a merge already approved, with no new inputs. It's also available to the operator as `mise run factory:resume -- <run-id>` [call].
    - Hermes **cannot answer Archon approvals or start new factory runs** in v1. New runs start only from merges.
    > **As built (noted 2026-10-29, H-083):** the Hermes and Archon containers have no network route to each other (§11.3's note; threat model B3, DS-1), and Archon's server listens on 127.0.0.1 inside its own container (`stack/compose.yaml`). So a tool in the Hermes container can neither reach Archon's API nor run Archon's CLI against its run DB, and how `hapi-status` gets run state is still open (Plan 04, H-198). The command policy's rule for it allows only `hapi status [<run-id>]`, with no flags (`policy/commands.yaml`, docs/policy.md).
+   > **As built (noted 2026-10-30, H-213):** there is no `resume` to re-drive, and no Archon server to call `status`, `list` or `cancel` on: a run is a one-shot container ([Plan 02's design](2026-10-29-hapi-factory-02-worker-design.md), §3.1). The host knows every run. `hapi run list` shows them, `hapi run watch <id>` follows one, and `hapi run stop <id>` stops one ([the runs runbook](../../runbooks/runs.md)), so `hapi-status` can read those host-side run records instead of Archon. How they reach the Hermes zone is still H-198 (Plan 04). `mise run factory:resume` is not built.
 7. **`hapi-gh-token` helper**: mints a 1-hour `hapi-planner` GitHub App installation token scoped to one repo, outside the agent. Overrides the bundled skill's advice to use a classic PAT.
 
 ### 9.2 Archon (run engine)
@@ -478,7 +481,11 @@ protected_paths:
 - Web console only through an SSH tunnel or an authenticating proxy that strips and sets `X-Archon-User`
 - Triggered runs execute as a `factory-bot` member user
 
+> **As built (noted 2026-10-30, H-088, H-182):** there is no Archon server, so there is no web console, no tunnel or authenticating proxy for one, no `HOST` to set and no `factory-bot` user for a trigger (threat model AC-13). A run is `archon workflow run` in a one-shot container: `hapi run start` makes one hardened container per run, on a network of its own, from the `archon` service of `stack/compose.yaml`, which is profile-only (`profiles: ["run"]`) and starts nothing. That service is the reviewed source of the image, user, limits, hardening and environment, and the launcher translates it into `docker run` arguments because Compose can't give a run its own network or tmpfs mounts, and `compose down` never stops a `docker run` container. `mise run down` and kill switch 3 stop run containers by their labels ([Plan 02's design](2026-10-29-hapi-factory-02-worker-design.md), §3.1 and §6a items 3, 4 and 12; [the runs runbook](../../runbooks/runs.md)). The workflow pack is bound read-only at `/.archon/workflows/hapi/`, Archon's home-scoped directory when `ARCHON_DOCKER=true`, not `~/.archon/workflows/hapi/`.
+
 **Workflows:** a small, tagged, home-scoped pack (`~/.archon/workflows/hapi/`, shipped from `archon/` in this repo) with a `compatibility.archon` range. CI runs `archon validate workflows --json`, **fails on parse warnings** (unknown keys are otherwise dropped silently), and runs `archon workflow test` stub fixtures.
+
+> **As built (noted 2026-10-30, H-152):** Archon 0.12.1 has no `compatibility.archon` workflow key. One would be a parse warning, which the CI check fails on, so the pack carries none: the version is held by the image pin (docs/runbooks/stack.md, Pinned images) and the audit's `tools.archon-validate`.
 
 `factory-task` steps [call; the builder writes the YAML. A documented-fields skeleton is in `archon_plugins_integration.md` §Q4]:
 
@@ -512,6 +519,8 @@ protected_paths:
   - `PI_TELEMETRY=0`
   - A `PI_CODING_AGENT_DIR` whose `models.json` (with `maxTokens` around 64K) nothing in the container can change. Spike T8 found Pi must write its own cache and sessions there, so the directory is a tmpfs with hapi's files bound read-only into it (docs/spikes/01-pi-under-archon.md).
     > **As built (noted 2026-10-29, H-083):** not yet. Plan 01's `stack/compose.yaml` still mounts the whole directory read-only (`../build/pi:/opt/hapi/pi-agent:ro`), which spike T8 found fails every Pi node: Pi can't write `models-store.json` at Archon's credential preflight (`EROFS`). Plan 02 makes it the tmpfs (H-181(a)).
+
+    > **As built (noted 2026-10-30, H-181, H-197):** built in Plan 02. The run container makes `/opt/hapi/pi-agent` a 64 MB tmpfs (`size=64m,uid=1001,gid=1001,mode=0700`) and binds `models.json`, `models-store.json` (`{}`), `hapi-guard.json`, `settings.json` and `extensions/` into it read-only. `models.json` pins each roster model's whole `cost` and `compat`, `maxTokens` and the provider's `baseUrl`, so a planted `models-store.json` can't reprice or reroute a model; hapi-guard compares the resolved model with the pin at `session_start`, and fails the node if Pi's directory holds anything but those files and Pi's own cache and sessions ([Plan 02's design](2026-10-29-hapi-factory-02-worker-design.md), §3.3 and §6a item 9; threat model DS-11; docs/generated-configs.md).
   - `hapi-guard` as the only user-level extension.
 - **Repo `.pi/` can't be excluded under Archon today.** Pi trusts every project under the SDK, and Archon only toggles extensions all-on or all-off. So `prepare` strips `.pi/` and `.agents/`, and hapi-guard blocks writes to them.
   - Longer term: upstream an Archon PR to honor Pi's native project trust [call; good showcase contribution].
@@ -524,6 +533,8 @@ protected_paths:
   - Read `traceparent` and the work-order id from the work-order file. Archon's `extensionFlags` are literal and can't carry them.
   - Emit normalized events and optional OTel spans.
   - **Jev-backed level 6 gates**, layered after the deterministic rules: the bash gate, write gate (credentials) and result screen (§9.5). Behind `jev.enabled`.
+
+  > **As built (noted 2026-10-30, H-087, H-089, H-184):** hapi-guard is `src/guard/`, bundled to `build/pi/extensions/hapi-guard.js` and loaded as Pi's only user extension ([Plan 02's design](2026-10-29-hapi-factory-02-worker-design.md), §3.3 and §6a items 6 to 10; docs/generated-configs.md, "What hapi-guard enforces"). It differs from the sketch in these ways. It registers no tools. It reads `build/pi/hapi-guard.json` and the run's `run.json` (the work-order id, `traceparent`, budget and public flag), not the work-order file. Each Pi node is a fresh `bun` process, so the run's spend is a ledger file per attempt in the container's tmpfs, which the worker can edit (a residual, behind Archon's `max_spend_usd` and the providers' caps). Its factory never throws, because Pi records a load error and Archon never reads it; bad settings fail the node at `session_start`, and the host fails a run in which a Pi attempt left no `session_start` record in the decision log. It pins the model (H-184, `drop_block`). It can't replace Archon's `bash` tool, so rule 7 (a `bash` command that plainly writes a protected path) is a signal, not a boundary: the boundary is the host-side diff gate on the run's bundle (Plan 03). Rule 8 deletes keys from the guard's own `process.env` and prefixes `unset` to a `bash` command, which keeps them out of casual output only. Pi's `bash` tool and the shell still read the parent's environment (threat model DS-16 and its Plan 02 residuals). The guard's glob matcher is the policy's own `effectiveModes`, bundled in (H-089).
 - **Skip:** community subagent, sandbox and web packages. They either bypass the guard or are stale.
 
 ### 9.4 Host poller and harvester (ours) [call]
@@ -571,6 +582,8 @@ Small scripts run by `hapi` (systemd user timers, installed by `mise run up`):
 - Every decision is a file in `policy/decisions/<name>.ts`, holding its questions, thresholds and fallback default. CODEOWNERS covers it.
 - All calls go through one `decide()` helper, built on the vendored client, which records the question, answer, probability, confidence, latency, cost and fallback use in run metrics.
 - Hermes's Python side calls it through a small `hapi decide` CLI.
+
+  > **As built (noted 2026-10-30, H-087, H-201):** `decide()` is `src/decide/`, on a vendored copy of the ten-levels client and mock. The write gate's credential check is local, not a model call: it compares exact secret values and the key formats of `policy/decisions/write-gate.ts`. The bash gate and the result screen go through `decide()` and fail closed when no classifier answers. The public-repo rule is enforced by a flag in the run's `run.json`: Jev is asked only when it is set, and otherwise the gates use the Haiku classifier, so a repo not marked public gets no Jev call. In Plan 02 the flag is `hapi run start --public`, the operator's assertion; Plan 03's poller sets it from the forge; a work order, which a model wrote, never can ([Plan 02's design](2026-10-29-hapi-factory-02-worker-design.md), §3.4; [the runs runbook](../../runbooks/runs.md)). `hapi decide` is a self-contained bundle, `build/decide/hapi-decide.js`; shipping it into the Hermes image, with a Hermes-zone Jev key, is Plan 04's (H-201).
 - With `jev.enabled: false`, or on error, `decide()` falls back in this order:
   1. a Haiku 5.5 classifier asked the same typed question;
   2. the decision file's deterministic default.
@@ -747,6 +760,8 @@ Why native beats an MCP server here:
   > **As built (noted 2026-10-29, H-083):** not yet. The Hermes main session, which reads chat, PR comments and briefs, runs its `local` terminal inside the long-lived Hermes container (`restart: unless-stopped`), with `HERMES_HOME` on the persistent `hermes-data` volume (`stack/compose.yaml`), so `terminal.container_persistent: false` has no effect (docs/generated-configs.md). The Archon container also keeps `$HOME` (`archon-home`) and `/.archon` (`archon-data`: the run DB and worktrees) on persistent volumes. Plan 02 gives each run its own `$HOME`, and Plan 03 mounts the workflow pack and config read-only and never reuses a run's worktree (H-182). Non-persistent containers stay planned with DS-15: the run side H-161, the Hermes side H-200.
 
 **Next level:** a microVM per run, or one container per run [call].
+
+> **As built (noted 2026-10-30, H-182):** one container per run is now the baseline for Archon runs, not the next level. Each run's container, network and volumes are made for it and removed with it, and `$HOME`, Archon's state and Pi's directory are tmpfs, so nothing a worker writes outlives its run but the four files the host copies out ([Plan 02's design](2026-10-29-hapi-factory-02-worker-design.md), §3.1; threat model DS-15 and DS-17; [the runs runbook](../../runbooks/runs.md)). Hermes's main session is still one long-lived container (H-200). A microVM per run stays the next level.
 
 ### 11.4 Egress
 
