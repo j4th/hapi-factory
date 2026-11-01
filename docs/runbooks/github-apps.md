@@ -35,6 +35,7 @@ Set these permissions **exactly**. Everything not listed is **No access**, inclu
 |---|---|---|---|
 | Contents | Read and write | Read and write | Push the App's own branches |
 | Pull requests | Read and write | Read and write | Open PRs, and label them: GitHub accepts Pull requests write for labels on a PR |
+| Checks | No access | Read-only | The poller reads CodeRabbit's check run on a factory PR's head (design §3.6) |
 | Issues | Read-only | No access | The planner reads issues for context. Neither App writes them. |
 | Metadata | Read-only | Read-only | Mandatory for every App |
 | Administration | **No access** | **No access** | Neither App may change settings or rulesets |
@@ -50,6 +51,24 @@ Set these permissions **exactly**. Everything not listed is **No access**, inclu
 `hapi token mint` asks for exactly these permissions (`APPS` in `src/forge/github/app-token.ts`), and rejects a token that comes back broader ([docs/secrets.md](../secrets.md#hapi-token-mint)).
 
 Both private keys live only in your secrets store and in the `host` zone's env file, which no container ever gets ([docs/secrets.md](../secrets.md#the-zones-and-their-keys)).
+
+## The engine's tokens
+
+The run engine (`src/forge/github/token.ts`) does not use `hapi token mint`'s files. `forgeToken(env, repo, purpose)` mints each token in memory, for one repository, with only the permissions of its purpose (`PURPOSE_PERMISSIONS`):
+
+| Purpose | Permission | Used for |
+|---|---|---|
+| `mirror` | Contents: read | The mirror's `git fetch` |
+| `push` | Contents: write | The harvester's push of `factory/*` |
+| `pr` | Pull requests: write | Opening and editing PRs, comments, labels, and the reads: PR, issue comments, label events, reviews, review comments, collaborator permission |
+| `checks` | Checks: read | CodeRabbit's check run on the PR head |
+
+CodeRabbit's round uses two of them: its reviews and review comments are read with the `pr` token, its check run with the `checks` token.
+
+- It never writes a token file. The engine revokes each token at the end of the tick or harvest that minted it.
+- It refuses a repo that `policy/repos.yaml` does not register, and a repo whose `hapi-factory` installation is not the id `policy/repos.yaml` records.
+- `markReady` (a draft PR to ready for review) is the only GraphQL call (`markPullRequestReadyForReview`): GitHub's REST "Update a pull request" takes no `draft` field (checked against API version `2026-03-10`).
+- GitHub documents these routes as accepting Pull requests (the issue-comment, label and "List issue events" routes accept Issues or Pull requests), so the factory App needs no Issues permission. "Get repository permissions for a user" needs only Metadata, and its `role_name` tells triage and maintain apart.
 
 ## Creating each App
 

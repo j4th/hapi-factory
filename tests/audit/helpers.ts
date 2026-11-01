@@ -240,7 +240,7 @@ export function githubRoutes(
   }
   const perms = o.appPermissions ?? {
     planner: { contents: "write", pull_requests: "write", issues: "read", metadata: "read" },
-    factory: { contents: "write", pull_requests: "write", metadata: "read" },
+    factory: { contents: "write", pull_requests: "write", checks: "read", metadata: "read" },
   };
   const app = appOf;
   routes[`GET ${API}/app`] = (c) => ({ status: 200, body: { id: APP_IDS[app(c)], slug: `hapi-${app(c)}`, permissions: perms[app(c)], events: [] } });

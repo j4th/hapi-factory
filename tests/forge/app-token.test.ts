@@ -13,6 +13,7 @@ import {
   tokenMint,
 } from "../../src/forge/github/app-token";
 import { envFileText } from "../../src/secrets/files";
+import { fakeFetch, type Reply } from "./helpers";
 
 // A throwaway key pair, made per run: no key material is ever committed. GitHub's own keys are PKCS#1.
 const { privateKey: PKCS1_PEM, publicKey: PUBLIC_PEM } = generateKeyPairSync("rsa", {
@@ -26,31 +27,6 @@ const NOW_S = NOW_MS / 1000;
 const TOKEN = "fake-installation-token-9c1e";
 const API = "https://api.github.com";
 
-interface Call {
-  method: string;
-  url: string;
-  headers: Record<string, string>;
-  body: unknown;
-}
-type Reply = { status: number; body?: unknown };
-/** A fake fetch: `routes` maps "METHOD url" to a reply. Records every call. */
-function fakeFetch(routes: Record<string, Reply | ((c: Call) => Reply)>): { fetch: typeof fetch; calls: Call[] } {
-  const calls: Call[] = [];
-  const f = async (input: string | URL | Request, init: RequestInit = {}) => {
-    const call: Call = {
-      method: init.method ?? "GET",
-      url: String(input),
-      headers: Object.fromEntries(new Headers(init.headers).entries()),
-      body: typeof init.body === "string" ? JSON.parse(init.body) : undefined,
-    };
-    calls.push(call);
-    const route = routes[`${call.method} ${call.url}`];
-    if (route === undefined) return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
-    const reply = typeof route === "function" ? route(call) : route;
-    return new Response(reply.body === undefined ? null : JSON.stringify(reply.body), { status: reply.status });
-  };
-  return { fetch: f as unknown as typeof fetch, calls };
-}
 const granted = (permissions: Record<string, string>, repositories = ["odoo-mcp"], extra: Record<string, unknown> = {}) => ({
   status: 201,
   body: {
@@ -271,7 +247,7 @@ describe("hapi token mint", () => {
     expect(APPS.factory).toEqual({
       name: "hapi-factory",
       envPrefix: "HAPI_FACTORY",
-      permissions: { contents: "write", pull_requests: "write", metadata: "read" },
+      permissions: { contents: "write", pull_requests: "write", checks: "read", metadata: "read" },
     });
   });
 
@@ -290,6 +266,23 @@ describe("hapi token mint", () => {
     expect(statSync(join(xdg, "hapi", "tokens")).mode & 0o777).toBe(0o700);
     expect(f.calls[1]!.body).toEqual({ repositories: ["odoo-mcp"], permissions: APPS.planner.permissions });
     expect(out.join("\n")).not.toContain(TOKEN);
+  });
+
+  test("a minted token whose file can't be written is revoked before the mint fails (H-195)", async () => {
+    capture();
+    const xdg = xdgWithHostEnv({ HAPI_FACTORY_APP_ID: "123456", HAPI_FACTORY_APP_PRIVATE_KEY: PKCS1_PEM });
+    const blocker = join(xdg, "hapi", "tokens", "factory.example-owner.odoo-mcp.token");
+    mkdirSync(join(blocker, "inside"), { recursive: true, mode: 0o700 });
+    chmodSync(join(xdg, "hapi", "tokens"), 0o700);
+    const f = fakeFetch({
+      [`GET ${API}/repos/example-owner/odoo-mcp/installation`]: { status: 200, body: { id: 123, suspended_at: null } },
+      [MINT]: granted({ ...APPS.factory.permissions }),
+      [REVOKE]: { status: 204 },
+    });
+    const e = await tokenMint(["--app", "factory", "--repo", "example-owner/odoo-mcp"], { fetch: f.fetch, env: { XDG_RUNTIME_DIR: xdg }, now: () => NOW_MS }).catch((x: Error) => x);
+    expect((e as Error).message).toMatch(/could not write the token to .*: it was revoked/);
+    expect((e as Error).message).not.toContain(TOKEN);
+    expect(f.calls.some((c) => `${c.method} ${c.url}` === REVOKE)).toBe(true);
   });
 
   test("each mint deletes token files in hapi/tokens/ older than one hour", async () => {
