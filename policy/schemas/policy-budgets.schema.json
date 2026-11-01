@@ -53,7 +53,7 @@
           "$ref": "policy-defs.schema.json#/$defs/enforcement"
         },
         "poller": {
-          "description": "The poller's checks before a run starts: repo_monthly_usd, daily_usd and the round counts in runs.yaml. hard refuses the run; soft starts it and flags it.",
+          "description": "The poller's checks before a run starts: repo_monthly_usd and daily_usd (the round counts in runs.yaml are always hard, whatever this says). hard refuses the run; soft starts it and flags it.",
           "$ref": "policy-defs.schema.json#/$defs/enforcement"
         }
       },

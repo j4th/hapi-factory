@@ -22,4 +22,4 @@ daily_usd: 10.00          # all repos together, per UTC calendar day; the poller
 enforcement:
   hapi_guard: hard        # Pi's hapi-guard extension (Plan 02 Task 5)
   archon: hard            # Archon's factory-task budget (Plan 03)
-  poller: hard            # the poller's repo_monthly_usd and daily_usd checks, and the round counts: hard refuses the run, soft starts it and flags it
+  poller: hard            # the poller's repo_monthly_usd and daily_usd checks: hard refuses the run, soft starts it and flags it

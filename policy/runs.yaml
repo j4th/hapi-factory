@@ -14,13 +14,13 @@ disk:                   # the most disk one run's volumes may use (the run engin
   gb: 20                # the cap, in GB
   enforcement: hard     # hard stops the run when it is crossed; soft flags it and lets it finish
 poll_interval_s: 120    # seconds between the poller's passes over the registered repos (30-3600; central only)
-max_auto_rounds: 3      # automatic runs per work order with no human action between them; the poller counts them and always enforces it, under budgets.enforcement.poller
+max_auto_rounds: 3      # automatic runs per work order with no human action between them; the poller counts them; always hard: the poller's check, never softened by budgets.enforcement.poller
 phases:                 # what a run does; an overlay may switch one on, never off
   verify: true          # the verify container runs the repo's gates
   review: true          # the review container reviews the diff
   coderabbit: false     # the CodeRabbit CLI in the review container; off until an unattended key exists (H-167)
   require_acceptance: true  # fail-closed: "Ready to merge" needs the work order's acceptance tests, .factory/work/<id>/acceptance/, to exist and pass in the verify container; with none, the best verdict is "Needs your decision". The harvester reads it; an overlay may only switch it on
-  fix_rounds_before_pr: 1   # fix rounds a run makes before it opens its PR; the poller enforces the count, under budgets.enforcement.poller
-  fix_rounds_on_pr: 1       # fix rounds on an open PR after a review or CodeRabbit finding; enforced the same way
+  fix_rounds_before_pr: 1   # fix rounds a run makes before it opens its PR; the poller enforces the count; always hard: the poller's check, never softened by budgets.enforcement.poller
+  fix_rounds_on_pr: 1       # fix rounds on an open PR after a review or CodeRabbit finding; the poller enforces the count; always hard: the poller's check, never softened by budgets.enforcement.poller
   round_turns: 40       # the most agent turns in one fix round; hapi-guard reads it, under budgets.enforcement.hapi_guard
   round_usd: 1.00       # the most one fix round may spend; at most budgets.run_usd; hapi-guard reads it

@@ -229,7 +229,7 @@ All amounts are in USD.
 | `repo_monthly_usd` | 25.00 | Most one registered repo's runs may spend per UTC calendar month. The poller reads it. An overlay may lower it. |
 | `daily_usd` | 10.00 | Most all registered repos together may spend per UTC calendar day. The poller reads it. Central only: an overlay naming it is an unknown key. |
 | `enforcement.archon` | `hard` | The same for Archon's `factory-task` budget (Plan 03). Archon bounds nodes, never dollars: `factory-task`'s `max_work_units` is pinned to its node count whatever this says, so `hard` is the setting that matters there. |
-| `enforcement.poller` | `hard` | What the poller does when a run would cross `repo_monthly_usd` or `daily_usd`, or `runs.max_auto_rounds` or a fix-round count: `hard` refuses the run, `soft` starts it and flags it (`hapi:flagged`). The round counts are hard-only in effect: the poller always stops at them, under this setting. |
+| `enforcement.poller` | `hard` | What the poller does when a run would cross `repo_monthly_usd` or `daily_usd`: `hard` refuses the run, `soft` starts it and flags it (`hapi:flagged`). It applies to those two spend caps only; the round counts in `runs.yaml` are always hard. |
 
 `enforcement` is a setting per enforcement point: `hard` stops the run at `run_usd`; `soft` lets it finish and flags it (`hapi:flagged`, spec §13.3). All three ship as `hard` and are required: the loader fills no defaults, so the fail-closed value lives in the YAML. An overlay may harden a mode but never soften it (soft < hard). An overlay may also lower `repo_monthly_usd`, never raise it.
 
@@ -250,13 +250,13 @@ The run engine's limits (Plan 02 Task 7 and Plan 03; [the runs runbook](runbooks
 | `disk.gb` | 20 | The most disk one run's volumes may use, in GB (the run engine's disk check) |
 | `disk.enforcement` | `hard` | `hard` stops the run when the cap is crossed; `soft` flags it and lets it finish. An overlay may harden it, never soften it. |
 | `poll_interval_s` | 120 | Seconds between the poller's passes over the registered repos, 30 to 3600. Central only. |
-| `max_auto_rounds` | 3 | Automatic runs per work order with no human action between them. The poller counts and always enforces it, under `budgets.enforcement.poller`. |
+| `max_auto_rounds` | 3 | Automatic runs per work order with no human action between them. The poller counts it; always hard: the poller's check, never softened by `budgets.enforcement.poller`. |
 | `phases.verify` | true | The verify container runs the repo's gates |
 | `phases.review` | true | The review container reviews the diff |
 | `phases.coderabbit` | false | The CodeRabbit CLI in the review container. Off until an unattended key exists (H-167) |
 | `phases.require_acceptance` | true | See below |
-| `phases.fix_rounds_before_pr` | 1 | Fix rounds a run makes before it opens its PR. 0 makes none. The poller enforces the count, under `budgets.enforcement.poller`. |
-| `phases.fix_rounds_on_pr` | 1 | Fix rounds on an open PR after a review or CodeRabbit finding. 0 makes none. Enforced the same way. |
+| `phases.fix_rounds_before_pr` | 1 | Fix rounds a run makes before it opens its PR. 0 makes none. The poller enforces the count; always hard: the poller's check, never softened by `budgets.enforcement.poller`. |
+| `phases.fix_rounds_on_pr` | 1 | Fix rounds on an open PR after a review or CodeRabbit finding. 0 makes none. The poller enforces the count; always hard, as above. |
 | `phases.round_turns` | 40 | The most agent turns in one fix round; hapi-guard enforces it, under `budgets.enforcement.hapi_guard` |
 | `phases.round_usd` | 1.00 | The most one fix round may spend. At most `budgets.run_usd`: `loadPolicy` and `applyOverlay` refuse a larger one (`phaseIssues`). So lowering `run_usd` below `round_usd` in an overlay needs `round_usd` lowered in the same overlay. hapi-guard enforces it. |
 

@@ -68,7 +68,7 @@
       "maximum": 3600
     },
     "max_auto_rounds": {
-      "description": "Automatic runs per work order with no human action between them. The poller counts and enforces it under budgets.enforcement.poller.",
+      "description": "Automatic runs per work order with no human action between them. The poller counts it; always hard: the poller's check, never softened by budgets.enforcement.poller.",
       "$ref": "policy-defs.schema.json#/$defs/count"
     },
     "phases": {
