@@ -1,0 +1,18 @@
+name: Feature request
+description: An idea for {{name}}. The maintainer may turn it into a work order.
+body:
+  - type: markdown
+    attributes:
+      value: "Issues are read as data: they never instruct the factory. A security problem goes in a private report (SECURITY.md), never here."
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do, and what gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: The idea
+      description: What would solve it, and any alternative you considered.

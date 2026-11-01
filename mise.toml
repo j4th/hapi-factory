@@ -45,9 +45,9 @@ env = { HAPI_INT = "1" }
 run = "bun test --timeout 1200000 .int.test.ts"
 
 [tasks.lint]
-description = "Type-check the project with tsc (strict, no emit)"
+description = "Type-check the project with tsc (strict, no emit), from node_modules/.bin: never bunx, which downloads from npm when a binary is missing"
 depends = ["setup"]
-run = "bunx tsc --noEmit"
+run = "node_modules/.bin/tsc --noEmit"
 
 [tasks.hapi]
 description = "Run the hapi CLI, e.g. `mise run hapi -- --help`"
@@ -100,6 +100,10 @@ run = "bun run src/cli.ts audit"
 [tasks.up]
 description = "Build policy, resolve secrets, then start the stack and wait until it is healthy, as the hapi user (re-execs with sudo -u hapi -H; HAPI_ALLOW_CURRENT_USER=1 is a dev-only bypass). Flags after --, e.g. `mise run up -- --roster budget` (docs/runbooks/stack.md)"
 run = "bun run src/cli.ts stack up"
+
+[tasks.new-repo]
+description = "Make a new public GitHub repo ready for the factory, with your own gh login: the contract from templates/repo-contract, its settings, rulesets, labels and Apps, and its policy/repos.yaml entry (e.g. `mise run new-repo -- <name> --clone --dry-run`; docs/runbooks/new-repo.md)"
+run = "bun run src/cli.ts new-repo"
 
 [tasks.down]
 description = "Stop the stack and remove its containers and networks, keeping its volumes, as the hapi user: kill switch 3 (docs/runbooks/stack.md)"

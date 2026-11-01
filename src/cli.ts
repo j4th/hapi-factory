@@ -15,6 +15,7 @@ import { tokenMint } from "./forge/github/app-token";
 import { decideCommand } from "./decide/cli";
 import { policyBuild } from "./generate/index";
 import { mcpPin, mcpVerify } from "./mcp/lock";
+import { newRepoCommand } from "./newrepo/cli";
 import { runStart, runStop, runSupervise } from "./run/lifecycle";
 import { runList, runWatch } from "./run/view";
 import {
@@ -152,6 +153,7 @@ register("run list", (args) => runList(args), "List the runs this host knows, ne
 register("token mint", tokenMint, "Mint a 1-hour GitHub App token for one repo into a 0600 file under $XDG_RUNTIME_DIR/hapi/tokens/");
 register("decide", (args) => decideCommand(args), "Run one typed decision (bash-gate, result-screen) on a state read from stdin; prints the result as JSON");
 register("audit", (args) => auditCommand(args), "Check the deployed config, pins, running stack, secrets setup and each --repo's GitHub settings against policy (docs/audit.md)");
+register("new-repo", (args) => newRepoCommand(args), "Make a new public repo ready for the factory from templates/repo-contract, with your own gh login (docs/runbooks/new-repo.md)");
 
 if (import.meta.main) {
   process.exitCode = await main(process.argv.slice(2));

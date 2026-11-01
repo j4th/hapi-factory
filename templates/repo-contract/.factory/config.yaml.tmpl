@@ -1,0 +1,13 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/{{owner}}/hapi-factory/{{gates_sha}}/policy/schemas/repo-overlay.schema.json
+#
+# {{name}}'s overlay on hapi-factory's central policy (hapi-factory spec §7).
+# It may only tighten that policy, and .factory/** is itself protected.
+#
+# The gates' own config: `mise run check` runs Biome, Bun and tsc with these
+# files, so a worker that could edit one could pass `check` by loosening it.
+# Same modes as AGENTS.md: the maintainer approves in an interactive session;
+# unattended sessions and workers may not edit them.
+protected_paths:
+  "**/biome.json*": { interactive: ask, unattended: deny, workers: deny }
+  "**/bunfig.toml": { interactive: ask, unattended: deny, workers: deny }
+  "**/tsconfig*.json": { interactive: ask, unattended: deny, workers: deny }

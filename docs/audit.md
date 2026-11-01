@@ -71,6 +71,8 @@ Without the stack and without `--repo`, as on a development machine, most checks
 | [`secrets.check`](#secretscheck) | Every secret `resolve` needs is found, none empty or invalid | §11.5 | The secrets config and store |
 | [`github.rulesets`](#githubrulesets) | The four rulesets, per `--repo` | §5.1, §11.5 | `--repo`; a token ([below](#github-credentials)) |
 | [`github.app-perms`](#githubapp-perms) | Neither App has administration, workflows or a bypass, per `--repo` | §11.5 | `--repo`; the App keys |
+| [`github.repo-settings`](#githubrepo-settings) | A registered repo has the settings `hapi new-repo` gives it, per `--repo` | design §3.2 | `--repo`; the operator's token |
+| [`github.labels`](#githublabels) | A registered repo has the five labels the factory reads, per `--repo` | design §3.2 | `--repo`; a token |
 | [`repo.ai-workflows`](#repoai-workflows) | No workflow runs an AI agent with secrets on comment, issue or review triggers, per `--repo` | §7, §11.7 | `--repo`; a token |
 | [`repo.private-untracked`](#repoprivate-untracked) | The checkout tracks nothing under `private/`, and its root `.gitignore` ignores `private/` | §11.5 (H-058) | The checkout (git) |
 
@@ -259,7 +261,7 @@ Under `--strict` that skip is a fail, like any other. So until H-101 closes, a s
 
 **Verifies**, per `--repo`, from the repo (`GET /repos/{owner}/{repo}`), the effective rules on `main` (`GET .../rules/branches/main`) and every ruleset (`GET .../rulesets`, then each by id), held to [docs/runbooks/github-apps.md](runbooks/github-apps.md) as `tests/docs/rulesets.test.ts` holds the README's JSON (H-023):
 - `main` is the default branch. `main-protect` and `main-review` follow the default branch (`~DEFAULT_BRANCH`) and `agent-branch-scope` exempts it, so `main`'s rules say what guards the default branch only while `main` is the default. A repo whose answer has no `default_branch` fails;
-- `main` has a `pull_request` rule with `required_approving_review_count` ≥ 1, a `required_status_checks` rule with `ci` from GitHub Actions (`integration_id` 15368) and no other required check, and `deletion` and `non_fast_forward` rules. A third-party reviewer's check, such as CodeRabbit's, is never required (spec §9.6): it would let an advisory reviewer block a merge, or stand in for a gate once green;
+- `main` has a `pull_request` rule with `required_approving_review_count` ≥ 1, a `required_status_checks` rule with exactly one gate check from GitHub Actions (`integration_id` 15368), `ci` (hapi-factory's own) or `ci / gates` (`CONTRACT_CHECK`: a repo made from the contract, whose `hapi-gates.yml` job `ci` calls the gates' job `gates`), and no other required check, and `deletion` and `non_fast_forward` rules. Both at once fails. A third-party reviewer's check, such as CodeRabbit's, is never required (spec §9.6): it would let an advisory reviewer block a merge, or stand in for a gate once green;
 - `main-review` applies to `main`, with the `update` rule (Restrict updates), a `pull_request` rule with `require_code_owner_review: true` and `required_approving_review_count` ≥ 1 (a missing or non-numeric count fails: "is missing or below 1"), and exactly the Admin role's PR-only bypass (`actor_id` 5, `bypass_mode: pull_request`);
 - `agent-branch-scope` and `tags-admin-only` exist and are `active`, with the runbook's target (`branch`, `tag`), refs and rules: `include` only `~ALL`; `agent-branch-scope` excludes `~DEFAULT_BRANCH`, `refs/heads/plan/**` and `refs/heads/factory/**`, plus `refs/heads/dependabot/**/*` if you added it for Dependabot, and nothing else, while `tags-admin-only` excludes nothing; the `creation`, `update` and `deletion` rules; and exactly the Admin role's bypass, always (`actor_id` 5, `bypass_mode: always`). Neither applies to `main`, so they are read by name (H-174);
 - no ruleset holding `required_status_checks` has a bypass actor; no ruleset without bypass actors has `update`; no ruleset has an `Integration` (GitHub App) bypass actor, ours or a third party's such as CodeRabbit.
@@ -285,6 +287,38 @@ Rules in a ruleset in `evaluate` or `disabled` mode don't apply to `main`, so th
 **Fix.** Set each App's permissions exactly as the runbook says (then accept the new permissions on the installation), and remove the App from any ruleset's bypass list.
 
 **Skip.** No `--repo`; no App keys (`hapi secrets resolve` writes `host.env`); or the permissions pass but no ruleset's `bypass_actors` could be read because no credential can see them. A read of the rulesets that fails (an HTTP error, not a missing credential) is a fail, as in `github.rulesets`.
+
+### github.repo-settings
+
+**Verifies**, per `--repo` that `policy/repos.yaml` registers (matched ignoring case, as GitHub names are), the settings `hapi new-repo` gives it (`contractSettings`, src/forge/index.ts; [the runbook](runbooks/new-repo.md#the-eleven-steps), step 5), each read with a GET:
+- the repo (`GET /repos/{owner}/{repo}`): `main` the default branch; merge commits allowed and squash, rebase and auto-merge not; head branches deleted on merge; `merge_commit_title: MERGE_MESSAGE` and `merge_commit_message: PR_TITLE`, GitHub's classic "Merge pull request #N from …" message, which the poller reads; `security_and_analysis`'s secret scanning and push protection `enabled`;
+- `.../actions/permissions/workflow`: `default_workflow_permissions: read`, `can_approve_pull_request_reviews: false`;
+- `.../actions/permissions`: Actions enabled, `allowed_actions: selected`, `sha_pinning_required: true`;
+- `.../actions/permissions/selected-actions`: GitHub's own actions, no "verified creator" actions, and exactly the patterns `jdx/mise-action@*` and `<owner>/hapi-factory/.github/workflows/gates.yml@*`, in any order;
+- `.../actions/permissions/fork-pr-contributor-approval`: `approval_policy: all_external_contributors`;
+- `.../private-vulnerability-reporting`: `enabled: true`.
+
+The detail names each setting that differs and its value. A repo that isn't registered passes: `<repo>: not registered in policy/repos.yaml, so the contract's settings don't apply` (hapi-factory's own settings are the README's, not the contract's).
+
+**Why.** Design §3.2 step 5: merge commits keep each piece's commit and trailers on `main` as reviewed (spec §5.3, §13.2); a read-only token that can't approve, and only pinned, chosen actions, keep a PR's workflow from reaching beyond its job; push protection and private reporting keep secrets and vulnerability reports out of public view.
+
+**Credential.** The operator's token, or new-repo's in-memory `gh` login ([below](#github-credentials)). GitHub returns `security_and_analysis` and the Actions settings only to a user who administers the repo, so an App token sees few of them.
+
+**Fix.** Set them as `hapi new-repo` does ([the runbook](runbooks/new-repo.md#the-eleven-steps)), in the repo's Settings or with the same API calls.
+
+**Skip.** No `--repo`; no credentials; or a setting GitHub didn't return to the credential, or a read it refused (403 or 404): `<repo>: <field> isn't visible with <credential>`. A setting that differs is a fail even when others are hidden.
+
+### github.labels
+
+**Verifies**, per `--repo` that `policy/repos.yaml` registers, that the repo has `lane:planning`, `lane:factory`, `lane:direct`, `hapi:rework` and `hapi:flagged` (`LABELS`, src/forge/index.ts), by name, ignoring case (`GET /repos/{owner}/{repo}/labels`). Colours and descriptions aren't checked. An unregistered repo passes, as in `github.repo-settings`.
+
+**Why.** The poller reads the lanes and the operator's two signals from these labels; a label GitHub doesn't know can't be added.
+
+**Credential.** The operator's token, new-repo's `gh` login, or an App token that can read labels.
+
+**Fix.** Make the missing label (`gh label create <name> --repo <owner>/<name>`), or as `hapi new-repo` does.
+
+**Skip.** No `--repo`; no credentials; or GitHub refused the list to the credential (403 or 404).
 
 ### repo.ai-workflows
 
@@ -330,6 +364,9 @@ Every GitHub check reads repo state with GET requests only. The audit's own App 
 | `GET /repos/{owner}/{repo}/rulesets`, `.../rulesets/{id}` | Metadata: read; but `bypass_actors` "is only returned if the user making the API request has write access to the ruleset". A fine-grained token with Administration read-only, its user the repo's admin, got them (stage b, 2026-10-28, H-150) | The same page; [Get a repository ruleset](https://docs.github.com/en/rest/repos/rules#get-a-repository-ruleset) |
 | `GET /repos/{owner}/{repo}/contents/{path}` | Contents: read | Permissions required for GitHub Apps, "Repository permissions for Contents" |
 | `GET /app`, `GET /repos/{owner}/{repo}/installation` | None: "You must use a JWT to access this endpoint"; each response holds the App's or installation's `permissions` | [REST API endpoints for GitHub Apps](https://docs.github.com/en/rest/apps/apps) (checked 2026-10-27) |
+| `GET /repos/{owner}/{repo}/actions/permissions`, `.../workflow`, `.../selected-actions`, `.../fork-pr-contributor-approval` | The `repo` scope for an OAuth or classic token; the repo's administration for anyone else | [GitHub Actions permissions](https://docs.github.com/en/rest/actions/permissions) (checked 2026-11-01) |
+| `GET /repos/{owner}/{repo}/private-vulnerability-reporting` | The repo's administration | [Repositories](https://docs.github.com/en/rest/repos/repos#check-if-private-vulnerability-reporting-is-enabled-for-a-repository) (checked 2026-11-01) |
+| `GET /repos/{owner}/{repo}/labels` | Issues or pull requests: read | [Labels](https://docs.github.com/en/rest/issues/labels) |
 
 Which credential each check uses:
 
@@ -338,6 +375,7 @@ Which credential each check uses:
   - **Which App.** `hapi-planner` first, then `hapi-factory`. An App whose keys aren't in `host.env` is passed over, and so is one whose keys load but which can't mint for this repo (it isn't installed there, its installation is suspended, GitHub refuses the request); its reason is kept. If neither mints, the GitHub checks fail with each App's reason (they skip, "no GitHub credentials", only when neither App's keys are there). A token GitHub returns broader than requested is a fail at once, naming the App: the audit never tries the other App after it. No reason holds a token.
   - **The revoke.** GitHub confirms a revoke with `204`. Any other answer, or a request that fails, prints one warning line on stderr naming the App, the repo and the HTTP status (or the error), never the token: `hapi audit: warning: GitHub didn't confirm revoking the read-only hapi-planner installation token the audit minted for $OWNER/hapi-factory (DELETE /installation/token: HTTP 500); it stays valid until <expires_at> ...`. The token then lasts until it expires, at most an hour (suspend the App's installation to end it sooner, [the runbook](runbooks/github-apps.md)). The warning doesn't change the results or the exit code.
 - **`github.app-perms` always uses each App's JWT,** which needs no permission.
+- **`hapi new-repo`'s verify step** passes the operator's `gh` login in memory (`githubToken` in the audit's context, which no flag sets), with only `github.rulesets`, `github.repo-settings`, `github.labels` and `repo.ai-workflows`. It wins over `--github-token-file` and is never printed. The login made the repo, so GitHub shows it every field ([the runbook](runbooks/new-repo.md#verify)).
 - With neither, each GitHub check skips: "no GitHub credentials".
 
 ## What the tool checks were checked against

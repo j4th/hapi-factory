@@ -1,0 +1,26 @@
+{
+  // Type-check only (`mise run lint` runs `node_modules/.bin/tsc --noEmit`). Bun runs the .ts files directly.
+  // Based on Bun's recommended config for TypeScript 6/7: https://bun.com/docs/typescript
+  // .factory/ is left out: a work order's acceptance tests may import code its run hasn't written yet.
+  "compilerOptions": {
+    "lib": ["ESNext"],
+    "target": "ESNext",
+    "module": "Preserve",
+    "moduleDetection": "force",
+    "moduleResolution": "bundler",
+    "types": ["bun"],
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "resolveJsonModule": true,
+    "noEmit": true,
+
+    "strict": true,
+    "skipLibCheck": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noImplicitReturns": true,
+    "exactOptionalPropertyTypes": true
+  },
+  "include": ["src", "tests", "smoke"]
+}

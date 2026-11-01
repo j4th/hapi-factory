@@ -24,7 +24,7 @@ import { userInfo } from "node:os";
 import { join, resolve } from "node:path";
 import { parseOwnerRepo } from "../forge/github/app-token";
 import { generatedDrift } from "./checks/generated";
-import { githubAppPerms, githubRulesets, repoAiWorkflows } from "./checks/github";
+import { githubAppPerms, githubLabels, githubRepoSettings, githubRulesets, repoAiWorkflows } from "./checks/github";
 import { mcpToolHashes } from "./checks/mcp";
 import { pinsVersions } from "./checks/pins";
 import { budgetEnforcement } from "./checks/policy";
@@ -50,6 +50,8 @@ const CHECKS: readonly (readonly [id: string, check: Check])[] = [
   ["secrets.check", secretsCheck],
   ["github.rulesets", githubRulesets],
   ["github.app-perms", githubAppPerms],
+  ["github.repo-settings", githubRepoSettings],
+  ["github.labels", githubLabels],
   ["repo.ai-workflows", repoAiWorkflows],
   ["repo.private-untracked", repoPrivateUntracked],
 ];
@@ -59,12 +61,14 @@ export const CHECK_IDS: readonly string[] = CHECKS.map(([id]) => id);
 /** An error as one line, never more than 500 characters. */
 const oneLine = (e: unknown) => (e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").trim().slice(0, 500);
 
-/** Run every check. With ctx.strict, every skip comes back a fail. */
+/** Run every check, or only those `ctx.only` names (an unknown id throws). With ctx.strict, every skip comes back a fail. */
 export async function runAudit(ctx: AuditContext): Promise<CheckResult[]> {
+  for (const id of ctx.only ?? []) if (!CHECK_IDS.includes(id)) throw new Error(`unknown audit check: ${id}`);
+  const checks = ctx.only === undefined ? CHECKS : CHECKS.filter(([id]) => ctx.only!.includes(id));
   const run = newRun(ctx);
   const out: CheckResult[] = [];
   try {
-    for (const [id, check] of CHECKS) {
+    for (const [id, check] of checks) {
       try {
         out.push(...(await check(run)));
       } catch (e) {

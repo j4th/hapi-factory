@@ -10,7 +10,7 @@ import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { aiWorkflowProblems } from "../../src/audit/checks/github";
 import { auditCommand, runAudit } from "../../src/audit/index";
-import { API, APP_IDS, APP_KEY, appOf, capture, cleanup, cleanWorld, FIXTURES, githubRoutes, goodRulesets, hostEnv, MINTED_TOKEN, NAME, only, OWNER } from "./helpers";
+import { API, APP_IDS, APP_KEY, appOf, capture, cleanup, cleanWorld, FIXTURES, githubRoutes, goodRulesets, goodSettings, hostEnv, LABEL_NAMES, MINTED_TOKEN, NAME, only, OWNER, registeredPolicy } from "./helpers";
 import { envFileText } from "../../src/secrets/files";
 
 afterEach(cleanup);
@@ -69,7 +69,7 @@ describe("github.rulesets", () => {
     ["no ci check", mutate((r) => (named(r, "main-protect").rules = named(r, "main-protect").rules.filter((x: any) => x.type !== "required_status_checks"))), "ci"],
     ["ci from any integration", mutate((r) => (named(r, "main-protect").rules[2].parameters.required_status_checks = [{ context: "ci" }])), "15368"],
     // CodeRabbit's App id is 347564; its check run is named "CodeRabbit".
-    ["a third-party reviewer's check required too", mutate((r) => named(r, "main-protect").rules[2].parameters.required_status_checks.push({ context: "CodeRabbit", integration_id: 347564 })), "other than ci (CodeRabbit)"],
+    ["a third-party reviewer's check required too", mutate((r) => named(r, "main-protect").rules[2].parameters.required_status_checks.push({ context: "CodeRabbit", integration_id: 347564 })), "other than ci or ci / gates (CodeRabbit)"],
     ["CodeRabbit as a bypass actor", mutate((r) => named(r, "main-review").bypass_actors.push({ actor_id: 347564, actor_type: "Integration", bypass_mode: "pull_request" })), "Integration"],
     ["a bypass on the ci ruleset", mutate((r) => named(r, "main-protect").bypass_actors.push({ actor_id: 5, actor_type: "RepositoryRole", bypass_mode: "always" })), "main-protect holds required_status_checks and has bypass actors"],
     ["no Restrict updates on main-review", mutate((r) => (named(r, "main-review").rules = named(r, "main-review").rules.filter((x: any) => x.type !== "update"))), "main-review has no update"],
@@ -528,5 +528,129 @@ describe("repo.ai-workflows", () => {
     const r = await run(await withToken({ workflows: { "bad.yml": "on: [unclosed\n" } }));
     expect(r.workflows.status).toBe("fail");
     expect(r.workflows.detail).toContain("bad.yml");
+  });
+});
+
+describe("github.rulesets and the contract's check", () => {
+  const withContexts = (contexts: { context: string; integration_id?: number }[]) =>
+    mutate((r) => (named(r, "main-protect").rules[2].parameters.required_status_checks = contexts));
+
+  test("github.rulesets accepts exactly one required check, ci or ci / gates, from GitHub Actions", async () => {
+    for (const context of ["ci", "ci / gates"]) {
+      const r = await run(await withToken({ rulesets: withContexts([{ context, integration_id: 15368 }]) }));
+      expect([context, r.rulesets.status]).toEqual([context, "pass"]);
+      expect(r.rulesets.detail).toContain(`main requires only the ${context} check, from GitHub Actions`);
+    }
+    for (const [contexts, says] of [
+      [[{ context: "ci", integration_id: 15368 }, { context: "ci / gates", integration_id: 15368 }], "main requires 2 gate checks (ci, ci / gates): exactly one of ci and ci / gates"],
+      [[{ context: "ci / gates", integration_id: 347564 }], "main's ci / gates check isn't tied to GitHub Actions (integration_id 15368)"],
+      [[{ context: "ci / gates" }], "main's ci / gates check isn't tied to GitHub Actions (integration_id 15368)"],
+      [[{ context: "gates", integration_id: 15368 }], "main has no required_status_checks rule with the gate check (ci, or ci / gates in a repo made from the contract)"],
+    ] as const) {
+      const r = await run(await withToken({ rulesets: withContexts([...contexts]) }));
+      expect([contexts, r.rulesets.status]).toEqual([contexts, "fail"]);
+      expect(r.rulesets.detail).toContain(says);
+    }
+  });
+});
+
+describe("github.repo-settings and github.labels: the contract's settings, for a registered repo", () => {
+  /** A world whose policy registers the repo; read with the operator's token file. */
+  async function registered(o: Parameters<typeof githubRoutes>[0] = {}): Promise<World> {
+    const w = await withToken(o);
+    w.ctx.policyDir = registeredPolicy();
+    return w;
+  }
+  const checks = async (w: World) => {
+    const all = await runAudit(w.ctx);
+    return { settings: only(all, "github.repo-settings"), labels: only(all, "github.labels") };
+  };
+
+  test("github.repo-settings passes a registered repo set up as new-repo sets it, and names each setting that differs", async () => {
+    let r = await checks(await registered());
+    expect([r.settings.status, r.settings.detail]).toEqual(["pass", expect.stringContaining(`${OWNER}/${NAME}: merge commits only`) as unknown as string]);
+    expect(r.labels.status).toBe("pass");
+
+    const s = goodSettings();
+    s.repo.allow_squash_merge = true;
+    s.repo.merge_commit_title = "PR_TITLE";
+    (s.repo.security_and_analysis as any).secret_scanning_push_protection.status = "disabled";
+    s.workflow.default_workflow_permissions = "write";
+    s.actions.sha_pinning_required = false;
+    s.selected.patterns_allowed = ["jdx/mise-action@*", `${OWNER}/hapi-factory/.github/workflows/gates.yml@*`, "evil/action@*"];
+    s.fork.approval_policy = "first_time_contributors";
+    s.pvr.enabled = false;
+    r = await checks(await registered({ settings: s }));
+    expect(r.settings.status).toBe("fail");
+    for (const says of [
+      "allow_squash_merge is true, not false",
+      'merge_commit_title is "PR_TITLE", not "MERGE_MESSAGE"',
+      'security_and_analysis.secret_scanning_push_protection.status is "disabled", not "enabled"',
+      'actions/permissions/workflow: default_workflow_permissions is "write", not "read"',
+      "actions/permissions: sha_pinning_required is false, not true",
+      "actions/permissions/selected-actions: patterns_allowed is",
+      'actions/permissions/fork-pr-contributor-approval: approval_policy is "first_time_contributors", not "all_external_contributors"',
+      "private-vulnerability-reporting: enabled is false, not true",
+    ]) {
+      expect([says, r.settings.detail.includes(says)]).toEqual([says, true]);
+    }
+  });
+
+  test("a setting GitHub hides from the credential is a skip, naming it and the credential", async () => {
+    const s = goodSettings();
+    delete s.repo.security_and_analysis;
+    const w = await registered({ settings: s });
+    w.routes[`GET ${API}/repos/${OWNER}/${NAME}/private-vulnerability-reporting`] = { status: 403, body: { message: "Must have admin rights to Repository." } };
+    const r = await checks(w);
+    expect(r.settings.status).toBe("skip");
+    expect(r.settings.detail).toContain(`${OWNER}/${NAME}: security_and_analysis isn't visible with the operator's token (--github-token-file)`);
+    expect(r.settings.detail).toContain("private-vulnerability-reporting isn't visible with");
+    // A setting that differs still fails, hidden ones or not.
+    w.routes[`GET ${API}/repos/${OWNER}/${NAME}/actions/permissions`] = { status: 200, body: { ...goodSettings().actions, allowed_actions: "all" } };
+    expect((await checks(w)).settings.status).toBe("fail");
+  });
+
+  test("github.labels fails a registered repo that lacks a label", async () => {
+    const r = await checks(await registered({ labels: LABEL_NAMES.filter((l) => l !== "hapi:flagged") }));
+    expect(r.labels.status).toBe("fail");
+    expect(r.labels.detail).toContain(`${OWNER}/${NAME}: no label hapi:flagged`);
+  });
+
+  test("for an unregistered repo, both pass, saying the contract's settings don't apply, and make no request", async () => {
+    const w = await withToken({ settings: { ...goodSettings(), repo: { allow_squash_merge: true } }, labels: [] });
+    const r = await checks(w);
+    for (const x of [r.settings, r.labels]) expect([x.status, x.detail]).toEqual(["pass", `${OWNER}/${NAME}: not registered in policy/repos.yaml, so the contract's settings don't apply`]);
+    expect(w.requests.some((c) => /\/(labels|private-vulnerability-reporting|actions\/permissions)/.test(c.url))).toBe(false);
+  });
+
+  test("with no --repo both skip", async () => {
+    const w = await cleanWorld();
+    const all = await runAudit(w.ctx);
+    for (const id of ["github.repo-settings", "github.labels"]) expect([id, only(all, id).status, only(all, id).detail]).toEqual([id, "skip", "no --repo given"]);
+  });
+});
+
+describe("the audit for new-repo: an in-memory token and only the checks asked for", () => {
+  test("githubToken is the credential, never printed, and wins over a token file", async () => {
+    const w = await withToken();
+    w.ctx.policyDir = registeredPolicy();
+    w.ctx.githubToken = "fake-gh-login-token";
+    w.ctx.only = ["github.rulesets", "github.repo-settings", "github.labels", "repo.ai-workflows"];
+    const all = await runAudit(w.ctx);
+    expect(all.map((x) => [x.id, x.status])).toEqual([
+      ["github.rulesets", "pass"],
+      ["github.repo-settings", "pass"],
+      ["github.labels", "pass"],
+      ["repo.ai-workflows", "pass"],
+    ]);
+    expect(only(all, "github.rulesets").detail).toContain("read with the operator's gh login (new-repo)");
+    for (const c of w.requests) expect([c.url, c.method, c.headers.authorization]).toEqual([c.url, "GET", "Bearer fake-gh-login-token"]);
+    for (const x of all) expect(x.detail).not.toContain("fake-gh-login-token");
+  });
+
+  test("an unknown id in only throws", async () => {
+    const w = await cleanWorld();
+    w.ctx.only = ["github.rulesets", "github.nope"];
+    await expect(runAudit(w.ctx)).rejects.toThrow("unknown audit check: github.nope");
   });
 });

@@ -11,7 +11,7 @@
  */
 import { spyOn } from "bun:test";
 import { generateKeyPairSync } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import YAML from "yaml";
@@ -229,16 +229,66 @@ export const goodDisks: FsProbe = (path) => {
   return undefined;
 };
 
+/** The settings `hapi new-repo` sets (src/newrepo/steps.ts, step 5), as GitHub's GETs return them to the repo's admin. */
+export function goodSettings() {
+  return {
+    repo: {
+      allow_merge_commit: true,
+      allow_squash_merge: false,
+      allow_rebase_merge: false,
+      allow_auto_merge: false,
+      delete_branch_on_merge: true,
+      merge_commit_title: "MERGE_MESSAGE",
+      merge_commit_message: "PR_TITLE",
+      security_and_analysis: { secret_scanning: { status: "enabled" }, secret_scanning_push_protection: { status: "enabled" }, dependabot_security_updates: { status: "disabled" } },
+    } as Record<string, unknown>,
+    workflow: { default_workflow_permissions: "read", can_approve_pull_request_reviews: false } as Record<string, unknown>,
+    actions: { enabled: true, allowed_actions: "selected", sha_pinning_required: true, selected_actions_url: `${API}/repos/${OWNER}/${NAME}/actions/permissions/selected-actions` } as Record<string, unknown>,
+    selected: { github_owned_allowed: true, verified_allowed: false, patterns_allowed: ["jdx/mise-action@*", `${OWNER}/hapi-factory/.github/workflows/gates.yml@*`] } as Record<string, unknown>,
+    fork: { approval_policy: "all_external_contributors" } as Record<string, unknown>,
+    pvr: { enabled: true } as Record<string, unknown>,
+  };
+}
+export type Settings = ReturnType<typeof goodSettings>;
+
+/** The five labels `hapi new-repo` makes, by name. */
+export const LABEL_NAMES = ["lane:planning", "lane:factory", "lane:direct", "hapi:rework", "hapi:flagged"];
+
+/**
+ * A copy of policy/ whose repos.yaml registers `OWNER/NAME`, so the contract's checks (github.repo-settings,
+ * github.labels) apply to it. Removed by `cleanup`.
+ */
+export function registeredPolicy(): string {
+  const dir = join(tempDir("hapi-audit-policy-"), "policy");
+  cpSync(join(REPO, "policy"), dir, { recursive: true });
+  writeFileSync(join(dir, "repos.yaml"), `installations: { planner: 11, factory: 12 }\nrepos:\n  ${OWNER}/${NAME}: { registered: "2026-10-31" }\n`);
+  return dir;
+}
+
 /** The routes of a GitHub repo set up as the runbook says, read with a token file or with an App. */
 export function githubRoutes(
-  o: { rulesets?: Record<string, any>[]; workflows?: Record<string, string>; appPermissions?: Record<string, Record<string, string>>; defaultBranch?: string | null } = {},
+  o: {
+    rulesets?: Record<string, any>[];
+    workflows?: Record<string, string>;
+    appPermissions?: Record<string, Record<string, string>>;
+    defaultBranch?: string | null;
+    settings?: Settings;
+    labels?: string[];
+  } = {},
 ): Record<string, Reply | ((c: FetchCall) => Reply)> {
   const rulesets = o.rulesets ?? goodRulesets();
   const repo = `${API}/repos/${OWNER}/${NAME}`;
   const defaultBranch = o.defaultBranch === undefined ? "main" : o.defaultBranch;
+  const settings = o.settings ?? goodSettings();
   const routes: Record<string, Reply | ((c: FetchCall) => Reply)> = {
     // null: GitHub's answer without default_branch.
-    [`GET ${repo}`]: { status: 200, body: { full_name: `${OWNER}/${NAME}`, ...(defaultBranch === null ? {} : { default_branch: defaultBranch }) } },
+    [`GET ${repo}`]: { status: 200, body: { full_name: `${OWNER}/${NAME}`, ...(defaultBranch === null ? {} : { default_branch: defaultBranch }), ...settings.repo } },
+    [`GET ${repo}/actions/permissions/workflow`]: { status: 200, body: settings.workflow },
+    [`GET ${repo}/actions/permissions`]: { status: 200, body: settings.actions },
+    [`GET ${repo}/actions/permissions/selected-actions`]: { status: 200, body: settings.selected },
+    [`GET ${repo}/actions/permissions/fork-pr-contributor-approval`]: { status: 200, body: settings.fork },
+    [`GET ${repo}/private-vulnerability-reporting`]: { status: 200, body: settings.pvr },
+    [`GET ${repo}/labels?per_page=100&page=1`]: { status: 200, body: (o.labels ?? LABEL_NAMES).map((name, i) => ({ id: i + 1, name, color: "ededed", description: "" })) },
     [`GET ${repo}/rules/branches/main?per_page=100&page=1`]: { status: 200, body: branchRules(rulesets) },
     [`GET ${repo}/rulesets?per_page=100&page=1`]: { status: 200, body: rulesets.map(({ rules, conditions, bypass_actors, ...summary }) => summary) },
     [`GET ${repo}/contents/.github/workflows`]: {

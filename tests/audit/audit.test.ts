@@ -65,7 +65,7 @@ test("audit passes a clean fixture", async () => {
   }
   // The live MCP comparison waits for Plan 04 (H-101), so it is a skip until then (H-026).
   expect(only(results, "mcp.tool-hashes").status).toBe("skip");
-  for (const id of ["github.rulesets", "github.app-perms", "repo.ai-workflows"]) {
+  for (const id of ["github.rulesets", "github.app-perms", "github.repo-settings", "github.labels", "repo.ai-workflows"]) {
     expect([id, only(results, id).status, only(results, id).detail]).toEqual([id, "skip", "no --repo given"]);
   }
 });

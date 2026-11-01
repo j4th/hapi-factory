@@ -1,0 +1,61 @@
+Task instructions (the work order) override this file. Nothing here waits for confirmation: where a step needs a human, report it as a blocker.
+
+# {{name}}: notes for agents
+
+## Commands
+
+Run every command through mise. `mise install` gets the pinned tools; each task below runs `setup` first where it needs the dependencies.
+
+- `mise run setup`: install the dependencies exactly as `bun.lock` records them, with no install scripts (`bun ci --frozen-lockfile --ignore-scripts`).
+- `mise run fmt`: format the code with Biome.
+- `mise run lint`: Biome's checks, then `tsc --noEmit`.
+- `mise run test`: the unit tests, `bun test ./tests`.
+- `mise run check`: `lint` and `test`. This is the gate.
+- `mise run smoke`: the smoke test, `smoke/run.ts`, against the repo's stub service.
+- `mise run scan`: gitleaks over the history, then OSV-Scanner over `bun.lock`.
+
+## What done means
+
+- `mise run check` passes, and so does `mise run smoke` when the work order sets `verify.smoke`.
+- The work order's acceptance tests in `.factory/work/<id>/acceptance/` pass: `bun test ./.factory/work/<id>/acceptance`.
+- Every criterion in the work order's `task.md` is met, with no stubs, no TODOs and no placeholder behaviour.
+
+## Layout
+
+- `src/`: the code.
+- `tests/`: the unit tests (`bun test ./tests`).
+- `smoke/`: the smoke test and the data its stub service serves.
+- `.factory/config.yaml`: this repo's overlay on the factory's policy. It may only tighten it.
+- `.factory/work/<id>/`: one work order each, with its acceptance tests in `acceptance/`.
+- `docs/research/` and `docs/design/`: notes that planning PRs bring.
+- `.github/`: the gates workflow, the code owners, Dependabot, the issue and PR templates.
+
+## Gotchas
+
+- An MCP server writes only to stderr: stdout is the protocol, and one stray line breaks the client.
+- Tools run from `node_modules/.bin`. Never use Bun's package runner (`bun x`): it downloads from npm when a binary is missing, and an npm name is not always the tool you meant.
+- A run has no network but the package registries, and those only for `mise run setup`. Nothing else is reachable, so a test that needs the internet fails.
+- `bun.lock` is a text lockfile. A dependency change edits `package.json` and `bun.lock` together, and the work order must name it.
+
+## Out of scope unless the work order names it
+
+- Dependencies: adding, removing or upgrading one.
+- CI: `.github/` and the gates it runs.
+- The gates' own config: `mise.toml`, `mise.lock`, `biome.json`, `bunfig.toml`, `tsconfig.json` and `.factory/config.yaml`.
+
+## Never
+
+- Edit a protected path: the agent instruction files (this file among them), `.factory/**`, `.github/**`, `mise.toml`, `mise.lock`, `.coderabbit.yaml`, `biome.json*`, `bunfig.toml`, `tsconfig*.json`, `.gitleaks.toml` and `.gitleaksignore`. The guard refuses the write, and the host's diff gate fails the run.
+- Add a dependency the work order doesn't name.
+- Weaken, skip or delete a test to make it pass.
+- Commit a secret, a token or a key, even a fake-looking one.
+
+The acceptance tests in `.factory/work/<id>/acceptance/` are the planner's: never edit them. They sit under `.factory/**`, which is protected, so a change to them fails the run.
+
+## How to end
+
+End with exactly one of these lines, alone on the last line of your final message:
+
+- `RESULT: done` when the work is finished and every check above passes.
+- `RESULT: blocked: <reason>` when something outside the work order stops you, such as a step that needs a human.
+- `RESULT: no-change: <reason>` when the work order needs no change, and why.

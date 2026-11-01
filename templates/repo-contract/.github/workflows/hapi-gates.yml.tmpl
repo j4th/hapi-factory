@@ -1,0 +1,21 @@
+# The factory's gates for {{name}}: hapi-factory's reusable gates workflow, on
+# every pull request and every push to main. Its check is `ci / gates` (this
+# job, `ci`, calling the workflow's job `gates`), which main-protect requires.
+#
+# The SHA below is the gates' only pin (hapi-factory design §6a item 6):
+# Actions' SHA-pinning policy and workflow lockfiles don't cover a reusable
+# workflow's call. It names a hapi-factory commit; bump it by PR.
+name: hapi-gates
+
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  ci:
+    permissions:
+      contents: read
+    uses: {{owner}}/hapi-factory/.github/workflows/gates.yml@{{gates_sha}}

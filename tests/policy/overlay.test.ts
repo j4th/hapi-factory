@@ -312,10 +312,10 @@ describe("applyOverlay", () => {
 });
 
 describe("loadOverlay", () => {
-  test("hapi-factory's own overlay protects policy/**, stack/** and .githooks/** like AGENTS.md", () => {
+  test("hapi-factory's own overlay protects policy/**, stack/**, .githooks/** and templates/** like AGENTS.md", () => {
     const r = applyOverlay(p, loadOverlay(".factory/config.yaml"));
     const ask = { interactive: "ask", unattended: "deny", workers: "deny" } as const;
-    for (const file of ["policy/protected_paths.yaml", "policy/rosters/budget.yaml", "stack/compose.yaml", "stack/secrets.yaml", ".githooks/pre-commit", ".githooks/lib.sh"]) {
+    for (const file of ["policy/protected_paths.yaml", "policy/rosters/budget.yaml", "stack/compose.yaml", "stack/secrets.yaml", ".githooks/pre-commit", ".githooks/lib.sh", "templates/repo-contract/AGENTS.md.tmpl"]) {
       expect(effectiveModes(r, file)).toEqual(ask);
       expect(effectiveModes(p, file)).toEqual({ interactive: "allow", unattended: "allow", workers: "allow" }); // central policy: every repo
     }

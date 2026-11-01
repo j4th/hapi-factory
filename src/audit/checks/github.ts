@@ -24,6 +24,8 @@
  *   names the App and the HTTP status, never the token.
  * - github.app-perms always uses each App's own JWT (GET /app, GET
  *   /repos/{owner}/{repo}/installation), which needs no permission.
+ * - `ctx.githubToken`, in memory only, wins over both: `hapi new-repo`'s
+ *   verify step passes the operator's `gh` login, which made the repo.
  * With neither, each check is a skip saying what is missing.
  *
  * - github.rulesets: that main is the default branch (GET /repos/{owner}/{repo}),
@@ -31,6 +33,14 @@
  *   and every ruleset (GET .../rulesets, then each by id), held to
  *   docs/runbooks/github-apps.md as tests/docs/rulesets.test.ts holds the
  *   README's JSON: main-protect and main-review, never one ruleset.
+ * - github.repo-settings and github.labels, for a repo policy/repos.yaml
+ *   registers (else a pass saying the contract doesn't apply): the settings
+ *   `hapi new-repo` sets (merge commits only, with GitHub's classic merge
+ *   message; head branches deleted; secret scanning and push protection; the
+ *   Actions token read-only and unable to approve; selected, SHA-pinned
+ *   actions; fork runs approved; private vulnerability reporting), read with
+ *   GETs; a field GitHub hides from the credential is a skip naming it. And
+ *   the five LABELS, by name.
  * - github.app-perms: neither App has administration or workflows, or any
  *   permission beyond the runbook's table, on the App or on its installation
  *   (selected repositories only), and neither is a bypass actor anywhere. A
@@ -55,7 +65,9 @@
  */
 import { lstat, readFile } from "node:fs/promises";
 import YAML from "yaml";
+import { CONTRACT_CHECK, contractSettings, LABELS } from "../../forge/index";
 import { APPS, type AppName, appCredentials, appJwt, findInstallationId, GITHUB_API, GITHUB_API_VERSION, mintInstallationToken, TokenScopeError } from "../../forge/github/app-token";
+import { loadPolicy } from "../../policy/load";
 import { HAPI_VERSION } from "../../version";
 import { type AuditRun, type CheckResult, type RepoRef, result } from "../types";
 
@@ -159,6 +171,10 @@ async function revokeAuditToken(run: AuditRun, appName: string, repo: RepoRef, t
 function credential(run: AuditRun, repo: RepoRef): Promise<Credential> {
   return run.once(`gh-cred:${repoName(repo)}`, async (): Promise<Credential> => {
     const { ctx } = run;
+    if (ctx.githubToken !== undefined) {
+      if (!/^\S+$/.test(ctx.githubToken)) throw new Error("the in-memory GitHub token is empty or holds whitespace");
+      return { token: ctx.githubToken, via: "the operator's gh login (new-repo)" };
+    }
     if (ctx.githubTokenFile !== undefined) return { token: await tokenFromFile(ctx.githubTokenFile), via: "the operator's token (--github-token-file)" };
     const noKeys: string[] = [];
     const cannotMint: string[] = [];
@@ -237,6 +253,8 @@ const ADMIN_PR_ONLY = [{ actor_id: 5, actor_type: "RepositoryRole", bypass_mode:
 const ADMIN_ALWAYS = [{ actor_id: 5, actor_type: "RepositoryRole", bypass_mode: "always" }];
 /** GitHub Actions' integration id: only Actions can satisfy the ci check. */
 const ACTIONS = 15368;
+/** The one required check a repo's main may name: hapi-factory's own `ci`, or `ci / gates` in a repo made from the contract. */
+const GATE_CHECKS: readonly string[] = ["ci", CONTRACT_CHECK];
 
 /**
  * The branch and tag scope rulesets (AC-8), as docs/runbooks/github-apps.md sets them. `mayExclude` is what the
@@ -298,13 +316,16 @@ export async function githubRulesets(run: AuditRun): Promise<CheckResult[]> {
       problems.push("main has no pull_request rule with required_approving_review_count ≥ 1");
     }
     const checks = of("required_status_checks").flatMap((r) => (Array.isArray(r.parameters?.required_status_checks) ? (r.parameters!.required_status_checks as Record<string, unknown>[]) : []));
-    const ci = checks.filter((c) => c.context === "ci");
-    if (ci.length === 0) problems.push("main has no required_status_checks rule with the ci check");
-    else if (!ci.some((c) => c.integration_id === ACTIONS)) problems.push(`main's ci check isn't tied to GitHub Actions (integration_id ${ACTIONS}), so another integration could satisfy it`);
-    // Only ci gates a merge. A third-party App's check (CodeRabbit's, spec §9.6) is never a required one: an advisory
-    // reviewer that could block or, once green, stand in for a gate.
-    const others = [...new Set(checks.filter((c) => c.context !== "ci").map((c) => String(c.context)))];
-    if (others.length > 0) problems.push(`main requires status checks other than ci (${others.join(", ")}): only GitHub Actions' ci gates a merge, and no third-party reviewer's check, such as CodeRabbit's, is ever a required one`);
+    // Exactly one gate check: `ci`, or `ci / gates` (CONTRACT_CHECK) in a repo made from the contract.
+    const gates = checks.filter((c) => GATE_CHECKS.includes(String(c.context)));
+    const gate = gates.length === 1 ? String(gates[0]!.context) : undefined;
+    if (gates.length === 0) problems.push(`main has no required_status_checks rule with the gate check (ci, or ${CONTRACT_CHECK} in a repo made from the contract)`);
+    else if (gates.length > 1) problems.push(`main requires ${gates.length} gate checks (${gates.map((c) => String(c.context)).join(", ")}): exactly one of ci and ${CONTRACT_CHECK}`);
+    else if (gates[0]!.integration_id !== ACTIONS) problems.push(`main's ${gate} check isn't tied to GitHub Actions (integration_id ${ACTIONS}), so another integration could satisfy it`);
+    // Only the gate check gates a merge. A third-party App's check (CodeRabbit's, spec §9.6) is never a required one:
+    // an advisory reviewer that could block or, once green, stand in for a gate.
+    const others = [...new Set(checks.filter((c) => !GATE_CHECKS.includes(String(c.context))).map((c) => String(c.context)))];
+    if (others.length > 0) problems.push(`main requires status checks other than ci or ${CONTRACT_CHECK} (${others.join(", ")}): only GitHub Actions' gate check gates a merge, and no third-party reviewer's check, such as CodeRabbit's, is ever a required one`);
     for (const t of ["deletion", "non_fast_forward"]) if (of(t).length === 0) problems.push(`main has no ${t} rule`);
 
     const onMain = new Set(rules.map((r) => r.ruleset_id));
@@ -351,7 +372,7 @@ export async function githubRulesets(run: AuditRun): Promise<CheckResult[]> {
         result(
           id,
           "pass",
-          `${name}: main requires only the ci check, from GitHub Actions, with no bypass, blocks force-pushes and deletion, and main-review requires 1 code-owner approval with Restrict updates and only the Admin PR-only bypass; agent-branch-scope and tags-admin-only are active, scoped as the runbook sets them, with only the Admin role's bypass; no ruleset without bypass actors restricts updates, and no App is a bypass actor (read with ${data.via})`,
+          `${name}: main requires only the ${gate} check, from GitHub Actions, with no bypass, blocks force-pushes and deletion, and main-review requires 1 code-owner approval with Restrict updates and only the Admin PR-only bypass; agent-branch-scope and tags-admin-only are active, scoped as the runbook sets them, with only the Admin role's bypass; no ruleset without bypass actors restricts updates, and no App is a bypass actor (read with ${data.via})`,
         ),
       );
     }
@@ -429,6 +450,145 @@ export async function githubAppPerms(run: AuditRun): Promise<CheckResult[]> {
     if (problems.length > 0) out.push(result(id, "fail", `${name}: ${problems.join("; ")}. Set each App's permissions exactly as docs/runbooks/github-apps.md, and never make an App a bypass actor`));
     else if (gaps.length > 0) out.push(result(id, "skip", `${name}: ${apps} have only the runbook's permissions, but ${gaps.join("; ")}`));
     else out.push(result(id, "pass", `${name}: ${apps} have only the runbook's permissions (no administration, no workflows), are installed on selected repositories, and neither is a ruleset bypass actor`));
+  }
+  return out;
+}
+
+/** The repos policy/repos.yaml registers, lowercased (GitHub names ignore case), read once per audit. */
+function registeredRepos(run: AuditRun): Promise<Set<string>> {
+  return run.once("registered-repos", async () => new Set(Object.keys(loadPolicy(run.ctx.policyDir).repos.repos).map((k) => k.toLowerCase())));
+}
+const notRegistered = (name: string) => `${name}: not registered in policy/repos.yaml, so the contract's settings don't apply`;
+
+/** Every leaf of `want` (arrays are leaves), as dotted path -> value. */
+function leaves(want: Record<string, unknown>, prefix = ""): [string, unknown][] {
+  return Object.entries(want).flatMap(([k, v]) => {
+    const path = prefix === "" ? k : `${prefix}.${k}`;
+    return v !== null && typeof v === "object" && !Array.isArray(v) ? leaves(v as Record<string, unknown>, path) : [[path, v] as [string, unknown]];
+  });
+}
+
+/** A list compared as a set: the same items, in any order. */
+const sameItems = (a: unknown, b: unknown) => Array.isArray(a) && Array.isArray(b) && JSON.stringify(a.map(String).sort()) === JSON.stringify(b.map(String).sort());
+
+/**
+ * What one read of the contract's settings finds against `want`: a value that differs (named with `label`), or a
+ * field GitHub didn't return (hidden from this credential, named by its first missing key). 403 and 404 hide the
+ * whole read; any other error throws.
+ */
+async function settingsRead(run: AuditRun, path: string, token: string, label: string, want: Record<string, unknown>): Promise<{ problems: string[]; hidden: string[] }> {
+  const r = await get(run, path, token);
+  if (r.status === 403 || r.status === 404) return { problems: [], hidden: [label] };
+  if (r.status !== 200) throw new Error(`GitHub: GET ${path}: HTTP ${r.status}${ghMessage(r.json)}`);
+  const problems: string[] = [];
+  const hidden = new Set<string>();
+  const at = label === "" ? "" : `${label}: `;
+  for (const [field, value] of leaves(want)) {
+    let got: unknown = r.json;
+    const seen: string[] = [];
+    for (const key of field.split(".")) {
+      seen.push(key);
+      got = asRecord(got)?.[key];
+      if (got === undefined) break;
+    }
+    if (got === undefined) hidden.add(`${at}${seen.join(".")}`);
+    else if (Array.isArray(value) ? !sameItems(got, value) : got !== value) problems.push(`${at}${field} is ${JSON.stringify(got)}, not ${JSON.stringify(value)}`);
+  }
+  return { problems, hidden: [...hidden] };
+}
+
+/** github.repo-settings */
+export async function githubRepoSettings(run: AuditRun): Promise<CheckResult[]> {
+  const id = "github.repo-settings";
+  if (run.ctx.repos.length === 0) return [result(id, "skip", NO_REPO)];
+  const out: CheckResult[] = [];
+  for (const repo of run.ctx.repos) {
+    const name = repoName(repo);
+    try {
+      if (!(await registeredRepos(run)).has(name.toLowerCase())) {
+        out.push(result(id, "pass", notRegistered(name)));
+        continue;
+      }
+      const cred = await credential(run, repo);
+      if ("none" in cred) {
+        out.push(result(id, "skip", `${name}: ${cred.none}`));
+        continue;
+      }
+      const want = contractSettings(repo.owner);
+      const p = repoPath(repo);
+      const reads: [path: string, label: string, want: Record<string, unknown>][] = [
+        [p, "", want.repo],
+        [`${p}/actions/permissions/workflow`, "actions/permissions/workflow", want.workflow],
+        [`${p}/actions/permissions`, "actions/permissions", want.actions],
+        [`${p}/actions/permissions/selected-actions`, "actions/permissions/selected-actions", want.selectedActions],
+        [`${p}/actions/permissions/fork-pr-contributor-approval`, "actions/permissions/fork-pr-contributor-approval", want.forkApproval],
+        [`${p}/private-vulnerability-reporting`, "private-vulnerability-reporting", { enabled: true }],
+      ];
+      const problems: string[] = [];
+      const hidden: string[] = [];
+      for (const [path, label, w] of reads) {
+        const found = await settingsRead(run, path, cred.token, label, w);
+        problems.push(...found.problems);
+        hidden.push(...found.hidden.map((h) => `${h} isn't visible with ${cred.via}`));
+      }
+      if (problems.length > 0) out.push(result(id, "fail", `${name}: ${problems.join("; ")}. Set them as hapi new-repo does (docs/runbooks/new-repo.md)`));
+      else if (hidden.length > 0) out.push(result(id, "skip", `${name}: ${hidden.join("; ")}; the rest match. Pass --github-token-file with the operator's token, whose user is the repo's admin (docs/audit.md#githubrepo-settings)`));
+      else {
+        out.push(
+          result(
+            id,
+            "pass",
+            `${name}: merge commits only, with GitHub's classic merge message, head branches deleted on merge and no auto-merge; secret scanning and push protection on; the Actions token read-only and unable to approve PRs; only GitHub's actions, mise-action and hapi-factory's gates, SHA-pinned; fork runs approved first; private vulnerability reporting on (read with ${cred.via})`,
+          ),
+        );
+      }
+    } catch (e) {
+      out.push(result(id, "fail", `${name}: ${oneLine(e)}`));
+    }
+  }
+  return out;
+}
+
+/** github.labels */
+export async function githubLabels(run: AuditRun): Promise<CheckResult[]> {
+  const id = "github.labels";
+  if (run.ctx.repos.length === 0) return [result(id, "skip", NO_REPO)];
+  const out: CheckResult[] = [];
+  for (const repo of run.ctx.repos) {
+    const name = repoName(repo);
+    try {
+      if (!(await registeredRepos(run)).has(name.toLowerCase())) {
+        out.push(result(id, "pass", notRegistered(name)));
+        continue;
+      }
+      const cred = await credential(run, repo);
+      if ("none" in cred) {
+        out.push(result(id, "skip", `${name}: ${cred.none}`));
+        continue;
+      }
+      const have = new Set<string>();
+      let hidden = false;
+      for (let page = 1; page <= 10; page++) {
+        const path = `${repoPath(repo)}/labels?per_page=100&page=${page}`;
+        const r = await get(run, path, cred.token);
+        if (page === 1 && (r.status === 403 || r.status === 404)) {
+          hidden = true;
+          break;
+        }
+        if (r.status !== 200 || !Array.isArray(r.json)) throw new Error(`GitHub: GET ${repoPath(repo)}/labels: HTTP ${r.status}${ghMessage(r.json)}`);
+        for (const l of r.json) if (typeof asRecord(l)?.name === "string") have.add((asRecord(l)!.name as string).toLowerCase());
+        if (r.json.length < 100) break;
+      }
+      if (hidden) {
+        out.push(result(id, "skip", `${name}: the labels aren't visible with ${cred.via}; pass --github-token-file with the operator's token`));
+        continue;
+      }
+      const missing = LABELS.map((l) => l.name).filter((l) => !have.has(l.toLowerCase()));
+      if (missing.length > 0) out.push(result(id, "fail", `${name}: ${missing.map((l) => `no label ${l}`).join("; ")}. Make them as hapi new-repo does (docs/runbooks/new-repo.md)`));
+      else out.push(result(id, "pass", `${name}: has the labels the factory reads (${LABELS.map((l) => l.name).join(", ")}) (read with ${cred.via})`));
+    } catch (e) {
+      out.push(result(id, "fail", `${name}: ${oneLine(e)}`));
+    }
   }
   return out;
 }

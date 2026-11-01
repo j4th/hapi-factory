@@ -58,6 +58,13 @@ export interface AuditContext {
   dev: boolean;
   /** `--github-token-file`: an operator token for the GitHub reads (never printed). */
   githubTokenFile?: string;
+  /**
+   * The operator's own token, in memory only, for the GitHub reads: `hapi new-repo`'s verify step passes its `gh`
+   * login. It wins over `githubTokenFile`, and is never printed, logged or written. No flag sets it.
+   */
+  githubToken?: string;
+  /** Run only these checks, by id (new-repo's verify step); an id the audit doesn't have throws. Default: every check. */
+  only?: readonly string[];
   env: Env;
   /** Who runs the audit (the process's user, not $USER). */
   user: string;
