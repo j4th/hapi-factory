@@ -24,8 +24,9 @@
  * never an encoded or split one: it keeps keys off the screen, and is no
  * boundary.
  *
- * `list`: every run's record, newest first, with the spend Archon recorded in
- * the run's copied out/result.json, if any.
+ * `list`: every run's record, newest first, with its spend from the run's
+ * copied `out/`: the guard's last spend record, else Archon's
+ * `total_cost_usd`, else `-` (./spend.ts `spendOfRun`; H-229).
  */
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -36,6 +37,7 @@ import { archonSecrets, asHapi, ended } from "./lifecycle";
 import { listRecords, readRecord, recordDir, type RunRecord } from "./records";
 import { redactSecrets, sanitizeTerminal } from "./sanitize";
 import type { RunDeps } from "./spec";
+import { spendOfRun } from "./spend";
 
 /** How long watch waits, once a live run's log has ended, for the run to be finalized (the supervisor's copy-out takes seconds). */
 export const WATCH_WAIT_S = 120;
@@ -159,18 +161,6 @@ export async function runWatch(args: string[], deps: Partial<RunDeps> = {}): Pro
   });
 }
 
-/** The spend Archon recorded for the run (out/result.json's `run.metadata.total_cost_usd`), as `$0.0000`, or "-". */
-async function spendOf(d: RunDeps, runId: string): Promise<string> {
-  let doc: { run?: { metadata?: { total_cost_usd?: unknown } } } | null = null;
-  try {
-    doc = JSON.parse(await readFile(join(recordDir(d.stateDir, runId), "out", "result.json"), "utf8"));
-  } catch {
-    doc = null;
-  }
-  const usd = doc?.run?.metadata?.total_cost_usd;
-  return typeof usd === "number" && Number.isFinite(usd) && usd >= 0 ? `$${usd.toFixed(4)}` : "-";
-}
-
 /** `hapi run list`: every run's id, status, repo, work order, start and spend, newest first. */
 export async function runList(args: string[], deps: Partial<RunDeps> = {}): Promise<number> {
   if (args.length > 0) {
@@ -184,7 +174,11 @@ export async function runList(args: string[], deps: Partial<RunDeps> = {}): Prom
       return 0;
     }
     const rows = [["RUN", "STATUS", "REPO", "WORK ORDER", "STARTED", "SPEND"]];
-    for (const r of records) rows.push([r.runId, r.status, r.repo, r.workOrder, r.startedAt, await spendOf(d, r.runId)]);
+    for (const r of records) {
+      // The guard's ledger, else Archon's; a spend neither recorded shows as "-", never as the budget a cap counts it at.
+      const spend = spendOfRun(join(recordDir(d.stateDir, r.runId), "out"), r.budgetUsd ?? 0);
+      rows.push([r.runId, r.status, r.repo, r.workOrder, r.startedAt, spend.known ? `$${spend.usd.toFixed(4)}` : "-"]);
+    }
     const widths = rows[0]!.map((_, i) => Math.max(...rows.map((row) => row[i]!.length)));
     console.log(sanitizeTerminal(rows.map((row) => row.map((cell, i) => cell.padEnd(widths[i]!)).join("  ").trimEnd()).join("\n")));
     return 0;

@@ -34,7 +34,7 @@ mise run audit -- --strict --repo "$OWNER/hapi-factory" --github-token-file <fil
 It prints one line per check, then a summary:
 
 ```text
-pass  generated.drift         /home/hapi/hapi-factory/build equals a fresh build of /home/hapi/hapi-factory/policy (roster anthropic, 17 files); 4 running containers were started from it (org.hapi.build-sha256)
+pass  generated.drift         /home/hapi/hapi-factory/build equals a fresh build of /home/hapi/hapi-factory/policy (roster anthropic, 18 files); 4 running containers were started from it (org.hapi.build-sha256)
 skip  mcp.tool-hashes         the live tool surfaces can't be compared with the lock until Plan 04 wires the live fetch (`hapi mcp verify`, H-101); ...
 skip  github.rulesets         no --repo given
 ...

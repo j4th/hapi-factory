@@ -7,6 +7,8 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse } from "yaml";
+import { loadPolicy } from "../../src/policy/load";
+import { rolesProblem } from "../../src/run/lifecycle";
 import { loadWorkOrder } from "../../src/workorder/validate";
 import { REPO } from "../stack/helpers";
 
@@ -135,5 +137,14 @@ describe("the check work orders", () => {
     expect(c.id).toBe("0003-check-guard-private");
     expect([a.id, b.id]).not.toContain(c.id);
     expect(c.budget).toEqual(a.budget);
+  });
+
+  test("each check work order, and the run integration test's, names a pi tier for implement and a claude tier for review on the anthropic and budget rosters, so a hand run of it starts (ruling m16)", () => {
+    const p = loadPolicy(join(REPO, "policy"));
+    const files = ["archon/checks/work-order.yaml", "archon/checks/work-order-budget.yaml", "archon/checks/work-order-private.yaml", "tests/fixtures/order-0003-check.yaml"];
+    for (const file of files) {
+      const o = loadWorkOrder(join(REPO, file));
+      for (const roster of ["anthropic", "budget"] as const) expect([file, roster, rolesProblem(o.roles, p.rosters[roster], roster)]).toEqual([file, roster, undefined]);
+    }
   });
 });

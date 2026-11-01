@@ -25,7 +25,11 @@
  *   `extensions/` (H-181(a)); Archon's `config.yaml`, an empty `/.archon/.env`
  *   (Archon loads it over the process env at every start, design §6a item 2)
  *   and the workflow pack; the run config, the gitconfig, the prelude
- *   (stack/archon/run.sh), the run's `run.json`, and the source repo's git dir;
+ *   (stack/archon/run.sh), the run's `run.json`, its work order and task text
+ *   (`order.json`, `task.md`), and the source repo's git dir. `hapi-guard.json`
+ *   and the run config are the run's own, in its record dir: generated per
+ *   run from the policy with the repo's overlay applied, for `build/roster`'s
+ *   roster (H-172; ./lifecycle.ts `startRun`). The rest of build/ is shared;
  * - two per-run volumes, `/work` (the clone) and `/out` (what may leave),
  *   which the launcher makes and chowns first (design §6a item 16): each is
  *   bind-backed, on a dir of its own on the run disk, a filesystem capped at
@@ -40,11 +44,12 @@
  * `--pull never` translates `pull_policy: build`: the image is the one `hapi
  * stack up` built, and a registry image of that name is never fetched.
  */
-import { readdirSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { mountable } from "../audit/checks/tools";
 import { RUN_PATHS } from "../generate/archon";
-import type { Runs } from "../policy/types";
+import { ROSTERS } from "../generate/index";
+import type { RosterName, Runs } from "../policy/types";
 import { ENV_NAME } from "../secrets/files";
 import type { FsProbe } from "./disk";
 import { proxyEnv, reservedEnvRule } from "../stack/env";
@@ -87,15 +92,31 @@ export interface RunDeps {
 
 export interface RunInputs {
   runId: string;
-  /** The source repository's git dir, absolute: `<checkout>/.git`, or a bare repo itself. */
+  /** The source repository's git dir, absolute: `<checkout>/.git`, a bare repo itself, or the repo's mirror. */
   repo: string;
-  /** The commit the run starts from: the source's HEAD. */
+  /** The commit the run starts from: a hand run's source's HEAD, or the commit the poller names. */
   sha: string;
   workOrder: WorkOrder;
   public: boolean;
-  /** min(work order budget.usd, --budget-usd). */
+  /** The run's budget (`RunFile.budget_usd`). */
   budgetUsd: number;
   packDir: string;
+}
+
+/** The roster the deployed build was made for: `<buildDir>/roster`, one bare word that `buildAll` writes. Throws when it is missing or names no roster. */
+export function readRoster(buildDir: string): RosterName {
+  const file = join(buildDir, "roster");
+  let text: string | undefined;
+  try {
+    text = readFileSync(file, "utf8");
+  } catch {
+    text = undefined;
+  }
+  const name = text?.trim();
+  if (name === undefined || !(ROSTERS as readonly string[]).includes(name)) {
+    throw new Error(`${file} is missing or names no roster (${ROSTERS.join(", ").replace(/, ([^,]+)$/, " or $1")}): \`mise run up\` writes it`);
+  }
+  return name as RosterName;
 }
 
 /**
@@ -275,19 +296,23 @@ export function runArgs(
   const tmpfs = (path: string, size: string) => `${path}:size=${size},uid=${uid},gid=${gid},mode=0700`;
   const pi = join(resolve(d.buildDir), "pi");
   const archon = join(resolve(d.buildDir), "archon");
+  // The run's own files, in its record dir (./records.ts `createRun`).
+  const own = join(resolve(d.stateDir), r.runId);
   const binds: [string, string][] = [
     [join(pi, "models.json"), `${RUN_PATHS.piDir}/models.json`],
     [join(pi, "models-store.json"), `${RUN_PATHS.piDir}/models-store.json`],
-    [join(pi, "hapi-guard.json"), `${RUN_PATHS.piDir}/hapi-guard.json`],
+    [join(own, "hapi-guard.json"), `${RUN_PATHS.piDir}/hapi-guard.json`],
     [join(pi, "settings.json"), `${RUN_PATHS.piDir}/settings.json`],
     [join(pi, "extensions"), `${RUN_PATHS.piDir}/extensions`],
     [join(archon, "config.yaml"), "/.archon/config.yaml"],
     [join(archon, "empty.env"), "/.archon/.env"],
     [resolve(r.packDir), RUN_PATHS.pack],
-    [join(archon, "run-config.yaml"), "/opt/hapi/run-config.yaml"],
+    [join(own, "run-config.yaml"), "/opt/hapi/run-config.yaml"],
     [join(archon, "gitconfig"), `${APP_HOME}/.gitconfig`],
     [join(resolve(d.root), "stack", "archon", "run.sh"), "/opt/hapi/run.sh"],
-    [join(resolve(d.stateDir), r.runId, "run.json"), RUN_PATHS.runFile],
+    [join(own, "run.json"), RUN_PATHS.runFile],
+    [join(own, "order.json"), RUN_PATHS.order],
+    [join(own, "task.md"), RUN_PATHS.task],
     [resolve(r.repo), RUN_PATHS.source],
   ];
   return [

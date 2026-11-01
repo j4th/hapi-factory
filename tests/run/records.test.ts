@@ -5,12 +5,14 @@
  * labels, never a pid.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { readdirSync, readFileSync, realpathSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { RUN_KINDS } from "../../src/run/kinds";
 import { runStart } from "../../src/run/lifecycle";
-import { isLive, keyProblem, RUN_ID, runKey, type RunRecord } from "../../src/run/records";
+import { isLive, keyPart, keyProblem, readRecord, RUN_ID, runKey, type RunRecord } from "../../src/run/records";
 import { PROJECT_LABEL, RUN_LABEL } from "../../src/stack/up";
-import { capture, cleanup } from "../secrets/helpers";
+import { capture, caught, cleanup, tempDir } from "../secrets/helpers";
 import { fakeRepo, fakeRun, fakeSecret, SHA, seedRun, writeArchonEnv, writeOrder } from "./helpers";
 
 afterEach(cleanup);
@@ -33,6 +35,57 @@ describe("runKey", () => {
     expect(runKey("0004-other", SHA)).not.toBe(KEY);
     // The two parts can't be shifted into each other.
     expect(runKey("a", "bc")).not.toBe(runKey("ab", "c"));
+  });
+
+  test("a non-worker run's key adds <kind>:<round>; a hand run's key is the two-part key, unchanged, so Plan 02's records stay valid", () => {
+    const id = "0003-check-run";
+    const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
+    expect(runKey(id, SHA)).toBe(sha256(`${id}\0${SHA}`));
+    expect(runKey(id, SHA, "fix:1")).toBe(sha256(`${id}\0${SHA}\0fix:1`));
+    expect(new Set([runKey(id, SHA), runKey(id, SHA, "fix:1"), runKey(id, SHA, "fix:2"), runKey(id, SHA, "verify:0")]).size).toBe(4);
+  });
+});
+
+describe("keyPart", () => {
+  test("keyPart: a hand run keeps the two-part key, and every engine key names its kind, its round and, from the first retry on, its retry", () => {
+    expect(keyPart("worker", 0)).toBeUndefined();
+    expect(keyPart("worker", 0, 0)).toBe("worker:0");
+    expect([keyPart("verify", 0), keyPart("verify", 0, 0), keyPart("fix", 1)]).toEqual(["verify:0", "verify:0", "fix:1"]);
+    expect([keyPart("worker", 0, 1), keyPart("review", 0, 2)]).toEqual(["worker:0:retry1", "review:0:retry2"]);
+    const id = "0003-check-run";
+    const keys = [runKey(id, SHA)];
+    for (const [k, r] of [["worker", 0], ["fix", 1]] as const) for (const n of [0, 1, 2]) keys.push(runKey(id, SHA, keyPart(k, r, n)));
+    expect(new Set(keys).size).toBe(7);
+  });
+});
+
+describe("readRecord", () => {
+  /** A record dir holding `rec` as record.json, written by hand: readRecord must refuse what hapi never writes. */
+  function written(rec: Record<string, unknown>): string {
+    const state = tempDir("hapi-records-");
+    mkdirSync(join(state, rec.runId as string));
+    writeFileSync(join(state, rec.runId as string, "record.json"), JSON.stringify(rec));
+    return state;
+  }
+  const base = { ...rec("aaaaaaaaaaaa", "succeeded", "2026-10-29T10:00:00Z") };
+
+  test("a record whose kind is no run kind is not one hapi wrote", async () => {
+    expect(RUN_KINDS).toEqual(["worker", "verify", "review", "fix"]);
+    for (const kind of ["build", "", 1, null]) {
+      const e = await caught(readRecord(written({ ...base, kind }), "aaaaaaaaaaaa"));
+      expect([kind, e.message]).toEqual([kind, expect.stringContaining("is not a run record hapi wrote")]);
+    }
+    for (const kind of RUN_KINDS) expect((await readRecord(written({ ...base, kind }), "aaaaaaaaaaaa"))!.kind).toBe(kind);
+    // A Plan 02 record has no kind, and still reads back.
+    expect((await readRecord(written(base), "aaaaaaaaaaaa"))!.kind).toBeUndefined();
+  });
+
+  test("a record whose retry isn't a whole number of at least 0 is not one hapi wrote", async () => {
+    for (const retry of [-1, 1.5, "1"]) {
+      const e = await caught(readRecord(written({ ...base, retry }), "aaaaaaaaaaaa"));
+      expect([retry, e.message]).toEqual([retry, expect.stringContaining("is not a run record hapi wrote")]);
+    }
+    expect((await readRecord(written({ ...base, retry: 0 }), "aaaaaaaaaaaa"))!.retry).toBe(0);
   });
 });
 

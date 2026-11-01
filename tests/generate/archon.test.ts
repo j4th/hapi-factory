@@ -23,10 +23,17 @@ test("RUN_PATHS holds the run container's fixed paths", () => {
     runFile: "/run/hapi/run.json",
     ledgerDir: "/tmp/hapi-guard",
     pack: "/.archon/workflows/hapi",
+    order: "/run/hapi/order.json",
+    task: "/run/hapi/task.md",
   });
   expect(RUN_PATHS.piDir).toBe(PI_AGENT_DIR);
+  // The host's copies of the work order and its task text, beside run.json: Task 11's nodes and prompts read them, never the clone's order.yaml.
+  expect([RUN_PATHS.order, RUN_PATHS.task]).toEqual(["/run/hapi/order.json", "/run/hapi/task.md"]);
   const run: RunFile = { run_id: "r", work_order: "w", traceparent: "t", budget_usd: 1, public: false, workflow: "x", started_at: "now" };
   expect(Object.keys(run)).toHaveLength(7);
+  // A run of Plan 03 also says its kind, round, turn budget and base commit.
+  const engine: RunFile = { ...run, kind: "fix", round: 1, turns: 10, base: "a".repeat(40) };
+  expect(Object.keys(engine)).toHaveLength(11);
 });
 
 test("config.yaml holds assistants.pi.enableExtensions: true for every roster (H-181(b))", () => {

@@ -24,7 +24,8 @@ export const SUPERVISE_USAGE = "usage: hapi run supervise <run-id>";
 export const WATCH_USAGE = "usage: hapi run watch <run-id>";
 export const LIST_USAGE = "usage: hapi run list";
 
-export interface StartOptions {
+/** `hapi run start`'s flags (`StartOptions` is the launcher API's, ./lifecycle.ts `startRun`). */
+export interface StartFlags {
   /** A checkout (its .git dir is bound) or a bare repo: the run starts from its HEAD. */
   repo: string;
   workOrder: string;
@@ -37,10 +38,10 @@ export interface StartOptions {
 }
 
 /** `hapi run start`'s flags, each at most once; undefined on any usage error. */
-export function parseStart(args: string[]): StartOptions | undefined {
+export function parseStart(args: string[]): StartFlags | undefined {
   let repo: string | undefined;
   let workOrder: string | undefined;
-  const out: Omit<StartOptions, "repo" | "workOrder"> = { public: false };
+  const out: Omit<StartFlags, "repo" | "workOrder"> = { public: false };
   const seen = new Set<string>();
   for (let i = 0; i < args.length; i++) {
     const flag = args[i]!;

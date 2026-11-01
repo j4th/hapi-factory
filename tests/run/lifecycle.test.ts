@@ -7,21 +7,30 @@
  * step fails.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, relative } from "node:path";
+import YAML from "yaml";
 import { main } from "../../src/cli";
+import { emitPi } from "../../src/generate/pi";
+import { loadPolicy } from "../../src/policy/load";
+import { applyOverlay } from "../../src/policy/overlay";
+import type { Policy, RepoOverlay, Roster } from "../../src/policy/types";
 import { runDeps, START_USAGE } from "../../src/run/cli";
 import { COPY_SCRIPT, HELPER_HOST_TIMEOUT_S, HELPER_KILL_AFTER_S, HELPER_TIMEOUT_S, LIST_SCRIPT, OUTPUT_FILES } from "../../src/run/copyout";
-import { CLEAN_SCRIPT, GIB } from "../../src/run/disk";
-import { bundleProblem, FINALIZE_WAIT_S, finalizeRun, guardProblems, LOGS_SCRIPT, reapRuns, runStart, runStop, runSupervise } from "../../src/run/lifecycle";
+import { CLEAN_SCRIPT, GIB, volumeDir } from "../../src/run/disk";
+import { CODERABBIT_CLI_TIMEOUT_S, type RunKind } from "../../src/run/kinds";
+import {
+  bundleProblem, FINALIZE_WAIT_S, finalizeRun, guardProblems, LOGS_SCRIPT, reapRuns, rolesProblem, runStart, runStop, runSupervise, type StartOptions, startRun,
+} from "../../src/run/lifecycle";
 import { lockHeld, withStackLock } from "../../src/run/locks";
-import { listRecords, readRecord, RUN_ID, runKey } from "../../src/run/records";
+import { listRecords, PER_RUN_FILES, readRecord, RUN_ID, runKey, withRunLock, withStartLock } from "../../src/run/records";
 import { STOP_GRACE_S } from "../../src/run/spec";
 import { reexecScript, runCommand } from "../../src/stack/up";
 import { loadWorkOrder } from "../../src/workorder/validate";
 import { capture, caught, cleanup, tempDir } from "../secrets/helpers";
 import { REPO } from "../stack/helpers";
-import { type Call, completedOutputs, fakeRepo, fakeRun, fakeSecret, file, NOW, SHA, seedRun, unbounded, writeArchonEnv, writeOrder } from "./helpers";
+import { type Call, completedOutputs, fakeRepo, fakeRun, fakeSecret, file, NOW, SHA, SHA2, seedRun, unbounded, writeArchonEnv, writeOrder } from "./helpers";
 
 afterEach(cleanup);
 
@@ -45,6 +54,12 @@ const changes = (calls: Call[]) =>
     return d[0] === "docker" && !["ps", "inspect", "ls", "info"].includes(d[1] === "network" || d[1] === "volume" ? d[2]! : d[1]!);
   });
 const locksIn = (xdg: string) => (existsSync(join(xdg, "hapi", "locks")) ? readdirSync(join(xdg, "hapi", "locks")).filter((n) => n.endsWith(".lock")) : []);
+const POLICY: Policy = loadPolicy(join(REPO, "policy"));
+const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
+/** The effective policy's hash, as a run's record carries it: here, the central policy's, with no overlay. */
+const POLICY_HASH = sha256(JSON.stringify(POLICY));
+/** The model `@implement` names for the fixture's work order (roles.implement small) on the anthropic roster. */
+const IMPLEMENT_MODEL = POLICY.rosters.anthropic.small.model;
 
 describe("hapi run start: refusals", () => {
   test("start refuses when the archon env file is missing (Review Focus 1)", async () => {
@@ -276,12 +291,14 @@ describe("hapi run start: the order of steps", () => {
     const dir = join(f.deps.stateDir, id);
     expect(JSON.parse(readFileSync(join(dir, "run.json"), "utf8"))).toEqual({
       run_id: id, work_order: "0003-check-run", traceparent: TRACEPARENT, budget_usd: 1.5, public: true, workflow: "hapi-check-run", started_at: NOW.toISOString(),
+      kind: "worker", round: 0, turns: 10, base: SHA,
     });
     const gitDir = realpathSync(join(f.repo, ".git"));
     expect(await readRecord(f.deps.stateDir, id)).toEqual({
       runId: id, key: runKey("0003-check-run", SHA), project: "hapi", repo: gitDir, sha: SHA, workOrder: "0003-check-run", workflow: "hapi-check-run",
       container: N, network: N, volumes: { work: `${N}-work`, out: `${N}-out` },
       startedAt: NOW.toISOString(), deadline: new Date(NOW.getTime() + 30 * 60_000).toISOString(), status: "live",
+      kind: "worker", round: 0, budgetUsd: 1.5, roster: "anthropic", policyHash: POLICY_HASH, model: IMPLEMENT_MODEL,
     });
     // run.json is read by the container's uid (another host uid under rootless Docker); record.json is hapi's alone.
     expect([statSync(dir).mode & 0o777, statSync(join(dir, "record.json")).mode & 0o777, statSync(join(dir, "run.json")).mode & 0o777]).toEqual([0o700, 0o600, 0o644]);
@@ -411,6 +428,305 @@ describe("hapi run start: rollback", () => {
   });
 });
 
+describe("startRun", () => {
+  const P = "0a0b0c0d0e0f";
+  /** A ready world (`ready`), its work order parsed, the source's git dir, and `base`: a worker's StartOptions with no retry, as a hand run's. */
+  function api(o: Parameters<typeof fakeRun>[0] = {}) {
+    const f = ready(o);
+    const order = loadWorkOrder(f.order);
+    const gitDir = realpathSync(join(f.repo, ".git"));
+    const base = (over: Partial<StartOptions> = {}): StartOptions => ({ repoGitDir: gitDir, workOrder: order, taskMd: "# 0003\n", sha: SHA, public: true, kind: "worker", ...over });
+    return { f, order, gitDir, base };
+  }
+  type Api = ReturnType<typeof api>;
+  const runJson = (f: Api["f"], id: string) => JSON.parse(readFileSync(join(f.deps.stateDir, id, "run.json"), "utf8"));
+  const ids = (f: Api["f"]) => (existsSync(f.deps.stateDir) ? readdirSync(f.deps.stateDir).filter((n) => RUN_ID.test(n)).sort() : []);
+
+  test("startRun returns the record it wrote, with its kind, round, budget, roster and the effective policy's hash", async () => {
+    const { out } = capture();
+    const { f, order, base } = api();
+    const rec = await startRun(f.deps, base());
+    expect(rec).toEqual((await readRecord(f.deps.stateDir, rec.runId))!);
+    expect([rec.kind, rec.round, rec.budgetUsd, rec.roster, rec.key]).toEqual(["worker", 0, 3, "anthropic", runKey("0003-check-run", SHA)]);
+    expect(rec.retry).toBeUndefined(); // a hand run's: no retry, so the two-part key
+    expect(rec.policyHash).toBe(sha256(JSON.stringify(loadPolicy(join(REPO, "policy")))));
+    // What an eval compares (design §3.8, m20): the model the run's alias names.
+    expect(rec.model).toBe(POLICY.rosters.anthropic[order.roles.implement].model);
+    expect(runJson(f, rec.runId)).toMatchObject({ kind: "worker", round: 0, turns: order.budget.turns, base: SHA });
+    // The API prints nothing: the caller gets the record, or the refusal as a thrown error.
+    expect(out).toEqual([]);
+    expect(f.spawned).toEqual([["hapi", "run", "supervise", rec.runId]]);
+  });
+
+  test("every refusal throws its text before anything is made", async () => {
+    capture();
+    const cases: [what: string, over: (a: Api) => Partial<StartOptions>, text: (a: Api) => string, setup?: (a: Api) => unknown][] = [
+      ["the work order's egress_extra", (a) => ({ workOrder: { ...a.order, egress_extra: ["docs.example.org"] } }), () => "egress_extra isn't supported yet (design §3.1, H-088); remove it or wait for the per-run proxy"],
+      ["the overlay's egress_extra", () => ({ overlay: { egress_extra: ["docs.example.org"] } }), () => "the repo's .factory/config.yaml adds egress_extra hosts, which aren't supported yet (H-207): remove them"],
+      ["a budget above the work order's", () => ({ budgetUsd: 3.5 }), () => "the run's budget 3.5 is above the work order's budget.usd (3): it may only lower it"],
+      ["a commit id that isn't one", () => ({ sha: "--output=x" }), () => '"--output=x" is not a commit id: 40 or 64 lower-case hex digits'],
+      ["a commit the source doesn't hold", () => ({ sha: "0".repeat(40) }), (a) => `${"0".repeat(40)} is not a commit in ${a.gitDir} (git rev-parse exited 0): fetch it into the source first`],
+      ["a parent with no record", () => ({ kind: "fix", parent: P }), (a) => `the parent run ${P} has no record in ${a.f.deps.stateDir}`],
+      ["no parent", () => ({ kind: "fix" }), () => "a fix run needs its parent (StartOptions.parent), the work order's worker run: its base commit is that run's sha"],
+      [
+        "a parent that isn't a worker run",
+        () => ({ kind: "fix", parent: "0b0c0d0e0f0a" }),
+        () => "the parent run 0b0c0d0e0f0a is a fix run, not the work order's worker run: a fix run's base commit is its worker run's sha",
+        (a) => seedRun(a.f, { id: "0b0c0d0e0f0a", kind: "fix", objects: false }),
+      ],
+      [
+        "no build/roster",
+        () => ({}),
+        (a) => `${join(a.f.deps.buildDir, "roster")} is missing or names no roster (budget, anthropic or portable): \`mise run up\` writes it`,
+        (a) => rmSync(join(a.f.deps.buildDir, "roster")),
+      ],
+      ["a retry of -1", () => ({ retry: -1 }), () => "the run's retry -1 is not a whole number of at least 0"],
+      ["a retry of 1.5", () => ({ retry: 1.5 }), () => "the run's retry 1.5 is not a whole number of at least 0"],
+    ];
+    for (const [what, over, text, setup] of cases) {
+      const a = api();
+      await setup?.(a);
+      const before = ids(a.f);
+      const e = await caught(startRun(a.f.deps, a.base(over(a))));
+      expect([what, e.message]).toEqual([what, text(a)]);
+      expect([what, changes(a.f.calls)]).toEqual([what, []]);
+      expect([what, ids(a.f)]).toEqual([what, before]);
+    }
+  });
+
+  test("startRun also refuses a role on the wrong provider for its roster (m16), a bad round, kind or budget, a parent it can't take, and an inputs dir, naming each, before anything is made", async () => {
+    capture();
+    const seeded = (o: Partial<Parameters<typeof seedRun>[1]> = {}) => (a: Api) => seedRun(a.f, { id: P, status: "succeeded", objects: false, ...o });
+    const cases: [what: string, over: (a: Api) => Partial<StartOptions>, text: string, setup?: (a: Api) => unknown][] = [
+      [
+        "implement on a claude tier",
+        (a) => ({ workOrder: { ...a.order, roles: { implement: "medium", review: "medium" } } }),
+        "the work order's roles.implement is medium, a claude tier in the anthropic roster: implement runs on Pi, so it must name a pi tier",
+      ],
+      [
+        "review on a pi tier",
+        (a) => ({ workOrder: { ...a.order, roles: { implement: "small", review: "small" } } }),
+        "the work order's roles.review is small, a pi tier in the anthropic roster: the review runs in Claude Code, so it must name a claude tier",
+      ],
+      ["a round of -1", () => ({ round: -1 }), "the run's round -1 is not a whole number of at least 0"],
+      ["a round of 0.5", () => ({ round: 0.5 }), "the run's round 0.5 is not a whole number of at least 0"],
+      ["a kind that isn't one", () => ({ kind: "build" as RunKind }), '"build" is not a run kind (worker, verify, review or fix)'],
+      ["a budget below 0", () => ({ budgetUsd: -1 }), "the run's budget -1 is not a number of at least 0"],
+      ["a budget that isn't a number", () => ({ budgetUsd: Number.NaN }), "the run's budget NaN is not a number of at least 0"],
+      [
+        "a fix's budget above its round's cap",
+        () => ({ kind: "fix", parent: P, round: 1, budgetUsd: 2 }),
+        `the run's budget 2 is above a fix run's cap, the smaller of the work order's budget.usd (3) and runs.phases.round_usd (${POLICY.runs.phases.round_usd}): it may only lower it`,
+        seeded(),
+      ],
+      ["a worker with a parent", () => ({ parent: P }), "a worker run takes no parent: it is the work order's first run, and its own base", seeded()],
+      ["a parent that isn't a run id", () => ({ kind: "fix", parent: "../x" }), 'the parent run "../x" is not a run id: twelve lower-case hex digits'],
+      [
+        "a parent of another work order",
+        () => ({ kind: "review", parent: P }),
+        `the parent run ${P} is a run of work order 0099-other, not of 0003-check-run`,
+        seeded({ workOrder: "0099-other" }),
+      ],
+      ["an inputs dir", () => ({ kind: "review", parent: P, inputsDir: "/srv/inputs" }), "a run's inputsDir isn't bound yet: no run kind takes an inputs dir", seeded()],
+      // An overlay that loosens the central policy, or fails its schema, names the repo's file (the poller's discovery refuses both first).
+      [
+        "an overlay that loosens the policy",
+        () => ({ overlay: { budgets: { run_usd: 100 } } }),
+        "the repo's .factory/config.yaml: /budgets/run_usd: raises budgets.run_usd from 3 to 100; overlays may only tighten policy",
+      ],
+      ["an overlay that fails its schema", () => ({ overlay: { nope: 1 } as RepoOverlay }), "the repo's .factory/config.yaml: /nope: unknown key"],
+    ];
+    for (const [what, over, text, setup] of cases) {
+      const a = api();
+      await setup?.(a);
+      const before = ids(a.f);
+      const e = await caught(startRun(a.f.deps, a.base(over(a))));
+      expect([what, e.message]).toEqual([what, text]);
+      expect([what, changes(a.f.calls)]).toEqual([what, []]);
+      expect([what, ids(a.f)]).toEqual([what, before]);
+    }
+  });
+
+  test("rolesProblem holds implement to a pi tier and review to a claude one, in the run's roster (m16)", () => {
+    const r: Roster = POLICY.rosters.anthropic;
+    expect(rolesProblem({ implement: "small", review: "medium" }, r, "anthropic")).toBeUndefined();
+    expect(rolesProblem({ implement: "large", review: "medium" }, r, "anthropic")).toBeUndefined();
+    expect(rolesProblem({ implement: "large", review: "large" }, r, "anthropic")).toBe(
+      "the work order's roles.review is large, a pi tier in the anthropic roster: the review runs in Claude Code, so it must name a claude tier",
+    );
+    // The portable roster runs every tier on Pi, so no work order can name a claude tier for its review there.
+    for (const review of ["small", "medium", "large"] as const) expect(rolesProblem({ implement: "large", review }, POLICY.rosters.portable, "portable")).toContain("a pi tier in the portable roster");
+  });
+
+  test("a held start lock throws an error lockHeld recognizes, so the poller tries again next tick", async () => {
+    capture();
+    const { f, base } = api();
+    const e = await withStartLock(f.deps, () => startRun(f.deps, base()).catch((x: unknown) => x));
+    expect(lockHeld(e)).toBe(true);
+    expect(changes(f.calls)).toEqual([]);
+  });
+
+  test("the run's hapi-guard.json and run-config.yaml come from the policy with the repo's overlay, for build/roster's roster (H-172); order.json and task.md are the host's copies, all 0644", async () => {
+    capture();
+    const { f, order, base } = api();
+    writeFileSync(join(f.deps.buildDir, "roster"), "budget\n");
+    const overlay: RepoOverlay = { protected_paths: { "secret-dir/**": { interactive: "ask", unattended: "deny", workers: "deny" } } };
+    const rec = await startRun(f.deps, base({ overlay }));
+    const dir = join(f.deps.stateDir, rec.runId);
+    const read = (name: string) => readFileSync(join(dir, name), "utf8");
+    const applied = applyOverlay(loadPolicy(join(REPO, "policy")), overlay);
+    expect(read("hapi-guard.json")).toBe(emitPi(applied, "budget")["hapi-guard.json"]!);
+    expect(JSON.parse(read("hapi-guard.json")).protected_paths["secret-dir/**"]).toBe("deny");
+    const config = YAML.parse(read("run-config.yaml"));
+    // The work order's tiers, not roles.yaml's (implement: large there).
+    expect(config.aliases["@implement"]).toEqual(config.tiers[order.roles.implement]);
+    expect(config.aliases["@review"]).toEqual(config.tiers[order.roles.review]);
+    expect(config.tiers.large.model).toBe(POLICY.rosters.budget.large.model);
+    expect(JSON.parse(read("order.json"))).toEqual(order);
+    expect(read("task.md")).toBe("# 0003\n");
+    for (const name of PER_RUN_FILES) expect([name, statSync(join(dir, name)).mode & 0o777]).toEqual([name, 0o644]);
+    expect([rec.roster, rec.policyHash]).toEqual(["budget", sha256(JSON.stringify(applied))]);
+    // The run container binds the run's own copies, never build/'s.
+    const argv = f.calls.find((c) => c.cmd[1] === "run" && c.cmd[2] === "-d")!.cmd;
+    for (const [name, dest] of [["hapi-guard.json", "/opt/hapi/pi-agent/hapi-guard.json"], ["run-config.yaml", "/opt/hapi/run-config.yaml"], ["order.json", "/run/hapi/order.json"], ["task.md", "/run/hapi/task.md"]] as const) {
+      expect(argv).toContain(`${join(dir, name)}:${dest}:ro`);
+    }
+    // No task text is an empty task.md, still bound.
+    const g = api();
+    const { taskMd: _, ...untasked } = g.base();
+    const none = await startRun(g.f.deps, untasked);
+    expect(readFileSync(join(g.f.deps.stateDir, none.runId, "task.md"), "utf8")).toBe("");
+  });
+
+  test("a fix round is keyed fix:<round>, takes its parent's sha as base, and is capped at the round's turns and dollars", async () => {
+    capture();
+    const { f, order, base } = api();
+    const ph = loadPolicy(join(REPO, "policy")).runs.phases;
+    // The worker ran at a second commit; the fix starts from SHA, so its base differs from its own commit.
+    await seedRun(f, { id: P, status: "succeeded", objects: false, sha: SHA2 });
+    // More turns than a round may take, so the cap shows.
+    const long = { ...order, budget: { ...order.budget, turns: ph.round_turns + 10 } };
+    const rec = await startRun(f.deps, base({ workOrder: long, kind: "fix", parent: P, round: 1 }));
+    expect([rec.key, rec.parent, rec.round, rec.budgetUsd, rec.sha]).toEqual([runKey("0003-check-run", SHA, "fix:1"), P, 1, Math.min(3, ph.round_usd), SHA]);
+    expect(rec.retry).toBeUndefined();
+    expect(rec.model).toBe(POLICY.rosters.anthropic[order.roles.implement].model);
+    expect(runJson(f, rec.runId)).toMatchObject({ kind: "fix", round: 1, turns: Math.min(long.budget.turns, ph.round_turns), base: SHA2, budget_usd: Math.min(3, ph.round_usd) });
+  });
+
+  test("a verify run takes a budget of 0 and names no model; a review run names review's, and its deadline covers the CodeRabbit CLI when phases.coderabbit is on (m17, m18, m20)", async () => {
+    capture();
+    const minutes = (m: number) => new Date(NOW.getTime() + m * 60_000).toISOString();
+    const v = api();
+    await seedRun(v.f, { id: P, status: "succeeded", objects: false });
+    const verify = await startRun(v.f.deps, v.base({ kind: "verify", parent: P, budgetUsd: 0 }));
+    expect([verify.budgetUsd, verify.model, verify.key, verify.deadline]).toEqual([0, undefined, runKey("0003-check-run", SHA, "verify:0"), minutes(30)]);
+    expect(runJson(v.f, verify.runId)).toMatchObject({ kind: "verify", budget_usd: 0, turns: 10 });
+    // A review with phases.coderabbit off (the central default) has the work order's minutes.
+    const r = api();
+    await seedRun(r.f, { id: P, status: "succeeded", objects: false });
+    const review = await startRun(r.f.deps, r.base({ kind: "review", parent: P }));
+    expect([review.model, review.deadline]).toEqual([POLICY.rosters.anthropic[r.order.roles.review].model, minutes(30)]);
+    // Switched on by the overlay, the review's deadline adds the CLI's own timeout, so the supervisor never stops the CLI's step.
+    const c = api();
+    await seedRun(c.f, { id: P, status: "succeeded", objects: false });
+    const on = await startRun(c.f.deps, c.base({ kind: "review", parent: P, overlay: { runs: { phases: { coderabbit: true } } } }));
+    expect(CODERABBIT_CLI_TIMEOUT_S).toBe(1800);
+    expect(on.deadline).toBe(minutes(30 + CODERABBIT_CLI_TIMEOUT_S / 60));
+    // A worker's deadline is its minutes either way.
+    const w = api();
+    expect((await startRun(w.f.deps, w.base({ overlay: { runs: { phases: { coderabbit: true } } } }))).deadline).toBe(minutes(30));
+  });
+
+  test("an engine pass never meets a hand run's key, and a retry's worker starts beside a succeeded worker of the same commit", async () => {
+    capture();
+    const seeded = async () => {
+      const a = api();
+      await seedRun(a.f, { id: P, status: "succeeded", objects: false, key: runKey("0003-check-run", SHA) });
+      return a;
+    };
+    const hand = await seeded();
+    expect((await caught(startRun(hand.f.deps, hand.base()))).message).toBe(`run ${P} of work order 0003-check-run at ${SHA.slice(0, 12)} already succeeded: a work order runs once per commit`);
+    const first = await seeded();
+    const zero = await startRun(first.f.deps, first.base({ retry: 0 }));
+    expect([zero.key, zero.retry]).toEqual([runKey("0003-check-run", SHA, "worker:0"), 0]);
+    const retried = await seeded();
+    const one = await startRun(retried.f.deps, retried.base({ retry: 1 }));
+    expect([one.key, one.retry, Object.hasOwn(one, "retryOf")]).toEqual([runKey("0003-check-run", SHA, "worker:0:retry1"), 1, false]);
+    expect(one).toEqual((await readRecord(retried.f.deps.stateDir, one.runId))!);
+  });
+
+  test("with real git: a hand run reads the overlay at its source's HEAD as a blob, and refuses a symlink or a directory there", async () => {
+    const dir = tempDir("hapi-run-overlay-");
+    const git = (...a: string[]) => {
+      const r = Bun.spawnSync(["git", "-C", dir, "-c", "user.name=t", "-c", "user.email=t@t.invalid", "-c", "commit.gpgSign=false", "-c", "core.hooksPath=/dev/null", ...a], { stdout: "pipe", stderr: "pipe", env: { PATH: process.env.PATH ?? "/usr/bin:/bin", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" } });
+      expect([a.join(" "), r.exitCode]).toEqual([a.join(" "), 0]);
+      return r.stdout.toString().trim();
+    };
+    git("init", "-q", "-b", "main");
+    mkdirSync(join(dir, ".factory"));
+    writeFileSync(join(dir, ".factory", "config.yaml"), 'protected_paths:\n  "secret-dir/**": { interactive: ask, unattended: deny, workers: deny }\n');
+    git("add", "-A");
+    git("commit", "-q", "-m", "overlay");
+    /** A hand run from `dir`, its git calls on real git (`env -i ... git`), the rest on the fake. */
+    const start = async () => {
+      const f = ready();
+      const fake = f.deps.run;
+      f.deps.run = (cmd, o) => (cmd[0] === "env" && cmd.includes("git") && !cmd.includes("list-heads") ? runCommand(cmd, o) : fake(cmd, o));
+      const { out, err } = capture();
+      const code = await runStart(["--repo", dir, "--work-order", f.order], f.deps);
+      return { f, code, out, err };
+    };
+    const one = await start();
+    expect(one.code).toBe(0);
+    const head = git("rev-parse", "HEAD");
+    const rec = (await readRecord(one.f.deps.stateDir, one.out.at(-1)!))!;
+    expect([rec.sha, JSON.parse(readFileSync(join(one.f.deps.stateDir, rec.runId, "hapi-guard.json"), "utf8")).protected_paths["secret-dir/**"]]).toEqual([head, "deny"]);
+    const at = join(dir, ".factory", "config.yaml");
+    const symlink = () => symlinkSync("../README.md", at);
+    // git tracks no empty directory, so this one holds a file.
+    const directory = () => (mkdirSync(at), writeFileSync(join(at, "x"), "x\n"));
+    for (const make of [symlink, directory]) {
+      rmSync(at, { recursive: true, force: true });
+      make();
+      git("add", "-A");
+      git("commit", "-q", "-m", "not a file");
+      const bad = await start();
+      expect([bad.code, bad.err.at(-1)]).toEqual([1, `hapi run start: .factory/config.yaml at ${git("rev-parse", "HEAD").slice(0, 12)} is not a regular file`]);
+      expect(changes(bad.f.calls)).toEqual([]);
+    }
+  });
+
+  test("a hand run (`hapi run start`) reads the repo's overlay at the run's commit and the task.md beside its work order (spec §3.5)", async () => {
+    const { out } = capture();
+    const overlay = 'protected_paths:\n  "secret-dir/**": { interactive: ask, unattended: deny, workers: deny }\n';
+    const f = ready({ overlay });
+    writeFileSync(join(f.tmp, "task.md"), "# 0003: check the run\n");
+    expect(await runStart(["--repo", f.repo, "--work-order", f.order], f.deps)).toBe(0);
+    const dir = join(f.deps.stateDir, out[0]!);
+    expect(JSON.parse(readFileSync(join(dir, "hapi-guard.json"), "utf8")).protected_paths["secret-dir/**"]).toBe("deny");
+    expect(readFileSync(join(dir, "task.md"), "utf8")).toBe("# 0003: check the run\n");
+    const gitDir = realpathSync(join(f.repo, ".git"));
+    const lsTree = f.calls.find((c) => c.cmd.includes("ls-tree"))!.cmd;
+    expect(lsTree).toEqual([
+      "env", "-i", `PATH=${f.deps.env.PATH}`, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null",
+      "git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", `safe.directory=${gitDir}`, "--git-dir", gitDir, "ls-tree", "-z", SHA, "--", ".factory/config.yaml",
+    ]);
+    // With no overlay in the repo, central policy, and no task.md: an empty one.
+    const { out: out2 } = capture();
+    const g = ready();
+    expect(await runStart(["--repo", g.repo, "--work-order", g.order], g.deps)).toBe(0);
+    const rec = (await readRecord(g.deps.stateDir, out2.at(-1)!))!;
+    expect(rec.policyHash).toBe(POLICY_HASH);
+    expect(readFileSync(join(g.deps.stateDir, rec.runId, "task.md"), "utf8")).toBe("");
+    // An overlay that fails its schema refuses the run, naming the commit's file.
+    const { err } = capture();
+    const h = ready({ overlay: "budgets: { nope: 1 }\n" });
+    expect(await runStart(["--repo", h.repo, "--work-order", h.order], h.deps)).toBe(1);
+    expect(err.at(-1)).toStartWith(`hapi run start: ${SHA.slice(0, 12)}:.factory/config.yaml: `);
+    expect(changes(h.calls)).toEqual([]);
+  });
+});
+
 describe("hapi run supervise", () => {
   test("supervise waits for the run, until its deadline at most, then finalizes it", async () => {
     capture();
@@ -531,7 +847,7 @@ describe("finalizeRun", () => {
     expect(stop).toBeLessThan(cmds.findIndex((c) => c.includes("docker run --rm")));
   });
 
-  test("a run whose container was removed around hapi (`mise run down`, a cleanup) is not copied out: no helper races that removal for its volumes, or makes an unlabelled one", async () => {
+  test("a run whose container was removed around hapi (`mise run down`, a cleanup) is not copied out, and keeps its volumes and their dirs, since nothing was copied out (H-209)", async () => {
     capture();
     const f = fakeRun();
     const rec = await seedRun(f, { id: ID, running: false, outputs: completedOutputs() });
@@ -539,25 +855,62 @@ describe("finalizeRun", () => {
     f.world.containers.delete(N);
     const done = await finalizeRun(rec, f.deps);
     const REMOVED = "the run's container was removed before the run was finalized (`mise run down`, or a cleanup): nothing was copied out";
-    expect([done.status, done.reason]).toEqual(["failed", REMOVED]);
+    const KEPT = `the run's volumes ${N}-work and ${N}-out were kept, since nothing was copied out (H-209)`;
+    expect([done.status, done.reason]).toEqual(["failed", `${REMOVED}; ${KEPT}`]);
     // The copy-out half: no volume is inspected or mounted, and nothing is copied.
-    const helpers = f.calls.filter((c) => unbounded(c.cmd)[1] === "run" && unbounded(c.cmd).at(-1) !== CLEAN_SCRIPT);
+    const helpers = f.calls.filter((c) => unbounded(c.cmd)[1] === "run");
     expect(helpers.concat(f.calls.filter((c) => c.cmd.join(" ").startsWith("docker volume inspect")))).toEqual([]);
     expect(f.calls.some((c) => c.cmd.includes(LIST_SCRIPT) || c.cmd.includes(COPY_SCRIPT))).toBe(false);
     expect(existsSync(join(f.deps.stateDir, ID, "out"))).toBe(false);
-    // The cleanup half follows the volumes: removeRuns removed both here, so their dirs go after them, through the helper.
-    expect(f.world.networks.size + f.world.volumes.size).toBe(0);
-    const cmds = f.calls.map((c) => unbounded(c.cmd));
-    const cleans = cmds.flatMap((c, i) => (c.at(-1) === CLEAN_SCRIPT ? [i] : []));
-    expect(cleans).toHaveLength(1);
-    expect(cleans[0]).toBeGreaterThan(cmds.findIndex((c) => c.join(" ") === `docker volume rm ${N}-work ${N}-out`));
-    expect(readdirSync(f.deps.diskDir)).toEqual([]);
+    // The network goes; both volumes stay, with their dirs on the run disk, for the outputs a finished run left in them.
+    expect(f.world.networks.size).toBe(0);
+    expect([...f.world.volumes.keys()].sort()).toEqual([`${N}-out`, `${N}-work`]);
+    expect([existsSync(volumeDir(f.deps.diskDir, `${N}-work`)), existsSync(volumeDir(f.deps.diskDir, `${N}-out`))]).toEqual([true, true]);
+    expect(f.calls.some((c) => unbounded(c.cmd).at(-1) === CLEAN_SCRIPT)).toBe(false);
+    expect(f.calls.filter((c) => c.cmd[1] === "volume" && ["ls", "rm"].includes(c.cmd[2]!))).toEqual([]);
     // A stop asked for first still says how the run ended.
     const g = fakeRun();
     const stopped = await seedRun(g, { id: ID, running: false, stopRequested: "stopped", outputs: completedOutputs() });
     g.world.containers.delete(N);
     const s = await finalizeRun(stopped, g.deps);
-    expect([s.status, s.reason]).toEqual(["stopped", `stopped by \`hapi run stop\`; ${REMOVED}`]);
+    expect([s.status, s.reason]).toEqual(["stopped", `stopped by \`hapi run stop\`; ${REMOVED}; ${KEPT}`]);
+    expect([...g.world.volumes.keys()].sort()).toEqual([`${N}-out`, `${N}-work`]);
+  });
+
+  test("finalize writes the outcome to record.json before it removes the run's objects (H-219)", async () => {
+    capture();
+    let f!: ReturnType<typeof fakeRun>;
+    let atRemoval: string | undefined;
+    f = fakeRun({
+      onCall: (cmd) => {
+        if (atRemoval === undefined && cmd[0] === "docker" && cmd[1] === "rm") atRemoval = JSON.parse(readFileSync(join(f.deps.stateDir, ID, "record.json"), "utf8")).status;
+      },
+    });
+    const done = await finalizeRun(await seedRun(f, { id: ID, running: false, outputs: completedOutputs() }), f.deps);
+    expect([done.status, atRemoval]).toEqual(["succeeded", "succeeded"]);
+    // A removal that fails writes the record again, with the cleanup's reason.
+    const g = fakeRun({ failing: [`docker network rm ${N}`] });
+    const left = await finalizeRun(await seedRun(g, { id: ID, running: false, outputs: completedOutputs() }), g.deps);
+    expect([left.status, left.reason?.startsWith("cleanup left run objects behind: ")]).toEqual(["succeeded", true]);
+    expect(await readRecord(g.deps.stateDir, ID)).toEqual(left);
+  });
+
+  test("finalize records the run's spend when it is known, and the turns its guard counted (m20)", async () => {
+    capture();
+    const f = fakeRun();
+    const outputs = { ...completedOutputs(), "decisions.jsonl": file('{"event":"budget","decision":"allow","rule":"spend","cost_usd":0.42}\n') };
+    const done = await finalizeRun(await seedRun(f, { id: ID, running: false, budgetUsd: 3, outputs }), f.deps);
+    expect([done.status, done.spendUsd, done.turns]).toEqual(["succeeded", 0.42, undefined]);
+    expect(await readRecord(f.deps.stateDir, ID)).toEqual(done);
+    // With the ledger's turns too.
+    const g = fakeRun();
+    const counted = { ...completedOutputs(), "decisions.jsonl": file('{"event":"budget","decision":"allow","rule":"spend","cost_usd":0.1,"turns":3}\n') };
+    const t = await finalizeRun(await seedRun(g, { id: ID, running: false, outputs: counted }), g.deps);
+    expect([t.spendUsd, t.turns]).toEqual([0.1, 3]);
+    // Neither the guard's nor Archon's: no spend is recorded, so a cap counts the run at its whole budget.
+    const h = fakeRun();
+    const none = await finalizeRun(await seedRun(h, { id: ID, running: false, budgetUsd: 3, outputs: completedOutputs() }), h.deps);
+    expect([Object.hasOwn(none, "spendUsd"), Object.hasOwn(none, "turns")]).toEqual([false, false]);
   });
 
   test("a copy-out helper that never returns fails the run at the host's bound instead of hanging finalize, which still cleans up and lets go of the run's lock", async () => {
@@ -863,6 +1216,25 @@ describe("reapRuns", () => {
     expect(f.calls.filter((c) => c.cmd[1] === "volume").map((c) => c.cmd)).toEqual([["docker", "volume", "ls", "-q", "--filter", "label=org.hapi.run", "--filter", "label=org.hapi.project=hapi"]]);
   });
 
+  test("the sweep leaves a run's dirs to the finalize that holds its lock: it writes the outcome before it removes them (H-219), so the record alone can't say they are done", async () => {
+    const { err } = capture();
+    const f = fakeRun();
+    const A = "aaaaaaaaaaaa";
+    // What a finalize leaves for the moment between its removeRuns and its removeVolumeDirs: an ended record, no volume, the dirs.
+    await seedRun(f, { id: A, status: "succeeded", objects: false });
+    for (const v of ["work", "out"]) {
+      mkdirSync(join(f.deps.diskDir, `hapi-run-${A}-${v}`), { mode: 0o700 });
+      writeFileSync(join(f.deps.diskDir, `hapi-run-${A}-${v}`, "f"), "x");
+    }
+    await withRunLock(f.deps, A, () => reapRuns(f.deps));
+    expect(readdirSync(f.deps.diskDir).sort()).toEqual([`hapi-run-${A}-out`, `hapi-run-${A}-work`]);
+    expect(f.calls.some((c) => unbounded(c.cmd).at(-1) === CLEAN_SCRIPT)).toBe(false);
+    expect(err).toEqual([]);
+    // Once that finalize has let go, a reap removes them, as for any run whose volumes are gone.
+    await reapRuns(f.deps);
+    expect(readdirSync(f.deps.diskDir)).toEqual([]);
+  });
+
   test("a run disk dir the reap can't empty is a failure: the run disk stops new starts until it is cleaned (fail-closed); with nothing to sweep, nothing is listed", async () => {
     capture();
     const f = fakeRun({ failing: ["docker run --rm"] });
@@ -907,6 +1279,58 @@ describe("hapi run stop", () => {
     };
     await runStop([ID], f.deps);
     expect(seen).toBe("stopped");
+  });
+
+  test("stop refuses a run whose container doesn't exist yet, as in start's creation window, and records nothing (H-218)", async () => {
+    const { err } = capture();
+    const f = fakeRun();
+    await seedRun(f, { id: ID, objects: false });
+    // Start holds its lock while it makes the run: the stop's reap can't take it, and the record is live with no container yet.
+    expect(await withStartLock(f.deps, () => runStop([ID], f.deps))).toBe(1);
+    expect(err.at(-1)).toBe(
+      `hapi run stop: run ${ID} has no container yet: its start may still be making it, so wait and stop it again; a container removed around hapi is reaped by the next \`hapi run\` command`,
+    );
+    expect((await readRecord(f.deps.stateDir, ID))!.stopRequested).toBeUndefined();
+    expect(f.calls.filter((c) => c.cmd[1] === "stop")).toEqual([]);
+  });
+
+  test("a stop outranks the deadline while the run is live; a run another process is finalizing keeps how it ends", async () => {
+    const { err } = capture();
+    const STOPPED = ["stopped", "stopped by `hapi run stop`", "stopped"];
+    const ending = async (f: ReturnType<typeof fakeRun>) => {
+      const r = (await readRecord(f.deps.stateDir, ID))!;
+      return [r.status, r.reason, r.stopRequested];
+    };
+    const past = new Date(NOW.getTime() - 1000).toISOString();
+    // The deadline's stop, in its grace: the record already says timed-out.
+    const a = fakeRun();
+    await seedRun(a, { id: ID, stopRequested: "timed-out", outputs: completedOutputs() });
+    expect(await runStop([ID], a.deps)).toBe(0);
+    expect(await ending(a)).toEqual(STOPPED);
+    // Past its deadline, its supervisor gone: the stop's own reap leaves it to the stop.
+    const b = fakeRun();
+    await seedRun(b, { id: ID, deadline: past, outputs: completedOutputs() });
+    const seen: (string | undefined)[] = [];
+    const run = b.deps.run;
+    b.deps.run = async (cmd, o) => {
+      if (cmd[1] === "stop") seen.push((await readRecord(b.deps.stateDir, ID))!.stopRequested);
+      return run(cmd, o);
+    };
+    expect(await runStop([ID], b.deps)).toBe(0);
+    expect(await ending(b)).toEqual(STOPPED);
+    expect([seen.length > 0, seen.every((x) => x === "stopped")]).toEqual([true, true]);
+    // Never the reverse: the deadline's reap leaves a stop as it is.
+    const c = fakeRun();
+    await seedRun(c, { id: ID, stopRequested: "stopped", deadline: past, outputs: completedOutputs() });
+    await reapRuns(c.deps);
+    expect(await ending(c)).toEqual(STOPPED);
+    // Another process finalizing it (it holds the run's lock): the stop fails, and the record is as it was.
+    const d = fakeRun();
+    await seedRun(d, { id: ID, outputs: completedOutputs() });
+    expect(await withRunLock(d.deps, ID, () => runStop([ID], d.deps))).toBe(1);
+    expect(err.at(-1)).toStartWith("hapi run stop: another command");
+    const rec = (await readRecord(d.deps.stateDir, ID))!;
+    expect([rec.status, rec.stopRequested]).toEqual(["live", undefined]);
   });
 
   test("stop of a run that has ended says so and changes nothing; an unknown run is an error", async () => {

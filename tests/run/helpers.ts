@@ -3,7 +3,8 @@
  * networks, volumes, and the files in a run's output volume) and answers the
  * commands src/run makes as Docker would, plus a temp state dir, runtime dir,
  * build dir, source repo and work order. No Docker, git, sudo or network: the
- * git calls (the source's HEAD, the bundle's heads) are answered too,
+ * git calls (the source's HEAD and commits, its `.factory/config.yaml`, the
+ * bundle's heads) are answered too,
  * `docker logs --follow` streams `logs`, and `docker logs --tail` prints a
  * container's `world.logs`. The run disk is a temp dir (`deps.diskDir`) whose
  * filesystem facts come from `deps.probeFs`, never from a real mount; the
@@ -57,6 +58,12 @@ export interface World {
 }
 
 export const SHA = "4bf92f3577b34da6a3ce929d0e0e47364bf92f35";
+/** A second commit the fake source holds: a parent run seeded there has a base that isn't the run's own commit. */
+export const SHA2 = "0d1e2f3a4b5c6d7e8f90a1b2c3d4e5f60718293a";
+/** The commits the fake source holds. `rev-parse <x>^{commit}` echoes one of them; any other name resolves to SHA, so a check that doesn't compare the answer with what it asked for takes it. */
+const COMMITS = [SHA, SHA2];
+/** The blob id the fake's `ls-tree` gives `.factory/config.yaml`. */
+const OVERLAY_BLOB = "e".repeat(40);
 /** What the fake `docker info --format {{.DockerRootDir}}` prints: Docker's data root, on a filesystem of its own (dev 3). */
 export const DATA_ROOT = "/fake/docker-root";
 export const NOW = new Date("2026-10-29T12:00:00.000Z");
@@ -121,6 +128,8 @@ export interface FakeOptions {
   waitCode?: number;
   /** What `git bundle list-heads` prints. */
   heads?: string;
+  /** The source's `.factory/config.yaml`, at every commit (`ls-tree` lists it, `cat-file blob` prints it); none by default. */
+  overlay?: string;
   /** The run network's subnet and whether it is internal, as `docker network inspect` says. */
   subnet?: string;
   internal?: boolean;
@@ -180,7 +189,12 @@ export function fakeRun(o: FakeOptions = {}) {
     }
     if (cmd[0] === "env" && cmd[1] === "-i") {
       if (cmd.includes("list-heads")) return ok(o.heads ?? `${SHA} HEAD\n`);
-      if (cmd.includes("rev-parse")) return ok(`${SHA}\n`);
+      if (cmd.includes("rev-parse")) {
+        const asked = cmd.at(-1)!.replace(/\^\{commit\}$/, "");
+        return ok(`${COMMITS.includes(asked) ? asked : SHA}\n`);
+      }
+      if (cmd.includes("ls-tree")) return ok(o.overlay === undefined ? "" : `100644 blob ${OVERLAY_BLOB}\t${cmd.at(-1)}\0`);
+      if (cmd.includes("cat-file") && cmd.at(-1) === OVERLAY_BLOB && o.overlay !== undefined) return ok(o.overlay);
       throw new Error(`fake: unexpected command ${joined}`);
     }
     if (cmd[0] !== "docker") throw new Error(`fake: unexpected command ${joined}`);
@@ -344,6 +358,7 @@ export const BUILD_FILES: Record<string, string> = {
   "archon/gitconfig": "[user]\n",
   "archon/empty.env": "# empty\n",
   "archon/archon.env": "PI_OFFLINE=1\n",
+  roster: "anthropic\n",
 };
 
 /** The archon zone's env file, as `hapi secrets resolve` writes it, at `<xdg>/hapi/env/archon.env`. Values are built at run time. */
@@ -358,10 +373,11 @@ export function writeArchonEnv(xdg: string, values: Record<string, string>): str
 /** A fake secret value, built at run time so no scanner sees a key in the source. */
 export const fakeSecret = (name: string) => ["fake", "hapi", "run", name.toLowerCase(), "value", "0123456789"].join("-");
 
-/** A source "repository": a directory with a .git dir (the fake answers git). */
+/** A source "repository": a directory with a .git dir that looks like a git dir (HEAD, objects/, refs/), so it is a source on its own too (the fake answers git). */
 export function fakeRepo(tmp: string, name = "src"): string {
   const repo = join(tmp, name);
-  mkdirSync(join(repo, ".git"), { recursive: true });
+  for (const dir of ["objects", "refs"]) mkdirSync(join(repo, ".git", dir), { recursive: true });
+  writeFileSync(join(repo, ".git", "HEAD"), "ref: refs/heads/main\n");
   return repo;
 }
 
@@ -372,7 +388,8 @@ export function writeOrder(tmp: string, over: Record<string, unknown> = {}, name
     lane: "direct",
     workflow: "hapi-check-run",
     risk: "low",
-    roles: { implement: "small", review: "small" },
+    // On the anthropic and budget rosters: small is a pi tier (implement runs on Pi), medium a claude one (the review runs in Claude Code).
+    roles: { implement: "small", review: "medium" },
     budget: { usd: 3, turns: 10, minutes: 30 },
     pieces: [{ id: "check", files: ["README.md"], size: "small" }],
     verify: { smoke: false },
@@ -395,17 +412,18 @@ export const LEFT_BY_THE_RUN = "left-by-the-run";
  */
 export async function seedRun(
   f: ReturnType<typeof fakeRun>,
-  o: { id: string; repo?: string; key?: string; status?: RunRecord["status"]; running?: boolean; startedAt?: string; deadline?: string; outputs?: Record<string, FakeFile>; objects?: boolean } & Partial<RunRecord>,
+  o: { id: string; repo?: string; key?: string; sha?: string; status?: RunRecord["status"]; running?: boolean; startedAt?: string; deadline?: string; outputs?: Record<string, FakeFile>; objects?: boolean } & Partial<RunRecord>,
 ): Promise<RunRecord> {
   const { deps, world } = f;
   const name = `${deps.project}-run-${o.id}`;
+  const optional = ["kind", "parent", "round", "budgetUsd", "spendUsd", "roster", "policyHash", "retry", "turns", "model"] as const;
   const rec: RunRecord = {
     runId: o.id,
     key: o.key ?? "k".repeat(64),
     project: deps.project,
     repo: o.repo ?? "/srv/repo/.git",
-    sha: SHA,
-    workOrder: "0003-check-run",
+    sha: o.sha ?? SHA,
+    workOrder: o.workOrder ?? "0003-check-run",
     workflow: "hapi-check-run",
     container: name,
     network: name,
@@ -417,6 +435,7 @@ export async function seedRun(
     ...(o.retryOf === undefined ? {} : { retryOf: o.retryOf }),
     ...(o.stopRequested === undefined ? {} : { stopRequested: o.stopRequested }),
     ...(o.harvestedAt === undefined ? {} : { harvestedAt: o.harvestedAt }),
+    ...Object.fromEntries(optional.filter((k) => o[k] !== undefined).map((k) => [k, o[k]])),
   };
   mkdirSync(recordDir(deps.stateDir, o.id), { recursive: true, mode: 0o700 });
   await writeRecord(deps.stateDir, rec);

@@ -38,8 +38,8 @@ import YAML from "yaml";
 import { buildAll } from "../../src/generate/index";
 import { loadPolicy } from "../../src/policy/load";
 import { runDeps } from "../../src/run/cli";
-import { bundleProblem, runStart, runStop } from "../../src/run/lifecycle";
-import { readRecord, recordDir, type RunRecord } from "../../src/run/records";
+import { bundleProblem, reapRuns, runStart, runStop } from "../../src/run/lifecycle";
+import { lockHeld, readRecord, recordDir, type RunRecord, withRunLock } from "../../src/run/records";
 import { type RunDeps, runName } from "../../src/run/spec";
 import { runWatch } from "../../src/run/view";
 import { loadManifest } from "../../src/secrets/manifest";
@@ -120,12 +120,16 @@ describe.skipIf(!INT || !ONLINE)("hapi run on a real Docker (a throwaway project
     return { ...r, id: r.out.at(-1)! };
   }
 
-  /** The run's record once it has ended (the supervisor finalizes it), or a failure naming the supervisor's log. */
+  /**
+   * The run's record once it has ended and its finalize has let go of the run's lock (the supervisor finalizes it,
+   * and writes the outcome before it removes the run's objects, H-219), or a failure naming the supervisor's log.
+   */
   async function settle(id: string, timeoutMs = 180_000): Promise<RunRecord> {
     const until = Date.now() + timeoutMs;
     for (;;) {
       const rec = await readRecord(state, id);
-      if (rec !== undefined && rec.status !== "live") return rec;
+      const finalized = async () => withRunLock({ stateDir: state, env }, id, async () => true).catch((e: unknown) => (lockHeld(e) ? false : Promise.reject(e)));
+      if (rec !== undefined && rec.status !== "live" && (await finalized())) return rec;
       if (Date.now() > until) {
         let log = "";
         try {
@@ -253,7 +257,9 @@ describe.skipIf(!INT || !ONLINE)("hapi run on a real Docker (a throwaway project
 
     test("a bash-only check run succeeds and leaves only its outputs", async () => {
       expect([rec.status, rec.reason]).toEqual(["succeeded", undefined]);
-      expect(readdirSync(recordDir(state, check)).sort()).toEqual(["out", "record.json", "run.json"]);
+      // Beside the record and run.json, the run's own guard settings and run config, and the host's copies of its work order and task text.
+      expect(readdirSync(recordDir(state, check)).sort()).toEqual(["hapi-guard.json", "order.json", "out", "record.json", "run-config.yaml", "run.json", "task.md"]);
+      expect([rec.kind, rec.round, rec.roster, rec.retry]).toEqual(["worker", 0, "anthropic", undefined]);
       // A bash-only run writes no decision log.
       expect(readdirSync(outDir(check)).sort()).toEqual(["result.json", "run.bundle", "transcript.jsonl"]);
       for (const f of readdirSync(outDir(check))) expect([f, statSync(join(outDir(check), f)).mode & 0o777]).toEqual([f, 0o600]);
@@ -421,8 +427,17 @@ describe.skipIf(!INT || !ONLINE)("hapi run on a real Docker (a throwaway project
     expect(await objectsOf(r.id)).toEqual([]);
     // The supervisor wakes as its container goes, and finalizes the run without copying out: the volumes were the cleanup's.
     const done = await settle(r.id);
-    expect([done.status, done.reason]).toEqual(["failed", "the run's container was removed before the run was finalized (`mise run down`, or a cleanup): nothing was copied out"]);
+    const N = runName(p.name, r.id);
+    expect([done.status, done.reason]).toEqual([
+      "failed",
+      `the run's container was removed before the run was finalized (\`mise run down\`, or a cleanup): nothing was copied out; the run's volumes ${N}-work and ${N}-out were kept, since nothing was copied out (H-209)`,
+    ]);
     expect(await objectsOf(r.id)).toEqual([]);
+    // The finalize removed neither the volumes nor their dirs (H-209); the cleanup had removed the volumes, so the next reap's sweep removes the dirs.
+    expect(readdirSync(join(p.root, "run-disk")).sort()).toEqual([`${N}-out`, `${N}-work`]);
+    const reap = await quietly(async () => (await reapRuns(await runDeps(deps(PACK))), 0));
+    expect([reap.code, reap.err]).toEqual([0, [`hapi run: removed run ${r.id}'s dirs on the run disk: their volumes were gone`]]);
+    expect(readdirSync(join(p.root, "run-disk"))).toEqual([]);
     // The proxy is still up: only the run's objects went.
     expect(lines(await must(["docker", "ps", "--filter", `name=${p.name}-egress-archon-1`, "--format", "{{.Names}}"]))).toEqual([`${p.name}-egress-archon-1`]);
   }, 300_000);

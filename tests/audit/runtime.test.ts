@@ -59,8 +59,8 @@ describe("runtime.run-container", () => {
     expect(r.detail).toContain("size=64m,uid=1001,gid=1001,mode=0700");
   });
 
-  test("a run definition that drops any host bind fails, naming it: the guard's extensions and settings, the run layer, the git config, the prelude, the run file and the source", async () => {
-    for (const dest of ["/opt/hapi/pi-agent/settings.json", "/opt/hapi/pi-agent/extensions", "/opt/hapi/run-config.yaml", "/home/appuser/.gitconfig", "/opt/hapi/run.sh", "/run/hapi/run.json", "/src/repo.git"]) {
+  test("a run definition that drops any host bind fails, naming it: the guard's extensions and settings, the run layer, the git config, the prelude, the run file, the work order and its task text, and the source", async () => {
+    for (const dest of ["/opt/hapi/pi-agent/settings.json", "/opt/hapi/pi-agent/extensions", "/opt/hapi/run-config.yaml", "/home/appuser/.gitconfig", "/opt/hapi/run.sh", "/run/hapi/run.json", "/run/hapi/order.json", "/run/hapi/task.md", "/src/repo.git"]) {
       const r = await withSpec(without("-v", (v) => v.endsWith(`:${dest}:ro`)));
       expect([dest, r.status]).toEqual([dest, "fail"]);
       expect(r.detail).toContain(`nothing is bound at ${dest}`);

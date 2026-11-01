@@ -3,18 +3,23 @@
  * `<stateDir>/<run-id>/` (0700), holding:
  * - `record.json` (`RunRecord`, 0600): what the launcher started and how it
  *   ended;
- * - `run.json` (the `RunFile`, 0644): the run's input, bound read-only into
- *   the container, whose uid is another host uid under rootless Docker;
+ * - `run.json` (the `RunFile`) and the `PER_RUN_FILES` (each 0644): the run's
+ *   input, its own guard settings and run config (generated from the policy
+ *   with the repo's overlay applied, H-172), and the host's copies of its work
+ *   order and task text, each bound read-only into the container, whose uid is
+ *   another host uid under rootless Docker;
  * - `out/`: the outputs copy-out brought back (./copyout.ts), 0600 each.
  * Nothing a run writes lands here but through copy-out.
  *
  * Admission, under the launcher's lock (`withStartLock`), before anything is
  * created:
- * - the key: a run is keyed by its work-order id and source commit
- *   (`runKey`). A key with a live or succeeded run is refused, and one whose
- *   last run ended otherwise unless `--retry-of` names that run
- *   (`keyProblem`), so a re-fire is safe, as Archon's trigger receipts made
- *   it (design §3.1, H-183(c));
+ * - the key: a run is keyed by its work-order id and source commit, and, for
+ *   the engine's runs, by its kind, round and pass (`runKey`, `keyPart`). A
+ *   key with a live or succeeded run is refused, and one whose last run ended
+ *   otherwise unless `--retry-of` names that run (`keyProblem`), so a re-fire
+ *   is safe, as Archon's trigger receipts made it (design §3.1, H-183(c)). A
+ *   hand run (`hapi run start`) keeps Plan 02's two-part key; every engine
+ *   key has a part, so the two never meet;
  * - one live run per repo (spec §4.4, H-090), and at most `runs.max_live` in
  *   all (`capacityProblem`).
  *
@@ -30,6 +35,7 @@ import { join } from "node:path";
 import type { RunFile } from "../generate/archon";
 import { withStoreLock } from "../secrets/store-files";
 import { definedEnv, listed, runFilters } from "../stack/up";
+import { RUN_KINDS, type RunKind } from "./kinds";
 import { type RunDeps, runName } from "./spec";
 
 /** Whether an error is a held lock: defined in ./locks.ts, which src/stack/up.ts can import too, and re-exported here for the launcher's locks. */
@@ -39,7 +45,7 @@ export type RunStatus = "live" | "succeeded" | "failed" | "timed-out" | "stopped
 
 export interface RunRecord {
   runId: string;
-  /** `runKey(workOrder, sha)`. */
+  /** `runKey(workOrder, sha, keyPart(kind, round, retry))`: Plan 02's two-part key for a hand run. */
   key: string;
   project: string;
   /** The source's git dir, as the run bound it: the per-repo lock's identity. */
@@ -58,9 +64,31 @@ export interface RunRecord {
   reason?: string;
   retryOf?: string;
   harvestedAt?: string;
-  /** Set before the container is stopped, so whichever process finalizes the run records why it ended. */
+  /** Set before the container is stopped, so whichever process finalizes the run records why it ended. A stop outranks the deadline: "stopped" may replace "timed-out" while the run is live, never the reverse. */
   stopRequested?: "timed-out" | "stopped";
+  // What an eval compares (design §3.8). A Plan 02 record has none of these: its kind is a worker's.
+  kind?: RunKind;
+  /** The work order's worker run, for every kind but `worker`: its sha is this run's base commit. */
+  parent?: string;
+  round?: number;
+  /** The run's budget: the work order's budget.usd for a worker, at most `runs.phases.round_usd` for any other kind, or lower as the caller asked. */
+  budgetUsd?: number;
+  /** What the run spent, when it is known (./spend.ts `spendOfRun`), written at finalize. */
+  spendUsd?: number;
+  /** The roster `build/roster` named when the run started. */
+  roster?: string;
+  /** The SHA-256 hex of the effective policy (the central policy with the repo's overlay applied) as JSON. */
+  policyHash?: string;
+  /** The engine's pass of the work order: 0 on the first, n after the n-th `hapi retry`. A hand run has none (its `--retry-of` is `retryOf`). */
+  retry?: number;
+  /** The turns the run took, its guard's count (./spend.ts `turnsOfRun`), written at finalize when known. */
+  turns?: number;
+  /** The model the run's alias names in its roster: `@implement`'s for a worker or fix, `@review`'s for a review; none for a verify, which runs no model. */
+  model?: string;
 }
+
+/** The files a run's dir holds beside record.json and run.json, each bound read-only into the container: see the module comment. */
+export const PER_RUN_FILES = ["hapi-guard.json", "run-config.yaml", "order.json", "task.md"] as const;
 
 const STATUSES: readonly RunStatus[] = ["live", "succeeded", "failed", "timed-out", "stopped"];
 const RECORD = "record.json";
@@ -73,17 +101,33 @@ export function newRunId(): string {
   return randomBytes(6).toString("hex");
 }
 
-/** The SHA-256 hex of the work-order id and the commit: the same pair always has the same key. */
-export function runKey(workOrderId: string, sha: string): string {
-  return createHash("sha256").update(`${workOrderId}\0${sha}`).digest("hex");
+/**
+ * The SHA-256 hex of the work-order id, the commit and, when given, the key's part (`keyPart`): the same triple
+ * always has the same key. With no part it is Plan 02's two-part key, unchanged, so Plan 02's records stay valid.
+ */
+export function runKey(workOrderId: string, sha: string, part?: string): string {
+  return createHash("sha256").update(part === undefined ? `${workOrderId}\0${sha}` : `${workOrderId}\0${sha}\0${part}`).digest("hex");
+}
+
+/**
+ * The key's part for a run of `kind` at `round`, in the engine's pass `retry` (the one formula startRun and the
+ * engine share): undefined for a worker with no retry, which is a hand run (Plan 02's two-part key);
+ * `<kind>:<round>` for any other kind with no retry, and for every kind at retry 0, the engine's first pass; and
+ * `<kind>:<round>:retry<n>` from the first retry on, so a new pass never meets an earlier pass's records.
+ */
+export function keyPart(kind: RunKind, round: number, retry?: number): string | undefined {
+  if (retry === undefined) return kind === "worker" ? undefined : `${kind}:${round}`;
+  return retry === 0 ? `${kind}:${round}` : `${kind}:${round}:retry${retry}`;
 }
 
 export const recordDir = (stateDir: string, runId: string): string => join(stateDir, runId);
 
-/** `x` as a record of run `runId`, or undefined if it isn't one. */
+/** `x` as a record of run `runId`, or undefined if it isn't one: a kind that is no run kind, or a retry that isn't a whole number of at least 0, isn't. */
 function asRecord(x: unknown, runId: string): RunRecord | undefined {
   const r = x as Partial<RunRecord> | null;
   if (r === null || typeof r !== "object" || r.runId !== runId || !STATUSES.includes(r.status as RunStatus)) return undefined;
+  if (r.kind !== undefined && !RUN_KINDS.includes(r.kind)) return undefined;
+  if (r.retry !== undefined && !(Number.isInteger(r.retry) && r.retry >= 0)) return undefined;
   const text = [r.key, r.project, r.repo, r.sha, r.workOrder, r.workflow, r.container, r.network, r.startedAt, r.deadline, r.volumes?.work, r.volumes?.out];
   return text.every((t) => typeof t === "string") ? (r as RunRecord) : undefined;
 }
@@ -134,17 +178,23 @@ export async function listRecords(stateDir: string): Promise<RunRecord[]> {
   return out;
 }
 
-/** Make the run's dir (it must not exist), with its record and run file; a write that fails removes the dir again. */
-export async function createRun(stateDir: string, rec: RunRecord, runFile: RunFile): Promise<void> {
+/**
+ * Make the run's dir (it must not exist), with its record, its run file and each of `PER_RUN_FILES`; a write that
+ * fails removes the dir again.
+ */
+export async function createRun(stateDir: string, rec: RunRecord, runFile: RunFile, files: Record<(typeof PER_RUN_FILES)[number], string>): Promise<void> {
   await mkdir(stateDir, { recursive: true, mode: 0o700 });
   const dir = recordDir(stateDir, rec.runId);
   await mkdir(dir, { mode: 0o700 });
   try {
     await writeRecord(stateDir, rec);
-    const file = join(dir, RUN_FILE);
-    await writeFile(file, `${JSON.stringify(runFile, null, 2)}\n`, { flag: "wx" });
-    // The container reads it as uid 1001, another host uid under rootless Docker: readable by all, whatever the umask.
-    await chmod(file, 0o644);
+    const bound: [name: string, text: string][] = [[RUN_FILE, `${JSON.stringify(runFile, null, 2)}\n`], ...PER_RUN_FILES.map((name) => [name, files[name]] as [string, string])];
+    for (const [name, text] of bound) {
+      const file = join(dir, name);
+      await writeFile(file, text, { flag: "wx" });
+      // The container reads it as uid 1001, another host uid under rootless Docker: readable by all, whatever the umask.
+      await chmod(file, 0o644);
+    }
   } catch (e) {
     await rm(dir, { recursive: true, force: true });
     throw e;

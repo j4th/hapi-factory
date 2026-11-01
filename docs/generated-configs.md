@@ -8,7 +8,7 @@
 - [how protected paths stay strictest-wins](#protected-paths-stay-strictest-wins) in every output;
 - [the MCP servers](#mcp-servers-mcp_servers) in Hermes's config and [the per-zone `mcp.json` files](#buildmcpmcpjson) for the CI scanners.
 
-`build/` is generated and gitignored. **Never edit a file in it by hand**: change `policy/` and rebuild. Every file starts with a notice that names its policy sources and says not to edit it. The YAML, env and Squid files carry it as `#` comments. JSON has no comments, so `models.json`, `settings.json`, `hapi-guard.json` and the `mcp.json` files carry it as a `$comment` string, their first key. The two bundled `.js` files carry it as `//` comments. The one exception is `build/pi/models-store.json`, which is exactly `{}` ([below](#buildpimodels-storejson-and-settingsjson)).
+`build/` is generated and gitignored. **Never edit a file in it by hand**: change `policy/` and rebuild. Every file starts with a notice that names its policy sources and says not to edit it. The YAML, env and Squid files carry it as `#` comments. JSON has no comments, so `models.json`, `settings.json`, `hapi-guard.json` and the `mcp.json` files carry it as a `$comment` string, their first key. The two bundled `.js` files carry it as `//` comments. The two exceptions are `build/pi/models-store.json`, which is exactly `{}` ([below](#buildpimodels-storejson-and-settingsjson)), and `build/roster`, one bare word ([below](#buildroster)).
 
 ## Regenerating
 
@@ -30,7 +30,7 @@ It prints each path it wrote, one per line, and exits 0. A usage error (an unkno
 
 **Builds are deterministic.** Keys come out in a fixed order, lists are sorted, and nothing holds a timestamp, so building twice from the same policy gives byte-identical files. That is how `mise run audit` detects a hand edit to a deployed file: `generated.drift` compares the deployed build/ with a fresh build, and fails on any path under it that a fresh build doesn't have ([docs/audit.md](audit.md#generateddrift)). Every emitter runs before anything is written, so a policy that an emitter refuses leaves the existing files untouched. `buildAll` only writes files; it never deletes any, so a file policy stops generating stays in build/ until you remove it, and `generated.drift` names it until then (H-156).
 
-**From code**, `buildAll(policy, outDir, { roster, o11y })` in `src/generate/index.ts` writes the files and returns their paths. `o11y` says whether the observability profile runs, which turns on the o11y-gated MCP servers in Hermes's config. It defaults to the policy's `flags.otel.enabled` (off), so to build with Phoenix MCP set that flag, or pass `o11y: true` from code. The emitters are pure functions that return `{ filename: contents }`: `emitHermes(p, { o11y })`, `emitArchon(p, roster)`, `emitPi(p, roster)`, `emitEgress(p)` and `emitMcp(p)`, in `src/generate/{hermes,archon,pi,egress,mcp}.ts`. `src/generate/mcp.ts` also has `hermesMcpServers(p, zone, { o11y })`, a zone's Hermes `mcp_servers`, which Plan 04's hapi-research profile uses for the research zone. Apply a repo overlay first (`applyOverlay`, [docs/policy.md](policy.md#repo-overlays-factoryconfigyaml)) to build for that repo.
+**From code**, `buildAll(policy, outDir, { roster, o11y })` in `src/generate/index.ts` writes the files and returns their paths. `o11y` says whether the observability profile runs, which turns on the o11y-gated MCP servers in Hermes's config. It defaults to the policy's `flags.otel.enabled` (off), so to build with Phoenix MCP set that flag, or pass `o11y: true` from code. The emitters are pure functions that return `{ filename: contents }`: `emitHermes(p, { o11y })`, `emitArchon(p, roster)`, `emitPi(p, roster)`, `emitEgress(p)` and `emitMcp(p)`, in `src/generate/{hermes,archon,pi,egress,mcp}.ts`. `src/generate/mcp.ts` also has `hermesMcpServers(p, zone, { o11y })`, a zone's Hermes `mcp_servers`, which Plan 04's hapi-research profile uses for the research zone. Apply a repo overlay first (`applyOverlay`, [docs/policy.md](policy.md#repo-overlays-factoryconfigyaml)) to build for that repo. The launcher does that for every run: `startRun` (`src/run/lifecycle.ts`) applies the repo's `.factory/config.yaml`, read at the run's commit, over the central policy, and emits the run's own `hapi-guard.json` (`emitPi`) and `run-config.yaml` (`emitArchon`, with the work order's tiers for `implement` and `review`) for the roster `build/roster` names, into the run's directory, where the run container binds them instead of build/'s (H-172). build/'s two stay the central policy's, for `mise run audit` to compare.
 
 ## The files
 
@@ -39,7 +39,7 @@ It prints each path it wrote, one per line, and exits 0. A usage error (an unkno
 | `build/hermes/config.yaml` | Hermes's `config.yaml` (Hermes v0.22.5 keys) | `budgets.yaml`, `flags.yaml`, `mcp.yaml`, `protected_paths.yaml`, `roles.yaml`, `rosters/anthropic.yaml` | Mounted read-only at `/opt/data/config.yaml` (`$HERMES_HOME`) in the `hermes` container |
 | `build/archon/config.yaml` | Archon's global config, `~/.archon/config.yaml` (Archon v0.12.1): model tiers and aliases | `roles.yaml`, `rosters/<roster>.yaml` | Mounted read-only at `/.archon/config.yaml` (Archon's home in its container) in `archon` |
 | `build/archon/archon.env` | The run container's environment | Spec §9.2, §9.3 and design §6a (no policy file) | The record of the settings the `archon` (run) service's `environment:` sets (`ARCHON_ENV`), and what the audit holds a run container to. Compose doesn't read the file ([below](#buildarchonarchonenv)) |
-| `build/archon/run-config.yaml` | Archon's per-run `--config` layer: the same tiers and aliases, `assistants.pi.enableExtensions: true`, `workflows.autoResumeOnQuotaReset: false` | `roles.yaml`, `rosters/<roster>.yaml` | Bound read-only at `/opt/hapi/run-config.yaml` in the run container (Plan 02 Task 7) |
+| `build/archon/run-config.yaml` | Archon's per-run `--config` layer: the same tiers and aliases, `assistants.pi.enableExtensions: true`, `workflows.autoResumeOnQuotaReset: false` | `roles.yaml`, `rosters/<roster>.yaml` | The central policy's copy. Each run binds its own at `/opt/hapi/run-config.yaml`, generated when it starts ([below](#buildarchonrun-configyaml-gitconfig-and-emptyenv)) |
 | `build/archon/gitconfig` | The run container's `~/.gitconfig`: `[safe]` directories and the worker's `[user]` | The container's paths (`RUN_PATHS`; no policy file) | Bound read-only at `/home/appuser/.gitconfig` in the run container |
 | `build/archon/empty.env` | An env file of only comments | No policy file | Bound read-only over `/.archon/.env` in the run container |
 | `build/pi/models.json` | Pi 1.3.0's model registry: `maxTokens`, `cost` and `compat` pins, and each provider's `baseUrl` | `rosters/<roster>.yaml`, Pi's 1.3.0 catalog (`src/generate/pi-catalog-1.3.0.json`) | Mounted read-only at `PI_CODING_AGENT_DIR` (Plan 02 binds it into a tmpfs there instead, H-181) |
@@ -47,12 +47,13 @@ It prints each path it wrote, one per line, and exits 0. A usage error (an unkno
 | `build/pi/settings.json` | Pi's `settings.json`, with nothing set | None | Bound read-only into Pi's agent dir (Plan 02 Task 7) |
 | `build/pi/extensions/hapi-guard.js` | The hapi-guard Pi extension, bundled from `src/guard/index.ts`: the in-run enforcer for workers ([what it enforces](#what-hapi-guard-enforces)) | `src/guard/*.ts`, with `src/policy/paths.ts`, `src/decide/` and `policy/decisions/*.ts` bundled in | Bound read-only into Pi's agent dir; it reads `hapi-guard.json` beside it |
 | `build/decide/hapi-decide.js` | `hapi decide`, bundled from `src/decide/cli.ts`: the level-6 classifier CLI | `src/decide/cli.ts` | Plan 04 ships it into the Hermes image |
-| `build/pi/hapi-guard.json` | Settings for Plan 02's hapi-guard Pi extension | `protected_paths.yaml`, `budgets.yaml`, `gates.yaml`, `flags.yaml`, `rosters/<roster>.yaml`, `stack/secrets.yaml` | Mounted read-only at `PI_CODING_AGENT_DIR` (Plan 02 binds it into a tmpfs there instead, H-181) |
+| `build/pi/hapi-guard.json` | Settings for Plan 02's hapi-guard Pi extension | `protected_paths.yaml`, `budgets.yaml`, `gates.yaml`, `flags.yaml`, `rosters/<roster>.yaml`, `stack/secrets.yaml` | The central policy's copy. Each run binds its own into Pi's agent dir, generated when it starts with the repo's overlay applied ([below](#buildpihapi-guardjson)) |
 | `build/egress/hermes.squid.conf` | Squid config for the `hermes` zone's egress proxy | `trusted_sources.yaml` | The `egress-hermes` container, read-only |
 | `build/egress/archon.squid.conf` | Squid config for the `archon` zone's egress proxy | `trusted_sources.yaml` | The `egress-archon` container, read-only |
 | `build/egress/research.squid.conf` | Squid config for the `research` zone's egress proxy | `trusted_sources.yaml` | The `egress-research` container, read-only (the research zone's own service arrives in Plan 04) |
 | `build/mcp/hermes.mcp.json` | A standard `mcp.json` with the `hermes` zone's whole MCP catalog | `mcp.yaml` | The CI scanners (Plan 05) |
 | `build/mcp/research.mcp.json` | A standard `mcp.json` with the `research` zone's whole MCP catalog | `mcp.yaml` | The CI scanners (Plan 05) |
+| `build/roster` | The roster the build was made for (`budget`, `anthropic` or `portable`), one bare word and a newline | `--roster` | `hapi run start` and the poller (`readRoster`, `src/run/spec.ts`): each run's own `hapi-guard.json` and `run-config.yaml` are made for it ([below](#buildroster)) |
 
 Plan 02 Task 4 added the files the per-run container binds read-only (Task 7): Pi's `settings.json` and `models-store.json`, the bundled guard, Archon's `run-config.yaml`, `gitconfig` and `empty.env`, and the `hapi-decide` bundle.
 
@@ -158,11 +159,11 @@ aliases:          # one per Archon role, at its roles.yaml tier
 
 The per-run container binds these three read-only (spike 07; Plan 02 Task 7).
 
-- **`run-config.yaml`** is passed as `--config /opt/hapi/run-config.yaml`. It holds `config.yaml`'s `assistants`, `tiers` and `aliases`, and adds `workflows.autoResumeOnQuotaReset: false`: a run never resumes itself, the launcher decides. Archon applies it above a repo's own `.archon/config.yaml`, so a repo can't turn `enableExtensions` off (spike 07, finding on `c1`/`c2`).
+- **`run-config.yaml`** is passed as `--config /opt/hapi/run-config.yaml`. It holds `config.yaml`'s `assistants`, `tiers` and `aliases`, and adds `workflows.autoResumeOnQuotaReset: false`: a run never resumes itself, the launcher decides. Archon applies it above a repo's own `.archon/config.yaml`, so a repo can't turn `enableExtensions` off (spike 07, finding on `c1`/`c2`). **It is generated per run** (Plan 03 Task 7): `startRun` emits it from the policy with the repo's overlay applied, for `build/roster`'s roster, with `roles.implement` and `roles.review` set to the work order's tiers, so `@implement` and `@review` name the tiers the work order picked. It is written 0644 to the run's directory (`<state dir>/<run-id>/run-config.yaml`) and bound from there; `build/archon/run-config.yaml` is the central policy's, which the audit compares.
 - **`gitconfig`** is the run container's `~/.gitconfig`. `[safe] directory` names `/src/repo.git` (the source clone is bind-mounted from another uid, so Git's ownership check refuses it otherwise) and Archon's `/.archon/workspaces`, `/.archon/workspaces/*`, `/.archon/worktrees` and `/.archon/worktrees/*`. The last four are for worktrees, which `--no-worktree` doesn't use but which do no harm. `[user]` is `hapi-factory worker <worker@hapi.invalid>`. Being read-only and generated fresh, nothing a worker writes can plant a `core.fsmonitor` or `core.hooksPath` here (H-182).
 - **`empty.env`** holds only `#` lines. Bound over `/.archon/.env`, it leaves Archon no env file to load.
 
-`RUN_PATHS` and `RunFile` in `src/generate/archon.ts` name the container's fixed paths and the per-run input the launcher writes at `RUN_PATHS.runFile`; every consumer imports them.
+`RUN_PATHS` and `RunFile` in `src/generate/archon.ts` name the container's fixed paths and the per-run input the launcher writes at `RUN_PATHS.runFile`; every consumer imports them. Plan 03 adds `RUN_PATHS.order` (`/run/hapi/order.json`, the host-validated work order as JSON) and `RUN_PATHS.task` (`/run/hapi/task.md`, its task text), which every run binds read-only, and the run file's `kind`, `round`, `turns` (the turn budget: the work order's `budget.turns`, at most `runs.phases.round_turns` for a fix) and `base` (the commit the work order's worker run started from).
 
 ## `build/archon/archon.env`
 
@@ -277,7 +278,7 @@ The ledger lives in the worker's own tmpfs, which is a residual. An unreadable f
 
 ## `build/pi/hapi-guard.json`
 
-The settings Plan 02's hapi-guard extension enforces inside every Pi worker (spec §9.3):
+The settings Plan 02's hapi-guard extension enforces inside every Pi worker (spec §9.3). **A run binds its own copy** (Plan 03 Task 7, H-172): `startRun` emits it when the run starts, with `emitPi` over the central policy with the repo's overlay (`.factory/config.yaml` at the run's commit) applied, for `build/roster`'s roster, and writes it 0644 to the run's directory (`<state dir>/<run-id>/hapi-guard.json`), which is bound read-only at `/opt/hapi/pi-agent/hapi-guard.json`. So an overlay's protected paths and lowered budgets bind its runs' guard. This file, `build/pi/hapi-guard.json`, is the same for the central policy alone: what `mise run audit` compares.
 
 ```json
 {
@@ -310,6 +311,10 @@ The settings Plan 02's hapi-guard extension enforces inside every Pi worker (spe
 | `gates` | `gates.yaml` exactly, classifiers nested: the guard passes it to `decide()` as `DecideOptions.gates`. |
 | `jev` | `flags.yaml`'s `jev.enabled` and `jev.fallback`. |
 | `paths` | `RUN_PATHS`' `out`, `runFile` and `ledgerDir`. |
+
+## `build/roster`
+
+The roster the build was made for: `budget`, `anthropic` or `portable` and a newline, as `--roster` (or `hapi stack up --roster`) named it. `hapi run start` and the poller read it (`readRoster`, `src/run/spec.ts`) to make each run's own `hapi-guard.json` and `run-config.yaml` for that roster, and record it on the run (`roster`). A build without it, or with anything else in it, refuses every run with `<build dir>/roster is missing or names no roster (budget, anthropic or portable): \`mise run up\` writes it`. It carries no notice, because it is read as one bare word.
 
 ## `build/egress/*.squid.conf`
 

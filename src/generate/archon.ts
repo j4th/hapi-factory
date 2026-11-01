@@ -23,6 +23,7 @@
  */
 import YAML from "yaml";
 import { type ModelSpec, type Policy, ROLES, type RosterName, type Tier } from "../policy/types";
+import type { RunKind } from "../run/kinds";
 import { hashComment, notice, wrap } from "./header";
 
 /**
@@ -44,22 +45,38 @@ export const RUN_PATHS = {
   ledgerDir: "/tmp/hapi-guard",
   /** The home-scoped workflow pack, bound read-only. */
   pack: "/.archon/workflows/hapi",
+  /**
+   * The host-validated work order as JSON, bound read-only (Plan 03 Task 7). A run's nodes and prompts read it and
+   * `task`, never the clone's own order.yaml, which a worker could commit to.
+   */
+  order: "/run/hapi/order.json",
+  /** The work order's task text (its task.md), bound read-only; empty when it has none. */
+  task: "/run/hapi/task.md",
 } as const;
 
 /**
  * The per-run input the launcher writes and binds read-only at
- * `RUN_PATHS.runFile`. No work-order file enters the container.
+ * `RUN_PATHS.runFile`. The work order itself enters the container only as the
+ * host's copy, `RUN_PATHS.order`.
  */
 export interface RunFile {
   run_id: string;
   /** The work order's id. */
   work_order: string;
   traceparent: string;
-  /** Already `min(work order budget.usd, --budget-usd)`. */
+  /** The run's budget, already folded: the work order's budget.usd, its kind's round cap, or lower as the caller asked. */
   budget_usd: number;
   public: boolean;
   workflow: string;
   started_at: string;
+  /** The run's kind; absent in a Plan 02 run file, which is a worker's. */
+  kind?: RunKind;
+  /** The run's round: 0 for the worker, n for the n-th fix round. */
+  round?: number;
+  /** The run's turn budget: the work order's budget.turns, at most `runs.phases.round_turns` for a fix. */
+  turns?: number;
+  /** The work order's base commit, the one its worker run started from (Task 11's CodeRabbit node: `jq -r .base /run/hapi/run.json`). */
+  base?: string;
 }
 
 /**

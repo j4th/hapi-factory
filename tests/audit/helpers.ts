@@ -475,6 +475,8 @@ export function runContainer(w: World, id = "ab12cd34ef56", over: { labels?: Rec
       bind(join(w.build, "archon", "gitconfig"), "/home/appuser/.gitconfig"),
       bind(join(REPO, "stack", "archon", "run.sh"), "/opt/hapi/run.sh"),
       bind("/state/runs/run.json", "/run/hapi/run.json"),
+      bind("/state/runs/order.json", "/run/hapi/order.json"),
+      bind("/state/runs/task.md", "/run/hapi/task.md"),
       bind("/srv/src/.git", "/src/repo.git"),
       { Type: "volume", Source: `/var/lib/docker/volumes/${name}-work/_data`, Destination: "/work", RW: true },
       { Type: "volume", Source: `/var/lib/docker/volumes/${name}-out/_data`, Destination: "/out", RW: true },

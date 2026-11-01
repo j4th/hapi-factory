@@ -4,9 +4,11 @@
  * fixed order, with every secret passed by name only. Pure: nothing runs.
  */
 import { afterEach, describe, expect, test } from "bun:test";
+import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { ROSTERS } from "../../src/generate/index";
 import { runDeps } from "../../src/run/cli";
-import { runArgs, type RunInputs, runName, STOP_GRACE_S, TRANSLATED_KEYS } from "../../src/run/spec";
+import { readRoster, runArgs, type RunInputs, runName, STOP_GRACE_S, TRANSLATED_KEYS } from "../../src/run/spec";
 import { type ComposeService, composeServices } from "../../src/stack/compose";
 import { serviceEnvironment } from "../../src/stack/env";
 import { buildDigest, PROJECT_LABEL, RUN_LABEL } from "../../src/stack/up";
@@ -26,6 +28,25 @@ function inputs(over: Partial<RunInputs> = {}): RunInputs {
   return { runId: ID, repo: "/srv/src/.git", sha: SHA, workOrder: ORDER, public: false, budgetUsd: 3, packDir: join(REPO, "archon", "workflows", "hapi"), ...over };
 }
 
+describe("readRoster", () => {
+  test("readRoster is build/roster's one word, which `mise run up` writes: a roster's name, or an error naming the fix", () => {
+    const f = fakeRun();
+    const file = join(f.deps.buildDir, "roster");
+    expect(readRoster(f.deps.buildDir)).toBe("anthropic");
+    for (const name of ROSTERS) {
+      writeFileSync(file, `${name}\n`);
+      expect(readRoster(f.deps.buildDir)).toBe(name);
+    }
+    const fix = `${file} is missing or names no roster (budget, anthropic or portable): \`mise run up\` writes it`;
+    for (const text of ["", "cheap\n", "budget anthropic\n", "Budget\n"]) {
+      writeFileSync(file, text);
+      expect(() => readRoster(f.deps.buildDir)).toThrow(fix);
+    }
+    rmSync(file);
+    expect(() => readRoster(f.deps.buildDir)).toThrow(fix);
+  });
+});
+
 describe("runArgs", () => {
   test("the argv, exactly and in order: name and labels, the hardening, its own network, the tmpfs mounts, the read-only binds, the volumes, the environment, the secrets by name, then the prelude", async () => {
     const f = fakeRun();
@@ -34,6 +55,8 @@ describe("runArgs", () => {
     const digest = buildDigest(Object.keys(BUILD_FILES).map((p) => `build/${p}`), f.tmp);
     const pi = (x: string) => `${join(f.deps.buildDir, "pi", x)}:/opt/hapi/pi-agent/${x}:ro`;
     const ar = (x: string, dest: string) => `${join(f.deps.buildDir, "archon", x)}:${dest}:ro`;
+    // The run's own files, generated per run from the overlaid policy (H-172) and the host's copies of its work order.
+    const own = (x: string, dest: string) => `${join(f.deps.stateDir, ID, x)}:${dest}:ro`;
     expect(runArgs(await archon(), inputs(), f.deps, ["ANTHROPIC_API_KEY", "HAPI_JEV_OPENROUTER_API_KEY"])).toEqual([
       "docker", "run", "-d", "--pull", "never", "--name", N,
       "--label", `org.hapi.run=${ID}`, "--label", "org.hapi.project=hapi",
@@ -45,11 +68,13 @@ describe("runArgs", () => {
       "--tmpfs", "/home/appuser:size=256m,uid=1001,gid=1001,mode=0700",
       "--tmpfs", "/.archon:size=512m,uid=1001,gid=1001,mode=0700",
       "--tmpfs", "/opt/hapi/pi-agent:size=64m,uid=1001,gid=1001,mode=0700",
-      "-v", pi("models.json"), "-v", pi("models-store.json"), "-v", pi("hapi-guard.json"), "-v", pi("settings.json"), "-v", pi("extensions"),
+      "-v", pi("models.json"), "-v", pi("models-store.json"), "-v", own("hapi-guard.json", "/opt/hapi/pi-agent/hapi-guard.json"), "-v", pi("settings.json"), "-v", pi("extensions"),
       "-v", ar("config.yaml", "/.archon/config.yaml"), "-v", ar("empty.env", "/.archon/.env"), "-v", `${join(REPO, "archon", "workflows", "hapi")}:/.archon/workflows/hapi:ro`,
-      "-v", ar("run-config.yaml", "/opt/hapi/run-config.yaml"), "-v", ar("gitconfig", "/home/appuser/.gitconfig"),
+      "-v", own("run-config.yaml", "/opt/hapi/run-config.yaml"), "-v", ar("gitconfig", "/home/appuser/.gitconfig"),
       "-v", `${join(REPO, "stack", "archon", "run.sh")}:/opt/hapi/run.sh:ro`,
       "-v", `${join(f.deps.stateDir, ID, "run.json")}:/run/hapi/run.json:ro`,
+      "-v", `${join(f.deps.stateDir, ID, "order.json")}:/run/hapi/order.json:ro`,
+      "-v", `${join(f.deps.stateDir, ID, "task.md")}:/run/hapi/task.md:ro`,
       "-v", "/srv/src/.git:/src/repo.git:ro",
       "-v", `${N}-work:/work`, "-v", `${N}-out:/out`,
       ...Object.entries(serviceEnvironment("archon")).flatMap(([k, v]) => ["-e", `${k}=${v}`]),
@@ -177,6 +202,7 @@ describe("runArgs", () => {
     const f = fakeRun();
     expect(() => runArgs(service, inputs({ repo: "/srv/a:b/.git" }), f.deps, [])).toThrow('cannot mount /srv/a:b/.git into the run container: its path holds ":" or ","');
     expect(() => runArgs(service, inputs({ packDir: "/srv/pack,ro" }), f.deps, [])).toThrow('cannot mount /srv/pack,ro into the run container: its path holds ":" or ","');
-    expect(() => runArgs(service, inputs(), { ...f.deps, stateDir: "/srv/state:x" }, [])).toThrow(/cannot mount \/srv\/state:x\/ab12cd34ef56\/run.json into the run container/);
+    // The run's own hapi-guard.json is the first of its files that is bound.
+    expect(() => runArgs(service, inputs(), { ...f.deps, stateDir: "/srv/state:x" }, [])).toThrow(/cannot mount \/srv\/state:x\/ab12cd34ef56\/hapi-guard.json into the run container/);
   });
 });

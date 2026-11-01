@@ -9,6 +9,7 @@
  *   build/decide/hapi-decide.js         (bundled from src/decide/cli.ts)
  *   build/egress/{hermes,archon,research}.squid.conf
  *   build/mcp/{hermes,research}.mcp.json
+ *   build/roster                        (the roster's name: each run's own guard settings and run config are made for it)
  *
  * The emitters are pure and deterministic (stable key order, no timestamps),
  * so a fresh build is byte-identical to the deployed files unless someone
@@ -109,6 +110,8 @@ export async function buildAll(p: Policy, outDir: string, opts: BuildOptions = {
     ["egress", emitEgress(p)],
     ["mcp", emitMcp(p)],
     ["decide", withBundle({}, "hapi-decide.js", DECIDE_ENTRY)],
+    // One bare word, with no notice: `hapi run start` reads it (src/run/spec.ts `readRoster`) to make each run's own files.
+    ["", { roster: `${roster}\n` }],
   ];
   const built = await Promise.all(groups.map(async ([dir, files]) => [dir, await files] as const));
   const written: string[] = [];
