@@ -685,10 +685,14 @@ describe("hapi stack down", () => {
   });
 
   test("when removing the runs fails, compose down still runs (the kill switch stops what it can), and down then fails naming the leftovers", async () => {
-    capture();
-    const f = fakes({ env: { HOME: "/home/hapi" }, runs: { containers: ["c1"] }, failing: ["docker rm -f c1"] });
+    const { err } = capture();
+    const f = fakes({ env: hapiEnv(), runs: { containers: ["c1"] }, failing: ["docker rm -f c1"] });
     await expect(stackDown([], f.deps)).rejects.toThrow(/docker rm -f c1 failed/);
     expect(f.calls.at(-1)!.cmd).toEqual(["docker", "compose", "-p", "hapi", "down"]);
+    // The failure came from inside the run disk's lock: one removal pass, volumes included (the second `ps` is that
+    // pass seeing what the failed `rm` left), and no fall-back pass without the lock.
+    expect(err.filter((l) => l.includes("could not take the run disk's lock"))).toEqual([]);
+    expect(f.calls.map((c) => c.cmd.slice(0, 3).join(" "))).toEqual(["docker ps -aq", "docker rm -f", "docker ps -aq", "docker network ls", "docker volume ls", "docker compose -p"]);
   });
 
   test("as another user: re-execs `mise run down` as hapi (the host admin's kill switch)", async () => {

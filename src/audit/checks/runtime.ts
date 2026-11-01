@@ -30,8 +30,10 @@
  *   bypass". Both fail, and so does this shell's own bypass
  *   (`currentUserOverride`), unless `--dev` makes them a skip.
  *
- * With no container of the Compose project, or no Docker, each but
- * runtime.run-container (whose definition needs none) is a skip.
+ * With no Docker, each but runtime.run-container (whose definition needs
+ * none) is a skip. With Docker but no container of the Compose project,
+ * runtime.hermes-no-yolo and runtime.dev-override skip; runtime.run-disk reads
+ * `docker info` and the filesystem, not the containers, so it doesn't.
  */
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -338,12 +340,14 @@ export async function runDisk(run: AuditRun): Promise<CheckResult[]> {
   const root = dataRootOf(info.code, info.stdout, info.stderr);
   const limits = loadPolicy(ctx.policyDir).runs.disk;
   const probe = ctx.probeFs ?? probeFs;
-  const problem = diskProblem(RUN_DISK, limits, root, probe);
+  // The run disk is probed once: the check and its detail read the same facts.
+  const disk = probe(RUN_DISK);
+  const problem = diskProblem(RUN_DISK, limits, root, (p) => (p === RUN_DISK ? disk : probe(p)));
   if (problem !== undefined) {
     const then = limits.enforcement === "hard" ? "refuses every run" : "warns and starts every run anyway";
     return [result(id, "fail", `${problem}; runs.disk.enforcement is ${limits.enforcement}, so \`hapi run start\` ${then}`)];
   }
-  const size = ((probe(RUN_DISK)?.bytes ?? 0) / GIB).toFixed(1);
+  const size = ((disk?.bytes ?? 0) / GIB).toFixed(1);
   return [result(id, "pass", `${RUN_DISK}: its own filesystem, ${size} GB of runs.disk.gb's ${limits.gb}, apart from Docker's data root (${root}), writable`)];
 }
 

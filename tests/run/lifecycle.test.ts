@@ -191,9 +191,13 @@ describe("hapi run start: refusals", () => {
 
   test("start refuses a run when the run disk fails its check and runs.disk.enforcement is hard (H-217)", async () => {
     const { err } = capture();
-    const f = ready({ disk: "missing" });
+    // The check is made before the start lock: no lock is held when it asks Docker for its data root.
+    const locksAtInfo: number[] = [];
+    let f!: ReturnType<typeof ready>;
+    f = ready({ disk: "missing", onCall: (cmd) => void (cmd[1] === "info" && locksAtInfo.push(locksIn(f.xdg).length)) });
     expect(await runStart(["--repo", f.repo, "--work-order", f.order], f.deps)).toBe(1);
     expect(err).toEqual([`hapi run start: the run disk ${f.deps.diskDir} does not exist: set it up as docs/runbooks/runs.md#the-run-disk says (H-217)`]);
+    expect(locksAtInfo).toEqual([0]);
     expect(changes(f.calls)).toEqual([]);
     expect(await listRecords(f.deps.stateDir)).toEqual([]);
     // Any problem refuses, Docker's data root's filesystem among them.
@@ -628,6 +632,28 @@ test("finalize copies out holding the run disk's lock, and while down holds it a
   // The next reap finalizes it.
   await reapRuns(g.deps);
   expect((await readRecord(g.deps.stateDir, ID))!.status).toBe("succeeded");
+});
+
+test("a finalize on the stop path waits out a short `down` hold of the run disk's lock, then finalizes (H-210)", async () => {
+  const { out } = capture();
+  let released = false;
+  let copiedAfterRelease: boolean | undefined;
+  const f = fakeRun({ onCall: (cmd) => void (cmd.includes(LIST_SCRIPT) && (copiedAfterRelease = released)) });
+  await seedRun(f, { id: ID, outputs: completedOutputs("failed") });
+  let entered!: () => void;
+  const inside = new Promise<void>((r) => (entered = r));
+  const down = withStackLock(f.deps, "stack-down", async () => {
+    entered();
+    await Bun.sleep(300);
+    released = true;
+  });
+  await inside;
+  expect(await runStop([ID], f.deps)).toBe(0);
+  await down;
+  // finalizeRun met the held lock, tried again a second later, and copied out only once `down` had let go.
+  expect(copiedAfterRelease).toBe(true);
+  expect(out).toEqual([`run ${ID}: stopped: stopped by \`hapi run stop\``]);
+  expect(readdirSync(f.deps.diskDir)).toEqual([]);
 });
 
 describe("the container's log, when no result.json came out (final review C-1)", () => {

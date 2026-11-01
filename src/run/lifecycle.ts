@@ -116,8 +116,10 @@ import { APP_USER, PROXY_ALIAS, runArgs, type RunDeps, type RunInputs, runLabels
  * How long `finalizeRun` waits for another process finalizing the same run: its stop's grace (STOP_GRACE_S, 30 s),
  * then its bounded helper calls, each at its host bound and KILL: three fixed ones (the listing, the container's log
  * and the run disk's cleanup helper) and a read per output file (OUTPUT_FILES, four): 7 × (150 + 10) = 1120 s, and
- * 100 s for the rest: 1250 s in all. The wait covers a finalize that finds the run disk's lock held, too: `down`
- * holds it only while it removes the runs, seconds.
+ * 100 s for the rest: 1250 s in all. The same loop waits on the run disk's lock (./locks.ts), which is one lock for
+ * every run: `down` holds it for seconds, while it removes the runs, but another run's copy-out, or a reap's
+ * finalize, holds it for up to about five bounded calls (5 × 160 s). With `runs.max_live` at 1 only one run is ever
+ * finalizing, so those holds can't stack; raising `max_live` needs this wait revisited.
  */
 export const FINALIZE_WAIT_S = STOP_GRACE_S + (3 + OUTPUT_FILES.length) * (HELPER_HOST_TIMEOUT_S + HELPER_KILL_AFTER_S) + 100;
 
@@ -513,17 +515,15 @@ async function finalizeLocked(rec: RunRecord, d: RunDeps): Promise<RunRecord> {
   if (disk.stopRequested === "stopped") reasons.push("stopped by `hapi run stop`");
 
   const problems: string[] = [];
-  // Set inside the lock's closure below, so typed as the whole union: TypeScript doesn't see a closure's assignment.
-  let archon = { problem: "nothing was copied out" } as Awaited<ReturnType<typeof archonStatus>>;
   // Under the run disk's lock, which `down` holds while it removes runs (H-210): held, it throws `lockHeld`, so
   // finalizeRun waits and a reap leaves the run for the next one, and no copy-out reads a volume `down` is removing.
-  await withStackLock(d, "run-copyout", async () => {
+  const archon = await withStackLock(d, "run-copyout", async (): Promise<Awaited<ReturnType<typeof archonStatus>>> => {
     if (!(await containerExists(d, disk.runId))) {
       // Removed around hapi (`mise run down`, a cleanup: `docker wait` returns as `rm -f` kills it), and its volumes
       // are going too: a helper would race that removal for them, and its `-v` of one just removed would make an
       // unlabelled volume that nothing removes.
       problems.push("the run's container was removed before the run was finalized (`mise run down`, or a cleanup): nothing was copied out");
-      return;
+      return { problem: "nothing was copied out" };
     }
     const copy = await copyOut(disk.volumes.out, out, d.runs.output_limits_mb, d);
     problems.push(...copy.problems);
@@ -531,14 +531,15 @@ async function finalizeLocked(rec: RunRecord, d: RunDeps): Promise<RunRecord> {
       const p = await bundleProblem(join(out, "run.bundle"), d);
       if (p !== undefined) problems.push(p);
     }
-    archon = await archonStatus(out, copy.copied);
-    if ("problem" in archon) problems.push(archon.problem);
+    const status = await archonStatus(out, copy.copied);
+    if ("problem" in status) problems.push(status.problem);
     const read = async (name: string) => (copy.copied.includes(name) ? readFile(join(out, name), "utf8") : undefined);
     problems.push(...guardProblems(await read("transcript.jsonl"), await read("decisions.jsonl")));
     if (!copy.copied.includes("result.json")) {
       const log = await keepContainerLog(d, disk, out);
       if (log !== undefined) problems.push(log);
     }
+    return status;
   });
 
   let status: RunStatus;

@@ -128,13 +128,14 @@ function present(path: string): boolean {
   return true;
 }
 
-/** `rmdir(path)`: true once it is gone, false if it isn't empty. Any other failure throws. */
+/** `rmdir(path)`: true once it is gone (already gone counts: that is the goal), false if it isn't empty. Any other failure throws. */
 async function removedIfEmpty(path: string): Promise<boolean> {
   try {
     await rmdir(path);
     return true;
   } catch (e) {
     const code = (e as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return true;
     if (code === "ENOTEMPTY" || code === "EEXIST") return false;
     throw new Error(`removing ${path} from the run disk failed (${code ?? (e as Error).message})`);
   }

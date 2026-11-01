@@ -7,7 +7,7 @@
  * every dir here is a temp dir.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readdirSync, statfsSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, statfsSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 // disk.ts first: a file whose first import is copyout.ts or spec.ts trips a load cycle that predates it
 // (spec.ts -> src/audit/checks/tools.ts -> generated.ts -> runtime.ts, which reads spec.ts's APP_HOME as it loads).
@@ -158,6 +158,20 @@ describe("the cleanup helper", () => {
     await removeVolumeDirs(g.deps, ID);
     expect(g.calls).toEqual([]);
     expect(readdirSync(g.deps.diskDir)).toEqual([]);
+  });
+
+  test("a dir already gone when it is removed counts as removed: that is the goal, so another remover getting there first is no failure", async () => {
+    const f = fakeRun();
+    const d = dirs(f, { work: true });
+    const run = f.deps.run;
+    // The helper empties the dir, and another process (a reap's sweep, say) removes it before this one's rmdir.
+    f.deps.run = async (cmd, o) => {
+      const r = await run(cmd, o);
+      if (unbounded(cmd).at(-1) === CLEAN_SCRIPT) rmSync(d.work, { recursive: true });
+      return r;
+    };
+    await removeVolumeDirs(f.deps, ID);
+    expect(existsSync(d.work)).toBe(false);
   });
 
   test("a helper that never returns is stopped at the host's bound, and the dirs are kept", async () => {

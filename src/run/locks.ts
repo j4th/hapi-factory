@@ -7,11 +7,16 @@
  *
  * Its lock is the one `hapi stack down` and a finalize's copy-out share: the
  * secrets commands' lock (`withStoreLock`, on the user's tmpfs), keyed by the
- * run disk's path. `down` holds it while it removes the runs, so a copy-out
- * never reads a volume `down` is removing (its helper's `-v` would make an
- * unlabelled volume, or meet `volume is in use`); a finalize holds it while it
- * copies a run out. A held lock fails at once, naming its holder: neither
- * waits on the other, so kill switch 3 still takes seconds.
+ * run disk's path, so one lock for every run. `down` holds it while it removes
+ * the runs, so a copy-out never reads a volume `down` is removing (its
+ * helper's `-v` would make an unlabelled volume, or meet `volume is in use`);
+ * a finalize holds it while it copies its run out, up to about five bounded
+ * helper calls (5 x 160 s). A held lock fails at once, naming its holder.
+ * `down` never waits for it, so kill switch 3 still takes seconds. A finalize
+ * does wait: `finalizeRun` tries again each second, up to FINALIZE_WAIT_S,
+ * whether `down` holds it or another run's copy-out (or a reap's finalize)
+ * does. With `runs.max_live` at 1 only one run is ever finalizing, so those
+ * waits can't stack; raising `max_live` needs this revisited.
  *
  * It imports nothing from src/run or src/stack, so src/stack/up.ts and
  * ./records.ts can both import it without a cycle.
