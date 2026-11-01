@@ -7,7 +7,8 @@ import { afterEach, expect, test } from "bun:test";
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { engineDirOf, ensureMirror, fetchMirror, type MirrorDeps, mirrorPath } from "../../src/engine/mirror";
-import { authedHostGit } from "../../src/run/git";
+import { pinWorkOrder } from "../../src/engine/discover";
+import { authedHostGit, hardenedGit } from "../../src/run/git";
 import { runCommand, type Runner } from "../../src/stack/up";
 import { caught, cleanup, tempDir } from "../secrets/helpers";
 import { workRepo } from "./helpers";
@@ -19,14 +20,25 @@ const TOKEN = "fake-mirror-token";
 const PATH = process.env.PATH ?? "/usr/bin:/bin";
 const mode = (p: string) => statSync(p).mode & 0o777;
 
-/** A Runner that records each call and answers with `answer`. */
-function fakeRunner(answer: { code: number; stdout?: string; stderr?: string } = { code: 0 }) {
+const ORIGIN_LINE = `remote.origin.url https://github.com/${REPO}.git\n`;
+
+/** A Runner that records each call, answers a `git config` read with `config`, and any other call with `answer`. */
+function fakeRunner(answer: { code: number; stdout?: string; stderr?: string } = { code: 0 }, config = ORIGIN_LINE) {
   const calls: { cmd: string[]; env: Record<string, string>; inherit: boolean }[] = [];
   const run: Runner = async (cmd, o) => {
     calls.push({ cmd, env: o.env, inherit: o.inherit });
+    if (cmd.includes("config")) return { code: config === "" ? 1 : 0, stdout: config, stderr: "" };
     return { code: answer.code, stdout: answer.stdout ?? "", stderr: answer.stderr ?? "" };
   };
   return { run, calls };
+}
+
+/** A mirror's HEAD, so the fake's fetchMirror finds one. */
+function fakeMirror(d: MirrorDeps): string {
+  const m = mirrorPath(d.engineDir, REPO);
+  mkdirSync(m, { recursive: true });
+  writeFileSync(join(m, "HEAD"), "ref: refs/heads/main\n");
+  return m;
 }
 
 /** Real git over a fresh engine dir. */
@@ -73,6 +85,30 @@ test("with real git: ensureMirror makes a world-readable bare repo whose config 
   );
 });
 
+test("with real git: a half-made mirror is finished, and any other remote setting is refused", async () => {
+  const d = realDeps();
+  const m = mirrorPath(d.engineDir, REPO);
+  const origin = `https://github.com/${REPO}.git`;
+  const remotes = () => readGit("config", "--file", join(m, "config"), "--list").trim().split("\n").filter((l) => l.startsWith("remote."));
+  // An init that ran before its origin was set: HEAD, and no remote.* at all.
+  mkdirSync(join(d.engineDir, "mirrors", "example-owner"), { recursive: true, mode: 0o700 });
+  readGit("init", "--bare", "--quiet", "--shared=0644", "--initial-branch=main", m);
+  expect(remotes()).toEqual([]);
+  expect(await ensureMirror(d, REPO)).toBe(m);
+  expect(remotes()).toEqual([`remote.origin.url=${origin}`]);
+
+  readGit("--git-dir", m, "config", "remote.origin.fetch", "+refs/*:refs/*");
+  expect((await caught(ensureMirror(d, REPO))).message).toBe(`${m}'s config has remote settings besides origin's URL (remote.origin.fetch): remove the mirror; the next tick makes it again`);
+  readGit("--git-dir", m, "config", "--unset", "remote.origin.fetch");
+  readGit("--git-dir", m, "config", "--add", "remote.origin.url", "https://example.invalid/second.git");
+  expect((await caught(ensureMirror(d, REPO))).message).toBe(`${m}'s origin is ${origin} and https://example.invalid/second.git, not ${origin}: remove the mirror; the next tick makes it again`);
+  readGit("--git-dir", m, "config", "--unset-all", "remote.origin.url");
+  readGit("--git-dir", m, "config", "remote.other.url", origin);
+  // No origin, but another remote: not half-made, so not repaired.
+  expect((await caught(ensureMirror(d, REPO))).message).toBe(`${m}'s origin is unset, not ${origin}: remove the mirror; the next tick makes it again`);
+  expect(remotes()).toEqual([`remote.other.url=${origin}`]);
+});
+
 test("with real git: a fetch brings only main and factory/*, prunes, and leaves the mirror's config as it was", async () => {
   const tmp = tempDir("hapi-engine-");
   mkdirSync(join(tmp, "work"));
@@ -106,9 +142,11 @@ test("with real git: a fetch brings only main and factory/*, prunes, and leaves 
     expect([p, text.includes(TOKEN) || text.includes(btoa(`x-access-token:${TOKEN}`))]).toEqual([p, false]);
   }
 
+  // The prune touches only main and factory/*: a pin stays.
+  await pinWorkOrder(d, REPO, "0001-one", git("rev-parse", "main"));
   git("branch", "-D", "factory/0002-two");
   await fetchMirror(d, REPO, TOKEN);
-  expect(refs()).toEqual(["refs/heads/factory/0001-one", "refs/heads/main"]);
+  expect(refs()).toEqual(["refs/hapi/orders/0001-one", "refs/heads/factory/0001-one", "refs/heads/main"]);
 });
 
 test("fetchMirror fetches only main and factory/*, with the token in the env and never in argv", async () => {
@@ -119,30 +157,46 @@ test("fetchMirror fetches only main and factory/*, with the token in the env and
   expect((await caught(fetchMirror(d, REPO, TOKEN))).message).toBe(`no mirror at ${m}: ensureMirror first`);
   expect(f.calls).toEqual([]);
 
-  mkdirSync(m, { recursive: true });
-  writeFileSync(join(m, "HEAD"), "ref: refs/heads/main\n");
+  fakeMirror(d);
   await fetchMirror(d, REPO, TOKEN);
   const authed = authedHostGit(d, TOKEN, { git: ["--git-dir", m] });
+  const plain = hardenedGit(d, { git: ["--git-dir", m] });
   expect(f.calls).toEqual([
+    // The origin is checked first, by hardened git with no token.
+    { cmd: [...plain.cmd, "config", "--get-regexp", "^remote\\."], env: { PATH: "/usr/bin:/bin" }, inherit: false },
     {
       cmd: [...authed.cmd, "fetch", "--quiet", "--prune", "--no-tags", "--no-write-fetch-head", "origin", "+refs/heads/main:refs/heads/main", "+refs/heads/factory/*:refs/heads/factory/*"],
       env: authed.env,
       inherit: false,
     },
   ]);
-  const argv = f.calls[0]!.cmd.join(" ");
+  const argv = f.calls[1]!.cmd.join(" ");
   expect(argv).not.toContain(TOKEN);
   expect(argv).not.toContain(btoa(`x-access-token:${TOKEN}`));
-  expect(f.calls[0]!.env.HOME).toBeUndefined();
+  expect(f.calls[1]!.env.HOME).toBeUndefined();
+});
+
+test("fetchMirror refuses a mirror whose origin isn't the repo's, before any fetch", async () => {
+  for (const [config, why] of [
+    ["remote.origin.url https://example.invalid/other.git\n", "origin is https://example.invalid/other.git"],
+    ["", "origin is unset"],
+    [`${ORIGIN_LINE}remote.origin.pushurl https://example.invalid/x.git\n`, "config has remote settings besides origin's URL (remote.origin.pushurl)"],
+  ] as const) {
+    const f = fakeRunner({ code: 0 }, config);
+    const d: MirrorDeps = { run: f.run, env: { PATH: "/usr/bin:/bin" }, engineDir: join(tempDir("hapi-engine-"), "engine") };
+    const m = fakeMirror(d);
+    const e = await caught(fetchMirror(d, REPO, TOKEN));
+    expect(e.message.startsWith(`${m}'s ${why}`)).toBe(true);
+    expect(e.message.endsWith(": remove the mirror; the next tick makes it again")).toBe(true);
+    expect(f.calls.filter((c) => c.cmd.includes("fetch"))).toEqual([]);
+  }
 });
 
 test("a failed fetch throws with the token and its header redacted", async () => {
   const header = `AUTHORIZATION: basic ${btoa(`x-access-token:${TOKEN}`)}`;
   const f = fakeRunner({ code: 128, stderr: `fatal: unable to access with ${TOKEN} and ${header}\nsecond line ${TOKEN}\n` });
   const d: MirrorDeps = { run: f.run, env: { PATH: "/usr/bin:/bin" }, engineDir: join(tempDir("hapi-engine-"), "engine") };
-  const m = mirrorPath(d.engineDir, REPO);
-  mkdirSync(m, { recursive: true });
-  writeFileSync(join(m, "HEAD"), "ref: refs/heads/main\n");
+  fakeMirror(d);
   const e = await caught(fetchMirror(d, REPO, TOKEN));
   expect(e.message).toBe("cannot fetch example-owner/example-repo into its mirror (git fetch exited 128): fatal: unable to access with [redacted] and AUTHORIZATION: basic [redacted]");
   expect(e.message).not.toContain(TOKEN);

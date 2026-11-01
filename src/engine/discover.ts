@@ -9,13 +9,16 @@
  *   merge (`readWorkOrder`), which is how the poller rebuilds each work order it already has state for.
  * - **Never re-keyed.** The poller passes the ids it has state for (`known`), and discovery skips them before it
  *   looks for a key, so a force-pushed main, which gives a merge a new sha, never makes a run a second time.
- * - **Problems, not work orders.** A bad one (YAML that doesn't parse, an order that fails validation, an id unlike
- *   its directory's name, no task.md, a file that isn't a regular file, an overlay that fails its schema or
- *   loosens the central policy) is pushed onto the caller's `problems`, for the tick report and the status
+ * - **Pinned.** The poller pins each work order it has state for at its merge (`pinWorkOrder`, `refs/hapi/orders/
+ *   <id>`), because a bare mirror keeps no reflog: after a rewrite of main the old merge is unreachable at once, and
+ *   gc would prune it. A merge the mirror no longer holds is `readWorkOrder`'s "<sha12> is not in the mirror".
+ * - **Problems, not work orders.** A bad one (a directory name that isn't a work-order id, YAML that doesn't parse,
+ *   an order that fails validation, an id unlike its directory's name, no task.md, a file that isn't a regular
+ *   file, an overlay that fails its schema or loosens the central policy) is pushed onto the caller's `problems`, for the tick report and the status
  *   comment's "Can't run" table, and is never returned.
  * - **Read as data.** Files are read with `cat-file blob`, never `git show`, so no textconv, attribute or pager
- *   applies; pathspecs are literal (`--literal-pathspecs`), so a directory name is never a glob; and a commit id
- *   is checked before it reaches git, so nothing is ever read as an option.
+ *   applies; pathspecs are literal (`--literal-pathspecs`), so a directory name is never a glob; and a work-order
+ *   id and a commit id are checked before either reaches git, so nothing is ever read as an option.
  *
  * `planningPrOf` reads a merge's PR number from GitHub's classic merge message, the only source there is: Task
  * 3's Forge has no commit-to-PR route, and `new-repo` repos allow merge commits only, with that message, which
@@ -26,7 +29,7 @@ import { PolicyError } from "../policy/load";
 import { parseYaml } from "../policy/schema";
 import type { Policy, RepoOverlay } from "../policy/types";
 import { hardenedGit } from "../run/git";
-import { validateWorkOrder, type WorkOrder } from "../workorder/validate";
+import { isWorkOrderId, validateWorkOrder, WORK_ORDER_ID_MAX, type WorkOrder } from "../workorder/validate";
 import { type MirrorDeps, mirrorPath } from "./mirror";
 
 export interface Discovered {
@@ -71,10 +74,32 @@ async function git(d: MirrorDeps, repo: string, args: string[], what: string): P
   return r.stdout;
 }
 
+/** Printable ASCII only, and at most 80 characters: for a name from the git tree, or from a caller, in a message. */
+function shown(s: string): string {
+  const safe = s.replace(/[^\x21-\x7e]/g, "?");
+  return safe.length > 80 ? `${safe.slice(0, 80)}...` : safe;
+}
+
 function commitId(sha: string): string {
-  if (!COMMIT.test(sha)) throw new Error(`not a commit id: ${sha.slice(0, 80)}`);
+  if (!COMMIT.test(sha)) throw new Error(`not a commit id: ${shown(sha)}`);
   return sha;
 }
+
+function workOrderId(id: string): string {
+  if (!isWorkOrderId(id)) throw new Error(`not a work-order id: ${shown(id)}`);
+  return id;
+}
+
+/** Throws unless `sha` is a commit the mirror holds. */
+async function commitIn(d: MirrorDeps, repo: string, sha: string): Promise<void> {
+  const at = sha.slice(0, 12);
+  const r = await onMirror(d, repo, ["cat-file", "-t", sha]);
+  if (r.code !== 0) throw new Error(`${at} is not in the mirror (main was rewritten and the work order wasn't pinned, or the mirror was deleted)`);
+  if (r.stdout.trim() !== "commit") throw new Error(`${at} is not a commit`);
+}
+
+/** The reason a directory under .factory/work whose name isn't a work-order id gives; the name itself is in `path`, shown safe. */
+const NOT_AN_ID = `its directory's name is not a work-order id (four or more digits, a hyphen and a lower-case slug, at most ${WORK_ORDER_ID_MAX} characters)`;
 
 /**
  * The work orders on the mirror's main, by id, that aren't in `known`: each keyed by the merge that first added
@@ -92,6 +117,10 @@ export async function discoverWorkOrders(d: DiscoverDeps, repo: string, known: R
     .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   const found: Discovered[] = [];
   for (const { path, id } of orders) {
+    if (!isWorkOrderId(id)) {
+      problems.push({ path: `.factory/work/${shown(id)}/order.yaml`, reason: NOT_AN_ID });
+      continue;
+    }
     if (known.has(id)) continue; // never re-keyed, never reported: the poller already has its state
     const log = await git(
       d,
@@ -118,8 +147,10 @@ export async function discoverWorkOrders(d: DiscoverDeps, repo: string, known: R
  * reason it can't run (the `reason` of a `DiscoverProblem`).
  */
 export async function readWorkOrder(d: DiscoverDeps, repo: string, id: string, mergeSha: string): Promise<Discovered> {
+  workOrderId(id);
   const sha = commitId(mergeSha);
   const at = sha.slice(0, 12);
+  await commitIn(d, repo, sha);
   const orderPath = `.factory/work/${id}/order.yaml`;
   const taskPath = `.factory/work/${id}/task.md`;
   const wanted = [orderPath, taskPath, OVERLAY];
@@ -170,20 +201,54 @@ export async function readWorkOrder(d: DiscoverDeps, repo: string, id: string, m
   return { repo, id, mergeSha: sha, workOrder, taskMd, overlay };
 }
 
-/** The planning PR whose merge `mergeSha` is, from GitHub's classic merge message, or undefined for any other commit. */
+/**
+ * The planning PR whose merge `mergeSha` is, from GitHub's classic merge message, or undefined for any other
+ * commit: one without exactly two parents, whatever its subject says, or one whose subject isn't the message.
+ */
 export async function planningPrOf(d: MirrorDeps, repo: string, mergeSha: string): Promise<number | undefined> {
   const sha = commitId(mergeSha);
-  const subject = (await git(d, repo, ["log", "-1", "--format=%s", sha], `read ${sha.slice(0, 12)}'s subject`)).replace(/\n$/, "");
-  const pr = PLANNING_MERGE.exec(subject)?.[1];
+  const out = await git(d, repo, ["log", "-1", "--format=%P%x00%s", sha], `read ${sha.slice(0, 12)}'s parents and subject`);
+  const nul = out.indexOf("\0");
+  if (nul === -1) return undefined;
+  if (out.slice(0, nul).split(" ").filter((p) => p !== "").length !== 2) return undefined;
+  const pr = PLANNING_MERGE.exec(out.slice(nul + 1).replace(/\n$/, ""))?.[1];
   if (pr === undefined) return undefined;
   const n = Number(pr);
   return Number.isSafeInteger(n) ? n : undefined;
 }
 
-/** A glob's literal prefix: the text before its first `*`, `?`, `[`, `{` or `!`, lower-cased (matching ignores case). */
+/** The ref that pins work order `id` at its merge in the mirror. */
+const pinRef = (id: string) => `refs/hapi/orders/${workOrderId(id)}`;
+
+/**
+ * Pin work order `id` at `mergeSha` in `repo`'s mirror, as `refs/hapi/orders/<id>`, so its merge stays reachable,
+ * and so through gc, after a rewrite of main. The fetch never touches it. The poller pins a work order when it
+ * makes its state, and unpins it when it retires it.
+ */
+export async function pinWorkOrder(d: MirrorDeps, repo: string, id: string, mergeSha: string): Promise<void> {
+  const ref = pinRef(id);
+  const sha = commitId(mergeSha);
+  await commitIn(d, repo, sha);
+  await git(d, repo, ["update-ref", ref, sha], `pin ${id} at ${sha.slice(0, 12)}`);
+}
+
+/** Drop work order `id`'s pin from `repo`'s mirror; a pin that isn't there is no error. */
+export async function unpinWorkOrder(d: MirrorDeps, repo: string, id: string): Promise<void> {
+  await git(d, repo, ["update-ref", "-d", pinRef(id)], `unpin ${id}`);
+}
+
+/**
+ * A glob's literal prefix: with its `.` and empty segments dropped (the schema accepts `./a`, `a//b` and `a/./b`,
+ * which name `a` and `a/b`), the text before its first `*`, `?`, `[`, `{` or `!`, lower-cased (matching ignores
+ * case).
+ */
 function prefixOf(glob: string): string {
-  const wild = glob.search(/[*?[{!]/);
-  return (wild === -1 ? glob : glob.slice(0, wild)).toLowerCase();
+  const path = glob
+    .split("/")
+    .filter((seg) => seg !== "" && seg !== ".")
+    .join("/");
+  const wild = path.search(/[*?[{!]/);
+  return (wild === -1 ? path : path.slice(0, wild)).toLowerCase();
 }
 
 /**

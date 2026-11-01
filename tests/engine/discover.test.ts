@@ -8,7 +8,7 @@
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { type Discovered, type DiscoverDeps, type DiscoverProblem, discoverWorkOrders, overlapProblem, planningPrOf, readWorkOrder } from "../../src/engine/discover";
+import { type Discovered, type DiscoverDeps, type DiscoverProblem, discoverWorkOrders, overlapProblem, pinWorkOrder, planningPrOf, readWorkOrder, unpinWorkOrder } from "../../src/engine/discover";
 import { ensureMirror } from "../../src/engine/mirror";
 import { loadPolicy } from "../../src/policy/load";
 import { overlayFromText } from "../../src/policy/overlay";
@@ -221,14 +221,86 @@ describe("discovery", () => {
     expect((await caught(readWorkOrder(d, REPO, "0001-one", merge))).message).toBe(reason);
   });
 
-  test("with real git: a mirror with no main says so, and a merge sha that isn't a commit id is refused before git", async () => {
+  test("with real git: a mirror with no main says so, and a merge sha or a work-order id that isn't one is refused before git", async () => {
     const { d } = await world();
     expect((await caught(discoverWorkOrders(d, REPO, new Set(), []))).message).toBe("example-owner/example-repo's mirror has no main: fetch it first");
     const seen: string[][] = [];
     const spy: DiscoverDeps = { ...d, run: async (cmd, o) => (seen.push(cmd), runCommand(cmd, o)) };
+    const sha = "a".repeat(40);
     expect((await caught(readWorkOrder(spy, REPO, "0001-one", "--output=x"))).message).toBe("not a commit id: --output=x");
     expect((await caught(planningPrOf(spy, REPO, "HEAD"))).message).toBe("not a commit id: HEAD");
+    expect((await caught(pinWorkOrder(spy, REPO, "0001-one", "main"))).message).toBe("not a commit id: main");
+    for (const id of ["../x", "0001-one/../../x", "-d", `0001-${"a".repeat(80)}`, "0001-x\u001b[31m"]) {
+      const want = `not a work-order id: ${id.replace(/[^\x21-\x7e]/g, "?").slice(0, 80)}${id.length > 80 ? "..." : ""}`;
+      expect((await caught(readWorkOrder(spy, REPO, id, sha))).message).toBe(want);
+      expect((await caught(pinWorkOrder(spy, REPO, id, sha))).message).toBe(want);
+      expect((await caught(unpinWorkOrder(spy, REPO, id))).message).toBe(want);
+    }
     expect(seen).toEqual([]);
+  });
+
+  test("with real git: a directory under .factory/work whose name isn't a work-order id is a problem, shown safe, and git never sees it", async () => {
+    const { git, d, mirror } = await world();
+    const names = ["Bad Name", "0001-x\u001b[31mred", `0001-${"a".repeat(90)}`];
+    plan(git, "plan/names", 5, () => {
+      addOrder(git, "0002-good");
+      for (const name of names) {
+        mkdirSync(join(git.dir, ".factory", "work", name), { recursive: true });
+        writeFileSync(join(git.dir, ".factory", "work", name, "order.yaml"), "id: 0001-x\n");
+        git("add", "--", `.factory/work/${name}/order.yaml`);
+      }
+    });
+    toMirror(git, mirror);
+    const seen: string[][] = [];
+    const spy: DiscoverDeps = { ...d, run: async (cmd, o) => (seen.push(cmd), runCommand(cmd, o)) };
+    const { found, problems } = await discover(spy);
+    expect(found.map((o) => o.id)).toEqual(["0002-good"]);
+    const reason = "its directory's name is not a work-order id (four or more digits, a hyphen and a lower-case slug, at most 80 characters)";
+    expect(problems).toEqual([
+      { path: `.factory/work/0001-${"a".repeat(75)}.../order.yaml`, reason },
+      { path: ".factory/work/0001-x?[31mred/order.yaml", reason },
+      { path: ".factory/work/Bad?Name/order.yaml", reason },
+    ]);
+    // Only ls-tree, which lists them, ever sees the names: no log or read is run for one.
+    for (const name of names) expect(seen.filter((c) => c.some((a) => a.includes(name)))).toEqual([]);
+  });
+
+  test("with real git: a commit that isn't a merge has no planning PR, whatever its subject says", async () => {
+    const { git, d, mirror } = await world();
+    git("commit", "-q", "--allow-empty", "-m", "Merge pull request #5 from example-owner/plan/fake");
+    const fake = git("rev-parse", "HEAD");
+    const merge = plan(git, "plan/one", 7, () => void addOrder(git, "0001-one"));
+    git("checkout", "-q", "-b", "side", `${merge}^1`);
+    git("commit", "-q", "--allow-empty", "-m", "side");
+    git("checkout", "-q", "main");
+    git("merge", "-q", "--no-ff", "-m", "Merge pull request #8 from example-owner/side", "side");
+    toMirror(git, mirror);
+    expect(await planningPrOf(d, REPO, fake)).toBeUndefined();
+    expect(await planningPrOf(d, REPO, merge)).toBe(7);
+    expect(await planningPrOf(d, REPO, git("rev-parse", "HEAD"))).toBe(8);
+  });
+
+  test("with real git: a pinned merge survives a rewrite of main and gc, an unpinned one doesn't, and readWorkOrder says so", async () => {
+    const { git, d, mirror } = await world();
+    let path = "";
+    const merge = plan(git, "plan/one", 7, () => {
+      path = addOrder(git, "0001-one");
+    });
+    toMirror(git, mirror);
+    const want = discovered("0001-one", merge, loadWorkOrder(path));
+    await pinWorkOrder(d, REPO, "0001-one", merge);
+    git("commit", "-q", "--amend", "-m", "Merge pull request #7 from example-owner/plan/one (rewritten)");
+    toMirror(git, mirror, true);
+    const gc = () => Bun.spawnSync(["git", "--git-dir", mirror, "gc", "--quiet", "--prune=now"], { env: { PATH, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } }).exitCode;
+    expect(gc()).toBe(0);
+    expect(await readWorkOrder(d, REPO, "0001-one", merge)).toEqual(want);
+
+    await unpinWorkOrder(d, REPO, "0001-one");
+    await unpinWorkOrder(d, REPO, "0001-one"); // a pin that isn't there is no error
+    expect(gc()).toBe(0);
+    const gone = `${merge.slice(0, 12)} is not in the mirror (main was rewritten and the work order wasn't pinned, or the mirror was deleted)`;
+    expect((await caught(readWorkOrder(d, REPO, "0001-one", merge))).message).toBe(gone);
+    expect((await caught(pinWorkOrder(d, REPO, "0001-one", merge))).message).toBe(gone);
   });
 });
 
@@ -273,6 +345,23 @@ describe("the overlap check", () => {
       ]),
     );
     expect(overlapProblem([order("0001-a", ["README.md"], ["README.md", "src/x.ts"])])).toEqual(new Map());
+  });
+
+  test("a `.` or empty segment, which the schema accepts, names the same path: ./a, a//b and a/./b", () => {
+    for (const [mine, theirs] of [
+      ["./src/x.ts", "src/x.ts"],
+      ["src//x.ts", "src/x.ts"],
+      ["src/./x.ts", "src/x.ts"],
+      ["./src/./tools//**", "src/Tools/Crack.ts"],
+    ]) {
+      expect(overlapProblem([order("0001-a", [mine!]), order("0002-b", [theirs!])])).toEqual(
+        new Map([
+          ["0001-a", `overlaps work order 0002-b (${mine} and ${theirs}): ${how}`],
+          ["0002-b", `overlaps work order 0001-a (${theirs} and ${mine}): ${how}`],
+        ]),
+      );
+    }
+    expect(overlapProblem([order("0001-a", ["./src/a/x.ts"]), order("0002-b", ["src//b.ts"])])).toEqual(new Map());
   });
 
   test("an order that already has a reason keeps it: the first overlap, in id order, names it", () => {

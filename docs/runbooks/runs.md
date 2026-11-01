@@ -166,9 +166,11 @@ with hapi's home as `~`.
 
 - **Only `main` and `factory/*`.** Each tick fetches exactly `+refs/heads/main:refs/heads/main` and `+refs/heads/factory/*:refs/heads/factory/*`, pruned, with no tags and no `FETCH_HEAD`. Nothing else of the repo's reaches the mirror. Both refspecs are forced, so a rewritten main is taken as it is ([the key](#discovery) keeps that from re-running anything).
 - **No credential on disk.** The mirror's config names origin's URL, `https://github.com/<owner>/<name>.git`, and nothing else: no fetch refspec, no `http.extraheader` and no credential helper. The fetch's App token reaches git only in the fetch process's environment (`GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_0` and `GIT_CONFIG_VALUE_0`, from `authedHostGit` in `src/run/git.ts`), never its argv or the mirror's config. A failed fetch's error quotes git's first line with the token and its header as `[redacted]`. So a run that reads the mirror reads no token.
+- **Its origin is checked.** Before every fetch, and each time the poller finds the mirror there, the mirror's only `remote.*` setting must be `remote.origin.url` with the repo's GitHub URL. Anything else is refused with `<path>'s origin is <url>, not https://github.com/<owner>/<name>.git: remove the mirror; the next tick makes it again` (or, for an extra setting beside the right URL, `<path>'s config has remote settings besides origin's URL (<keys>): …`), so the token is never sent anywhere else. One exception repairs itself: a mirror whose init ran but whose origin was never set (no `remote.*` at all) gets its origin set.
+- **Pins.** The poller pins each work order it has state for at its merge commit, as `refs/hapi/orders/<id>` (`pinWorkOrder`, and `unpinWorkOrder` when it retires the state). A bare mirror keeps no reflog, so once main is rewritten the old merge is unreachable at once, and git's automatic gc, which a fetch can start, would prune it; the pin keeps it. The fetch's `--prune` touches only `main` and `factory/*`, so the pins stay.
 - **World-readable.** The poller makes it with `git init --bare --shared=0644`, so its files are 0644 and its dirs 0755, and git keeps them so on every fetch (`core.sharedRepository`). The run container's uid can read it that way. The dir above it, `mirrors/<owner>`, is 0700 and hapi's alone. `--shared` also sets `receive.denyNonFastforwards`, which only a push would meet, and nothing pushes to a mirror.
-- **Read as data.** Every other git call on the mirror is host git with no system or global config, no hooks and no fsmonitor (`hardenedGit`, the launcher's own), with literal pathspecs. Files are read as blobs (`git cat-file blob`), never with `git show`, so no textconv, attribute or pager applies.
-- **Safe to delete.** A mirror holds nothing that isn't on GitHub, so the next tick makes it again and fetches it. Delete one that is broken, or one whose origin is wrong: the poller refuses it with `<path>'s origin is <url>, not https://github.com/<owner>/<name>.git: remove the mirror; the next tick makes it again`. Do it as hapi, from your own terminal, when no run of that repo is live (`hapi run list`), with the owner and name filled in:
+- **Read as data.** Every other git call on the mirror is host git with no system or global config, no hooks and no fsmonitor (`hardenedGit`, the launcher's own), and discovery's calls also take literal pathspecs (`--literal-pathspecs`), so a directory name is never a glob. Files are read as blobs (`git cat-file blob`), never with `git show`, so no textconv, attribute or pager applies.
+- **Safe to delete, but for its pins.** A mirror holds nothing that isn't on GitHub but its pins, so the next tick makes it again and fetches it. Deleting it drops the pins: if main has been rewritten, a work order the poller has state for that is keyed at an old merge can't be rebuilt any more (`<sha12> is not in the mirror (main was rewritten and the work order wasn't pinned, or the mirror was deleted)`), so retire its state, or plan the work again as a new work order. Delete one that is broken, or one whose origin is wrong ([above](#the-mirror)). Do it as hapi, from your own terminal, when no run of that repo is live (`hapi run list`), with the owner and name filled in:
 
   ```bash
   sudo -u hapi -H -- sh -c \
@@ -188,6 +190,7 @@ After each fetch, the poller discovers the work orders on the mirror's main: eve
 
   | Reason | What is wrong |
   |---|---|
+  | `its directory's name is not a work-order id (four or more digits, a hyphen and a lower-case slug, at most 80 characters)` | The directory under `.factory/work/` isn't named as a work order's id is. The problem's path shows the name with anything but printable ASCII as `?`, cut at 80 characters, and no git call is made with it. |
   | `invalid YAML: <first line>` | `order.yaml` doesn't parse. |
   | `<path>: <message>` | The order fails its schema ([work orders](../policy.md#work-orders)). |
   | `its id is <id>, not its directory's name <dir>` | The order's `id` isn't the name of the directory it is in. |
@@ -197,6 +200,8 @@ After each fetch, the poller discovers the work orders on the mirror's main: eve
   | `no commit on main's first-parent line adds it` | Git found no commit that adds the order, which shouldn't happen: a defensive check. |
 
   Because a work order is read at its merge, a fix on main doesn't change it. Plan the work again as a new work order, with a new id.
+
+  Rebuilding a work order the poller has state for (`readWorkOrder`, at its merge) can fail the same ways, and one more: `<sha12> is not in the mirror (…)`, when its merge is gone ([the pins](#the-mirror)).
 
 ## The run disk
 

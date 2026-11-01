@@ -12,7 +12,13 @@
  *   every fetch (`core.sharedRepository`), so the run container's uid can read it. The dir above it,
  *   `mirrors/<owner>`, is 0700: only hapi (and so hapi's rootless Docker, which makes the bind mount) gets to it.
  *   `--shared` also sets `receive.denyNonFastforwards`, which only a push would meet; the poller only fetches.
- * - **Disposable.** A mirror holds nothing that isn't on GitHub: delete it and the next tick makes it again.
+ * - **Its origin is checked.** `ensureMirror` and the fetch both refuse a mirror whose only remote setting isn't
+ *   origin's URL, so the token is never sent anywhere else.
+ * - **Pins.** A work order the poller has state for is pinned at its merge (`refs/hapi/orders/<id>`, ./discover.ts),
+ *   which the fetch's prune never touches: a bare mirror keeps no reflog, so after a rewrite of main the old merge
+ *   is otherwise unreachable at once, and gc would prune it.
+ * - **Disposable.** A mirror holds nothing that isn't on GitHub, but its pins: delete it and the next tick makes it
+ *   again, without them.
  *
  * Every git call is `hardenedGit`, but the fetch, which is `authedHostGit`.
  */
@@ -56,34 +62,61 @@ function mirrorGit(d: MirrorDeps, m: string | undefined, args: string[]) {
   return d.run([...g.cmd, ...args], { env: g.env, inherit: false });
 }
 
+/** Every `remote.*` line of the mirror's config, as git lists it (`<key> <value>`); [] when there is none. */
+async function remoteLines(d: MirrorDeps, m: string): Promise<string[]> {
+  const r = await mirrorGit(d, m, ["config", "--get-regexp", "^remote\\."]);
+  if (r.code === 1) return []; // git config's "no such key"
+  if (r.code !== 0) throw new Error(`cannot read ${m}'s config (git config exited ${r.code}): ${firstLine(r.stderr)}`);
+  return r.stdout.split("\n").filter((l) => l !== "");
+}
+
+/** Throws unless the mirror's only remote setting is origin's URL, `origin`. */
+function checkOrigin(m: string, lines: string[], origin: string): void {
+  if (lines.length === 1 && lines[0] === `remote.origin.url ${origin}`) return;
+  const urls = lines.filter((l) => l.startsWith("remote.origin.url ")).map((l) => l.slice("remote.origin.url ".length));
+  if (urls.length === 1 && urls[0] === origin) {
+    const keys = lines.map((l) => l.split(" ")[0]).filter((k) => k !== "remote.origin.url");
+    throw new Error(`${m}'s config has remote settings besides origin's URL (${keys.join(", ")}): remove the mirror; the next tick makes it again`);
+  }
+  throw new Error(`${m}'s origin is ${urls.length === 0 ? "unset" : urls.join(" and ")}, not ${origin}: remove the mirror; the next tick makes it again`);
+}
+
+async function setOrigin(d: MirrorDeps, repo: string, m: string): Promise<void> {
+  const set = await mirrorGit(d, m, ["config", "remote.origin.url", originOf(repo)]);
+  if (set.code !== 0) throw new Error(`cannot set ${repo}'s mirror's origin (git config exited ${set.code}): ${firstLine(set.stderr)}`);
+}
+
 /**
- * Make `repo`'s mirror if it isn't there, and check the one that is: its origin must be the repo's GitHub URL.
- * Returns its path. Never adds a fetch refspec or anything else to its config.
+ * Make `repo`'s mirror if it isn't there, and check the one that is: its only remote setting must be origin's URL,
+ * the repo's on GitHub. A half-made one (its init ran, its origin was never set, and it has no other remote
+ * setting) is finished by setting the origin; any other difference is refused. Returns its path. Never adds a
+ * fetch refspec or anything else to its config.
  */
 export async function ensureMirror(d: MirrorDeps, repo: string): Promise<string> {
   const m = mirrorPath(d.engineDir, repo);
-  const origin = originOf(repo);
   if (!(await exists(join(m, "HEAD")))) {
     await mkdir(dirname(m), { recursive: true, mode: 0o700 });
     const init = await mirrorGit(d, undefined, ["init", "--bare", "--quiet", "--shared=0644", "--initial-branch=main", m]);
     if (init.code !== 0) throw new Error(`cannot make ${repo}'s mirror at ${m} (git init exited ${init.code}): ${firstLine(init.stderr)}`);
-    const set = await mirrorGit(d, m, ["config", "remote.origin.url", origin]);
-    if (set.code !== 0) throw new Error(`cannot set ${repo}'s mirror's origin (git config exited ${set.code}): ${firstLine(set.stderr)}`);
+    await setOrigin(d, repo, m);
     return m;
   }
-  const got = await mirrorGit(d, m, ["config", "--get", "remote.origin.url"]);
-  const url = got.code === 0 ? got.stdout.trim() : "";
-  if (url !== origin) throw new Error(`${m}'s origin is ${url === "" ? "unset" : url}, not ${origin}: remove the mirror; the next tick makes it again`);
+  const lines = await remoteLines(d, m);
+  if (lines.length === 0) await setOrigin(d, repo, m);
+  else checkOrigin(m, lines, originOf(repo));
   return m;
 }
 
 /**
  * Fetch `repo`'s main and factory/* into its mirror (made by `ensureMirror`), forced and pruned, with `token` in
- * the fetch's environment only. A failure throws with git's first stderr line, the token and its header redacted.
+ * the fetch's environment only, once the mirror's origin is checked as `ensureMirror` checks it. The prune touches
+ * only those refs, so the pins (`refs/hapi/orders/*`, ./discover.ts) stay. A failure throws with git's first
+ * stderr line, the token and its header redacted.
  */
 export async function fetchMirror(d: MirrorDeps, repo: string, token: string): Promise<void> {
   const m = mirrorPath(d.engineDir, repo);
   if (!(await exists(join(m, "HEAD")))) throw new Error(`no mirror at ${m}: ensureMirror first`);
+  checkOrigin(m, await remoteLines(d, m), originOf(repo)); // never fetch, with the token, from anywhere else
   const g = authedHostGit(d, token, { git: ["--git-dir", m] });
   const r = await d.run(
     [...g.cmd, "fetch", "--quiet", "--prune", "--no-tags", "--no-write-fetch-head", "origin", "+refs/heads/main:refs/heads/main", "+refs/heads/factory/*:refs/heads/factory/*"],
