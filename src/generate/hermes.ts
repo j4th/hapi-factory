@@ -143,6 +143,10 @@ function configYaml(p: Policy, opts: McpOptions): string {
     auxiliary: Object.fromEntries(AUX_SLOTS.map((slot) => [slot, { provider: "anthropic", model: aux.id }])),
     delegation: { provider: "anthropic", model: aux.id, subagent_auto_approve: false },
     cron: { model_provider: "anthropic", model: aux.id },
+    // The Kanban dispatcher, on in the gateway by default, spawns `hermes -p <assignee>` (full terminal, no
+    // approval step) for each ready card; dispatch_profiles: [] claims nothing, where an omitted key means any
+    // profile. Notifications stay on (kanban.md at v0.22.5).
+    kanban: { dispatch_in_gateway: false, dispatch_profiles: [], auto_decompose: false, review_dispatch: false },
     hooks_auto_accept: false,
   };
 

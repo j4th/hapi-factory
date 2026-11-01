@@ -42,6 +42,14 @@ test("hermes flips defaults", () => {
   expect(c.delegation.subagent_auto_approve).toBe(false);
 });
 
+test("hermes pins its Kanban board's dispatch off: no worker is spawned, nothing is decomposed or review-dispatched", () => {
+  // At v0.22.5 the dispatcher runs in the gateway by default and spawns `hermes -p <assignee>`, a worker with full
+  // terminal access and no approval step, for each ready card (website/docs/user-guide/features/kanban.md).
+  // dispatch_profiles: [] claims nothing; only an omitted key means "any profile".
+  const k = config().kanban;
+  expect(k).toEqual({ dispatch_in_gateway: false, dispatch_profiles: [], auto_decompose: false, review_dispatch: false });
+});
+
 test("every Hermes auxiliary slot, delegation and cron run Haiku 5.5 on the anthropic provider", () => {
   const c = config();
   const haiku = { provider: "anthropic", model: "claude-haiku-5-5" };
