@@ -4,10 +4,13 @@
 # It may only tighten that policy, and .factory/** is itself protected.
 #
 # The gates' own config: `mise run check` runs Biome, Bun and tsc with these
-# files, so a worker that could edit one could pass `check` by loosening it.
+# files, so a worker that could edit one could pass `check` by loosening it;
+# and an osv-scanner.toml could ignore a vulnerability (the gates pass
+# OSV-Scanner a config of their own, but `mise run scan` reads this one).
 # Same modes as AGENTS.md: the maintainer approves in an interactive session;
 # unattended sessions and workers may not edit them.
 protected_paths:
   "**/biome.json*": { interactive: ask, unattended: deny, workers: deny }
   "**/bunfig.toml": { interactive: ask, unattended: deny, workers: deny }
   "**/tsconfig*.json": { interactive: ask, unattended: deny, workers: deny }
+  "**/osv-scanner.toml": { interactive: ask, unattended: deny, workers: deny }

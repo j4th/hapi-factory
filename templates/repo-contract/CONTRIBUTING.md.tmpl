@@ -7,7 +7,8 @@
 - **Planning PRs** bring the work: one or more work orders under `.factory/work/`, each with its acceptance tests. Merging a planning PR approves both the work orders and their tests.
 - Each work order's behaviour-level tests live in `.factory/work/<id>/acceptance/`: the planner writes them in the planning PR, the factory's verify container runs them, and no factory PR may change them.
 - **Factory PRs** come from the `hapi-factory` GitHub App, one per work order. Each one's description says what the host verified and what the agent claims, and the gates run on it like on any other PR.
-- **Only the maintainer merges.** Every merge into `main` goes through a pull request with the `ci / gates` check green, and a code owner's approval.
+- **Only the maintainer merges.** Every merge into `main` goes through a pull request with the `ci / gates` check green, and a code owner's approval. A green `ci / gates` is evidence only when the PR leaves `.github/workflows/` alone.
+- **A PR that touches `.github/workflows/`** runs its own copy of the workflows, so it can report any check it likes, `ci / gates` included. The maintainer never approves a fork's workflow run for such a PR, never trusts its checks, and reviews every line of the workflow change by hand before merging it.
 
 ## Outside contributions
 

@@ -63,7 +63,7 @@ reviews:
     custom_checks:
       - name: "Protected paths declared"
         mode: warning
-        instructions: "Fail if the PR changes a protected path (an agent instruction file at any depth and in any case: AGENTS.md, AGENTS.override.md, AGENT.md, CLAUDE.md, CLAUDE.local.md, GEMINI.md, HERMES.md, .hermes.md, SOUL.md, REVIEW.md, .cursorrules, .windsurfrules, or anything under .claude/, .hermes/, .cursor/, .clinerules/ or .rules/; or .factory/**, .github/**, mise.toml, .pi/**, .agents/**, .archon/**, .coderabbit.yaml, .coderabbit.yml, .coderabbit.config.ts) or policy/protected_paths.yaml, and its description has no section titled 'Protected-path change' saying why. Pass otherwise."
+        instructions: "Fail if the PR changes a protected path (an agent instruction file at any depth and in any case: AGENTS.md, AGENTS.override.md, AGENT.md, CLAUDE.md, CLAUDE.local.md, GEMINI.md, HERMES.md, .hermes.md, SOUL.md, REVIEW.md, .cursorrules, .windsurfrules, or anything under .claude/, .hermes/, .cursor/, .clinerules/ or .rules/; or .factory/**, .github/**, mise.toml, .pi/**, .agents/**, .archon/**, .coderabbit.yaml, .coderabbit.yml, .coderabbit.config.ts; or the gates' own config: mise.lock, biome.json*, bunfig.toml, tsconfig*.json, .gitleaks.toml, .gitleaksignore, osv-scanner.toml, at any depth), and its description has no section titled 'Protected-path change' saying why. Pass otherwise."
   tools:
     gitleaks: { enabled: true }
     osvScanner: { enabled: true }
@@ -76,7 +76,7 @@ reviews:
     languagetool: { enabled: false }
 chat:
   auto_reply: false
-  # Applies only to organization repos; hapi-factory is a personal account's.
+  # Applies only to organization repos.
   allow_non_org_members: false
 knowledge_base:
   opt_out: false

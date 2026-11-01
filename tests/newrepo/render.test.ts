@@ -119,7 +119,7 @@ test("the rendered contract passes the checks new-repo makes before it pushes", 
   expect(contractProblems(files, policy)).toEqual([]);
 
   const overlaid = applyOverlay(policy, overlayFromText(text(".factory/config.yaml"), ".factory/config.yaml"));
-  for (const path of ["biome.json", "src/biome.jsonc", "bunfig.toml", "tsconfig.json", ".factory/work/0001-example/acceptance/tools.test.ts"]) {
+  for (const path of ["biome.json", "src/biome.jsonc", "bunfig.toml", "tsconfig.json", "osv-scanner.toml", ".factory/work/0001-example/acceptance/tools.test.ts"]) {
     expect([path, effectiveModes(overlaid, path).workers]).toEqual([path, "deny"]);
   }
   expect(effectiveModes(overlaid, "src/server.ts")).toEqual(UNPROTECTED);
@@ -136,10 +136,18 @@ test("the rendered contract passes the checks new-repo makes before it pushes", 
   expect(mise.min_version).toBe("2026.10.9");
   expect(mise.tools).toEqual({ bun: "1.4.2", gitleaks: "8.30.1", "osv-scanner": "2.7.0", zizmor: "1.31.1" });
 
+  // hapi-factory's, without its path instructions and code guidelines, and with the protected-paths check naming
+  // the contract's own protected files where hapi's names policy/protected_paths.yaml.
   const ours = YAML.parse(readFileSync(join(REPO, ".coderabbit.yaml"), "utf8"));
   delete ours.reviews.path_instructions;
   delete ours.knowledge_base.code_guidelines;
-  expect(YAML.parse(text(".coderabbit.yaml"))).toEqual(ours);
+  const theirs = YAML.parse(text(".coderabbit.yaml"));
+  const instructions = (c: any) => c.reviews.pre_merge_checks.custom_checks[0].instructions as string;
+  const contractFiles = "or the gates' own config: mise.lock, biome.json*, bunfig.toml, tsconfig*.json, .gitleaks.toml, .gitleaksignore, osv-scanner.toml, at any depth)";
+  expect(instructions(theirs)).toBe(instructions(ours).replace(") or policy/protected_paths.yaml", `; ${contractFiles}`));
+  theirs.reviews.pre_merge_checks.custom_checks[0].instructions = instructions(ours);
+  expect(theirs).toEqual(ours);
+  expect(text(".coderabbit.yaml")).not.toContain("personal account");
 
   // As tests/scripts/ci-workflow.test.ts checks the root lock: each tool at its pin, for both platforms.
   const locked = Bun.TOML.parse(text("mise.lock")) as { tools: Record<string, { version: string; [platform: string]: unknown }[]> };

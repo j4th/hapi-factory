@@ -7,18 +7,24 @@
 #         contents: read
 #       uses: <owner>/hapi-factory/.github/workflows/gates.yml@<40-hex commit>
 #
-# The caller's job is `ci` and this one is `gates`, so the check GitHub reports is `ci / gates`
-# (CONTRACT_CHECK in src/forge/index.ts), which the repo's main-protect requires, from GitHub Actions.
+# Three jobs. The caller's job is `ci`, so GitHub reports them as `ci / scan`, `ci / check` and `ci / gates`, and the
+# repo's main-protect requires only `ci / gates` (CONTRACT_CHECK in src/forge/index.ts), from GitHub Actions:
 #
-# - It runs the caller's own `mise run check` (its `setup` installs with `--ignore-scripts`), gitleaks over the
-#   whole history, OSV-Scanner over bun.lock (GitHub's dependency graph doesn't read it), zizmor over the caller's
-#   workflows, and, on a pull request from a factory/** branch, the commit-trailer check (H-113's factory half).
-# - Least privilege: `permissions: {}` here and `contents: read` on the job, which the caller grants; no secret is
-#   used; checkout doesn't keep the token in .git/config. Every action is pinned to a full commit SHA, the tag it was
-#   resolved from in a comment (spec §11.7). mise is the version the template's mise.toml names as `min_version`, and
-#   it installs each tool from the caller's mise.lock (--locked).
-# - The two mise steps are ci.yml's, word for word (tests/scripts/gates-workflow.test.ts holds them so): a mise file
-#   besides the root mise.toml and mise.lock could change what every later step runs (H-194).
+# - `scan` never runs anything the PR controls. On its own fresh runner and checkout, with no mise, it runs the
+#   mise-file scan, refuses a PR's scanner config, installs gitleaks, OSV-Scanner and zizmor from release URLs whose
+#   sha256 is pinned below (the same versions as the template's mise.toml), and runs them, and the factory-commit
+#   trailer check (H-113's factory half), by absolute path under `env -i` with GIT_NO_REPLACE_OBJECTS=1, each with
+#   the gates' own config. A PR's code runs only in `check`, on another runner, so it can't touch a scan.
+# - `check` runs the caller's own `mise install --locked && mise run check` (its `setup` installs with
+#   `--ignore-scripts`), after ci.yml's two mise steps.
+# - `gates` passes only when both succeeded. It runs even when one failed (`if: always()`): GitHub reports a job
+#   skipped because a needed job failed as a success, which would turn the required check green.
+#
+# Least privilege: `permissions: {}` here and on `gates`, `contents: read` on `scan` and `check`, which the caller
+# grants; no secret is used (zizmor's online audits get the job's read-only token); checkout doesn't keep the token
+# in .git/config. Every action is pinned to a full commit SHA, the tag it was resolved from in a comment (spec
+# §11.7). The mise steps are ci.yml's, word for word (tests/scripts/gates-workflow.test.ts holds them so): a mise
+# file besides the root mise.toml and mise.lock could change what a later step runs (H-194).
 name: gates
 
 on:
@@ -27,8 +33,136 @@ on:
 permissions: {}
 
 jobs:
-  gates:
-    name: gates
+  scan:
+    name: scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      # Each scanner's linux-x64 release and its sha256, from the project's own checksums file (gitleaks'
+      # gitleaks_8.30.1_checksums.txt, OSV-Scanner's osv-scanner_SHA256SUMS) or, for zizmor, which publishes none,
+      # GitHub's release-asset digest (the asset carries GitHub artifact attestations). Versions as the template's
+      # mise.toml pins them.
+      GITLEAKS_URL: https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+      OSV_SCANNER_URL: https://github.com/google/osv-scanner/releases/download/v2.7.0/osv-scanner_linux_amd64
+      OSV_SCANNER_SHA256: 160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b
+      ZIZMOR_URL: https://github.com/zizmorcore/zizmor/releases/download/v1.31.1/zizmor-x86_64-unknown-linux-gnu.tar.gz
+      ZIZMOR_SHA256: d185f726bdaf92df78273217dfdd24ebcd6b0ef48cf3ce776ff5762b6e138c99
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0   # the whole history, for the gitleaks scan and the trailer check
+
+      # mise reads config, tasks and locked tools from more files than mise.toml (.mise.toml,
+      # mise.local.toml, mise.<env>.toml, .config/mise.toml, mise/ and .mise/, mise-tasks/,
+      # .tool-versions, mise.<env>.lock, ...), and a later file overrides mise.toml. mise-action installs
+      # the tools they name and exports the env they set to every later step, so a commit that adds
+      # one could change what this job runs, a check after it included. So this is a plain file
+      # scan, before mise-action, for the names policy/protected_paths.yaml protects, at any depth
+      # and in any case. Only the root mise.toml may configure mise here, and only the root
+      # mise.lock, which locks the tools it names (H-116), may sit beside it.
+      - name: Only the root mise.toml configures mise
+        run: |
+          extra="$(find . -path ./.git -prune -o \( -iname mise.toml -o -iname .mise.toml -o -iname 'mise.*.toml' -o -iname '.mise.*.toml' \
+            -o -iname mise.lock -o -iname 'mise.*.lock' -o -iname mise -o -iname .mise -o -iname mise-tasks -o -iname .mise-tasks \
+            -o -iname .tool-versions \) ! -path ./mise.toml ! -path ./mise.lock -print -prune)"
+          if [[ -n "$extra" ]]; then
+            echo "::error::mise files besides the root mise.toml and mise.lock. Move what is needed into mise.toml and remove:"
+            printf '%s\n' "$extra"
+            exit 1
+          fi
+
+      # The scanners' configs are the gates' own. gitleaks gets an explicit --config (its default rules), and
+      # always reads a root .gitleaksignore whatever --gitleaks-ignore-path says (checked with 8.30.1), so a root
+      # .gitleaks.toml or .gitleaksignore, either of which could allowlist a PR's own secret, is refused. OSV-Scanner
+      # gets an empty --config, which replaces any osv-scanner.toml it would find. zizmor runs with --no-config
+      # --no-ignores. Under env -i, no GITLEAKS_CONFIG, GITLEAKS_CONFIG_TOML or ZIZMOR_CONFIG reaches a scanner.
+      - name: The scanners' configs are the gates' own
+        run: |
+          if [[ -e .gitleaks.toml || -e .gitleaksignore ]]; then
+            echo "::error::a root .gitleaks.toml or .gitleaksignore would change what gitleaks finds. Remove it; the gates scan with gitleaks's own rules."
+            exit 1
+          fi
+          printf '[extend]\nuseDefault = true\n' > "$RUNNER_TEMP/gitleaks.toml"
+          : > "$RUNNER_TEMP/osv-scanner.toml"
+
+      # Each download is checked against the sha256 above before anything is unpacked or run; a mismatch fails the
+      # step. Nothing here reads the checkout: the files go to $RUNNER_TEMP.
+      - name: Install the scanners, each checked against its pinned sha256
+        run: |
+          cd "$RUNNER_TEMP" || exit 1
+          mkdir -p bin dl
+          fetch() {
+            curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "dl/$3" "$1"
+            printf '%s  %s\n' "$2" "dl/$3" | sha256sum -c --strict -
+          }
+          fetch "$GITLEAKS_URL" "$GITLEAKS_SHA256" gitleaks.tar.gz
+          fetch "$OSV_SCANNER_URL" "$OSV_SCANNER_SHA256" osv-scanner
+          fetch "$ZIZMOR_URL" "$ZIZMOR_SHA256" zizmor.tar.gz
+          tar -xzf dl/gitleaks.tar.gz -C bin gitleaks
+          install -m 0755 dl/osv-scanner bin/osv-scanner
+          tar -xzf dl/zizmor.tar.gz -C bin zizmor
+          chmod 0755 bin/gitleaks bin/zizmor
+
+      # The whole history, not just the diff: a secret in any commit stays public even after a later
+      # commit removes it. Inline gitleaks:allow comments are ignored.
+      - name: Scan the whole history for secrets (gitleaks)
+        run: |
+          env -i PATH=/usr/bin:/bin HOME="$RUNNER_TEMP" GIT_NO_REPLACE_OBJECTS=1 \
+            "$RUNNER_TEMP/bin/gitleaks" git --config "$RUNNER_TEMP/gitleaks.toml" --ignore-gitleaks-allow --redact --no-banner --no-color -v .
+
+      - name: Known vulnerabilities in bun.lock (OSV-Scanner)
+        run: |
+          env -i PATH=/usr/bin:/bin HOME="$RUNNER_TEMP" GIT_NO_REPLACE_OBJECTS=1 \
+            "$RUNNER_TEMP/bin/osv-scanner" scan source --config "$RUNNER_TEMP/osv-scanner.toml" --lockfile bun.lock
+
+      # Online, so the impostor-commit and ref-confusion audits run: zizmor needs only a token with contents: read
+      # (zizmor's docs), the job's own, passed by name.
+      - name: Workflow security (zizmor)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          env -i PATH=/usr/bin:/bin HOME="$RUNNER_TEMP" GIT_NO_REPLACE_OBJECTS=1 GH_TOKEN="$GH_TOKEN" \
+            "$RUNNER_TEMP/bin/zizmor" --no-config --no-ignores --format=github .github/workflows
+
+      # A factory PR's every commit carries the run's trailers (spec §13.2), so a commit on a
+      # factory/** branch that no run made, such as one another App or a reviewer pushed, is caught
+      # before merge (H-113). Other branches pass: plan/** is H-237. git runs by absolute path in a
+      # clean environment, as the scanners do.
+      - name: Factory commits carry their trailers
+        if: github.event_name == 'pull_request'
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          case "$HEAD_REF" in
+            factory/*) ;;
+            *) echo "not a factory/** branch: no trailer check"; exit 0 ;;
+          esac
+          git() { env -i PATH=/usr/bin:/bin HOME="$RUNNER_TEMP" GIT_NO_REPLACE_OBJECTS=1 /usr/bin/git "$@"; }
+          shas="$(git rev-list "$BASE_SHA..$HEAD_SHA")"
+          missing=0
+          for sha in $shas; do
+            trailers="$(git log -1 --format='%(trailers:only,unfold)' "$sha")"
+            for key in Work-Order Hapi-Run Trace-Id Agent Model; do
+              if ! grep -Eq "^${key}: *[^[:space:]]" <<< "$trailers"; then
+                echo "::error::$sha has no $key trailer"
+                missing=1
+              fi
+            done
+            if ! grep -Fxq 'Hapi-Lane: factory' <<< "$trailers"; then
+              echo "::error::$sha has no Hapi-Lane: factory trailer"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+  check:
+    name: check
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -37,7 +171,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: 0   # the whole history, for the gitleaks scan and the trailer check
 
       # mise reads config, tasks and locked tools from more files than mise.toml (.mise.toml,
       # mise.local.toml, mise.<env>.toml, .config/mise.toml, mise/ and .mise/, mise-tasks/,
@@ -82,52 +215,21 @@ jobs:
       - name: check
         run: mise install --locked && mise run check
 
-      # The whole history, not just the diff: a secret in any commit stays public even after a later
-      # commit removes it. gitleaks reads a root .gitleaks.toml (its config) and a root .gitleaksignore,
-      # and either could allowlist a PR's own secret, so the step refuses both: the caller's
-      # protected_paths already keep workers off them, and a false positive is fixed in the code, not
-      # here. Inline gitleaks:allow comments are ignored.
-      - name: Scan the whole history for secrets (gitleaks)
+  gates:
+    name: gates
+    needs: [scan, check]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: scan and check both succeeded
+        env:
+          SCAN: ${{ needs.scan.result }}
+          CHECK: ${{ needs.check.result }}
         run: |
-          if [[ -e .gitleaks.toml || -e .gitleaksignore ]]; then
-            echo "::error::a root .gitleaks.toml or .gitleaksignore would change what gitleaks finds. Remove it; the gates scan with gitleaks's own rules."
+          echo "scan: $SCAN, check: $CHECK"
+          if [[ "$SCAN" != success || "$CHECK" != success ]]; then
+            echo "::error::ci / gates needs both ci / scan and ci / check to succeed (scan: $SCAN, check: $CHECK)"
             exit 1
           fi
-          mise exec -- gitleaks git --ignore-gitleaks-allow --redact --no-banner --no-color -v .
-
-      - name: Known vulnerabilities in bun.lock (OSV-Scanner)
-        run: mise exec -- osv-scanner scan source --lockfile bun.lock
-
-      - name: Workflow security (zizmor)
-        run: mise exec -- zizmor --offline --format=github .github/workflows
-
-      # A factory PR's every commit carries the run's trailers (spec §13.2), so a commit on a
-      # factory/** branch that no run made, such as one another App or a reviewer pushed, is caught
-      # before merge (H-113). Other branches pass: plan/** is H-113's other half.
-      - name: Factory commits carry their trailers
-        if: github.event_name == 'pull_request'
-        env:
-          HEAD_REF: ${{ github.head_ref }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          case "$HEAD_REF" in
-            factory/*) ;;
-            *) echo "not a factory/** branch: no trailer check"; exit 0 ;;
-          esac
-          shas="$(git rev-list "$BASE_SHA..$HEAD_SHA")"
-          missing=0
-          for sha in $shas; do
-            trailers="$(git log -1 --format='%(trailers:only,unfold)' "$sha")"
-            for key in Work-Order Hapi-Run Trace-Id Agent Model; do
-              if ! grep -Eq "^${key}: *[^[:space:]]" <<< "$trailers"; then
-                echo "::error::$sha has no $key trailer"
-                missing=1
-              fi
-            done
-            if ! grep -Fxq 'Hapi-Lane: factory' <<< "$trailers"; then
-              echo "::error::$sha has no Hapi-Lane: factory trailer"
-              missing=1
-            fi
-          done
-          exit "$missing"

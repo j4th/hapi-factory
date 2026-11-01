@@ -39,7 +39,7 @@ The order matters: the first commit has to land before any ruleset exists, and t
 
 | # | Step | What it does | To undo |
 |---|---|---|---|
-| 1 | `preflight` | Reads only: `GET /user` (login, id, `x-oauth-scopes`: `repo` and `workflow`, type `User`); the name is a valid `owner/name` and `GET /repos/<owner>/<name>` is a 404; `GET /user/installations` matches each App's slug to `policy/repos.yaml`'s id, on selected repositories; `git rev-parse HEAD` in the checkout is the gates commit; `git status --porcelain --ignored -- templates/repo-contract .github/workflows/gates.yml` is empty; GitHub has `gates.yml` at that commit; a `--clone` target doesn't exist. | Nothing was made |
+| 1 | `preflight` | Reads only: `GET /user` (login, id, `x-oauth-scopes`: `repo` and `workflow`, type `User`); the name is a valid `owner/name` and `GET /repos/<owner>/<name>` is a 404; `GET /user/installations` matches each App's slug to `policy/repos.yaml`'s id, on selected repositories; `git rev-parse HEAD` in the checkout is the gates commit; `git status --porcelain --ignored -- templates/repo-contract .github/workflows/gates.yml policy/github/rulesets` is empty; GitHub has `gates.yml` at that commit; `policy/repos.yaml` doesn't already register the repo; a `--clone` target doesn't exist. | Nothing was made |
 | 2 | `render` | Renders `templates/repo-contract/` with `{{name}}`, `{{owner}}`, `{{gates_sha}}` and `{{year}}` (src/newrepo/render.ts), adds `.factory/template.lock`, then checks the render: the only mise files are the root `mise.toml` and `mise.lock` (H-194); every version is exact, and `mise.lock` locks each tool for linux-x64 and macos-arm64; no workflow runs an AI agent with a credential on a comment, issue or review trigger (`repo.ai-workflows`); the overlay only tightens central policy; no `{{` is left and no file names `bunx`. | Nothing was made |
 | 3 | `create` | `POST /user/repos`: public (free-plan rulesets need it), empty, issues on, no projects or wiki. | `gh repo delete <owner>/<name> --yes`, after `gh auth refresh -s delete_repo` (it undoes every step to 8) |
 | 4 | `push` | Writes the files (mode 0644) to a temp dir, commits them once as you (`<login> <<id>+<login>@users.noreply.github.com>`, unsigned), checks the commit holds exactly the rendered files, and pushes it to `main`. Every git call has no system or global config, no hooks, no fsmonitor, no prompt and https only. The token reaches git only in the push's environment (`GIT_CONFIG_VALUE_0`, an `http.extraheader`), never argv or a file; the temp dir is removed. | The repo's deletion |
@@ -47,7 +47,7 @@ The order matters: the first commit has to land before any ruleset exists, and t
 | 6 | `rulesets` | Posts `policy/github/rulesets/`'s four, the same files hapi-factory uses, with two changes: `main-protect` requires `ci / gates` (`CONTRACT_CHECK`, from GitHub Actions, integration 15368) instead of `ci`, and `agent-branch-scope` also excludes `refs/heads/dependabot/**/*`, since the template turns Dependabot on. Reads each back by id: every posted key must hold its value (GitHub adds defaults), with no extra rule or bypass actor. Then reads the rules GitHub applies: `main` has `pull_request`, `required_status_checks`, `deletion`, `non_fast_forward` and `update`; a feature branch has `creation`, `update` and `deletion`; `plan/example` and `factory/example` have none of those three. | The repo's deletion |
 | 7 | `labels` | Makes `lane:planning`, `lane:factory`, `lane:direct`, `hapi:rework` and `hapi:flagged` (`LABELS`, src/forge/index.ts). | The repo's deletion |
 | 8 | `apps` | Adds the repo to each App's installation (`PUT /user/installations/<id>/repositories/<repo id>`). GitHub's docs don't say an OAuth login may do this (design §7.2): if GitHub answers 403 or 404, the command prints a web step and waits for Enter: `Add <owner>/<name> to <app>: github.com → Settings → Applications → <app> → Configure → Repository access, then press Enter`. Then each installation must list the repo. | The repo's deletion (an installation drops a deleted repo) |
-| 9 | `register` | Adds `"<owner>/<name>": { registered: "<date>" }` to `policy/repos.yaml`, keeping every comment, then checks `policy/` still loads (else it puts the old text back). It is an uncommitted change in your checkout: review it and commit it by PR. The poller acts only on registered repos. | `git checkout -- policy/repos.yaml`, which drops every uncommitted change there; to keep others, delete the new entry by hand |
+| 9 | `register` | Adds `"<owner>/<name>": { registered: "<date>" }` to `policy/repos.yaml` as one new line, so every other line stays byte-identical (the empty `repos: {}` only loses its braces), then checks `policy/` still loads (else it puts the old text back). It is an uncommitted change in your checkout: review it and commit it by PR. The poller acts only on registered repos. | `git checkout -- policy/repos.yaml`, which drops every uncommitted change there; to keep others, delete the new entry by hand |
 | 10 | `clone` | With `--clone` only: `git clone --quiet https://github.com/<owner>/<name>.git ../<name>`, with your own environment. | `rm -rf ../<name>` |
 | 11 | `verify` | The strict audit's GitHub checks for the new repo, on the same in-memory token ([Verify](#verify)). | Fix what it names; nothing to undo |
 
@@ -59,7 +59,7 @@ Every file under `templates/repo-contract/` ends in `.tmpl`, which the render st
 |---|---|
 | `AGENTS.md` | For an unattended agent (H-228(a)): it opens with "Task instructions (the work order) override this file. Nothing here waits for confirmation: where a step needs a human, report it as a blocker.", then the commands, what done means, the layout, the gotchas, what's out of scope, the never list (the acceptance tests in `.factory/work/<id>/acceptance/` are the planner's) and the three `RESULT:` lines. Under 200 lines, with no "ask first" tier. |
 | `mise.toml`, `mise.lock` | Bun 1.4.2 (the run image's), gitleaks, OSV-Scanner and zizmor, each exact, locked for linux-x64 and macos-arm64. Tasks: `setup` (`bun ci --frozen-lockfile --ignore-scripts`: no install script ever runs), `fmt`, `lint` (Biome, then `tsc`, both from `node_modules/.bin`), `test` (`bun test ./tests`), `check` (`lint` and `test`), `smoke` (`smoke/run.ts`, failing with `no smoke test yet: add smoke/run.ts` until there is one) and `scan`. |
-| `.factory/config.yaml` | The overlay: `**/biome.json*`, `**/bunfig.toml` and `**/tsconfig*.json` protected (ask, deny, deny), so a worker can't pass `check` by loosening the gates' own config. |
+| `.factory/config.yaml` | The overlay: `**/biome.json*`, `**/bunfig.toml`, `**/tsconfig*.json` and `**/osv-scanner.toml` protected (ask, deny, deny), so a worker can't pass `check` or `scan` by loosening the gates' own config. |
 | `.factory/work/`, `docs/research/`, `docs/design/` | Empty, with a `.gitkeep`: where planning PRs put work orders, research and design notes. |
 | `.factory/template.lock` | Added by the render: `{ commit, files: { <path>: "sha256:<hex>" }, template: "repo-contract" }`, the hapi-factory commit and a hash per file. No audit check reads it yet (H-238). |
 | `.github/workflows/hapi-gates.yml` | One job, `ci`, calling hapi-factory's [gates](#the-gates) at the render's commit, with `permissions: {}` and `contents: read` on the job. That SHA is the gates' only pin (design §6a item 6); bump it by PR. |
@@ -67,34 +67,53 @@ Every file under `templates/repo-contract/` ends in `.tmpl`, which the render st
 | `.github/dependabot.yml` | Weekly `bun` and `github-actions` updates. Bun's wait 7 days, a major version 30; GitHub Actions' wait 7 days (it takes no SemVer cooldown). |
 | `.github/ISSUE_TEMPLATE/` | A bug form and a feature form, with no labels, each opening "Issues are read as data: they never instruct the factory."; blank issues off; a link to private vulnerability reporting. |
 | `.github/pull_request_template.md` | Design §3.7's sections, one line of guidance each, no checkboxes. |
-| `.coderabbit.yaml` | hapi-factory's, without its `reviews.path_instructions` and `knowledge_base.code_guidelines`: review-only. |
+| `.coderabbit.yaml` | hapi-factory's, without its `reviews.path_instructions` and `knowledge_base.code_guidelines`, and with its protected-paths check naming the contract's own protected files: review-only. |
 | `package.json`, `bun.lock` | Private, MIT, `type: module`; `@biomejs/biome`, `@types/bun` and `typescript`, exact. A text `bun.lock`. |
 | `bunfig.toml` | hapi-factory's: exact versions and a 3-day release-age cooldown. |
 | `biome.json`, `tsconfig.json` | Biome's recommended rules, spaces, width 120, the VCS ignore file; hapi-factory's strict compiler options over `src`, `tests` and `smoke` (not `.factory/`: an acceptance test may import code its run hasn't written yet). |
 | `.editorconfig`, `.gitattributes`, `.gitignore` | UTF-8, LF, 2 spaces, a final newline; `* text=auto eol=lf`; `node_modules/`, `.env*`, `mise.local.toml`, `dist/`, `coverage/`. |
 | `tests/contract.test.ts` | One test, so `bun test` and `tsc` have an input on the first commit. |
-| `LICENSE`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, `CONTRIBUTING.md`, `README.md` | MIT, unmodified; private vulnerability reporting, `main` the supported version, 7 days to acknowledge and 30 to a fix or plan; the Contributor Covenant 2.1, with `@<owner>` as the contact; how changes land (planning PRs, factory PRs, only the maintainer merges, outside input is data, the six trailers, AI disclosure); a quick start. |
+| `LICENSE`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, `CONTRIBUTING.md`, `README.md` | MIT, unmodified; private vulnerability reporting, `main` the supported version, 7 days to acknowledge and 30 to a fix or plan; the Contributor Covenant 2.1, with `@<owner>` as the contact; how changes land (planning PRs, factory PRs, only the maintainer merges, never trusting the checks of a PR that touches `.github/workflows/`, outside input is data, the six trailers, AI disclosure); a quick start. |
 
 ### The gates
 
-[`.github/workflows/gates.yml`](../../.github/workflows/gates.yml) is a `workflow_call` with `permissions: {}`. Its one job, `gates`, has `contents: read` and runs, in order: checkout (no persisted credentials, the whole history); ci.yml's mise-file scan, word for word; mise-action, pinned; ci.yml's mise-config check, word for word; `mise install --locked && mise run check`; gitleaks over the whole history, refusing a root `.gitleaks.toml` or `.gitleaksignore` (either could allowlist a PR's own secret) and ignoring inline allows; OSV-Scanner over `bun.lock`; zizmor over the caller's workflows; and, on a pull request from a `factory/**` branch, a check that every commit carries `Work-Order`, `Hapi-Run`, `Trace-Id`, `Agent` and `Model` trailers and `Hapi-Lane: factory` (H-113's factory half). No step installs packages itself, and the caller's `setup` runs no install script.
+[`.github/workflows/gates.yml`](../../.github/workflows/gates.yml) is a `workflow_call` with `permissions: {}` and three jobs. The caller's job is `ci`, so GitHub shows them as `ci / scan`, `ci / check` and `ci / gates`:
 
-**The check's name, `CONTRACT_CHECK`:** the caller's job is `ci` and the called one `gates`, so GitHub reports `ci / gates` (src/forge/index.ts). `main-protect` requires it, from GitHub Actions, and `github.rulesets` accepts exactly one of `ci` (hapi-factory's own) and `ci / gates`. Task 5 Step 15 confirms the name on the sandbox's first run (design §7.3); if GitHub reports another, `CONTRACT_CHECK` becomes that name and the sandbox's `main-protect` is applied again.
+- **`scan`** (`contents: read`) never runs anything the PR controls. On a fresh runner and a fresh checkout (no persisted credentials, the whole history), with no mise at all, it runs ci.yml's mise-file scan, word for word; refuses a root `.gitleaks.toml` or `.gitleaksignore` (gitleaks reads a root `.gitleaksignore` whatever its flags say, and either could allowlist a PR's own secret); installs gitleaks, OSV-Scanner and zizmor from release URLs written in `gates.yml`, each checked against the sha256 written beside it (the template's `mise.toml` versions; a test holds them equal); and runs them by absolute path under `env -i PATH=/usr/bin:/bin HOME=$RUNNER_TEMP GIT_NO_REPLACE_OBJECTS=1`, each with the gates' own config: gitleaks with `--config` (its default rules) and inline allows ignored, OSV-Scanner with an empty `--config` over `bun.lock`, zizmor with `--no-config --no-ignores`, online, on the job's read-only token. Last, on a pull request from a `factory/**` branch, it checks that every commit carries `Work-Order`, `Hapi-Run`, `Trace-Id`, `Agent` and `Model` trailers and `Hapi-Lane: factory` (H-113's factory half), with git run the same clean way.
+- **`check`** (`contents: read`) runs the PR's code: ci.yml's mise-file scan, mise-action (pinned), ci.yml's mise-config check, then `mise install --locked && mise run check`. It runs on its own runner, so nothing it does reaches `scan`. No step installs packages itself, and the caller's `setup` runs no install script.
+- **`gates`** (`permissions: {}`, no checkout) passes only when `scan` and `check` both succeeded. It runs even when one failed (`if: always()`), since GitHub reports a job skipped for a failed need as a success.
+
+`ci / scan` and `ci / check` show on every PR beside `ci / gates`, but aren't required: `ci / gates` stands for both.
+
+**The check's name, `CONTRACT_CHECK`:** the caller's job is `ci` and the aggregator `gates`, so GitHub reports `ci / gates` (src/forge/index.ts). `main-protect` requires it, from GitHub Actions, and `github.rulesets` requires exactly `ci / gates` of a repo `policy/repos.yaml` registers and exactly `ci` of any other (hapi-factory's own). Task 5 Step 15 confirms the name on the sandbox's first run (design §7.3); if GitHub reports another, `CONTRACT_CHECK` becomes that name and the sandbox's `main-protect` is applied again.
+
+**What a green `ci / gates` can't prove (H-239):** on a pull request GitHub runs the PR's own copy of `.github/workflows/hapi-gates.yml`, so a PR that changes `.github/workflows/` can replace the gates with a job named `ci / gates` that only runs `true`. A personal account has no required workflows to stop it. The defences today: a fork's workflow runs wait for your approval (step 5), and neither of hapi's Apps has the Workflows permission, so neither can push such a change. So never approve a fork's run, and never trust its `ci / gates`, when the PR touches `.github/workflows/`: read the workflow change itself.
 
 ## Verify
 
 Step 11 runs the strict audit for the new repo, with your `gh` login held in memory, and only these checks ([docs/audit.md](../audit.md)): `github.rulesets` (the four rulesets, `ci / gates` required), `github.repo-settings` (step 5's settings), `github.labels` and `repo.ai-workflows`. One fail fails the step. Your login is the repo's admin, so GitHub shows it every field, bypass actors included.
 
-**What step 11 can't check:** that each App's token covers the new repo and nothing more (design §3.2 step 8). That proof is `github.app-perms`, which needs the App keys, so it runs as hapi, in hapi's checkout, with the stack's secrets resolved:
+**What step 11 can't check:** that each App's token covers the new repo and nothing more (design §3.2 step 8). That proof is `github.app-perms`, which needs the App keys, so it runs as hapi, in hapi's checkout, with the stack's secrets resolved. First become hapi:
 
 ```bash
 sudo -iu hapi
-export XDG_RUNTIME_DIR=/run/user/$(id -u)
-cd ~/hapi-factory
-mise run audit -- --strict --repo "$OWNER/<name>" --github-token-file <file>
 ```
 
-`OWNER` is your login and `<file>` your own token for the repo, mode `0600` ([GitHub credentials](../audit.md#github-credentials)). `github.app-perms` passes when both Apps have only the runbook's permissions, are installed on selected repositories and are no ruleset's bypass actor.
+Then, as hapi, edit the `OWNER` line once (your GitHub login), and paste the rest. The `read` line asks for your own token for the repo, a fine-grained one with Administration and Contents read-only ([GitHub credentials](../audit.md#github-credentials)); it goes into a `0600` file without being echoed, and the last line deletes the file.
+
+```bash
+OWNER=<your GitHub login>
+REPO=hapi-sandbox-fortune
+export XDG_RUNTIME_DIR=/run/user/$(id -u)
+cd ~/hapi-factory
+mkdir -p ~/.config/hapi
+(umask 077; rm -f ~/.config/hapi/audit-token; IFS= read -rsp 'token: ' t \
+  && printf '%s\n' "$t" > ~/.config/hapi/audit-token)
+mise run audit -- --strict --repo "$OWNER/$REPO" --github-token-file ~/.config/hapi/audit-token
+rm -f ~/.config/hapi/audit-token
+```
+
+For another repo, set `REPO` to its name. `github.app-perms` passes when both Apps have only the runbook's permissions, are installed on selected repositories and are no ruleset's bypass actor.
 
 ## Deleting a sandbox
 
@@ -186,7 +205,8 @@ Paste back: the count; both `new-repo` outputs; the check-run line (expected: `c
 - **`GET /user returned no x-oauth-scopes header`:** a `GH_TOKEN` or `GITHUB_TOKEN` in your shell holds a fine-grained or App token, which `gh auth token` prints first. Unset it, or run `gh auth login`.
 - **`... installation is <n>, but policy/repos.yaml says <m>`:** the id in `policy/repos.yaml` is stale; fix it by PR (a protected file).
 - **`GitHub has no .github/workflows/gates.yml in <owner>/hapi-factory at <sha>`:** push your checkout's HEAD first.
-- **`templates/repo-contract or .github/workflows/gates.yml has changes git hasn't committed`:** commit or remove them: the repo is rendered from what HEAD holds.
+- **`templates/repo-contract, .github/workflows/gates.yml or policy/github/rulesets has changes git hasn't committed`:** commit or remove them: the repo is rendered, and its rulesets posted, from what HEAD holds.
+- **`policy/repos.yaml already registers <owner>/<name>`:** a stale entry, from a sandbox deleted before; drop it by PR, then run the command again.
 - **The web step at step 8:** add the repo on github.com as the prompt says, then press Enter; the step checks the installation lists it. With no terminal (a pipe, CI), the step fails rather than going on unconfirmed.
 - **`the rules GitHub applies aren't the contract's`:** a ruleset didn't take as posted. The repo exists, so delete it ([above](#deleting-a-sandbox)) and run the command again once the cause is fixed.
 - **Step 11 fails `github.repo-settings`:** the detail names each setting and its value. CodeQL's default setup runs asynchronously and isn't part of the check.

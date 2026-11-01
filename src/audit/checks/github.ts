@@ -253,8 +253,6 @@ const ADMIN_PR_ONLY = [{ actor_id: 5, actor_type: "RepositoryRole", bypass_mode:
 const ADMIN_ALWAYS = [{ actor_id: 5, actor_type: "RepositoryRole", bypass_mode: "always" }];
 /** GitHub Actions' integration id: only Actions can satisfy the ci check. */
 const ACTIONS = 15368;
-/** The one required check a repo's main may name: hapi-factory's own `ci`, or `ci / gates` in a repo made from the contract. */
-const GATE_CHECKS: readonly string[] = ["ci", CONTRACT_CHECK];
 
 /**
  * The branch and tag scope rulesets (AC-8), as docs/runbooks/github-apps.md sets them. `mayExclude` is what the
@@ -316,16 +314,20 @@ export async function githubRulesets(run: AuditRun): Promise<CheckResult[]> {
       problems.push("main has no pull_request rule with required_approving_review_count ≥ 1");
     }
     const checks = of("required_status_checks").flatMap((r) => (Array.isArray(r.parameters?.required_status_checks) ? (r.parameters!.required_status_checks as Record<string, unknown>[]) : []));
-    // Exactly one gate check: `ci`, or `ci / gates` (CONTRACT_CHECK) in a repo made from the contract.
-    const gates = checks.filter((c) => GATE_CHECKS.includes(String(c.context)));
-    const gate = gates.length === 1 ? String(gates[0]!.context) : undefined;
-    if (gates.length === 0) problems.push(`main has no required_status_checks rule with the gate check (ci, or ${CONTRACT_CHECK} in a repo made from the contract)`);
-    else if (gates.length > 1) problems.push(`main requires ${gates.length} gate checks (${gates.map((c) => String(c.context)).join(", ")}): exactly one of ci and ${CONTRACT_CHECK}`);
-    else if (gates[0]!.integration_id !== ACTIONS) problems.push(`main's ${gate} check isn't tied to GitHub Actions (integration_id ${ACTIONS}), so another integration could satisfy it`);
+    // Exactly one gate check: `ci / gates` (CONTRACT_CHECK) in a repo policy/repos.yaml registers, which new-repo made
+    // from the contract; `ci` in any other, hapi-factory's own included.
+    const registered = (await registeredRepos(run)).has(name.toLowerCase());
+    const gate = registered ? CONTRACT_CHECK : "ci";
+    const gates = checks.filter((c) => c.context === gate);
+    if (gates.length === 0) {
+      problems.push(
+        `main has no required_status_checks rule with the ${gate} check (${registered ? "the contract's: the repo is registered in policy/repos.yaml" : `the check of a repo policy/repos.yaml doesn't register; a registered one requires ${CONTRACT_CHECK}`})`,
+      );
+    } else if (gates.some((c) => c.integration_id !== ACTIONS)) problems.push(`main's ${gate} check isn't tied to GitHub Actions (integration_id ${ACTIONS}), so another integration could satisfy it`);
     // Only the gate check gates a merge. A third-party App's check (CodeRabbit's, spec §9.6) is never a required one:
     // an advisory reviewer that could block or, once green, stand in for a gate.
-    const others = [...new Set(checks.filter((c) => !GATE_CHECKS.includes(String(c.context))).map((c) => String(c.context)))];
-    if (others.length > 0) problems.push(`main requires status checks other than ci or ${CONTRACT_CHECK} (${others.join(", ")}): only GitHub Actions' gate check gates a merge, and no third-party reviewer's check, such as CodeRabbit's, is ever a required one`);
+    const others = [...new Set(checks.filter((c) => c.context !== gate).map((c) => String(c.context)))];
+    if (others.length > 0) problems.push(`main requires status checks other than ${gate} (${others.join(", ")}): only GitHub Actions' ${gate} gates a merge, and no third-party reviewer's check, such as CodeRabbit's, is ever a required one`);
     for (const t of ["deletion", "non_fast_forward"]) if (of(t).length === 0) problems.push(`main has no ${t} rule`);
 
     const onMain = new Set(rules.map((r) => r.ruleset_id));
@@ -566,23 +568,16 @@ export async function githubLabels(run: AuditRun): Promise<CheckResult[]> {
         out.push(result(id, "skip", `${name}: ${cred.none}`));
         continue;
       }
-      const have = new Set<string>();
-      let hidden = false;
-      for (let page = 1; page <= 10; page++) {
-        const path = `${repoPath(repo)}/labels?per_page=100&page=${page}`;
-        const r = await get(run, path, cred.token);
-        if (page === 1 && (r.status === 403 || r.status === 404)) {
-          hidden = true;
-          break;
-        }
-        if (r.status !== 200 || !Array.isArray(r.json)) throw new Error(`GitHub: GET ${repoPath(repo)}/labels: HTTP ${r.status}${ghMessage(r.json)}`);
-        for (const l of r.json) if (typeof asRecord(l)?.name === "string") have.add((asRecord(l)!.name as string).toLowerCase());
-        if (r.json.length < 100) break;
-      }
-      if (hidden) {
+      let labels: unknown[];
+      try {
+        labels = await getAll(run, `${repoPath(repo)}/labels`, cred.token);
+      } catch (e) {
+        // A list GitHub refuses to this credential is a gap, not a finding.
+        if (!/: HTTP (403|404)\b/.test((e as Error).message)) throw e;
         out.push(result(id, "skip", `${name}: the labels aren't visible with ${cred.via}; pass --github-token-file with the operator's token`));
         continue;
       }
+      const have = new Set(labels.map((l) => asRecord(l)?.name).filter((n): n is string => typeof n === "string").map((n) => n.toLowerCase()));
       const missing = LABELS.map((l) => l.name).filter((l) => !have.has(l.toLowerCase()));
       if (missing.length > 0) out.push(result(id, "fail", `${name}: ${missing.map((l) => `no label ${l}`).join("; ")}. Make them as hapi new-repo does (docs/runbooks/new-repo.md)`));
       else out.push(result(id, "pass", `${name}: has the labels the factory reads (${LABELS.map((l) => l.name).join(", ")}) (read with ${cred.via})`));

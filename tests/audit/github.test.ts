@@ -69,7 +69,7 @@ describe("github.rulesets", () => {
     ["no ci check", mutate((r) => (named(r, "main-protect").rules = named(r, "main-protect").rules.filter((x: any) => x.type !== "required_status_checks"))), "ci"],
     ["ci from any integration", mutate((r) => (named(r, "main-protect").rules[2].parameters.required_status_checks = [{ context: "ci" }])), "15368"],
     // CodeRabbit's App id is 347564; its check run is named "CodeRabbit".
-    ["a third-party reviewer's check required too", mutate((r) => named(r, "main-protect").rules[2].parameters.required_status_checks.push({ context: "CodeRabbit", integration_id: 347564 })), "other than ci or ci / gates (CodeRabbit)"],
+    ["a third-party reviewer's check required too", mutate((r) => named(r, "main-protect").rules[2].parameters.required_status_checks.push({ context: "CodeRabbit", integration_id: 347564 })), "other than ci (CodeRabbit)"],
     ["CodeRabbit as a bypass actor", mutate((r) => named(r, "main-review").bypass_actors.push({ actor_id: 347564, actor_type: "Integration", bypass_mode: "pull_request" })), "Integration"],
     ["a bypass on the ci ruleset", mutate((r) => named(r, "main-protect").bypass_actors.push({ actor_id: 5, actor_type: "RepositoryRole", bypass_mode: "always" })), "main-protect holds required_status_checks and has bypass actors"],
     ["no Restrict updates on main-review", mutate((r) => (named(r, "main-review").rules = named(r, "main-review").rules.filter((x: any) => x.type !== "update"))), "main-review has no update"],
@@ -534,21 +534,24 @@ describe("repo.ai-workflows", () => {
 describe("github.rulesets and the contract's check", () => {
   const withContexts = (contexts: { context: string; integration_id?: number }[]) =>
     mutate((r) => (named(r, "main-protect").rules[2].parameters.required_status_checks = contexts));
+  const ci = { context: "ci", integration_id: 15368 };
+  const gates = { context: "ci / gates", integration_id: 15368 };
 
-  test("github.rulesets accepts exactly one required check, ci or ci / gates, from GitHub Actions", async () => {
-    for (const context of ["ci", "ci / gates"]) {
-      const r = await run(await withToken({ rulesets: withContexts([{ context, integration_id: 15368 }]) }));
-      expect([context, r.rulesets.status]).toEqual([context, "pass"]);
-      expect(r.rulesets.detail).toContain(`main requires only the ${context} check, from GitHub Actions`);
-    }
-    for (const [contexts, says] of [
-      [[{ context: "ci", integration_id: 15368 }, { context: "ci / gates", integration_id: 15368 }], "main requires 2 gate checks (ci, ci / gates): exactly one of ci and ci / gates"],
-      [[{ context: "ci / gates", integration_id: 347564 }], "main's ci / gates check isn't tied to GitHub Actions (integration_id 15368)"],
-      [[{ context: "ci / gates" }], "main's ci / gates check isn't tied to GitHub Actions (integration_id 15368)"],
-      [[{ context: "gates", integration_id: 15368 }], "main has no required_status_checks rule with the gate check (ci, or ci / gates in a repo made from the contract)"],
+  test("a repo policy/repos.yaml registers must require exactly ci / gates; any other repo exactly ci, from GitHub Actions", async () => {
+    for (const [registered, contexts, status, says] of [
+      [false, [ci], "pass", "main requires only the ci check, from GitHub Actions"],
+      [false, [gates], "fail", "main has no required_status_checks rule with the ci check"],
+      [false, [ci, gates], "fail", "main requires status checks other than ci (ci / gates)"],
+      [true, [gates], "pass", "main requires only the ci / gates check, from GitHub Actions"],
+      [true, [ci], "fail", "main has no required_status_checks rule with the ci / gates check (the contract's: the repo is registered in policy/repos.yaml)"],
+      [true, [ci, gates], "fail", "main requires status checks other than ci / gates (ci)"],
+      [true, [{ context: "ci / gates", integration_id: 347564 }], "fail", "main's ci / gates check isn't tied to GitHub Actions (integration_id 15368)"],
+      [true, [{ context: "ci / gates" }], "fail", "main's ci / gates check isn't tied to GitHub Actions (integration_id 15368)"],
     ] as const) {
-      const r = await run(await withToken({ rulesets: withContexts([...contexts]) }));
-      expect([contexts, r.rulesets.status]).toEqual([contexts, "fail"]);
+      const w = await withToken({ rulesets: withContexts([...contexts]) });
+      if (registered) w.ctx.policyDir = registeredPolicy();
+      const r = await run(w);
+      expect([registered, contexts, r.rulesets.status]).toEqual([registered, contexts, status]);
       expect(r.rulesets.detail).toContain(says);
     }
   });
@@ -610,6 +613,17 @@ describe("github.repo-settings and github.labels: the contract's settings, for a
     expect((await checks(w)).settings.status).toBe("fail");
   });
 
+  test("github.labels skips when GitHub refuses the list to the credential, and fails on any other error", async () => {
+    let w = await registered();
+    w.routes[`GET ${API}/repos/${OWNER}/${NAME}/labels?per_page=100&page=1`] = { status: 403, body: { message: "Resource not accessible by integration" } };
+    let r = await checks(w);
+    expect([r.labels.status, r.labels.detail]).toEqual(["skip", `${OWNER}/${NAME}: the labels aren't visible with the operator's token (--github-token-file); pass --github-token-file with the operator's token`]);
+    w = await registered();
+    w.routes[`GET ${API}/repos/${OWNER}/${NAME}/labels?per_page=100&page=1`] = { status: 500, body: { message: "boom" } };
+    r = await checks(w);
+    expect([r.labels.status, r.labels.detail]).toEqual(["fail", `${OWNER}/${NAME}: GitHub: GET /repos/${OWNER}/${NAME}/labels: HTTP 500: boom`]);
+  });
+
   test("github.labels fails a registered repo that lacks a label", async () => {
     const r = await checks(await registered({ labels: LABEL_NAMES.filter((l) => l !== "hapi:flagged") }));
     expect(r.labels.status).toBe("fail");
@@ -632,7 +646,7 @@ describe("github.repo-settings and github.labels: the contract's settings, for a
 
 describe("the audit for new-repo: an in-memory token and only the checks asked for", () => {
   test("githubToken is the credential, never printed, and wins over a token file", async () => {
-    const w = await withToken();
+    const w = await withToken({ rulesets: mutate((r) => (named(r, "main-protect").rules[2].parameters.required_status_checks = [{ context: "ci / gates", integration_id: 15368 }])) });
     w.ctx.policyDir = registeredPolicy();
     w.ctx.githubToken = "fake-gh-login-token";
     w.ctx.only = ["github.rulesets", "github.repo-settings", "github.labels", "repo.ai-workflows"];

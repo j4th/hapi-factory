@@ -6,8 +6,9 @@
  * The eleven steps, in this order (the order matters):
  *  1. preflight: reads only. The login has the `repo` and `workflow` scopes and is a personal account; the name is
  *     valid and free; hapi-planner and hapi-factory are installed on selected repositories only, with the ids
- *     policy/repos.yaml records (and CodeRabbit's, if it records one); the checkout's HEAD is the gates commit, its
- *     template and gates.yml are committed, and GitHub has gates.yml at that commit; a --clone target is free.
+ *     policy/repos.yaml records (and CodeRabbit's, if it records one), which doesn't register the repo yet; the
+ *     checkout's HEAD is the gates commit, its template, gates.yml and rulesets are committed, and GitHub has gates.yml
+ *     at that commit; a --clone target is free.
  *  2. render: templates/repo-contract, then the checks of `contractProblems` (H-194, exact versions, mise.lock,
  *     repo.ai-workflows, the overlay only tightening).
  *  3. create: the repo, public and empty, issues on.
@@ -32,7 +33,7 @@
 import { lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
-import { isMap, isScalar, parseDocument, Scalar } from "yaml";
+import { parseDocument } from "yaml";
 import { defaultExec, type runAudit } from "../audit/index";
 import { parseOwnerRepo } from "../forge/github/app-token";
 import { authedGit } from "../forge/github/git";
@@ -159,7 +160,9 @@ async function preflight(c: Ctx): Promise<StepResult> {
   if (taken.status === 200) throw new Error(`${c.full} already exists`);
   if (taken.status !== 404) throw new Error(`GET /repos/${c.full}: HTTP ${taken.status}${ghMessage(taken.json)}`);
 
-  const ids = loadPolicy(join(d.root, "policy")).repos.installations;
+  const registry = loadPolicy(join(d.root, "policy")).repos;
+  const ids = registry.installations;
+  if (Object.keys(registry.repos).some((k) => k.toLowerCase() === c.full.toLowerCase())) throw new Error(`policy/repos.yaml already registers ${c.full}: drop the stale entry by PR first`);
   const listed = (await paginate(d.fetch, "/user/installations", c.token, (j) => asRecord(j)?.installations as unknown[] | undefined)).map(asRecord);
   const notes: string[] = [];
   const find = (slug: string, want: number) => {
@@ -185,8 +188,8 @@ async function preflight(c: Ctx): Promise<StepResult> {
   const head = (await git(c, d.root, ["rev-parse", "HEAD"])).trim();
   if (!/^[0-9a-f]{40}$/.test(head)) throw new Error(`git rev-parse HEAD in ${d.root} printed no commit`);
   c.gatesSha = head;
-  const dirty = (await git(c, d.root, ["status", "--porcelain", "--ignored", "--", TEMPLATE_DIR, ".github/workflows/gates.yml"])).trim();
-  if (dirty !== "") throw new Error(`templates/repo-contract or .github/workflows/gates.yml has changes git hasn't committed (${dirty.split("\n")[0]!.trim()}): new-repo renders the template HEAD holds, so commit or remove them first`);
+  const dirty = (await git(c, d.root, ["status", "--porcelain", "--ignored", "--", TEMPLATE_DIR, ".github/workflows/gates.yml", "policy/github/rulesets"])).trim();
+  if (dirty !== "") throw new Error(`templates/repo-contract, .github/workflows/gates.yml or policy/github/rulesets has changes git hasn't committed (${dirty.split("\n")[0]!.trim()}): new-repo uses what HEAD holds, so commit or remove them first`);
   const gates = await rest(d.fetch, "GET", `/repos/${c.owner}/hapi-factory/contents/.github/workflows/gates.yml?ref=${head}`, c.token);
   if (gates.status === 404) throw new Error(`GitHub has no .github/workflows/gates.yml in ${c.owner}/hapi-factory at ${short(head)}: push this checkout's HEAD first, since the new repo's hapi-gates.yml calls the gates at that commit`);
   if (gates.status !== 200) throw new Error(`GET /repos/${c.owner}/hapi-factory/contents/.github/workflows/gates.yml: HTTP ${gates.status}${ghMessage(gates.json)}`);
@@ -340,31 +343,44 @@ async function apps(c: Ctx): Promise<StepResult> {
   return done(`${c.full} added to ${adding.map((a) => `${a.slug} (${a.id})`).join(", ")}, and each installation lists it${skipped}`);
 }
 
-/** policy/repos.yaml with `full` registered on `date`, its comments kept: `repos: {}` becomes a block map, with its note still on the `repos:` line. */
-export function registerText(text: string, full: string, date: string): string {
+/** The repos map of policy/repos.yaml's text, as plain data, or undefined if the text has none. */
+function reposOf(text: string): Record<string, unknown> | undefined {
   const doc = parseDocument(text);
   if (doc.errors.length > 0) throw new Error(`policy/repos.yaml doesn't parse: ${doc.errors[0]!.message}`);
-  const contents = doc.contents;
-  const pair = isMap(contents) ? contents.items.find((p) => isScalar(p.key) && p.key.value === "repos") : undefined;
-  if (pair === undefined || !isMap(pair.value) || !isScalar(pair.key)) throw new Error("policy/repos.yaml has no repos map");
-  const repos = pair.value;
-  const lineNote = /^repos:[ \t]*(?:\{\}[ \t]*)?#(.*)$/m.exec(text)?.[1];
-  if (repos.flow) {
-    repos.flow = false;
-    if (typeof repos.comment === "string") {
-      pair.key.comment = repos.comment;
-      repos.comment = null;
-    }
-  } else if (lineNote !== undefined && repos.commentBefore === lineNote) {
-    pair.key.comment = lineNote;
-    repos.commentBefore = null;
+  return asRecord(asRecord(doc.toJS())?.repos);
+}
+
+/**
+ * policy/repos.yaml with `"<full>": { registered: "<date>" }` added as one new line, so every other line stays
+ * byte-identical: it goes after the last line of a block `repos:` map, or, for the empty `repos: {}`, right after
+ * that line, whose `{}` becomes two spaces (its note keeps its column). Any other layout of `repos` is refused (add
+ * the entry by hand), as is a repo already registered. The result is parsed back: it must hold exactly the old
+ * data plus the new entry.
+ */
+export function registerText(text: string, full: string, date: string): string {
+  const before = reposOf(text);
+  if (before === undefined) throw new Error("policy/repos.yaml has no repos map");
+  if (Object.keys(before).some((k) => k.toLowerCase() === full.toLowerCase())) throw new Error(`policy/repos.yaml already registers ${full}`);
+  const lines = text.split("\n");
+  const at = lines.findIndex((l) => /^repos:/.test(l));
+  const entry = `${JSON.stringify(full)}: { registered: ${JSON.stringify(date)} }`;
+  const empty = at < 0 ? null : /^repos:([ \t]*)\{\}(.*)$/.exec(lines[at]!);
+  if (at >= 0 && empty !== null) {
+    lines[at] = `repos:${empty[1]}  ${empty[2]}`.replace(/[ \t]+$/, "");
+    lines.splice(at + 1, 0, `  ${entry}`);
+  } else if (at >= 0 && /^repos:[ \t]*(#.*)?$/.test(lines[at]!)) {
+    let last = at;
+    for (let i = at + 1; i < lines.length && (lines[i] === "" || /^[ \t]/.test(lines[i]!)); i++) if (lines[i]!.trim() !== "") last = i;
+    const indent = lines.slice(at + 1, last + 1).find((l) => l.trim() !== "" && !l.trim().startsWith("#"))?.match(/^[ \t]+/)?.[0] ?? "  ";
+    lines.splice(last + 1, 0, `${indent}${entry}`);
+  } else throw new Error("policy/repos.yaml's repos isn't `repos: {}` or a block map at the top level: add the entry by hand");
+  const out = lines.join("\n");
+  const after = reposOf(out);
+  const want = { ...before, [full]: { registered: date } };
+  if (JSON.stringify(after) !== JSON.stringify(want) || JSON.stringify({ ...(parseDocument(out).toJS() as object), repos: null }) !== JSON.stringify({ ...(parseDocument(text).toJS() as object), repos: null })) {
+    throw new Error("policy/repos.yaml didn't read back as the old registry plus the new entry: add the entry by hand");
   }
-  const registered = new Scalar(date);
-  registered.type = "QUOTE_DOUBLE";
-  const entry = doc.createNode({ registered });
-  entry.flow = true;
-  doc.setIn(["repos", full], entry);
-  return String(doc);
+  return out;
 }
 
 async function register(c: Ctx): Promise<StepResult> {

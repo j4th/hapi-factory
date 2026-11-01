@@ -4,7 +4,7 @@
  * failed step's report, the App web step, the registration, --clone and the verify step. No network, no real token.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { CONTRACT_CHECK, LABELS } from "../../src/forge/index";
 import { STEPS, newRepo, type NewRepoOptions, registerText } from "../../src/newrepo/steps";
@@ -179,7 +179,7 @@ describe("new-repo refuses before any write", () => {
     ],
     ["an installation id that policy doesn't name", { policyInstallations: { planner: 11, factory: 99, coderabbit: 13 } }, "hapi-factory's installation is 12, but policy/repos.yaml says 99"],
     ["an App that isn't installed", { installations: [{ id: 12, app_slug: "hapi-factory", repository_selection: "selected" }] }, "hapi-planner isn't installed on example-owner's account"],
-    ["a dirty templates/", { dirtyTemplates: true }, "templates/repo-contract or .github/workflows/gates.yml has changes git hasn't committed"],
+    ["a dirty templates/", { dirtyTemplates: true }, "templates/repo-contract, .github/workflows/gates.yml or policy/github/rulesets has changes git hasn't committed"],
     ["gates.yml not on GitHub at HEAD", { gatesOnGitHub: false }, `GitHub has no .github/workflows/gates.yml in ${OWNER}/hapi-factory at ${GATES.slice(0, 7)}`],
   ] as const) {
     test(what, async () => {
@@ -192,6 +192,22 @@ describe("new-repo refuses before any write", () => {
       expect(w.out).toContain("Done so far: nothing");
     });
   }
+
+  test("the uncommitted-change check covers the template, gates.yml and the rulesets new-repo posts", async () => {
+    const w = newRepoWorld({ dirtyTemplates: true });
+    expect(await go(w)).toBe(1);
+    const status = w.runs.find((r) => r.cmd.includes("status"))!.cmd;
+    expect(status.slice(status.indexOf("status"))).toEqual(["status", "--porcelain", "--ignored", "--", "templates/repo-contract", ".github/workflows/gates.yml", "policy/github/rulesets"]);
+  });
+
+  test("a repo policy/repos.yaml already registers is refused before any write", async () => {
+    const w = newRepoWorld();
+    const file = join(w.root, "policy", "repos.yaml");
+    writeFileSync(file, readFileSync(file, "utf8").replace(/^repos: \{\}/m, `repos:\n  "${OWNER}/Example-Repo": { registered: "2026-01-01" }\n#`));
+    expect(await go(w)).toBe(1);
+    expect(failLine(w)).toBe(`step 1 (preflight) failed: policy/repos.yaml already registers ${FULL}: drop the stale entry by PR first`);
+    expect(w.calls.filter((c) => c.method !== "GET")).toEqual([]);
+  });
 
   test("a missing repo scope is named too, and so is a login with no scopes header", async () => {
     let w = newRepoWorld({ scopes: "workflow" });
@@ -299,16 +315,27 @@ test("register adds the repo to policy/repos.yaml and keeps its comments", async
   expect(w.out.find((l) => l.startsWith("[9/11] register: "))).toBe(`[9/11] register: added ${FULL} to policy/repos.yaml (registered 2026-10-31), uncommitted: review it and commit it by PR`);
 });
 
-test("registerText keeps every comment and the repos: line's note, on a first registration and on a later one", () => {
+test("registerText adds one line and leaves every other line byte-identical, on a first registration and on a later one", () => {
   const text = readFileSync(join(REPO, "policy", "repos.yaml"), "utf8");
-  const comments = (t: string) => t.split("\n").filter((l) => l.trimStart().startsWith("#"));
   const one = registerText(text, "example-owner/a", "2026-10-31");
   const two = registerText(one, "example-owner/b", "2026-11-01");
-  for (const t of [one, two]) {
-    expect(comments(t)).toEqual(comments(text));
-    expect(t).toContain('repos: # "owner/name": { registered: "YYYY-MM-DD" }\n  example-owner/a: { registered: "2026-10-31" }\n');
-  }
-  expect(two).toEndWith('  example-owner/a: { registered: "2026-10-31" }\n  example-owner/b: { registered: "2026-11-01" }\n');
+  const old = text.split("\n");
+  const at = old.findIndex((l) => l.startsWith("repos:"));
+  // The first: `repos: {}` loses its braces (two spaces, so the note keeps its column), and the entry follows it.
+  expect(one.split("\n")).toEqual([...old.slice(0, at), old[at]!.replace("{}", "  "), '  "example-owner/a": { registered: "2026-10-31" }', ...old.slice(at + 1)]);
+  // A later one: exactly one line added, after the last entry.
+  const first = one.split("\n");
+  expect(two.split("\n")).toEqual([...first.slice(0, at + 2), '  "example-owner/b": { registered: "2026-11-01" }', ...first.slice(at + 2)]);
+  // The note on the repos: line, and every comment line, as they were; the data is the old plus the entries.
+  expect(first[at]).toMatch(/^repos: {3,}# "owner\/name": \{ registered: "YYYY-MM-DD" \}$/);
+  const policy = (t: string) => {
+    const dir = join(newRepoWorld().root, "policy");
+    writeFileSync(join(dir, "repos.yaml"), t);
+    return loadPolicy(dir).repos;
+  };
+  expect(policy(two)).toEqual({ ...policy(text), repos: { "example-owner/a": { registered: "2026-10-31" }, "example-owner/b": { registered: "2026-11-01" } } });
+  expect(() => registerText(one, "Example-Owner/A", "2026-11-02")).toThrow("policy/repos.yaml already registers Example-Owner/A");
+  expect(() => registerText("installations: { planner: 1, factory: 2 }\nrepos: { a/b: { registered: \"2026-01-01\" } }\n", "x/y", "2026-11-02")).toThrow("add the entry by hand");
 });
 
 test("register restores the old text when the new one doesn't load", async () => {

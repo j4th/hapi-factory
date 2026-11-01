@@ -14,7 +14,7 @@ mise install && mise run setup && mise run check
 
 ## How changes land
 
-Every change reaches `main` through a pull request, with the `ci / gates` check green and the maintainer's approval. Planning PRs bring work orders and their acceptance tests; the factory opens one PR per work order; only the maintainer merges. [CONTRIBUTING.md](CONTRIBUTING.md) has the details, and [SECURITY.md](SECURITY.md) says how to report a vulnerability.
+Every change reaches `main` through a pull request, with the `ci / gates` check green and the maintainer's approval; a PR that touches `.github/workflows/` is reviewed by hand, since it runs its own copy of the checks. Planning PRs bring work orders and their acceptance tests; the factory opens one PR per work order; only the maintainer merges. [CONTRIBUTING.md](CONTRIBUTING.md) has the details, and [SECURITY.md](SECURITY.md) says how to report a vulnerability.
 
 ## License
 
