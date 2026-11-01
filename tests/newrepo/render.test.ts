@@ -290,7 +290,7 @@ describe("no template file is a live one to hapi-factory", () => {
   });
 
   test("CI's any-depth mise-file scan passes over the templates", () => {
-    const steps = YAML.parse(readFileSync(join(REPO, ".github", "workflows", "ci.yml"), "utf8")).jobs.ci.steps as { name?: string; run?: string }[];
+    const steps = YAML.parse(readFileSync(join(REPO, ".github", "workflows", "ci.yml"), "utf8")).jobs.build.steps as { name?: string; run?: string }[];
     const script = steps.find((s) => s.name === "Only the root mise.toml configures mise")!.run!;
     const root = tempDir();
     writeFileSync(join(root, "mise.toml"), "");

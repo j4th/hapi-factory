@@ -1,14 +1,22 @@
-# CI for hapi-factory itself: install the pinned toolchain, type-check, run the unit tests, and
-# scan the whole history for secrets.
+# CI for hapi-factory itself, in three jobs: `build` installs the pinned toolchain, type-checks and runs the unit
+# tests; `secrets` scans the whole history for secrets; `ci` passes only when both did.
 #
-# - The job is named `ci`. The `main-protect` ruleset requires a passing `ci` check and has no
-#   bypass actors, so nobody can merge with `ci` red or missing (see README, "Manual setup steps").
-# - Every action is pinned to a full commit SHA (spec §11.7). The comment after each SHA is the
-#   release tag it was resolved from (`gh api repos/<owner>/<repo>/git/ref/tags/<tag>`).
-# - Least privilege: the token can only read the repo, and checkout doesn't keep it in .git/config.
-# - mise itself is pinned to the version in mise.toml's `min_version`; mise then installs the
-#   exact tool versions from mise.toml, each download checked against the checksum the root
-#   mise.lock records for it.
+# - The required check is the aggregator, `ci`. The `main-protect` ruleset requires a passing `ci` check and has no
+#   bypass actors, so nobody can merge with `ci` red or missing (see README, "Manual setup steps"). `build` and
+#   `secrets` show beside it and aren't required. `ci` runs even when one failed (`if: always()`): GitHub reports a
+#   job skipped because a needed job failed as a success, which would turn the required check green.
+# - `secrets` runs no PR code, on its own fresh runner and checkout, with no mise: the history scan of the reusable
+#   gates (.github/workflows/gates.yml's `scan` job), word for word but its gitleaks config, which here is this
+#   repo's .githooks/gitleaks.toml (gitleaks's default rules; a protected path). The PR's code runs only in
+#   `build`, on another runner (H-241).
+# - Every action is pinned to a full commit SHA (spec §11.7). The comment after each SHA is the release tag it was
+#   resolved from (`gh api repos/<owner>/<repo>/git/ref/tags/<tag>`).
+# - Least privilege: `permissions: {}` here and on `ci`; `build` and `secrets` can only read the repo, and
+#   checkout doesn't keep the token in .git/config.
+# - mise itself is pinned to the version in mise.toml's `min_version`; mise then installs the exact tool versions
+#   from mise.toml, each download checked against the checksum the root mise.lock records for it. `secrets`
+#   installs gitleaks from its release URL instead, checked against the sha256 pinned in its `env` (gates.yml's,
+#   and mise.toml's version: tests/scripts/ci-workflow.test.ts holds them equal).
 name: ci
 
 on:
@@ -16,8 +24,7 @@ on:
     branches: [main]
   pull_request:
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -25,15 +32,16 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  ci:
-    name: ci
+  build:
+    name: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: 0   # the whole history, for the gitleaks scan
 
       # mise reads config, tasks and locked tools from more files than mise.toml (.mise.toml,
       # mise.local.toml, mise.<env>.toml, .config/mise.toml, mise/ and .mise/, mise-tasks/,
@@ -78,16 +86,172 @@ jobs:
       - name: Install tools, type-check, unit tests
         run: mise install --locked && mise run lint && mise run test
 
-      # The whole history, not just the diff: a secret in any commit stays public
-      # even after a later commit removes it (H-057). Nothing in a commit can turn the scan
-      # off without changing a protected path: its config is .githooks/gitleaks.toml, not a
-      # .gitleaks.toml the commit adds; inline gitleaks:allow comments are ignored; and
-      # gitleaks always reads a root .gitleaksignore, which no flag turns off, so the step
-      # refuses one.
-      - name: Scan the whole history for secrets (gitleaks)
+  secrets:
+    name: secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    # `bash --noprofile --norc -eo pipefail {0}`: the gitleaks step's exit code comes through a pipe, and without a
+    # shell named Actions runs `bash -e {0}`, with no pipefail.
+    defaults:
+      run:
+        shell: bash
+    env:
+      # gitleaks 8.30.1's linux-x64 release and its sha256, from the project's gitleaks_8.30.1_checksums.txt.
+      GITLEAKS_URL: https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0   # the whole history, for the gitleaks scan
+
+      # From here on, gates.yml's history scan, word for word but the gitleaks --config: this repo's own
+      # .githooks/gitleaks.toml (tests/scripts/ci-workflow.test.ts holds them so).
+      # gitleaks reads the history through `git log -p`, which honours the checkout's .gitattributes: a PR that
+      # commits `* -diff` or `* binary` (at the root, or in any directory over the files below it), or a file with a
+      # NUL byte, turns its diffs into "Binary files differ", and gitleaks never sees them. .git/info/attributes
+      # outranks every .gitattributes, and `diff` set on a path makes git diff it as text, NUL bytes and all. So
+      # every path is scanned as text, and a real binary that looks like a secret fails the scan, closed, unless it
+      # sits in a path gitleaks's default allowlist skips (*.png, *.pdf, node_modules/, package-lock.json, ...:
+      # H-240). The dry run's git and gitleaks's also read no in-tree .gitattributes at all (GIT_ATTR_SOURCE); this
+      # stays as a second net.
+      - name: Git diffs every path as text, whatever the PR's .gitattributes say
         run: |
-          if [[ -e .gitleaksignore ]]; then
-            echo "::error::.gitleaksignore would hide gitleaks findings. Remove it; the operator allows a false positive in .githooks/gitleaks.toml."
+          mkdir -p .git/info
+          printf '* diff\n' > .git/info/attributes
+
+      # gitleaks always reads a root .gitleaksignore whatever --gitleaks-ignore-path says (checked with 8.30.1), and
+      # a root .gitleaks.toml is its default config, so either could allowlist a PR's own secret: both are refused.
+      # A symlink counts even when it dangles: gitleaks could follow it once the target exists.
+      - name: A PR can't bring its own gitleaks config
+        run: |
+          if [[ -e .gitleaks.toml || -L .gitleaks.toml || -e .gitleaksignore || -L .gitleaksignore ]]; then
+            echo "::error::a root .gitleaks.toml or .gitleaksignore would change what gitleaks finds. Remove it; the history scan names its own config."
             exit 1
           fi
-          mise exec -- gitleaks git --config .githooks/gitleaks.toml --ignore-gitleaks-allow --redact --no-banner --no-color -v .
+
+      # Each download is checked against the sha256 above before anything is unpacked or run; a mismatch fails the
+      # step. Nothing here reads the checkout: the files go to $RUNNER_TEMP.
+      - name: Install gitleaks, checked against its pinned sha256
+        run: |
+          cd "$RUNNER_TEMP" || exit 1
+          mkdir -p bin dl
+          curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o dl/gitleaks.tar.gz "$GITLEAKS_URL"
+          printf '%s  %s\n' "$GITLEAKS_SHA256" dl/gitleaks.tar.gz | sha256sum -c --strict -
+          tar -xzf dl/gitleaks.tar.gz -C bin gitleaks
+          chmod 0755 bin/gitleaks
+
+      # The whole history, not just the diff: a secret in any commit stays public even after a later
+      # commit removes it. Inline gitleaks:allow comments are ignored.
+      # GIT_ATTR_SOURCE (below) is honoured from git 2.40 and silently ignored before it.
+      - name: git is 2.40 or later
+        run: |
+          v="$(env -i PATH=/usr/bin:/bin /usr/bin/git --version)"
+          major=0
+          minor=0
+          if [[ "$v" =~ ^git\ version\ ([0-9]+)\.([0-9]+) ]]; then
+            major="${BASH_REMATCH[1]}"
+            minor="${BASH_REMATCH[2]}"
+          fi
+          if (( 10#$major < 2 || (10#$major == 2 && 10#$minor < 40) )); then
+            echo "::error::the history scan needs git 2.40 or later, which honours GIT_ATTR_SOURCE; /usr/bin/git says: $v"
+            exit 1
+          fi
+          echo "$v"
+
+      # gitleaks 8.30.1 ignores git's exit status, and logs a git stderr line as a WRN, not an ERR, when it contains
+      # one of git's renameLimit, skipped-rename-detection or auto-gc messages. A PR can make git die quoting its
+      # own text (a .gitmodules value git can't parse as a boolean, read while git diffs a gitlink), so gitleaks
+      # scans what came before and passes. So the scan first runs, itself, exactly the git command gitleaks runs
+      # (captured from gitleaks: `git -C . log -p -U0` and the --log-opts words, git found on PATH as /usr/bin/git),
+      # in the same environment, and fails on a non-zero exit or any byte on stderr. tests/scripts/gates-workflow.test.ts
+      # holds this argv and environment equal to the real gitleaks's. Its stdout, the patches, is discarded.
+      # The log options, the same in both steps:
+      # - --full-history --all: every commit on every fetched ref. -m: a merge's own diff against each parent, so an
+      #   evil merge (a token in neither parent) is seen; `log -p` shows none without it. Naming them replaces
+      #   gitleaks's default `--diff-filter=tuxdb`, which skips type changes (a symlink or a gitlink later turned
+      #   into a file holding a token).
+      # - --no-mailmap: no .mailmap. --no-renames: a moved file is a deletion and an addition, so a token first
+      #   committed in a path gitleaks's allowlist skips (node_modules/, *.png, package-lock.json: H-240) and then
+      #   moved anywhere else is scanned in full there; with rename detection only the edited lines would be.
+      # - --ignore-submodules=none: git never reads .gitmodules for a gitlink's settings. --no-ext-diff
+      #   --no-textconv: no external diff or textconv driver (both need git config a PR can't write; hardening).
+      # GIT_ATTR_SOURCE, git's empty tree, makes git read no .gitattributes from the checkout (.git/info/attributes
+      # still applies), and GIT_CONFIG_NOSYSTEM=1 no /etc/gitconfig, whose settings (log.diffMerges, say) could change
+      # what these options mean.
+      # git's stderr can quote a PR's text, so it is shown behind a `git: ` prefix and between a random
+      # ::stop-commands:: token and its end: Actions reads a workflow command at the start of any line, and a bare
+      # CR starts one too.
+      - name: git log runs clean, exactly as gitleaks will run it
+        run: |
+          err="$RUNNER_TEMP/git-log.err"
+          code=0
+          env -i PATH=/usr/bin:/bin HOME="$RUNNER_TEMP" GIT_NO_REPLACE_OBJECTS=1 GIT_ATTR_SOURCE=4b825dc642cb6eb9a060e54bf8d69288fbee4904 GIT_CONFIG_NOSYSTEM=1 \
+            /usr/bin/git -C . log -p -U0 --full-history --all -m --no-mailmap --no-renames --ignore-submodules=none --no-ext-diff --no-textconv \
+            > /dev/null 2> "$err" || code=$?
+          if [[ "$code" != 0 || -s "$err" ]]; then
+            t="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+            echo "::stop-commands::$t"
+            head -n 20 "$err" | sed 's/^/git: /'
+            echo "::$t::"
+            echo "::error::git log, run as gitleaks runs it, exited $code or wrote to stderr, and gitleaks 8.30.1 would scan on regardless: the history scan fails closed"
+            exit 1
+          fi
+
+      # gitleaks, with the log options above, in the same environment. It fails open on git's stderr: on any line
+      # (a PR's .gitattributes with a nested macro, a negative pattern or a line over 2048 bytes, a symlinked
+      # .gitattributes or .mailmap, before GIT_ATTR_SOURCE and --no-mailmap) it logs an ERR, reports the commits it
+      # got through (0 or more) and exits 0, and git's renameLimit, rename-detection and auto-gc lines it logs as a
+      # WRN. So any ERR line, any WRN line but its own `leaks found: N`, or "0 commits scanned" fails the step; a
+      # clean scan logs none of them. Inline gitleaks:allow comments are ignored. A finding (exit 1) fails the step.
+      - name: Scan the whole history for secrets (gitleaks)
+        run: |
+          log="$RUNNER_TEMP/gitleaks.log"
+          code=0
+          # gitleaks prints a finding's file name, which a PR picks: no workflow command in its output is read.
+          t="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+          echo "::stop-commands::$t"
+          env -i PATH=/usr/bin:/bin HOME="$RUNNER_TEMP" GIT_NO_REPLACE_OBJECTS=1 GIT_ATTR_SOURCE=4b825dc642cb6eb9a060e54bf8d69288fbee4904 GIT_CONFIG_NOSYSTEM=1 \
+            "$RUNNER_TEMP/bin/gitleaks" git --config .githooks/gitleaks.toml \
+            --log-opts="--full-history --all -m --no-mailmap --no-renames --ignore-submodules=none --no-ext-diff --no-textconv" \
+            --ignore-gitleaks-allow --redact --no-banner --no-color -v . 2>&1 | tee "$log" || code=$?
+          echo "::$t::"
+          # The guards read the saved log, as text even with a NUL byte in it (-a): GNU grep would otherwise call it
+          # a binary file and print no matching line.
+          if grep -aEq '(^|[[:space:]])ERR([[:space:]]|$)' "$log"; then
+            echo "::error::gitleaks logged an error, so its scan can't be trusted: the history scan fails closed"
+            exit 1
+          fi
+          # No grep -q in this pipe: under pipefail, its early exit could kill the grep before it (SIGPIPE), and the
+          # pipeline's non-zero status would read as "no warning".
+          warned="$(grep -aE '(^|[[:space:]])WRN([[:space:]]|$)' "$log" | grep -aEv '^[^[:space:]]+ WRN leaks found: [0-9]+$' || true)"
+          if [[ -n "$warned" ]]; then
+            echo "::error::gitleaks logged a warning other than its findings count (it logs some of git's errors as warnings), so its scan can't be trusted: the history scan fails closed"
+            exit 1
+          fi
+          if grep -aEq '(^|[[:space:]])0 commits scanned' "$log"; then
+            echo "::error::gitleaks scanned 0 commits: the history scan fails closed"
+            exit 1
+          fi
+          exit "$code"
+
+  ci:
+    name: ci
+    needs: [build, secrets]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: build and secrets both succeeded
+        env:
+          BUILD: ${{ needs.build.result }}
+          SECRETS: ${{ needs.secrets.result }}
+        run: |
+          echo "build: $BUILD, secrets: $SECRETS"
+          if [[ "$BUILD" != success || "$SECRETS" != success ]]; then
+            echo "::error::ci needs both build and secrets to succeed (build: $BUILD, secrets: $SECRETS)"
+            exit 1
+          fi

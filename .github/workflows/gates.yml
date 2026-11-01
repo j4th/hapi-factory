@@ -19,8 +19,9 @@
 #   runs, itself, the `git log` gitleaks will run (every fetched ref, merges' diffs with `-m`, type changes, no
 #   rename detection, no .mailmap, submodule config not read, no system git config), and fails on a non-zero exit
 #   or any byte on stderr; then gitleaks, which fails the step on a finding, on any ERR line, on any WRN line but its
-#   findings count, or on a scan of 0 commits. Known residual: gitleaks's default path allowlist (H-240). A PR's
-#   code runs only in `check`, on another runner.
+#   findings count, or on a scan of 0 commits, its output shown with workflow commands stopped. Known residuals:
+#   gitleaks's default path allowlist (H-240), and a token outside file contents (H-242). hapi-factory's own ci.yml
+#   runs the same history scan in its `secrets` job. A PR's code runs only in `check`, on another runner.
 # - `check` runs the caller's own `mise install --locked && mise run check` (its `setup` installs with
 #   `--ignore-scripts`), after ci.yml's two mise steps.
 # - `gates` passes only when both succeeded. It runs even when one failed (`if: always()`): GitHub reports a job
@@ -86,6 +87,17 @@ jobs:
             exit 1
           fi
 
+      # The scanners' configs are the gates' own. gitleaks gets an explicit --config (its default rules).
+      # OSV-Scanner gets an empty --config, which replaces any osv-scanner.toml it would find. zizmor runs with
+      # --no-config --no-ignores. Under env -i, no GITLEAKS_CONFIG, GITLEAKS_CONFIG_TOML or ZIZMOR_CONFIG reaches a
+      # scanner.
+      - name: The scanners' configs are the gates' own
+        run: |
+          printf '[extend]\nuseDefault = true\n' > "$RUNNER_TEMP/gitleaks.toml"
+          : > "$RUNNER_TEMP/osv-scanner.toml"
+
+      # From here through the gitleaks step, the steps are also hapi-factory's own ci.yml `secrets` job's, word for
+      # word but the gitleaks --config (tests/scripts/ci-workflow.test.ts holds them so): the history scan.
       # gitleaks reads the history through `git log -p`, which honours the checkout's .gitattributes: a PR that
       # commits `* -diff` or `* binary` (at the root, or in any directory over the files below it), or a file with a
       # NUL byte, turns its diffs into "Binary files differ", and gitleaks never sees them. .git/info/attributes
@@ -99,38 +111,26 @@ jobs:
           mkdir -p .git/info
           printf '* diff\n' > .git/info/attributes
 
-      # The scanners' configs are the gates' own. gitleaks gets an explicit --config (its default rules), and
-      # always reads a root .gitleaksignore whatever --gitleaks-ignore-path says (checked with 8.30.1), so a root
-      # .gitleaks.toml or .gitleaksignore, either of which could allowlist a PR's own secret, is refused. OSV-Scanner
-      # gets an empty --config, which replaces any osv-scanner.toml it would find. zizmor runs with --no-config
-      # --no-ignores. Under env -i, no GITLEAKS_CONFIG, GITLEAKS_CONFIG_TOML or ZIZMOR_CONFIG reaches a scanner. A
-      # symlink counts even when it dangles: gitleaks could follow it once the target exists.
-      - name: The scanners' configs are the gates' own
+      # gitleaks always reads a root .gitleaksignore whatever --gitleaks-ignore-path says (checked with 8.30.1), and
+      # a root .gitleaks.toml is its default config, so either could allowlist a PR's own secret: both are refused.
+      # A symlink counts even when it dangles: gitleaks could follow it once the target exists.
+      - name: A PR can't bring its own gitleaks config
         run: |
           if [[ -e .gitleaks.toml || -L .gitleaks.toml || -e .gitleaksignore || -L .gitleaksignore ]]; then
-            echo "::error::a root .gitleaks.toml or .gitleaksignore would change what gitleaks finds. Remove it; the gates scan with gitleaks's own rules."
+            echo "::error::a root .gitleaks.toml or .gitleaksignore would change what gitleaks finds. Remove it; the history scan names its own config."
             exit 1
           fi
-          printf '[extend]\nuseDefault = true\n' > "$RUNNER_TEMP/gitleaks.toml"
-          : > "$RUNNER_TEMP/osv-scanner.toml"
 
       # Each download is checked against the sha256 above before anything is unpacked or run; a mismatch fails the
       # step. Nothing here reads the checkout: the files go to $RUNNER_TEMP.
-      - name: Install the scanners, each checked against its pinned sha256
+      - name: Install gitleaks, checked against its pinned sha256
         run: |
           cd "$RUNNER_TEMP" || exit 1
           mkdir -p bin dl
-          fetch() {
-            curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "dl/$3" "$1"
-            printf '%s  %s\n' "$2" "dl/$3" | sha256sum -c --strict -
-          }
-          fetch "$GITLEAKS_URL" "$GITLEAKS_SHA256" gitleaks.tar.gz
-          fetch "$OSV_SCANNER_URL" "$OSV_SCANNER_SHA256" osv-scanner
-          fetch "$ZIZMOR_URL" "$ZIZMOR_SHA256" zizmor.tar.gz
+          curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o dl/gitleaks.tar.gz "$GITLEAKS_URL"
+          printf '%s  %s\n' "$GITLEAKS_SHA256" dl/gitleaks.tar.gz | sha256sum -c --strict -
           tar -xzf dl/gitleaks.tar.gz -C bin gitleaks
-          install -m 0755 dl/osv-scanner bin/osv-scanner
-          tar -xzf dl/zizmor.tar.gz -C bin zizmor
-          chmod 0755 bin/gitleaks bin/zizmor
+          chmod 0755 bin/gitleaks
 
       # The whole history, not just the diff: a secret in any commit stays public even after a later
       # commit removes it. Inline gitleaks:allow comments are ignored.
@@ -170,8 +170,9 @@ jobs:
       # GIT_ATTR_SOURCE, git's empty tree, makes git read no .gitattributes from the checkout (.git/info/attributes
       # still applies), and GIT_CONFIG_NOSYSTEM=1 no /etc/gitconfig, whose settings (log.diffMerges, say) could change
       # what these options mean.
-      # git's stderr can quote a PR's text, so each line is shown behind a `git: ` prefix, never at the start of a
-      # line, where Actions would read it as a workflow command.
+      # git's stderr can quote a PR's text, so it is shown behind a `git: ` prefix and between a random
+      # ::stop-commands:: token and its end: Actions reads a workflow command at the start of any line, and a bare
+      # CR starts one too.
       - name: git log runs clean, exactly as gitleaks will run it
         run: |
           err="$RUNNER_TEMP/git-log.err"
@@ -180,7 +181,10 @@ jobs:
             /usr/bin/git -C . log -p -U0 --full-history --all -m --no-mailmap --no-renames --ignore-submodules=none --no-ext-diff --no-textconv \
             > /dev/null 2> "$err" || code=$?
           if [[ "$code" != 0 || -s "$err" ]]; then
+            t="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+            echo "::stop-commands::$t"
             head -n 20 "$err" | sed 's/^/git: /'
+            echo "::$t::"
             echo "::error::git log, run as gitleaks runs it, exited $code or wrote to stderr, and gitleaks 8.30.1 would scan on regardless: the history scan fails closed"
             exit 1
           fi
@@ -195,26 +199,47 @@ jobs:
         run: |
           log="$RUNNER_TEMP/gitleaks.log"
           code=0
+          # gitleaks prints a finding's file name, which a PR picks: no workflow command in its output is read.
+          t="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+          echo "::stop-commands::$t"
           env -i PATH=/usr/bin:/bin HOME="$RUNNER_TEMP" GIT_NO_REPLACE_OBJECTS=1 GIT_ATTR_SOURCE=4b825dc642cb6eb9a060e54bf8d69288fbee4904 GIT_CONFIG_NOSYSTEM=1 \
             "$RUNNER_TEMP/bin/gitleaks" git --config "$RUNNER_TEMP/gitleaks.toml" \
             --log-opts="--full-history --all -m --no-mailmap --no-renames --ignore-submodules=none --no-ext-diff --no-textconv" \
             --ignore-gitleaks-allow --redact --no-banner --no-color -v . 2>&1 | tee "$log" || code=$?
-          if grep -Eq '(^|[[:space:]])ERR([[:space:]]|$)' "$log"; then
+          echo "::$t::"
+          # The guards read the saved log, as text even with a NUL byte in it (-a): GNU grep would otherwise call it
+          # a binary file and print no matching line.
+          if grep -aEq '(^|[[:space:]])ERR([[:space:]]|$)' "$log"; then
             echo "::error::gitleaks logged an error, so its scan can't be trusted: the history scan fails closed"
             exit 1
           fi
           # No grep -q in this pipe: under pipefail, its early exit could kill the grep before it (SIGPIPE), and the
           # pipeline's non-zero status would read as "no warning".
-          warned="$(grep -E '(^|[[:space:]])WRN([[:space:]]|$)' "$log" | grep -Ev '^[^[:space:]]+ WRN leaks found: [0-9]+$' || true)"
+          warned="$(grep -aE '(^|[[:space:]])WRN([[:space:]]|$)' "$log" | grep -aEv '^[^[:space:]]+ WRN leaks found: [0-9]+$' || true)"
           if [[ -n "$warned" ]]; then
             echo "::error::gitleaks logged a warning other than its findings count (it logs some of git's errors as warnings), so its scan can't be trusted: the history scan fails closed"
             exit 1
           fi
-          if grep -Eq '(^|[[:space:]])0 commits scanned' "$log"; then
+          if grep -aEq '(^|[[:space:]])0 commits scanned' "$log"; then
             echo "::error::gitleaks scanned 0 commits: the history scan fails closed"
             exit 1
           fi
           exit "$code"
+
+      # Like gitleaks's, each download is checked against its sha256 before anything is unpacked or run.
+      - name: Install OSV-Scanner and zizmor, each checked against its pinned sha256
+        run: |
+          cd "$RUNNER_TEMP" || exit 1
+          mkdir -p bin dl
+          fetch() {
+            curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "dl/$3" "$1"
+            printf '%s  %s\n' "$2" "dl/$3" | sha256sum -c --strict -
+          }
+          fetch "$OSV_SCANNER_URL" "$OSV_SCANNER_SHA256" osv-scanner
+          fetch "$ZIZMOR_URL" "$ZIZMOR_SHA256" zizmor.tar.gz
+          install -m 0755 dl/osv-scanner bin/osv-scanner
+          tar -xzf dl/zizmor.tar.gz -C bin zizmor
+          chmod 0755 bin/zizmor
 
       - name: Known vulnerabilities in bun.lock (OSV-Scanner)
         run: |

@@ -12,7 +12,7 @@
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { randomBytes } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import YAML from "yaml";
@@ -39,12 +39,15 @@ interface Job {
 const TEXT = await Bun.file(join(REPO, ".github", "workflows", "gates.yml")).text();
 const doc = YAML.parse(TEXT) as { on: Record<string, unknown>; permissions: unknown; jobs: Record<string, Job> };
 const { scan, check, gates } = doc.jobs as { scan: Job; check: Job; gates: Job };
-const ci: Step[] = YAML.parse(await Bun.file(join(REPO, ".github", "workflows", "ci.yml")).text()).jobs.ci.steps;
+/** ci.yml's `build` job: the mise steps gates.yml copies. */
+const ci: Step[] = YAML.parse(await Bun.file(join(REPO, ".github", "workflows", "ci.yml")).text()).jobs.build.steps;
 const MISE_SCAN = "Only the root mise.toml configures mise";
 const MISE_CHECK = "mise loads no config or tasks but the root mise.toml";
 const ATTRS = "Git diffs every path as text, whatever the PR's .gitattributes say";
 const CONFIGS = "The scanners' configs are the gates' own";
-const INSTALL = "Install the scanners, each checked against its pinned sha256";
+const REFUSE = "A PR can't bring its own gitleaks config";
+const INSTALL_GITLEAKS = "Install gitleaks, checked against its pinned sha256";
+const INSTALL_OTHERS = "Install OSV-Scanner and zizmor, each checked against its pinned sha256";
 const GITVER = "git is 2.40 or later";
 const DRYRUN = "git log runs clean, exactly as gitleaks will run it";
 const SECRETS = "Scan the whole history for secrets (gitleaks)";
@@ -96,6 +99,33 @@ const runStep = (script: string, cwd: string, env: Record<string, string>) => {
   return { code: r.exitCode, out: r.stdout.toString() + r.stderr.toString() };
 };
 
+/**
+ * The workflow commands the Actions runner would act on in a step's output: it reads a line at a time, splitting on a
+ * bare CR as well as LF, takes a line that starts with `::` (after leading space) as a command, and between
+ * `::stop-commands::<token>` and `::<token>::` acts on none.
+ */
+const workflowCommands = (out: string) => {
+  const acted: string[] = [];
+  let stopped: string | undefined;
+  for (const raw of out.split(/\r\n|\r|\n/)) {
+    const line = raw.trimStart();
+    if (stopped !== undefined) {
+      if (line === `::${stopped}::`) stopped = undefined;
+      continue;
+    }
+    const stop = line.match(/^::stop-commands::(.*)$/);
+    if (stop) stopped = stop[1];
+    else if (line.startsWith("::")) acted.push(line);
+  }
+  return acted;
+};
+/** The step's script without its stop-commands lines: the control for the tests above. */
+const withoutStopToken = (script: string) =>
+  script
+    .split("\n")
+    .filter((l) => !/::stop-commands::|echo "::\$t::"/.test(l))
+    .join("\n");
+
 test("gates.yml is a workflow_call with no permissions, and three jobs: scan, check and the aggregator gates", () => {
   expect(Object.keys(doc.on)).toEqual(["workflow_call"]);
   expect(doc.permissions).toEqual({});
@@ -114,7 +144,7 @@ test("gates.yml is a workflow_call with no permissions, and three jobs: scan, ch
   }
   expect(scan.permissions).toEqual({ contents: "read" });
   expect(check.permissions).toEqual({ contents: "read" });
-  expect(scan.steps.map((s) => s.uses?.replace(/@.*$/, "") ?? s.name)).toEqual(["actions/checkout", MISE_SCAN, ATTRS, CONFIGS, INSTALL, GITVER, DRYRUN, SECRETS, OSV, ZIZMOR, TRAILERS]);
+  expect(scan.steps.map((s) => s.uses?.replace(/@.*$/, "") ?? s.name)).toEqual(["actions/checkout", MISE_SCAN, CONFIGS, ATTRS, REFUSE, INSTALL_GITLEAKS, GITVER, DRYRUN, SECRETS, INSTALL_OTHERS, OSV, ZIZMOR, TRAILERS]);
   expect(check.steps.map((s) => s.uses?.replace(/@.*$/, "") ?? s.name)).toEqual(["actions/checkout", MISE_SCAN, "jdx/mise-action", MISE_CHECK, "check"]);
   expect(scan.steps[0]!.with).toEqual({ "persist-credentials": false, "fetch-depth": 0 });
   expect(check.steps[0]!.with).toEqual({ "persist-credentials": false });
@@ -226,7 +256,7 @@ describe("the scan job runs no PR code, and ignores the PR's scanner configs, .g
   });
 });
 
-describe("the scanners' configs are the gates' own", () => {
+describe("the scanners' configs are the gates' own, and a PR can't bring its own gitleaks config", () => {
   const configs = (files: Record<string, string>) => {
     const root = tempDir("hapi-gates-cfg-");
     const runnerTemp = tempDir("hapi-gates-rt-");
@@ -237,9 +267,10 @@ describe("the scanners' configs are the gates' own", () => {
     return { ...runStep(step(scan, CONFIGS).run!, root, { PATH: process.env.PATH!, RUNNER_TEMP: runnerTemp }), runnerTemp };
   };
 
-  test("with neither gitleaks file, it writes gitleaks's default rules and an empty OSV-Scanner config", () => {
+  test("with neither gitleaks file, the refusal passes, and the gates write gitleaks's default rules and an empty OSV-Scanner config", () => {
     const r = configs({ "README.md": "# x\n", "osv-scanner.toml": "[[IgnoredVulns]]\nid = \"GHSA-x\"\n", ".github/zizmor.yml": "rules: {}\n" });
     expect(r.code).toBe(0);
+    expect(runStep(step(scan, REFUSE).run!, tempDir("hapi-gates-cfgok-"), { PATH: process.env.PATH!, RUNNER_TEMP: r.runnerTemp })).toEqual({ code: 0, out: "" });
     expect(readFileSync(join(r.runnerTemp, "gitleaks.toml"), "utf8")).toBe("[extend]\nuseDefault = true\n");
     expect(readFileSync(join(r.runnerTemp, "osv-scanner.toml"), "utf8")).toBe("");
   });
@@ -255,25 +286,27 @@ describe("the scanners' configs are the gates' own", () => {
           writeFileSync(join(root, "real.toml"), "x\n");
           symlinkSync(join(root, "real.toml"), join(root, file));
         }
-        const r = runStep(step(scan, CONFIGS).run!, root, { PATH: process.env.PATH!, RUNNER_TEMP: runnerTemp });
+        const r = runStep(step(scan, REFUSE).run!, root, { PATH: process.env.PATH!, RUNNER_TEMP: runnerTemp });
         expect([file, make, r.code]).toEqual([file, make, 1]);
         expect(r.out).toContain("::error::a root .gitleaks.toml or .gitleaksignore would change what gitleaks finds");
-        expect(existsSync(join(runnerTemp, "gitleaks.toml"))).toBe(false);
+        expect(readdirSync(runnerTemp)).toEqual([]);
       }
     });
   }
 });
 
-test("the install fails closed: a download that doesn't match its pinned sha256 is never unpacked or installed", () => {
-  const runnerTemp = tempDir("hapi-gates-install-");
+test("each install fails closed: a download that doesn't match its pinned sha256 is never unpacked or installed", () => {
   const bin = tempDir("hapi-gates-fakebin-");
   // A curl that "downloads" bytes that aren't the release: the -o file gets them.
   writeFileSync(join(bin, "curl"), '#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && { printf "not the release" > "$2"; exit 0; }; shift; done\nexit 1\n');
   chmodSync(join(bin, "curl"), 0o755);
-  const r = runStep(step(scan, INSTALL).run!, tempDir("hapi-gates-cwd-"), { PATH: `${bin}:${process.env.PATH}`, RUNNER_TEMP: runnerTemp, ...scan.env! });
-  expect(r.code).not.toBe(0);
-  expect(r.out).toContain("FAILED");
-  expect(readdirSync(join(runnerTemp, "bin"))).toEqual([]);
+  for (const name of [INSTALL_GITLEAKS, INSTALL_OTHERS]) {
+    const runnerTemp = tempDir("hapi-gates-install-");
+    const r = runStep(step(scan, name).run!, tempDir("hapi-gates-cwd-"), { PATH: `${bin}:${process.env.PATH}`, RUNNER_TEMP: runnerTemp, ...scan.env! });
+    expect([name, r.code === 0]).toEqual([name, false]);
+    expect(r.out).toContain("FAILED");
+    expect([name, readdirSync(join(runnerTemp, "bin"))]).toEqual([name, []]);
+  }
 });
 
 describe("each scanner gets exactly its flags and a clean environment", () => {
@@ -323,13 +356,13 @@ describe("each scanner gets exactly its flags and a clean environment", () => {
 
 describe("the gitleaks step fails closed on what gitleaks 8.30.1 would let pass", () => {
   /** A stub gitleaks that prints `out` and exits `code`; the step's exit code and output. */
-  const withStub = (out: string, code: number) => {
+  const withStub = (out: string, code: number, edit: (script: string) => string = (x) => x) => {
     const runnerTemp = tempDir("hapi-gates-glstub-");
     mkdirSync(join(runnerTemp, "bin"));
     writeFileSync(join(runnerTemp, "out.txt"), out);
     writeFileSync(join(runnerTemp, "bin", "gitleaks"), `#!/bin/sh\ncat "$HOME/out.txt"\nexit ${code}\n`);
     chmodSync(join(runnerTemp, "bin", "gitleaks"), 0o755);
-    return runStep(step(scan, SECRETS).run!, tempDir("hapi-gates-glcwd-"), { PATH: process.env.PATH!, RUNNER_TEMP: runnerTemp });
+    return runStep(edit(step(scan, SECRETS).run!), tempDir("hapi-gates-glcwd-"), { PATH: process.env.PATH!, RUNNER_TEMP: runnerTemp });
   };
   const CLEAN_RUN = "10:07AM INF 3 commits scanned.\n10:07AM INF scanned ~120 bytes in 116ms\n10:07AM INF no leaks found\n";
 
@@ -379,6 +412,35 @@ describe("the gitleaks step fails closed on what gitleaks 8.30.1 would let pass"
     expect(withStub("10:07AM INF 10 commits scanned.\n", 0).code).toBe(0);
   });
 
+  test("the guards read the log as text: a NUL byte in it doesn't blind the WRN guard (grep -a)", () => {
+    const out = `10:07AM WRN fatal: bad boolean config value 'you may want to set your diff.renameLimit variable' for 'submodule.sub.shallow'\nx\0y\n${CLEAN_RUN}`;
+    const r = withStub(out, 0);
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("::error::gitleaks logged a warning other than its findings count");
+    // The control: without -a, GNU grep calls the log a binary file, prints no line, and the warning passes.
+    expect(withStub(out, 0, (sc) => sc.replaceAll("grep -a", "grep -")).code).toBe(0);
+  });
+
+  test("gitleaks's output is read with no workflow command in it: a random stop token, new on every run, surrounds it", () => {
+    // A finding's file name is the PR's: it can end a line with LF or a bare CR and start a command.
+    const forged = "10:07AM INF 1 commits scanned.\nFinding:     GITHUB_TOKEN=REDACTED\nFile:        a\n::error::forged by the PR\nCommit:      x\r::add-mask::hidden\n10:07AM WRN leaks found: 1\n";
+    const [a, b] = [withStub(forged, 1), withStub(forged, 1)];
+    for (const r of [a, b]) {
+      expect(r.code).toBe(1);
+      const lines = r.out.split("\n");
+      expect(lines[0]).toMatch(/^::stop-commands::[0-9a-f]{32}$/);
+      const t = lines[0]!.slice("::stop-commands::".length);
+      expect(lines.indexOf(`::${t}::`)).toBe(lines.indexOf("10:07AM WRN leaks found: 1") + 1);
+      expect(workflowCommands(r.out)).toEqual([]);
+    }
+    expect(a.out.split("\n")[0]).not.toBe(b.out.split("\n")[0]);
+    // The guards' own ::error:: comes after the token's end, so Actions still reads it.
+    const warned = withStub(`10:07AM WRN you may want to set your diff.renameLimit\n${CLEAN_RUN}`, 0);
+    expect(workflowCommands(warned.out)).toEqual([expect.stringMatching(/^::error::gitleaks logged a warning other than its findings count/)]);
+    // The control: without the token, the forged commands would be read.
+    expect(workflowCommands(withStub(forged, 1, withoutStopToken).out)).toEqual(["::error::forged by the PR", "::add-mask::hidden"]);
+  });
+
   test("the version gate runs before gitleaks, with the absolute /usr/bin/git, and passes only git 2.40 or later", () => {
     const at = (name: string) => scan.steps.findIndex((x) => x.name === name);
     expect(at(GITVER)).toBeLessThan(at(SECRETS));
@@ -408,9 +470,9 @@ describe("the gitleaks step fails closed on what gitleaks 8.30.1 would let pass"
 
 describe("the dry run fails the scan on anything git does that gitleaks 8.30.1 would scan on through", () => {
   /** The dry run with its /usr/bin/git swapped for a fake (the test's only change), or the real one when `fake` is undefined. */
-  const dryRun = (cwd: string, fake?: string) => {
+  const dryRun = (cwd: string, fake?: string, edit: (script: string) => string = (x) => x) => {
     const runnerTemp = tempDir("hapi-gates-dryrt-");
-    let script = step(scan, DRYRUN).run!;
+    let script = edit(step(scan, DRYRUN).run!);
     if (fake !== undefined) {
       writeFileSync(join(runnerTemp, "git"), `#!/bin/sh\n${fake}\n`);
       chmodSync(join(runnerTemp, "git"), 0o755);
@@ -431,12 +493,15 @@ describe("the dry run fails the scan on anything git does that gitleaks 8.30.1 w
     expect(r.out).toContain("::error::git log, run as gitleaks runs it, exited 128 or wrote to stderr");
   });
 
-  test("a git that writes one stderr line and exits 0 fails it, and the line is shown behind a prefix, never as a workflow command", () => {
-    const r = dryRun(tempDir("hapi-gates-dry2-"), "echo '::warning::text from the PR' >&2\nexit 0");
+  test("a git that writes one stderr line and exits 0 fails it, and the line is shown behind a prefix and a stop token, never as a workflow command", () => {
+    const fake = "printf '::warning::text from the PR\\rx ::add-mask::y\\r::error::forged\\n' >&2\nexit 0";
+    const r = dryRun(tempDir("hapi-gates-dry2-"), fake);
     expect(r.code).toBe(1);
-    expect(r.out).toContain("::error::git log, run as gitleaks runs it, exited 0 or wrote to stderr");
     expect(r.out).toContain("git: ::warning::text from the PR");
-    expect(r.out.split("\n").filter((l) => l.trimStart().startsWith("::warning::"))).toEqual([]);
+    // Actions reads only the step's own error; the PR's text, CR and all, sits behind the token.
+    expect(workflowCommands(r.out)).toEqual([expect.stringMatching(/^::error::git log, run as gitleaks runs it, exited 0 or wrote to stderr/)]);
+    // The control: behind the prefix alone, a bare CR would still start the PR's command.
+    expect(workflowCommands(dryRun(tempDir("hapi-gates-dry2c-"), fake, withoutStopToken).out)).toContain("::error::forged");
   });
 
   test("the real git on a clean repo passes, silently", () => {
@@ -541,7 +606,7 @@ describe.skipIf(gitleaks === undefined && !inCI)("the real gitleaks, run as the 
     const upTo = scan.steps.findIndex((x) => x.name === SECRETS);
     let last = { code: 0, out: "" };
     for (const x of scan.steps.slice(1, upTo + 1)) {
-      if (x.name === INSTALL || v.skip?.includes(x.name!)) continue;
+      if (x.name === INSTALL_GITLEAKS || v.skip?.includes(x.name!)) continue;
       const script = v.replace?.[x.name!] ?? x.run!;
       last = runStep(v.edit?.(script) ?? script, root, runner);
       if (last.code !== 0) return last;
