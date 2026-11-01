@@ -48,13 +48,13 @@ import YAML from "yaml";
 import { RUN_PATHS } from "../../generate/archon";
 import { loadPolicy } from "../../policy/load";
 import { dataRootOf, diskProblem, GIB, probeFs } from "../../run/disk";
-import { KIND_LABEL, type KindProfile, kindProfile, proxyZoneOf, RUN_KINDS, type RunKind } from "../../run/kinds";
+import { egressOf, KIND_LABEL, type KindProfile, kindProfile, proxyZoneOf, RUN_KINDS, type RunKind } from "../../run/kinds";
 import { RUN_DISK } from "../../run/locks";
 import { APP_HOME, APP_USER, NO_NEW_PRIVILEGES, runArgs, type RunInputs, STOP_GRACE_S } from "../../run/spec";
 import { loadManifest, MANIFEST_FILE, manifestEntries } from "../../secrets/manifest";
 import { composeServices } from "../../stack/compose";
 import { HERMES_HOME, proxyEnv, serviceEnvironment } from "../../stack/env";
-import { currentUserOverride, HAPI_USER, PROJECT, runFilters } from "../../stack/up";
+import { currentUserOverride, HAPI_USER, networkProblem, PROJECT, runFilters } from "../../stack/up";
 import type { WorkOrder } from "../../workorder/validate";
 import { type AuditContext, type AuditRun, type CheckResult, result } from "../types";
 import { freshBuilds } from "./generated";
@@ -67,7 +67,11 @@ export interface Container {
   Args?: string[];
   Config?: { Labels?: Record<string, string> | null; Env?: string[] | null; Cmd?: string[] | null; Entrypoint?: string[] | null; User?: string | null; StopTimeout?: number | null };
   Mounts?: { Type?: string; Source?: string; Destination?: string; RW?: boolean }[] | null;
+  /** The networks the container is on, by name. */
+  NetworkSettings?: { Networks?: Record<string, unknown> | null } | null;
   HostConfig?: {
+    /** `--network`: a run container's is its own network's name. */
+    NetworkMode?: string;
     PortBindings?: Record<string, unknown> | null;
     Tmpfs?: Record<string, string> | null;
     CapDrop?: string[] | null;
@@ -238,6 +242,42 @@ export function kindProblems(c: Container, profile: KindProfile, zoneKeys: Recor
   return problems;
 }
 
+/**
+ * How a live run container's network falls short of its kind's: it must be on exactly one network, its own (named as
+ * the container is: src/run/spec.ts `runName`, which `createRunObjects` makes), and that network, read with
+ * `docker network inspect`, must be internal with a private subnet (src/stack/up.ts `networkProblem`, start's own
+ * check) and hold exactly two endpoints: the container and its kind's proxy (`egressOf`: egress-archon, or
+ * egress-review for a review). Another network, Docker's default bridge, an extra endpoint, or the other zone's
+ * proxy each fail.
+ */
+export async function runNetworkProblems(run: AuditRun, c: Container, profile: KindProfile): Promise<string[]> {
+  const name = containerName(c);
+  const problems: string[] = [];
+  const mode = c.HostConfig?.NetworkMode;
+  if (mode !== name) problems.push(`its network is ${shown(mode ?? "(none)")}, not its own network ${name}`);
+  const on = Object.keys(c.NetworkSettings?.Networks ?? {}).sort();
+  if (on.length !== 1 || on[0] !== name) problems.push(`it is on ${on.length === 0 ? "no network" : on.map(shown).join(", ")}, not on its own network ${name} alone`);
+  if (!on.includes(name)) return problems;
+  const r = await run.ctx.exec(["docker", "network", "inspect", name]);
+  if (r.code !== 0) return [...problems, `its network ${name} could not be inspected (docker network inspect exited ${r.code}): ${firstLine(r.stderr) || "no error output"}`];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(r.stdout);
+  } catch {
+    parsed = undefined;
+  }
+  const net = (Array.isArray(parsed) && parsed.length === 1 ? parsed[0] : undefined) as { Containers?: Record<string, { Name?: unknown }> | null } | undefined;
+  const problem = networkProblem(net);
+  if (problem !== undefined) problems.push(problem);
+  if (net === undefined || net === null || typeof net !== "object") return problems;
+  const want = [name, ...egressOf({ project: PROJECT, egress: `${PROJECT}-egress-archon-1` }, profile)].sort();
+  const have = Object.values(net.Containers ?? {}).map((e) => (typeof e?.Name === "string" ? e.Name : "")).sort();
+  if (have.length !== want.length || have.some((n, i) => n !== want[i])) {
+    problems.push(`its network ${name} holds ${have.length === 0 ? "no endpoint" : have.map(shown).join(", ")}, not exactly ${want.join(" and ")}`);
+  }
+  return problems;
+}
+
 /** The sample run of `kind` that `runArgs` is asked about: none of it reaches Docker. */
 function sampleInputs(packDir: string, kind: RunKind): RunInputs {
   const traceparent = "00-00000000000000000000000000000001-0000000000000001-01";
@@ -387,14 +427,28 @@ export async function runContainer(run: AuditRun): Promise<CheckResult[]> {
   const packDir = join(ctx.root, "archon", "workflows", "hapi");
   const buildDir = join(fresh.root, "build");
   const fix = "the run container's definition is stack/compose.yaml's archon service, translated by src/run/spec.ts for each kind's profile (src/run/kinds.ts): restore them";
+  const zoneKeys = zoneKeysOf(ctx);
+  const deps = { project: PROJECT, image: service.image, root: ctx.root, buildDir, stateDir: "/audit/sample/state", user: ctx.user, env: ctx.env };
   // One definition per kind, each checked on its own.
   const wants = new Map<RunKind, RunShape>();
   const static_: string[] = [];
   for (const kind of RUN_KINDS) {
     const profile = kindProfile(kind);
-    const argv = runArgs(service, sampleInputs(packDir, kind), { project: PROJECT, image: service.image, root: ctx.root, buildDir, stateDir: "/audit/sample/state", user: ctx.user, env: ctx.env }, [], profile);
+    const argv = runArgs(service, sampleInputs(packDir, kind), deps, [], profile);
     const want = shapeOf(argv);
     const p = definitionProblems(want, packDir, profile, buildDir);
+    // A kind that holds no key (verify): runArgs, given the archon zone's names for it, must refuse them, never bind one.
+    const archonKeys = zoneKeys.archon ?? [];
+    if (profile.zone === undefined && archonKeys.length > 0) {
+      let bound = true;
+      try {
+        runArgs(service, sampleInputs(packDir, kind), deps, archonKeys, profile);
+      } catch (e) {
+        if (!/holds no key/.test((e as Error).message)) throw e;
+        bound = false;
+      }
+      if (bound) p.push("runArgs binds the archon zone's keys into it when given them, where it must refuse them: it holds no key");
+    }
     if (p.length > 0) static_.push(`${kind}: ${p.join("; ")}`);
     wants.set(kind, want);
   }
@@ -402,16 +456,19 @@ export async function runContainer(run: AuditRun): Promise<CheckResult[]> {
 
   const runs = await runContainers(run);
   const live = "containers" in runs ? runs.containers.filter(isRunning) : [];
-  const zoneKeys = zoneKeysOf(ctx);
-  const bad = live
-    .map((c) => {
-      // A container's kind is its label; a Plan 02 run container has none, and is a worker's.
-      const label = c.Config?.Labels?.[KIND_LABEL];
-      if (label !== undefined && !(RUN_KINDS as readonly string[]).includes(label)) return [c, [`carries ${KIND_LABEL}=${shown(label)}, which is no run kind`]] as const;
-      const kind = (label ?? "worker") as RunKind;
-      return [c, [...liveProblems(c, wants.get(kind)!, packDir), ...kindProblems(c, kindProfile(kind), zoneKeys)]] as const;
-    })
-    .filter(([, p]) => p.length > 0);
+  const checkedLive: (readonly [Container, string[]])[] = [];
+  for (const c of live) {
+    // A container's kind is its label; a Plan 02 run container has none, and is a worker's.
+    const label = c.Config?.Labels?.[KIND_LABEL];
+    if (label !== undefined && !(RUN_KINDS as readonly string[]).includes(label)) {
+      checkedLive.push([c, [`carries ${KIND_LABEL}=${shown(label)}, which is no run kind`]]);
+      continue;
+    }
+    const kind = (label ?? "worker") as RunKind;
+    const profile = kindProfile(kind);
+    checkedLive.push([c, [...liveProblems(c, wants.get(kind)!, packDir), ...kindProblems(c, profile, zoneKeys), ...(await runNetworkProblems(run, c, profile))]]);
+  }
+  const bad = checkedLive.filter(([, p]) => p.length > 0);
   if (bad.length > 0) {
     return [
       result(
@@ -426,14 +483,14 @@ export async function runContainer(run: AuditRun): Promise<CheckResult[]> {
       ? `no live run container was checked (${runs.unavailable})`
       : live.length === 0
         ? "no live run container was checked (none is running)"
-        : `${live.length} live run containers are as their kind's definition says, each holding only its kind's zone's keys`;
+        : `${live.length} live run containers are as their kind's definition says, each holding only its kind's zone's keys, on its own internal network with only its kind's proxy`;
   const nonProxy = Object.entries(serviceEnvironment("archon")).filter(([k]) => !/proxy/i.test(k)).length;
   const binds = RUN_KINDS.map((k) => `${k} ${readOnlyDestinations(kindProfile(k), buildDir).length}`).join(", ");
   return [
     result(
       id,
       "pass",
-      `the run definition (runArgs, src/run/spec.ts), for each of the ${RUN_KINDS.length} run kinds (${RUN_KINDS.join(", ").replace(/, ([^,]+)$/, " and $1")}), gives ${RUN_PATHS.piDir} a tmpfs (${PI_TMPFS}), binds every host file its kind has (${binds}: build/'s generated ones and the run's own guard settings and run config, /.archon/.env, the pack ${packDir}, its prelude, the run file, the work order and its task text, the source repo, and a review's or fix's inputs dir) read-only, sets all ${Object.keys(serviceEnvironment("archon")).length} values of serviceEnvironment("archon") (${nonProxy} besides the proxy's, which are egress-review's for a review), labels its container with its kind and runs its kind's prelude, passes no key to a verify, publishes no port, and has every hardening flag and a ${STOP_GRACE_S} s stop timeout; ${checked}`,
+      `the run definition (runArgs, src/run/spec.ts), for each of the ${RUN_KINDS.length} run kinds (${RUN_KINDS.join(", ").replace(/, ([^,]+)$/, " and $1")}), gives ${RUN_PATHS.piDir} a tmpfs (${PI_TMPFS}), binds every host file its kind has (${binds}: build/'s generated ones and the run's own guard settings and run config, /.archon/.env, the pack ${packDir}, its prelude, the run file, the work order and its task text, the source repo, and a review's or fix's inputs dir) read-only, sets all ${Object.keys(serviceEnvironment("archon")).length} values of serviceEnvironment("archon") (${nonProxy} besides the proxy's, which are egress-review's for a review), labels its container with its kind and runs its kind's prelude, passes no key to a verify (and refuses the archon zone's names for one), publishes no port, and has every hardening flag and a ${STOP_GRACE_S} s stop timeout; ${checked}`,
     ),
   ];
 }

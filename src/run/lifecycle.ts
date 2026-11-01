@@ -18,10 +18,11 @@
  * 1. reap (`reapRuns`);
  * 2. `egress_extra`, in the work order or the repo's overlay: refused until a
  *    per-run proxy exists (H-088, H-207);
- * 3. the run's kind, and its workflow: its kind's (`factory-verify`,
- *    `factory-review`) or, for a worker or a fix, the work order's own, which
- *    must be one of hapi's pack (`packNodes`), which must parse, name each
- *    workflow by its file's stem and keep `pi.enableExtensions` on;
+ * 3. the run's kind, and the workflow it runs, which must be one of hapi's pack
+ *    (`packNodes`): its kind's (`factory-verify`, `factory-review`) for a verify
+ *    or a review, the work order's own for a worker or a fix. The pack must
+ *    parse, name each workflow by its file's stem and keep
+ *    `pi.enableExtensions` on;
  * 4. the run's round, budget (it may only lower the work order's budget.usd),
  *    retry and GitHub repo (`forgeRepo`, an owner/name), each in range;
  * 5. the run disk against `runs.disk` (`diskProblem`, ./disk.ts: refused under
@@ -41,8 +42,9 @@
  * 11. the parent, for every kind but `worker`: the work order's worker run, whose
  *     sha is the run's base commit (`RunFile.base`);
  * 12. the inputs dir (`StartOptions.inputsDir`): a review and a fix need one, a
- *     worker and a verify take none, and it holds only regular files named for
- *     `RUN_INPUTS`' (./records.ts `inputsProblem`): never a bundle;
+ *     worker and a verify take none, and it holds only regular files, its kind's
+ *     inputs (./kinds.ts `inputFiles`; ./records.ts `inputsProblem`): a fix's
+ *     findings.md, a review's diff.patch and verify.json; never a bundle;
  * 13. the run's own files (./records.ts `PER_RUN_FILES`): its `hapi-guard.json`
  *     and run config, generated from that policy for that roster, and the host's
  *     copies of its work order and task text; and the container's argv
@@ -99,7 +101,8 @@
  * Pi attempt (design §6a item 7; spike 08 finding 10), keep the tail of the
  * container's log when no result.json came out (`keepContainerLog`); then
  * write the record, with the run's spend and turns when they are known
- * (./spend.ts), before anything is removed, so a finalizer that dies next
+ * (./spend.ts) and the container's exit code (`docker inspect`; never the
+ * status), before anything is removed, so a finalizer that dies next
  * leaves the outcome (H-219); then remove every object of the run, disconnecting
  * only its kind's egress, empty and remove its volumes' dirs on the run disk
  * (`removeVolumeDirs`), and, only if that cleanup fails, add its reason to the
@@ -181,14 +184,15 @@ import { spendOfRun, turnsOfRun } from "./spend";
 
 /**
  * How long `finalizeRun` waits for another process finalizing the same run: its stop's grace (STOP_GRACE_S, 30 s),
- * then its bounded helper calls, each at its host bound and KILL: three fixed ones (the listing, the container's log
- * and the run disk's cleanup helper) and a read per output of the kind with the most (MAX_OUTPUTS, four: a worker's,
- * a fix's and a review's): 7 × (150 + 10) = 1120 s, and 100 s for the rest: 1250 s in all. The same loop waits on
- * the run disk's lock (./locks.ts), which is one lock for every run: `down` holds it for seconds, while it removes
- * the runs, but another run's copy-out, or a reap's finalize, holds it for up to about five bounded calls (5 × 160 s). With `runs.max_live` at 1 only one run is ever
- * finalizing, so those holds can't stack; raising `max_live` needs this wait revisited.
+ * then its bounded helper calls, each at its host bound and KILL: four fixed ones (the container's exit code, the
+ * listing, the container's log and the run disk's cleanup helper) and a read per output of the kind with the most
+ * (MAX_OUTPUTS, four: a worker's, a fix's and a review's): 8 × (150 + 10) = 1280 s, and 100 s for the rest: 1410 s in
+ * all. The same loop waits on the run disk's lock (./locks.ts), which is one lock for every run: `down` holds it for
+ * seconds, while it removes the runs, but another run's copy-out, or a reap's finalize, holds it for up to about six
+ * bounded calls (6 × 160 s). With `runs.max_live` at 1 only one run is ever finalizing, so those holds can't stack;
+ * raising `max_live` needs this wait revisited.
  */
-export const FINALIZE_WAIT_S = STOP_GRACE_S + (3 + MAX_OUTPUTS) * (HELPER_HOST_TIMEOUT_S + HELPER_KILL_AFTER_S) + 100;
+export const FINALIZE_WAIT_S = STOP_GRACE_S + (4 + MAX_OUTPUTS) * (HELPER_HOST_TIMEOUT_S + HELPER_KILL_AFTER_S) + 100;
 
 const firstLine = (s: string | undefined) => (s ?? "").trim().split("\n")[0]?.slice(0, 300) || "(no error output)";
 /** Printable ASCII only, and short: for a name a run made (a node path, an attempt id, a ref). */
@@ -382,7 +386,7 @@ export interface StartOptions {
    * worker and a verify.
    */
   inputsDir?: string;
-  /** The GitHub repository the run is of, `owner/name` (Task 13: `Discovered.repo`): one live run per repo counts by it (m23). */
+  /** The GitHub repository the run is of, `owner/name` (Task 13: `Discovered.repo`), lower-cased here: one live run per repo counts by it (m23). */
   forgeRepo?: string;
 }
 
@@ -488,6 +492,8 @@ export async function startRun(d: RunDeps, o: StartOptions): Promise<StartedRun>
   if (o.budgetUsd !== undefined && o.budgetUsd > order.budget.usd) throw new Error(`the run's budget ${o.budgetUsd} is above the work order's budget.usd (${order.budget.usd}): it may only lower it`);
   if (o.retry !== undefined && !wholeFrom0(o.retry)) throw new Error(`the run's retry ${o.retry} is not a whole number of at least 0`);
   if (o.forgeRepo !== undefined && parseOwnerRepo(o.forgeRepo) === undefined) throw new Error(`the run's forgeRepo ${JSON.stringify(o.forgeRepo.slice(0, 120))} is not a GitHub repository's owner/name`);
+  // GitHub's owner and repository names aren't case-sensitive, so one repo has one forgeRepo, the lower-cased one.
+  const forgeRepo = o.forgeRepo?.toLowerCase();
   if (o.kind === "worker" && o.parent !== undefined) throw new Error("a worker run takes no parent: it is the work order's first run, and its own base");
   const disk = await checkRunDisk(d);
   // A verify run holds no key of any kind (design §3.5): no zone's env file is read for it.
@@ -508,7 +514,7 @@ export async function startRun(d: RunDeps, o: StartOptions): Promise<StartedRun>
   const base = o.kind === "worker" ? o.sha : (await parentOf(d, o)).sha;
   if (profile.inputs && o.inputsDir === undefined) throw new Error(`a ${o.kind} run needs an inputs dir (StartOptions.inputsDir): ${INPUTS_FOR[o.kind]}`);
   if (!profile.inputs && o.inputsDir !== undefined) throw new Error(`a ${o.kind} run takes no inputs dir${NO_INPUTS[o.kind] ?? ""}`);
-  const inputs = o.inputsDir === undefined ? undefined : await inputsProblem(o.inputsDir);
+  const inputs = o.inputsDir === undefined ? undefined : await inputsProblem(o.inputsDir, profile);
   if (inputs !== undefined) throw new Error(inputs);
 
   // The run's own files: the guard's settings and Archon's run layer, from the overlaid policy for build/roster's
@@ -541,7 +547,7 @@ export async function startRun(d: RunDeps, o: StartOptions): Promise<StartedRun>
     policyHash: createHash("sha256").update(JSON.stringify(applied)).digest("hex"),
     ...(o.retry === undefined ? {} : { retry: o.retry }),
     ...(alias === undefined ? {} : { model: applied.rosters[roster][alias].model }),
-    ...(o.forgeRepo === undefined ? {} : { forgeRepo: o.forgeRepo }),
+    ...(forgeRepo === undefined ? {} : { forgeRepo }),
   };
   const runFile: RunFile = {
     run_id: runId, work_order: order.id, traceparent: order.trace.traceparent, budget_usd: budgetUsd, public: o.public, workflow, started_at: rec.startedAt,
@@ -554,7 +560,7 @@ export async function startRun(d: RunDeps, o: StartOptions): Promise<StartedRun>
     const records = await listRecords(d.stateDir);
     const refused =
       keyProblem(records, { key: rec.key, workOrder: order.id, sha: o.sha, ...(o.retryOf === undefined ? {} : { retryOf: o.retryOf }) }) ??
-      capacityProblem(await liveRuns(d), records, { repo, ...(o.forgeRepo === undefined ? {} : { forgeRepo: o.forgeRepo }) }, d);
+      capacityProblem(await liveRuns(d), records, { repo, ...(forgeRepo === undefined ? {} : { forgeRepo }) }, d);
     if (refused !== undefined) throw new Error(refused);
     await createRun(d.stateDir, rec, runFile, files, o.inputsDir);
     try {
@@ -782,6 +788,22 @@ async function keepContainerLog(d: RunDeps, rec: RunRecord, out: string): Promis
   return `the container's last log line: ${last.length > LOG_LINE_CHARS ? `${last.slice(0, LOG_LINE_CHARS)}…` : last}`;
 }
 
+/**
+ * The run container's exit code as Docker recorded it (`docker inspect`, under the helpers' host bound), or undefined
+ * when it can't be read. It is never the run's status (a paused run exits 0); the record keeps it for Task 12's
+ * cross-check of a verify run, whose results the code it ran could have forged.
+ */
+async function containerExitCode(d: RunDeps, container: string): Promise<number | undefined> {
+  let r: Awaited<ReturnType<RunDeps["run"]>>;
+  try {
+    r = await d.run(bounded(["docker", "inspect", "--format", "{{.State.ExitCode}}", container]), { env: definedEnv(d.env), inherit: false });
+  } catch {
+    return undefined;
+  }
+  const text = r.stdout.trim();
+  return r.code === 0 && /^-?\d{1,10}$/.test(text) ? Number(text) : undefined;
+}
+
 /** Archon's status of the run, from out/result.json's `run.status` (`workflow get`), or why it can't be read. */
 async function archonStatus(out: string, copied: string[]): Promise<{ status: string } | { problem: string }> {
   if (!copied.includes("result.json")) return { problem: "no result.json was copied out" };
@@ -817,6 +839,7 @@ async function finalizeLocked(rec: RunRecord, d: RunDeps): Promise<RunRecord> {
 
   const problems: string[] = [];
   let gone = false;
+  let exitCode: number | undefined;
   // Under the run disk's lock, which `down` holds while it removes runs (H-210): held, it throws `lockHeld`, so
   // finalizeRun waits and a reap leaves the run for the next one, and no copy-out reads a volume `down` is removing.
   const archon = await withStackLock(d, "run-copyout", async (): Promise<Awaited<ReturnType<typeof archonStatus>>> => {
@@ -828,6 +851,7 @@ async function finalizeLocked(rec: RunRecord, d: RunDeps): Promise<RunRecord> {
       problems.push("the run's container was removed before the run was finalized (`mise run down`, or a cleanup): nothing was copied out");
       return { problem: "nothing was copied out" };
     }
+    exitCode = await containerExitCode(d, disk.container);
     const copy = await copyOut(disk.volumes.out, out, profile.outputs, d.runs.output_limits_mb, d);
     problems.push(...copy.problems);
     if (copy.copied.includes("run.bundle")) {
@@ -866,6 +890,7 @@ async function finalizeLocked(rec: RunRecord, d: RunDeps): Promise<RunRecord> {
     ...(reasons.length > 0 ? { reason: reasons.join("; ") } : {}),
     ...(spend.known ? { spendUsd: spend.usd } : {}),
     ...(turns === undefined ? {} : { turns }),
+    ...(exitCode === undefined ? {} : { exitCode }),
   };
   // The outcome first (H-219): a finalizer that dies during the removal leaves it recorded, never a live record
   // whose container is gone, which the next finalize would record failed.

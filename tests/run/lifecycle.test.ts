@@ -700,7 +700,7 @@ describe("startRun", () => {
       const r = api();
       await seedRun(r.f, { id: P, status: "succeeded", objects: false });
       const reviewed = { ...r.order, roles: { implement: "small" as const, review: "medium" as const } };
-      const review = await startRun(r.f.deps, r.base({ workOrder: reviewed, kind: "review", parent: P, inputsDir: inputsIn(r.f.tmp), ...(overlay === undefined ? {} : { overlay }) }));
+      const review = await startRun(r.f.deps, r.base({ workOrder: reviewed, kind: "review", parent: P, inputsDir: inputsIn(r.f.tmp, { "diff.patch": "x\n" }), ...(overlay === undefined ? {} : { overlay }) }));
       expect([review.model, review.deadline]).toEqual([POLICY.rosters.anthropic.medium.model, minutes(30)]);
     }
   });
@@ -782,7 +782,7 @@ describe("startRun", () => {
       expect([changes(f.calls), ids(f)]).toEqual([[], before]);
     });
 
-    test("a fix or review run needs an inputs dir holding only RUN_INPUTS' files, copied into its run dir 0755 with 0644 files; a worker or verify run takes none", async () => {
+    test("a fix or review run needs an inputs dir holding its kind's inputs alone (a fix's findings.md; a review's diff.patch, and verify.json), copied into its run dir 0755 with 0644 files; a worker or verify run takes none", async () => {
       capture();
       type K = Awaited<ReturnType<typeof kinded>>;
       const holding = (k: K, make: (dir: string) => void) => {
@@ -820,7 +820,27 @@ describe("startRun", () => {
         [
           "a bundle",
           (k) => k.base({ kind: "fix", parent: P, inputsDir: holding(k, (d) => writeFileSync(join(d, "run.bundle"), "# v2 git bundle\n")) }),
-          (_, o) => `${o.inputsDir}/run.bundle is none of RUN_INPUTS' files (diff.patch, verify.json, findings.md): an inputs dir never holds a bundle`,
+          (_, o) => `${o.inputsDir}/run.bundle is not one of a fix run's inputs (findings.md): an inputs dir never holds a bundle`,
+        ],
+        [
+          "a review's input in a fix's",
+          (k) => k.base({ kind: "fix", parent: P, inputsDir: holding(k, (d) => (writeFileSync(join(d, "findings.md"), "f\n"), writeFileSync(join(d, "diff.patch"), "d\n"))) }),
+          (_, o) => `${o.inputsDir}/diff.patch is not one of a fix run's inputs (findings.md)`,
+        ],
+        [
+          "a fix's input in a review's",
+          (k) => k.review({ inputsDir: holding(k, (d) => (writeFileSync(join(d, "diff.patch"), "d\n"), writeFileSync(join(d, "findings.md"), "f\n"))) }),
+          (_, o) => `${o.inputsDir}/findings.md is not one of a review run's inputs (diff.patch, verify.json)`,
+        ],
+        [
+          "a fix's with no findings",
+          (k) => k.base({ kind: "fix", parent: P, inputsDir: holding(k, () => {}) }),
+          (_, o) => `${o.inputsDir} has no findings.md: a fix run's inputs dir must hold it`,
+        ],
+        [
+          "a review's with no diff",
+          (k) => k.review({ inputsDir: holding(k, (d) => writeFileSync(join(d, "verify.json"), "{}\n")) }),
+          (_, o) => `${o.inputsDir} has no diff.patch: a review run's inputs dir must hold it`,
         ],
         [
           "a path that isn't a dir",
@@ -852,13 +872,13 @@ describe("startRun", () => {
       expect([statSync(copy).mode & 0o777, readdirSync(copy), statSync(join(copy, "findings.md")).mode & 0o777]).toEqual([0o755, ["findings.md"], 0o644]);
       expect(readFileSync(join(copy, "findings.md"), "utf8")).toBe("# findings\n");
       expect(runCall(k.f.calls).cmd).toContain(`${copy}:/run/hapi/inputs:ro`);
-      // A review's holds the diff and verify's results; an empty one is an inputs dir too (a review whose verify phase is off).
+      // A review's holds the diff and verify's results, or the diff alone (a review whose verify phase is off).
       const r = await kinded();
       const reviewed = await startRun(r.f.deps, r.review());
       expect(readdirSync(join(r.f.deps.stateDir, reviewed.runId, "inputs")).sort()).toEqual(["diff.patch", "verify.json"]);
       const e = await kinded();
-      const empty = await startRun(e.f.deps, e.review({ inputsDir: inputsIn(e.f.tmp, {}, "empty") }));
-      expect(readdirSync(join(e.f.deps.stateDir, empty.runId, "inputs"))).toEqual([]);
+      const diffOnly = await startRun(e.f.deps, e.review({ inputsDir: inputsIn(e.f.tmp, { "diff.patch": "x\n" }, "diff-only") }));
+      expect(readdirSync(join(e.f.deps.stateDir, diffOnly.runId, "inputs"))).toEqual(["diff.patch"]);
     });
 
     test("one live run per GitHub repo (m23): a verify on a scratch source counts against a run live on the mirror of the same forgeRepo", async () => {
@@ -870,8 +890,11 @@ describe("startRun", () => {
       const e = await caught(startRun(f.deps, base({ repoGitDir: scratch, kind: "verify", parent: P, budgetUsd: 0, forgeRepo: "example-owner/sandbox" })));
       expect(e.message).toBe(`run ${L} is live for example-owner/sandbox: one live run per repo (H-090); wait for it, or stop it with \`hapi run stop ${L}\``);
       expect(changes(f.calls)).toEqual([]);
-      // Another GitHub repo's verify, below max_live, starts, and its record names its repo.
-      const other = await startRun(f.deps, base({ repoGitDir: scratch, kind: "verify", parent: P, budgetUsd: 0, forgeRepo: "example-owner/other" }));
+      // GitHub's names aren't case-sensitive: the same repo spelt another way is the same repo.
+      const upper = await caught(startRun(f.deps, base({ repoGitDir: scratch, kind: "verify", parent: P, budgetUsd: 0, forgeRepo: "Example-Owner/Sandbox" })));
+      expect(upper.message).toStartWith(`run ${L} is live for example-owner/sandbox: one live run per repo (H-090)`);
+      // Another GitHub repo's verify, below max_live, starts, and its record names its repo, lower-cased.
+      const other = await startRun(f.deps, base({ repoGitDir: scratch, kind: "verify", parent: P, budgetUsd: 0, forgeRepo: "Example-Owner/Other" }));
       expect([other.repo, other.forgeRepo]).toEqual([scratch, "example-owner/other"]);
       expect((await readRecord(f.deps.stateDir, other.runId))!.forgeRepo).toBe("example-owner/other");
     });
@@ -1025,7 +1048,8 @@ describe("finalizeRun", () => {
     const f = fakeRun();
     const rec = await seedRun(f, { id: ID, running: false, outputs: { ...completedOutputs(), "run.bundle": file(new Uint8Array([0x23, 0x20, 0xff])) } });
     const done = await finalizeRun(rec, f.deps);
-    expect(done).toEqual({ ...rec, status: "succeeded" });
+    // The container's exit code, as Docker recorded it, is kept on the record (never read as its status).
+    expect(done).toEqual({ ...rec, status: "succeeded", exitCode: 0 });
     expect(await readRecord(f.deps.stateDir, ID)).toEqual(done);
     const out = join(f.deps.stateDir, ID, "out");
     expect(readdirSync(out).sort()).toEqual(["result.json", "run.bundle", "transcript.jsonl"]);
@@ -1095,7 +1119,7 @@ describe("finalizeRun", () => {
     await seedRun(f, { id: "0a0b0c0d0e0f", status: "succeeded", objects: false });
     const order = { ...loadWorkOrder(f.order), roles: { implement: "small" as const, review: "medium" as const } };
     const gitDir = realpathSync(join(f.repo, ".git"));
-    const e = await caught(startRun(f.deps, { repoGitDir: gitDir, workOrder: order, sha: SHA, public: false, kind: "review", parent: "0a0b0c0d0e0f", inputsDir: inputsIn(f.tmp) }));
+    const e = await caught(startRun(f.deps, { repoGitDir: gitDir, workOrder: order, sha: SHA, public: false, kind: "review", parent: "0a0b0c0d0e0f", inputsDir: inputsIn(f.tmp, { "diff.patch": "x\n" }) }));
     expect(e.message).toMatch(/^docker run hapi-run-[0-9a-f]{12} failed \(exit 1\): boom\. What start had created was removed\.$/);
     expect(disconnects(f.calls).map((c) => c.at(-1))).toEqual(["hapi-egress-review-1"]);
     expect([f.world.containers.size, f.world.networks.size, f.world.volumes.size]).toEqual([0, 0, 0]);
@@ -1249,11 +1273,36 @@ describe("finalizeRun", () => {
 });
 
 test("a finalize waits long enough for every kind's bounded calls", () => {
-  // The stop's grace, then the three fixed calls (the listing, the container's log, the cleanup helper) and a read per
-  // output of the kind with the most (MAX_OUTPUTS), each at its host bound and KILL, and 100 s for the rest.
-  expect(FINALIZE_WAIT_S).toBe(STOP_GRACE_S + (3 + MAX_OUTPUTS) * (HELPER_HOST_TIMEOUT_S + HELPER_KILL_AFTER_S) + 100);
-  // 30 + 7 × 160 + 100: the number Task 4 pinned, now from MAX_OUTPUTS (4).
-  expect(FINALIZE_WAIT_S).toBe(1250);
+  // The stop's grace, then the four fixed calls (the container's exit code, the listing, the container's log, the
+  // cleanup helper) and a read per output of the kind with the most (MAX_OUTPUTS), each at its host bound and KILL,
+  // and 100 s for the rest.
+  expect(FINALIZE_WAIT_S).toBe(STOP_GRACE_S + (4 + MAX_OUTPUTS) * (HELPER_HOST_TIMEOUT_S + HELPER_KILL_AFTER_S) + 100);
+  // 30 + 8 × 160 + 100: Task 4's 1250, with one more bounded call for the exit code.
+  expect(FINALIZE_WAIT_S).toBe(1410);
+});
+
+test("finalize records the container's exit code as Docker recorded it, under the helpers' host bound, and never as the status; one it can't read is left out", async () => {
+  capture();
+  const f = fakeRun({ exitCode: 3 });
+  const done = await finalizeRun(await seedRun(f, { id: ID, running: false, outputs: completedOutputs() }), f.deps);
+  // Archon says completed, so the run succeeded: the exit code is evidence for Task 12, not the status.
+  expect([done.status, done.exitCode]).toEqual(["succeeded", 3]);
+  expect((await readRecord(f.deps.stateDir, ID))!.exitCode).toBe(3);
+  const inspect = f.calls.map((c) => c.cmd).find((c) => c.includes("{{.State.ExitCode}}"))!;
+  expect(inspect).toEqual(["timeout", "-k", String(HELPER_KILL_AFTER_S), String(HELPER_HOST_TIMEOUT_S), "docker", "inspect", "--format", "{{.State.ExitCode}}", N]);
+  // Read before the container is removed.
+  const cmds = f.calls.map((c) => c.cmd.join(" "));
+  expect(cmds.findIndex((c) => c.includes("{{.State.ExitCode}}"))).toBeLessThan(cmds.indexOf(`docker rm -f ${N}`));
+  const unread: [Parameters<typeof fakeRun>[0], string][] = [[{ failing: ["docker inspect"] }, "fails"], [{ hangs: (c) => c.includes("{{.State.ExitCode}}") }, "hangs"]];
+  for (const [o, why] of unread) {
+    const g = fakeRun(o);
+    const left = await finalizeRun(await seedRun(g, { id: ID, running: false, outputs: completedOutputs() }), g.deps);
+    expect([why, left.status, Object.hasOwn(left, "exitCode")]).toEqual([why, "succeeded", false]);
+  }
+  // A container removed around hapi has no exit code to read.
+  const h = fakeRun();
+  const gone = await finalizeRun(await seedRun(h, { id: ID, objects: false }), h.deps);
+  expect(Object.hasOwn(gone, "exitCode")).toBe(false);
 });
 
 test("finalize copies out holding the run disk's lock, and while down holds it a reap leaves the run to the next one (H-210)", async () => {

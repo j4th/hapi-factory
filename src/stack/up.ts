@@ -291,8 +291,8 @@ async function liveRuns(run: Runner, env: Env, project: string): Promise<string[
  * Removes every run object of `project`: the labelled containers (`rm -f`), then each egress proxy's attachment to
  * each labelled network (Docker refuses to remove a network with an endpoint attached, spike 07 finding 13): both
  * `<project>-egress-archon-1` and `<project>-egress-review-1`, since a review run's network has the second and every
- * other kind's the first (src/run/kinds.ts), then the networks, then the volumes. Only what the two labels select, never by name or prefix.
- * It tries every removal and throws at the end naming the ones that failed. A listing that fails (`docker ps`,
+ * other kind's the first (src/run/kinds.ts), then the networks, then the volumes. Only what the two labels select,
+ * never by name or prefix. It tries every removal and throws at the end naming the ones that failed. A listing that fails (`docker ps`,
  * `network ls`, `volume ls`) throws at once and skips the steps after it: that almost always means the daemon is
  * down, when they would fail too. Either way `down`, kill switch 3, goes on to `compose down`. A disconnect that
  * fails is not an error by itself (the proxy may be gone, or not attached); the network removal after it says
@@ -301,9 +301,8 @@ async function liveRuns(run: Runner, env: Env, project: string): Promise<string[
  *
  * With `o.runId`, only that run's objects (`org.hapi.run=<id>`): `hapi run` finalizes one run, or rolls back a
  * start, this way, disconnecting only `o.egress`, the proxies its kind joined (src/run/kinds.ts `egressOf`), when
- * given. With `o.volumes` false (the default
- * is true), the volumes are neither listed nor removed: the one way to keep them, for `down` without the run disk's
- * lock, and for a finalize whose volumes must stay.
+ * given. With `o.volumes` false (the default is true), the volumes are neither listed nor removed: the one way to
+ * keep them, for `down` without the run disk's lock, and for a finalize whose volumes must stay.
  */
 export async function removeRuns(project: string, run: Runner, env: Env, o: { runId?: string; egress?: string[]; volumes?: boolean } = {}): Promise<void> {
   const failures: string[] = [];
@@ -324,7 +323,9 @@ export async function removeRuns(project: string, run: Runner, env: Env, o: { ru
   if (containers.length > 0) await remove(["docker", "rm", "-f", ...containers], containers, ps);
   const nets = ["docker", "network", "ls", "--format", "{{.Name}}", ...filters];
   const networks = await listed(run, env, nets);
-  for (const n of networks) for (const e of egress) await run(["docker", "network", "disconnect", "-f", n, e], { env: definedEnv(env), inherit: false });
+  for (const n of networks) {
+    for (const e of egress) await run(["docker", "network", "disconnect", "-f", n, e], { env: definedEnv(env), inherit: false });
+  }
   if (networks.length > 0) await remove(["docker", "network", "rm", ...networks], networks, nets);
   if (o.volumes !== false) {
     const vols = ["docker", "volume", "ls", "-q", ...filters];

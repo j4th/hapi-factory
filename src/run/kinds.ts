@@ -52,6 +52,12 @@ export interface KindProfile {
   workflow: "factory-verify" | "factory-review" | undefined;
   /** Whether `StartOptions.inputsDir` is required, copied and bound at `RUN_PATHS.inputs` (and refused when false). */
   inputs: boolean;
+  /**
+   * Which of `RUN_INPUTS`' files the kind's inputs dir may hold (`allowed`), and must (`required`): a fix's must hold
+   * the findings; a review's the diff, and verify's results unless the verify phase is off. Empty for a kind that
+   * takes none.
+   */
+  inputFiles: { required: readonly string[]; allowed: readonly string[] };
   /** More read-only binds, each through `mountable`: every kind's is empty here (Task 11 gives review's one). */
   extraBinds: (d: Pick<RunDeps, "buildDir">) => [src: string, dst: string][];
   /** The files copy-out reads from `/out`, in order, each capped by its limit in `runs.output_limits_mb`; any other name is reported. */
@@ -68,20 +74,31 @@ const WORKER_OUTPUTS = [
   { name: "run.bundle", limit: "bundle" },
 ] as const;
 
-const freeze = (p: KindProfile): KindProfile => Object.freeze({ ...p, outputs: Object.freeze(p.outputs.map((o) => Object.freeze({ ...o }))) });
+const freeze = (p: KindProfile): KindProfile =>
+  Object.freeze({
+    ...p,
+    inputFiles: Object.freeze({ required: Object.freeze([...p.inputFiles.required]), allowed: Object.freeze([...p.inputFiles.allowed]) }),
+    outputs: Object.freeze(p.outputs.map((o) => Object.freeze({ ...o }))),
+  });
+const NO_INPUTS = { required: [], allowed: [] };
 
 const PROFILES: Readonly<Record<RunKind, KindProfile>> = Object.freeze({
-  worker: freeze({ kind: "worker", zone: "archon", egress: "egress-archon", prelude: "run.sh", workflow: undefined, inputs: false, extraBinds: none, outputs: WORKER_OUTPUTS }),
-  fix: freeze({ kind: "fix", zone: "archon", egress: "egress-archon", prelude: "run.sh", workflow: undefined, inputs: true, extraBinds: none, outputs: WORKER_OUTPUTS }),
+  worker: freeze({ kind: "worker", zone: "archon", egress: "egress-archon", prelude: "run.sh", workflow: undefined, inputs: false, inputFiles: NO_INPUTS, extraBinds: none, outputs: WORKER_OUTPUTS }),
+  fix: freeze({
+    kind: "fix", zone: "archon", egress: "egress-archon", prelude: "run.sh", workflow: undefined, inputs: true,
+    inputFiles: { required: [RUN_INPUTS.findings], allowed: [RUN_INPUTS.findings] }, extraBinds: none, outputs: WORKER_OUTPUTS,
+  }),
   // Its results are verify.json, held to result.json's limit; it commits nothing, so it leaves no bundle, and it runs no model, so no decisions.
   verify: freeze({
-    kind: "verify", zone: undefined, egress: "egress-archon", prelude: "verify.sh", workflow: "factory-verify", inputs: false, extraBinds: none,
+    kind: "verify", zone: undefined, egress: "egress-archon", prelude: "verify.sh", workflow: "factory-verify", inputs: false, inputFiles: NO_INPUTS, extraBinds: none,
     outputs: [{ name: "result.json", limit: "result" }, { name: "transcript.jsonl", limit: "transcript" }, { name: "verify.json", limit: "result" }],
   }),
   // Its verdict and findings are the review node's structured output in its result.json and transcript (Tasks 11, 12):
   // there is no review.json. decisions.jsonl is a Pi-run review's (the portable roster); coderabbit.ndjson is CodeRabbit's CLI's.
   review: freeze({
-    kind: "review", zone: "review", egress: "egress-review", prelude: "review.sh", workflow: "factory-review", inputs: true, extraBinds: none,
+    kind: "review", zone: "review", egress: "egress-review", prelude: "review.sh", workflow: "factory-review", inputs: true,
+    // verify.json is absent when runs.phases.verify is off (design §3.5: every phase is a knob).
+    inputFiles: { required: [RUN_INPUTS.diff], allowed: [RUN_INPUTS.diff, RUN_INPUTS.verify] }, extraBinds: none,
     outputs: [
       { name: "result.json", limit: "result" },
       { name: "transcript.jsonl", limit: "transcript" },

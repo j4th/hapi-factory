@@ -118,6 +118,12 @@ describe("forgeRepo (m23)", () => {
     }
     expect((await readRecord(state({ ...base, forgeRepo: "example-owner/sandbox" }), "aaaaaaaaaaaa"))!.forgeRepo).toBe("example-owner/sandbox");
     expect((await readRecord(state(base), "aaaaaaaaaaaa"))!.forgeRepo).toBeUndefined();
+    // The container's exit code, when finalize could read it, is an integer.
+    for (const exitCode of [1.5, "0", null]) {
+      const e = await caught(readRecord(state({ ...base, exitCode }), "aaaaaaaaaaaa"));
+      expect([exitCode, e.message]).toEqual([exitCode, expect.stringContaining("is not a run record hapi wrote")]);
+    }
+    for (const exitCode of [0, 137, -1]) expect((await readRecord(state({ ...base, exitCode }), "aaaaaaaaaaaa"))!.exitCode).toBe(exitCode);
   });
 
   test("capacityProblem keys one live run per repo by forgeRepo when the start has one, and by the source's git dir always", () => {
@@ -129,6 +135,8 @@ describe("forgeRepo (m23)", () => {
     expect(capacityProblem(["aaaaaaaaaaaa"], [mirror], { repo: "/engine/scratch/0003/repo.git", forgeRepo: "example-owner/other" }, d)).toBeUndefined();
     // The same git dir is the same repo, whatever either says of GitHub (a hand run names none).
     expect(capacityProblem(["aaaaaaaaaaaa"], [mirror], { repo: mirror.repo }, d)).toBe(`run aaaaaaaaaaaa is live for ${mirror.repo}: one live run per repo (H-090); wait for it, or stop it with \`hapi run stop aaaaaaaaaaaa\``);
+    // GitHub's names aren't case-sensitive, so neither is the comparison.
+    expect(capacityProblem(["aaaaaaaaaaaa"], [mirror], { repo: "/engine/scratch/0003/repo.git", forgeRepo: "Example-Owner/Sandbox" }, d)).toBe(refused.replace("for example-owner/sandbox", "for Example-Owner/Sandbox"));
     // A run that isn't live doesn't count.
     expect(capacityProblem([], [mirror], { repo: "/x.git", forgeRepo: "example-owner/sandbox" }, d)).toBeUndefined();
   });

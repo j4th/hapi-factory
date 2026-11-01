@@ -17,9 +17,19 @@ git -C /work/repo sparse-checkout set --no-cone '/*' '!/.pi/' '!/.agents/' '!/.a
 git -C /work/repo checkout --detach "$2"
 git -C /work/repo remote remove origin
 
+# The checkout holds no symlink: a committed one (`notes.md -> /proc/1/environ`, `d -> /`) would let the review's
+# Read, Grep and Glob leave /work/repo. With core.symlinks off, git checks each one out again as a plain file that
+# holds its target's text, so the review still reads what the change committed, and the status stays clean;
+# anything else ends the prelude here, before Archon starts.
+git -C /work/repo config core.symlinks false
+find /work/repo -path /work/repo/.git -prune -o -type l -exec rm -f {} +
+git -C /work/repo checkout -- .
+st=$(git -C /work/repo status --porcelain)
+if [ -n "$st" ]; then echo "prelude: the checkout is not clean once its symlinks are plain files" >&2; exit 1; fi
+
 # The checkout is read-only, .git aside, which git still writes: the review reads the repo and never changes it.
-# Archon writes nothing there (spike 09, T19 r6). A symlink is skipped: chmod would follow it to its target, out of
-# the checkout (/out, say), and fail the prelude on a dangling one; the link's own mode means nothing.
+# Archon writes nothing there (spike 09, T19 r6). No symlink is left, and none is followed: chmod would follow one
+# to its target, out of the checkout (/out, say), and fail the prelude on a dangling one.
 find /work/repo -path /work/repo/.git -prune -o ! -type l -exec chmod a-w {} +
 
 # Archon starts from /app, never from inside the clone: started there it would load the repo's .archon/.env
@@ -41,6 +51,10 @@ while kill -0 "$pid" 2>/dev/null; do wait "$pid" || rc=$?; done
 # From here on, nothing may abort: a failed, stopped or timed-out run still leaves what it can. Each failure
 # is noted on stderr (the launcher's live view is `docker logs`).
 set +e
+# As PID 1, kill whatever the workflow left running (a background job the repo's checks started), so nothing the
+# change ran still writes the clone or /out while the strip and the read-back below run. The guard matters: where
+# this shell isn't PID 1 (a test's sandbox), `kill -1` would signal every process its user has.
+if [ "$$" = 1 ]; then kill -s KILL -1 2>/dev/null; fi
 # The strip again, before the CLI calls below read the repo's .archon (config, env): the checkout is read-only, so
 # this is defence in depth. No bundle: what a review run leaves is its results.
 rm -rf /work/repo/.archon /work/repo/.pi /work/repo/.agents /work/repo/.claude /work/repo/CLAUDE.md /work/repo/.mcp.json || echo "prelude: strip failed" >&2

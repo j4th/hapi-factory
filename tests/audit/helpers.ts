@@ -94,7 +94,17 @@ export interface Container {
   Args: string[];
   Config: { Labels: Record<string, string>; Env: string[]; Cmd: string[] | null; Entrypoint: string[] | null; User?: string; StopTimeout?: number };
   Mounts: { Type: string; Source: string; Destination: string; RW: boolean }[];
-  HostConfig?: { PortBindings: Record<string, unknown>; Tmpfs?: Record<string, string>; CapDrop?: string[]; ReadonlyRootfs?: boolean; SecurityOpt?: string[]; PidsLimit?: number; Memory?: number };
+  NetworkSettings?: { Networks: Record<string, unknown> };
+  HostConfig?: { NetworkMode?: string; PortBindings: Record<string, unknown>; Tmpfs?: Record<string, string>; CapDrop?: string[]; ReadonlyRootfs?: boolean; SecurityOpt?: string[]; PidsLimit?: number; Memory?: number };
+}
+
+/** A network as `docker network inspect` prints one (the fields the audit reads). */
+export interface Network {
+  Name: string;
+  Internal: boolean;
+  IPAM: { Config: { Subnet: string }[] };
+  /** By container id: each endpoint's container name. */
+  Containers: Record<string, { Name: string }>;
 }
 
 export interface Reply {
@@ -114,6 +124,8 @@ export interface World {
   /** Its digest, as `hapi stack up` labels the containers. */
   digest: string;
   containers: Container[];
+  /** The networks `docker network inspect` finds, by name: each run container's own (`runContainer` adds it). */
+  networks: Map<string, Network>;
   /** What the archon validation run prints: Archon's `validate workflows --json` output (an object or raw text). */
   archonValidate: { code: number; out: unknown };
   /** What the `assistants.pi.enableExtensions` read-back prints (and its exit code). */
@@ -411,6 +423,7 @@ export async function cleanWorld(o: { repos?: boolean; workflows?: Record<string
     build,
     digest,
     containers,
+    networks: new Map(),
     archonValidate: { code: 0, out: readJson("archon-validate-v0.12.1.json") },
     enableExtensions: { code: 0, out: "true" },
     hermes: { defaults, issues: [], config_version: 0, latest_config_version: 51, effective: hermesMerge(defaults, ours) },
@@ -457,10 +470,14 @@ export type Kind = "worker" | "verify" | "review" | "fix";
  * - worker and fix: run.sh, the work order's workflow, egress-archon; a fix's inputs dir too;
  * - verify: verify.sh, factory-verify, egress-archon, no inputs;
  * - review: review.sh, factory-review, egress-review, its inputs dir.
+ * It is on its own network, named as it is, which this adds to `w.networks`: internal, on a private subnet, and
+ * holding the container and its kind's proxy (`hapi-egress-archon-1`, or `hapi-egress-review-1` for a review).
  */
 export function runContainer(w: World, id = "ab12cd34ef56", over: { labels?: Record<string, string>; kind?: Kind } = {}): Container {
   const name = `hapi-run-${id}`;
   const kind = over.kind ?? "worker";
+  const egress = kind === "review" ? "hapi-egress-review-1" : "hapi-egress-archon-1";
+  w.networks.set(name, { Name: name, Internal: true, IPAM: { Config: [{ Subnet: "172.30.0.0/16" }] }, Containers: { [`id-run-${id}`]: { Name: name }, [`id-${egress}`]: { Name: egress } } });
   const prelude = { worker: "run.sh", fix: "run.sh", verify: "verify.sh", review: "review.sh" }[kind];
   const workflow = { worker: "hapi-check-run", fix: "hapi-check-run", verify: "factory-verify", review: "factory-review" }[kind];
   const env = { ...serviceEnvironment("archon") };
@@ -510,7 +527,9 @@ export function runContainer(w: World, id = "ab12cd34ef56", over: { labels?: Rec
       { Type: "volume", Source: `/var/lib/docker/volumes/${name}-work/_data`, Destination: "/work", RW: true },
       { Type: "volume", Source: `/var/lib/docker/volumes/${name}-out/_data`, Destination: "/out", RW: true },
     ],
+    NetworkSettings: { Networks: { [name]: { NetworkID: `net-${id}` } } },
     HostConfig: {
+      NetworkMode: name,
       PortBindings: {},
       Tmpfs: {
         "/tmp": "size=1g,uid=1001,gid=1001,mode=1777",
@@ -560,6 +579,11 @@ function fakeExec(w: World, cmd: string[]): ExecResult {
   if (cmd[1] === "inspect") {
     const ids = cmd.slice(2);
     return ok(JSON.stringify(w.containers.filter((c) => ids.includes(c.Id))));
+  }
+  if (cmd[1] === "network" && cmd[2] === "inspect") {
+    const nets = cmd.slice(3).map((n) => w.networks.get(n));
+    if (nets.some((n) => n === undefined)) return { code: 1, stdout: "[]", stderr: `Error response from daemon: network ${cmd[3]} not found` };
+    return ok(JSON.stringify(nets));
   }
   if (cmd[1] === "image" && cmd[2] === "inspect") {
     const image = cmd.at(-1)!;

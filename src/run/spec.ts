@@ -138,8 +138,9 @@ export function readRoster(buildDir: string): RosterName {
  *   `mem_limit`, `logging`, `tmpfs`: their `docker run` flags;
  * - `labels`: as given, but the three the stack's anchor interpolates
  *   (`LABEL_VALUES`), which are computed as `up` computes them;
- * - `env_file`: the launcher reads the same file itself (`parseEnvFile`) and
- *   passes each name as `-e NAME`;
+ * - `env_file`: the launcher reads the run's kind's zone's file itself
+ *   (./lifecycle.ts `zoneSecrets`: the archon zone's archon.env, or a review's
+ *   review.env; a verify run reads none) and passes each name as `-e NAME`;
  * - `environment`: `-e K=V`, each value as written.
  */
 export const TRANSLATED_KEYS: readonly string[] = [

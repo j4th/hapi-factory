@@ -16,14 +16,18 @@ const WORKER_OUTPUTS = [
 
 /** design §3.5's table, as Task 8 writes it: each kind's profile without its extraBinds. */
 const TABLE = {
-  worker: { kind: "worker", zone: "archon", egress: "egress-archon", prelude: "run.sh", workflow: undefined, inputs: false, outputs: WORKER_OUTPUTS },
-  fix: { kind: "fix", zone: "archon", egress: "egress-archon", prelude: "run.sh", workflow: undefined, inputs: true, outputs: WORKER_OUTPUTS },
+  worker: { kind: "worker", zone: "archon", egress: "egress-archon", prelude: "run.sh", workflow: undefined, inputs: false, inputFiles: { required: [], allowed: [] }, outputs: WORKER_OUTPUTS },
+  fix: {
+    kind: "fix", zone: "archon", egress: "egress-archon", prelude: "run.sh", workflow: undefined, inputs: true,
+    inputFiles: { required: ["findings.md"], allowed: ["findings.md"] }, outputs: WORKER_OUTPUTS,
+  },
   verify: {
-    kind: "verify", zone: undefined, egress: "egress-archon", prelude: "verify.sh", workflow: "factory-verify", inputs: false,
+    kind: "verify", zone: undefined, egress: "egress-archon", prelude: "verify.sh", workflow: "factory-verify", inputs: false, inputFiles: { required: [], allowed: [] },
     outputs: [{ name: "result.json", limit: "result" }, { name: "transcript.jsonl", limit: "transcript" }, { name: "verify.json", limit: "result" }],
   },
   review: {
     kind: "review", zone: "review", egress: "egress-review", prelude: "review.sh", workflow: "factory-review", inputs: true,
+    inputFiles: { required: ["diff.patch"], allowed: ["diff.patch", "verify.json"] },
     outputs: [
       { name: "result.json", limit: "result" },
       { name: "transcript.jsonl", limit: "transcript" },
@@ -53,6 +57,11 @@ describe("kindProfile", () => {
     const names = Object.values(RUN_INPUTS);
     for (const n of ["base.txt", "run.bundle", "order.json", "task.md"]) expect([n, names.includes(n as never)]).toEqual([n, false]);
     for (const k of RUN_KINDS) expect([k, kindProfile(k).outputs.some((o) => o.name === "review.json")]).toEqual([k, false]);
+    // Each kind's inputs are RUN_INPUTS' files: a kind takes an inputs dir exactly when it allows some, and requires only what it allows.
+    for (const k of RUN_KINDS) {
+      const { inputs, inputFiles } = kindProfile(k);
+      expect([k, inputs, inputFiles.allowed.every((n) => names.includes(n as never)), inputFiles.required.every((n) => inputFiles.allowed.includes(n))]).toEqual([k, inputFiles.allowed.length > 0, true, true]);
+    }
   });
 
   test("only verify holds no zone's keys; only review takes the review zone's keys and proxy", () => {

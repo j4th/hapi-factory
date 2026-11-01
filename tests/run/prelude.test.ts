@@ -30,6 +30,16 @@ const SPARSE = "git -C /work/repo sparse-checkout set --no-cone '/*' '!/.pi/' '!
 const STRIP = 'rm -rf /work/repo/.archon /work/repo/.pi /work/repo/.agents /work/repo/.claude /work/repo/CLAUDE.md /work/repo/.mcp.json || echo "prelude: strip failed" >&2';
 /** review.sh's read-only checkout, .git aside, never following a symlink out of it. */
 const CHMOD = "find /work/repo -path /work/repo/.git -prune -o ! -type l -exec chmod a-w {} +";
+/** review.sh's symlinks, each checked out again as a plain file holding its target's text, before the chmod; a status that isn't clean then ends it. */
+const PLAIN_LINKS = [
+  "git -C /work/repo config core.symlinks false",
+  "find /work/repo -path /work/repo/.git -prune -o -type l -exec rm -f {} +",
+  "git -C /work/repo checkout -- .",
+  "st=$(git -C /work/repo status --porcelain)",
+  'if [ -n "$st" ]; then echo "prelude: the checkout is not clean once its symlinks are plain files" >&2; exit 1; fi',
+];
+/** verify.sh's and review.sh's kill of what the workflow left running, right after `set +e`: only as PID 1, the container's init. */
+const KILL = 'if [ "$$" = 1 ]; then kill -s KILL -1 2>/dev/null; fi';
 /**
  * The regions every prelude holds as run.sh does, byte for byte, comments and all, each from its first text to its
  * last: the start, the clone, the checkout and the remote's removal, the CLI's run with its trap and wait up to
@@ -159,8 +169,10 @@ function sandbox(script0: string = text) {
   writeFileSync(join(seed, ".mcp.json"), '{"mcpServers":{"x":{"command":"sh"}}}\n');
   writeFileSync(join(seed, "sub", "CLAUDE.md"), "decoy: nested\n");
   writeFileSync(join(seed, "sub", "keep.txt"), "kept\n");
-  // A link out of the checkout, to a file of the run's own user, as `x -> /out` would be.
+  // Links out of the checkout: to a file of the run's own user (as `x -> /out` would be), to a dir, and to nothing.
   symlinkSync(join(root, "state", "outside.jsonl"), join(seed, "link"));
+  symlinkSync(join(root, "state"), join(seed, "d"));
+  symlinkSync(join(root, "nowhere"), join(seed, "dangling"));
   git(seed, "add", "-A");
   git(seed, "commit", "-q", "-m", "A");
   const sha = git(seed, "rev-parse", "HEAD");
@@ -384,14 +396,28 @@ describe("the text of verify.sh and review.sh", () => {
     });
   }
 
-  test("verify.sh is run.sh with the seven sparse patterns, no bundle and the six-path strip; review.sh is verify.sh with the checkout made read-only right after the remote goes", () => {
+  test("verify.sh is run.sh with the seven sparse patterns, no bundle, the guarded kill after set +e and the six-path strip; review.sh is verify.sh with its symlinks made plain files and the checkout made read-only right after the remote goes", () => {
     const want = code
       .map((l) => (l.startsWith("git -C /work/repo sparse-checkout set") ? SPARSE : l.startsWith("rm -rf /work/repo/.archon") ? STRIP : l))
-      .filter((l) => !l.startsWith("head=") && !l.includes("bundle create"));
-    expect(want).toHaveLength(code.length - 2);
+      .filter((l) => !l.startsWith("head=") && !l.includes("bundle create"))
+      .flatMap((l) => (l === "set +e" ? [l, KILL] : [l]));
+    expect(want).toHaveLength(code.length - 1);
     expect(codeOf(VERIFY)).toEqual(want);
     const at = want.indexOf("git -C /work/repo remote remove origin");
-    expect(codeOf(REVIEW)).toEqual([...want.slice(0, at + 1), CHMOD, ...want.slice(at + 1)]);
+    expect(codeOf(REVIEW)).toEqual([...want.slice(0, at + 1), ...PLAIN_LINKS, CHMOD, ...want.slice(at + 1)]);
+  });
+
+  test("the kill of what the workflow left runs only as PID 1, never in run.sh, and is the preludes' one kill of every process", () => {
+    for (const [name, t] of [["verify.sh", VERIFY], ["review.sh", REVIEW]] as const) {
+      const c = codeOf(t);
+      expect([name, c.filter((l) => /\bkill\b/.test(l) && !l.includes('"$pid"'))]).toEqual([name, [KILL]]);
+      // Right after set +e: the strip and the read-back come after it.
+      expect([name, c[c.indexOf("set +e") + 1]]).toEqual([name, KILL]);
+    }
+    expect(codeOf(text).some((l) => l.includes("kill -s KILL -1"))).toBe(false);
+    // The guard holds in a sandbox: the shell isn't PID 1, so the line does nothing (the session it runs in lives on).
+    const r = Bun.spawnSync(["sh", "-c", `${KILL}; echo alive`], { stdout: "pipe", stderr: "pipe" });
+    expect([r.exitCode, r.stdout.toString()]).toEqual([0, "alive\n"]);
   });
 
   test("the three preludes' shared regions are byte-equal, comments too (ruling m46): a change to one is a change to all three", () => {
@@ -450,7 +476,7 @@ describe.skipIf(!HAVE_JQ)("verify.sh and review.sh, run on a sandbox with a stan
         expect(await p.exited).toBe(0);
         expect(await new Response(p.stderr).text()).not.toContain("prelude:");
         expect(Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: clone, stdout: "pipe" }).stdout.toString().trim()).toBe(s.sha);
-        expect(tree(clone).sort()).toEqual(["README.md", "link", "sub", "sub/keep.txt"]);
+        expect(tree(clone).sort()).toEqual(["README.md", "d", "dangling", "link", "sub", "sub/keep.txt"]);
         // The stripped paths stay in the index as skip-worktree entries: nothing reads as deleted.
         expect(Bun.spawnSync(["git", "status", "--porcelain"], { cwd: clone, stdout: "pipe" }).stdout.toString()).toBe("");
         expect(readdirSync(join(s.root, "work"))).toEqual(["repo"]);
@@ -474,6 +500,45 @@ describe.skipIf(!HAVE_JQ)("verify.sh and review.sh, run on a sandbox with a stan
     expect(existsSync(join(s.root, "out", "result.json"))).toBe(true);
   });
 
+  test("review.sh checks every symlink out again as a plain file holding its target's text (a file link, a dir link and a dangling one), and the status stays clean", async () => {
+    const s = sandbox(REVIEW);
+    const clone = join(s.root, "work", "repo");
+    try {
+      const p = s.start();
+      expect(await p.exited).toBe(0);
+      expect(await new Response(p.stderr).text()).not.toContain("prelude:");
+      for (const [name, target] of [["link", join(s.root, "state", "outside.jsonl")], ["d", join(s.root, "state")], ["dangling", join(s.root, "nowhere")]]) {
+        const st = lstatSync(join(clone, name!));
+        expect([name, st.isSymbolicLink(), st.isFile(), readFileSync(join(clone, name!), "utf8")]).toEqual([name, false, true, target]);
+      }
+      expect(Bun.spawnSync(["git", "-C", clone, "config", "core.symlinks"], { stdout: "pipe" }).stdout.toString()).toBe("false\n");
+      expect(Bun.spawnSync(["git", "status", "--porcelain"], { cwd: clone, stdout: "pipe" }).stdout.toString()).toBe("");
+      // The index still records each as a link (mode 120000): the review reads what the change committed.
+      expect(Bun.spawnSync(["git", "-C", clone, "ls-files", "-s", "link", "d", "dangling"], { stdout: "pipe" }).stdout.toString().split("\n").filter(Boolean).every((l) => l.startsWith("120000 "))).toBe(true);
+      // Archon ran, after all of it.
+      expect(existsSync(join(s.root, "state", "started"))).toBe(true);
+    } finally {
+      Bun.spawnSync(["chmod", "-R", "u+w", clone]);
+    }
+  });
+
+  test("review.sh ends before Archon starts when the checkout isn't clean once its symlinks are plain files", async () => {
+    const s = sandbox(REVIEW);
+    const clone = join(s.root, "work", "repo");
+    // A git that reports the checkout changed, and is otherwise the real one.
+    const realGit = Bun.which("git")!;
+    writeFileSync(join(s.root, "bin", "git"), `#!/bin/sh\nif [ "$3" = status ]; then echo " M README.md"; exit 0; fi\nexec ${realGit} "$@"\n`, { mode: 0o755 });
+    try {
+      const p = s.start();
+      expect(await p.exited).toBe(1);
+      expect(await new Response(p.stderr).text()).toContain("prelude: the checkout is not clean once its symlinks are plain files");
+      expect(existsSync(join(s.root, "state", "started"))).toBe(false);
+      expect(existsSync(join(s.root, "out", "result.json"))).toBe(false);
+    } finally {
+      Bun.spawnSync(["chmod", "-R", "u+w", clone]);
+    }
+  });
+
   test("review.sh leaves the checkout's files and dirs unwritable, .git aside", async () => {
     const s = sandbox(REVIEW);
     const clone = join(s.root, "work", "repo");
@@ -481,10 +546,11 @@ describe.skipIf(!HAVE_JQ)("verify.sh and review.sh, run on a sandbox with a stan
       const p = s.start();
       expect(await p.exited).toBe(0);
       const paths = ["", ...tree(clone)];
-      expect(paths.sort()).toEqual(["", "README.md", "link", "sub", "sub/keep.txt"]);
-      for (const rel of paths.filter((p) => !lstatSync(join(clone, p)).isSymbolicLink())) expect([rel, lstatSync(join(clone, rel)).mode & 0o222]).toEqual([rel, 0]);
-      // The link was never followed: its target, out of the checkout, keeps its write bit.
-      expect(lstatSync(join(s.root, "state", "outside.jsonl")).mode & 0o200).toBe(0o200);
+      expect(paths.sort()).toEqual(["", "README.md", "d", "dangling", "link", "sub", "sub/keep.txt"]);
+      expect(paths.filter((p) => lstatSync(join(clone, p)).isSymbolicLink())).toEqual([]);
+      for (const rel of paths) expect([rel, lstatSync(join(clone, rel)).mode & 0o222]).toEqual([rel, 0]);
+      // No link was followed: their targets, out of the checkout, keep their write bits.
+      for (const t of ["state/outside.jsonl", "state"]) expect([t, lstatSync(join(s.root, t)).mode & 0o200]).toEqual([t, 0o200]);
       // git still writes its own dir (the remote's removal did), so .git keeps its owner's write bit.
       expect(lstatSync(join(clone, ".git")).mode & 0o200).toBe(0o200);
       expect(lstatSync(join(clone, ".git", "config")).mode & 0o200).toBe(0o200);

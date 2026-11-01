@@ -60,11 +60,11 @@ describe("sanitizeTerminal", () => {
     expect(sanitizeTerminal("plain text: [node] Started, 100% done; tabs\tand ünïcödé")).toBe("plain text: [node] Started, 100% done; tabs\tand ünïcödé");
   });
 
-  test("the bidi embedding, override and isolate controls go (H-220, Trojan Source): U+202A–202E and U+2066–2069; other text stays", () => {
-    const controls = [0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069].map((c) => String.fromCodePoint(c));
+  test("the bidi controls go (H-220, Trojan Source): the embedding, override and isolate ones, U+202A–202E and U+2066–2069, and the marks LRM, RLM and ALM, U+200E, U+200F and U+061C; other text stays", () => {
+    const controls = [0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069, 0x200e, 0x200f, 0x061c].map((c) => String.fromCodePoint(c));
     expect(sanitizeTerminal(`run ab12cd34ef56: ${controls.join("")}deliaf${controls[2]} ok`)).toBe("run ab12cd34ef56: deliaf ok");
-    // Their neighbours stay: U+2029 and U+206A are not among them, nor is right-to-left text itself.
-    expect(sanitizeTerminal("a\u2029b\u206ac שלום")).toBe("a\u2029b\u206ac שלום");
+    // Their neighbours stay: U+200D, U+2029 and U+206A are not among them, nor is right-to-left text itself (Arabic's U+061B too).
+    expect(sanitizeTerminal("a\u2029b\u206ac\u200dd שלום \u061b")).toBe("a\u2029b\u206ac\u200dd שלום \u061b");
   });
 });
 

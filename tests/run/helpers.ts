@@ -33,6 +33,8 @@ interface Container {
   name: string;
   labels: Record<string, string>;
   running: boolean;
+  /** What `docker inspect --format {{.State.ExitCode}}` prints for it: FakeOptions.exitCode, 0 by default. */
+  exitCode?: number;
 }
 interface Network {
   labels: Record<string, string>;
@@ -126,6 +128,8 @@ export interface FakeOptions {
   hangs?: (cmd: string[]) => boolean;
   /** The exit code of `timeout <s> docker wait <run>`: 0 (the run exited) or 124 (the deadline came first). */
   waitCode?: number;
+  /** The run container's exit code, as `docker inspect --format {{.State.ExitCode}}` prints it (0 by default). */
+  exitCode?: number;
   /** What `git bundle list-heads` prints. */
   heads?: string;
   /** The source's `.factory/config.yaml`, at every commit (`ls-tree` lists it, `cat-file blob` prints it); none by default. */
@@ -200,6 +204,10 @@ export function fakeRun(o: FakeOptions = {}) {
     if (cmd[0] !== "docker") throw new Error(`fake: unexpected command ${joined}`);
     const [, a, b] = cmd;
     if (a === "info" && after(cmd, "--format") === "{{.DockerRootDir}}") return ok(`${DATA_ROOT}\n`);
+    if (a === "inspect" && after(cmd, "--format") === "{{.State.ExitCode}}") {
+      const c = world.containers.get(cmd.at(-1)!);
+      return c === undefined ? fail(`Error: No such object: ${cmd.at(-1)}`) : ok(`${c.exitCode ?? o.exitCode ?? 0}\n`);
+    }
     if (a === "ps") {
       const all = cmd.includes("-aq") || cmd.includes("-a");
       const found = [...world.containers.values()].filter((c) => (all || c.running) && matches(cmd, c.labels));

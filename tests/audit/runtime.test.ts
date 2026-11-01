@@ -300,6 +300,50 @@ describe("runtime.run-container", () => {
       for (const name of ["CODERABBIT_API_KEY", "SLACK_BOT_TOKEN"]) expect(y.detail).toContain(`${name} is set: a fix container holds only its zone's keys`);
     });
 
+    test("a live run container is on its own internal network alone, which holds only it and its kind's proxy: another network, the default bridge, an extra endpoint, the other zone's proxy or a network that isn't internal each fail", async () => {
+      const N = "hapi-run-aaaaaaaaaaaa";
+      const cases: [what: string, kind: Kind, edit: (c: Container, w: World) => void, part: string][] = [
+        ["another network", "worker", (c) => void (c.NetworkSettings!.Networks.hapi_archon = {}), `it is on ${N}, hapi_archon, not on its own network ${N} alone`],
+        [
+          "the default bridge",
+          "verify",
+          (c) => {
+            c.HostConfig!.NetworkMode = "bridge";
+            c.NetworkSettings!.Networks = { bridge: {} };
+          },
+          `its network is bridge, not its own network ${N}; it is on bridge, not on its own network ${N} alone`,
+        ],
+        [
+          "an extra endpoint",
+          "fix",
+          (_, w) => void (w.networks.get(N)!.Containers["id-x"] = { Name: "hapi-hermes-1" }),
+          `its network ${N} holds hapi-egress-archon-1, hapi-hermes-1, ${N}, not exactly hapi-egress-archon-1 and ${N}`,
+        ],
+        [
+          "egress-archon on a review's network",
+          "review",
+          (_, w) => void (w.networks.get(N)!.Containers = { "id-run-aaaaaaaaaaaa": { Name: N }, "id-hapi-egress-archon-1": { Name: "hapi-egress-archon-1" } }),
+          `its network ${N} holds hapi-egress-archon-1, ${N}, not exactly hapi-egress-review-1 and ${N}`,
+        ],
+        ["a network that isn't internal", "worker", (_, w) => void (w.networks.get(N)!.Internal = false), `network ${N} is not internal: it would have a route out around the proxy`],
+        ["a network docker can't find", "worker", (_, w) => void w.networks.delete(N), `its network ${N} could not be inspected (docker network inspect exited 1)`],
+      ];
+      for (const [what, kind, edit, part] of cases) {
+        const w = await cleanWorld();
+        const live = runContainer(w, "aaaaaaaaaaaa", { kind });
+        edit(live, w);
+        w.containers.push(live);
+        const r = await check(w, "runtime.run-container");
+        expect([what, r.status]).toEqual([what, "fail"]);
+        expect([what, r.detail.includes(`${N}: ${part}`) || r.detail.includes(part)]).toEqual([what, true]);
+      }
+      // A review's own network, with egress-review, passes; and the check read it with docker network inspect.
+      const ok = await cleanWorld();
+      ok.containers.push(runContainer(ok, "aaaaaaaaaaaa", { kind: "review" }));
+      expect((await check(ok, "runtime.run-container")).status).toBe("pass");
+      expect(ok.calls).toContainEqual(["docker", "network", "inspect", N]);
+    });
+
     test("with no zoneKeys in its context, the zones are stack/secrets.yaml's: until the review zone is there, a review container holding a key fails", async () => {
       const w = await cleanWorld();
       delete w.ctx.zoneKeys;
@@ -327,6 +371,22 @@ describe("runtime.run-container", () => {
       // A verify definition that binds a secret by name: verify holds no key.
       r = await withSpec((argv) => (argv.includes("/opt/hapi/verify.sh") ? [...argv.slice(0, argv.indexOf("-w")), "-e", "ANTHROPIC_API_KEY", ...argv.slice(argv.indexOf("-w"))] : argv));
       expect(r.detail).toContain("verify: it passes ANTHROPIC_API_KEY, a key, to a container that holds none");
+      // The check also gives runArgs the archon zone's names for a verify: it must refuse them. One that drops them instead fails.
+      const real = spec.runArgs;
+      const calls: string[][] = [];
+      const spy = spyOn(spec, "runArgs").mockImplementation((service, inputs, d, names, profile) => {
+        calls.push(names);
+        return real(service, inputs, d, profile.zone === undefined ? [] : names, profile);
+      });
+      try {
+        r = await check(await cleanWorld(), "runtime.run-container");
+      } finally {
+        spy.mockRestore();
+      }
+      expect(r.detail).toContain("verify: runArgs binds the archon zone's keys into it when given them, where it must refuse them: it holds no key");
+      expect(calls).toContainEqual(["ANTHROPIC_API_KEY", "CLAUDE_API_KEY", "OPENCODE_API_KEY", "HAPI_JEV_OPENROUTER_API_KEY"]);
+      // The real runArgs refuses them, so the clean world passes.
+      expect((await check(await cleanWorld(), "runtime.run-container")).status).toBe("pass");
     });
   });
 

@@ -36,6 +36,10 @@ while kill -0 "$pid" 2>/dev/null; do wait "$pid" || rc=$?; done
 # From here on, nothing may abort: a failed, stopped or timed-out run still leaves what it can. Each failure
 # is noted on stderr (the launcher's live view is `docker logs`).
 set +e
+# As PID 1, kill whatever the workflow left running (a background job the repo's checks started), so nothing the
+# change ran still writes the clone or /out while the strip and the read-back below run. The guard matters: where
+# this shell isn't PID 1 (a test's sandbox), `kill -1` would signal every process its user has.
+if [ "$$" = 1 ]; then kill -s KILL -1 2>/dev/null; fi
 # The strip again: the repo's checks could write the clone, and the CLI calls below read the repo's .archon (config,
 # env) from it, so the steering paths go before any Archon call. No bundle: what a verify run leaves is its results.
 rm -rf /work/repo/.archon /work/repo/.pi /work/repo/.agents /work/repo/.claude /work/repo/CLAUDE.md /work/repo/.mcp.json || echo "prelude: strip failed" >&2
