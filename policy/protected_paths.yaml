@@ -42,6 +42,10 @@ protected_paths:
   "**/.cursor/**":      { interactive: ask, unattended: deny, workers: deny }
   "**/.clinerules/**":  { interactive: ask, unattended: deny, workers: deny }
   "**/.rules/**":       { interactive: ask, unattended: deny, workers: deny }
+  # Claude Code loads a project's .mcp.json without asking under -p (design §3.3),
+  # so a worker that wrote one would add an MCP server to the next run.
+  "**/.mcp.json":       { interactive: ask, unattended: deny, workers: deny }
+  "**/.vscode/mcp.json": { interactive: ask, unattended: deny, workers: deny }
   ".factory/**": { interactive: ask, unattended: deny, workers: deny }
   ".github/**":  { interactive: ask, unattended: deny, workers: deny }
   "mise.toml":   { interactive: ask, unattended: deny, workers: deny }

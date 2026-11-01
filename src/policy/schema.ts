@@ -18,6 +18,8 @@ import commands from "../../policy/schemas/policy-commands.schema.json";
 import trustedSources from "../../policy/schemas/policy-trusted-sources.schema.json";
 import budgets from "../../policy/schemas/policy-budgets.schema.json";
 import runs from "../../policy/schemas/policy-runs.schema.json";
+import repos from "../../policy/schemas/policy-repos.schema.json";
+import sidecars from "../../policy/schemas/policy-sidecars.schema.json";
 import gates from "../../policy/schemas/policy-gates.schema.json";
 import approvals from "../../policy/schemas/policy-approvals.schema.json";
 import roles from "../../policy/schemas/policy-roles.schema.json";
@@ -45,6 +47,8 @@ const schemas = {
   "policy-trusted-sources": trustedSources,
   "policy-budgets": budgets,
   "policy-runs": runs,
+  "policy-repos": repos,
+  "policy-sidecars": sidecars,
   "policy-gates": gates,
   "policy-approvals": approvals,
   "policy-roles": roles,
@@ -144,6 +148,11 @@ export function readYaml(file: string): unknown {
     const code = (e as NodeJS.ErrnoException).code;
     throw new Error(`cannot read file${code ? ` (${code})` : ""}`);
   }
+  return parseYaml(text);
+}
+
+/** Parse YAML text. Throws an Error whose message is `invalid YAML: <first line>`; a duplicate key is a parse error. */
+export function parseYaml(text: string): unknown {
   try {
     return parse(text);
   } catch (e) {

@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { commandRuleIssues } from "./commands";
 import { mcpIssues } from "./mcp";
 import { check, formatIssue, type Issue, readYaml, type SchemaName } from "./schema";
-import type { Commands, Flags, Gates, McpCatalog, Policy, Roster, RosterName } from "./types";
+import type { Budgets, Commands, Flags, Gates, McpCatalog, Policy, Roster, RosterName, Runs } from "./types";
 
 /** A policy or overlay file failed to load. `path` is a JSON Pointer into the file ("" = the whole file). */
 export class PolicyError extends Error {
@@ -63,6 +63,20 @@ function gateIssues(flags: Flags, gates: Gates): Issue[] {
   return issues;
 }
 
+/**
+ * A fix round must fit in one run's budget: `phases.round_usd` is at most
+ * `budgets.run_usd`. Paths are relative to runs.yaml's root, so `/phases/round_usd`.
+ */
+export function phaseIssues(budgets: Budgets, runs: Runs): Issue[] {
+  if (runs.phases.round_usd <= budgets.run_usd) return [];
+  return [
+    {
+      path: "/phases/round_usd",
+      message: `phases.round_usd ${runs.phases.round_usd} is more than budgets.run_usd ${budgets.run_usd}: a fix round must fit in one run's budget; lower round_usd`,
+    },
+  ];
+}
+
 const ROSTERS: RosterName[] = ["budget", "anthropic", "portable"];
 
 /**
@@ -84,12 +98,16 @@ export function loadPolicy(dir: string): Policy {
   const gates = load<Gates>("gates.yaml", "policy-gates");
   const gate = gateIssues(flags, gates);
   if (gate.length > 0) throw new PolicyError(join(dir, "gates.yaml"), gate);
+  const budgets = load<Budgets>("budgets.yaml", "policy-budgets");
+  const runs = load<Runs>("runs.yaml", "policy-runs");
+  const phase = phaseIssues(budgets, runs);
+  if (phase.length > 0) throw new PolicyError(join(dir, "runs.yaml"), phase);
   return {
     protectedPaths: protectedPaths.protected_paths,
     commands,
     trustedSources: load("trusted_sources.yaml", "policy-trusted-sources"),
-    budgets: load("budgets.yaml", "policy-budgets"),
-    runs: load("runs.yaml", "policy-runs"),
+    budgets,
+    runs,
     gates,
     approvals: load("approvals.yaml", "policy-approvals"),
     roles: load("roles.yaml", "policy-roles"),
@@ -98,5 +116,7 @@ export function loadPolicy(dir: string): Policy {
     ) as Record<RosterName, Roster>,
     flags,
     mcp,
+    repos: load("repos.yaml", "policy-repos"),
+    sidecars: load<{ sidecars: Policy["sidecars"] }>("sidecars.yaml", "policy-sidecars").sidecars,
   };
 }

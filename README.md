@@ -316,45 +316,14 @@ Set `OWNER` to your GitHub login first (`export OWNER=<your-login>`); the comman
 
    The GitHub Apps get no bypass in either ruleset. `integration_id` 15368 is GitHub Actions, so only Actions can satisfy the `ci` check. In `bypass_actors`, `actor_id` 5 is the repository Admin role.
 
-   ```bash
-   gh api -X POST repos/$OWNER/hapi-factory/rulesets --input - <<'EOF'
-   {
-     "name": "main-protect",
-     "target": "branch",
-     "enforcement": "active",
-     "conditions": { "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] } },
-     "bypass_actors": [],
-     "rules": [
-       { "type": "deletion" },
-       { "type": "non_fast_forward" },
-       { "type": "required_status_checks", "parameters": {
-           "strict_required_status_checks_policy": false,
-           "required_status_checks": [ { "context": "ci", "integration_id": 15368 } ] } }
-     ]
-   }
-   EOF
+   The two rulesets are files, `policy/github/rulesets/main-protect.json` and `main-review.json`. Apply each from your checkout of hapi-factory:
 
-   gh api -X POST repos/$OWNER/hapi-factory/rulesets --input - <<'EOF'
-   {
-     "name": "main-review",
-     "target": "branch",
-     "enforcement": "active",
-     "conditions": { "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] } },
-     "bypass_actors": [
-       { "actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "pull_request" }
-     ],
-     "rules": [
-       { "type": "pull_request", "parameters": {
-           "required_approving_review_count": 1,
-           "dismiss_stale_reviews_on_push": true,
-           "require_code_owner_review": true,
-           "require_last_push_approval": false,
-           "required_review_thread_resolution": false } },
-       { "type": "update" }
-     ]
-   }
-   EOF
+   ```bash
+   gh api -X POST "repos/$OWNER/hapi-factory/rulesets" --input policy/github/rulesets/main-protect.json
+   gh api -X POST "repos/$OWNER/hapi-factory/rulesets" --input policy/github/rulesets/main-review.json
    ```
+
+   `hapi new-repo` applies the same files to a new repo (Plan 03 Task 5). `main-review.json` sets `require_last_push_approval: true` (design §3.2 step 5): the last push to a PR needs an approval from someone other than the pusher. hapi-factory's own `main-review` keeps `false` until Task 5's operator step applies the file.
 
    **Check the result.** Run `gh api repos/$OWNER/hapi-factory/rulesets`, or open **Settings → Rules → Rulesets**. You should see both rulesets, and `main-protect` should list no bypass actors. To see the combined rules that apply to `main`, run `gh api repos/$OWNER/hapi-factory/rules/branches/main`.
 
@@ -365,7 +334,7 @@ Set `OWNER` to your GitHub login first (`export OWNER=<your-login>`); the comman
 
    Once the GitHub Apps exist, also confirm that **an App's merge call is refused**, even with the operator's approval and `ci` green ([GitHub Apps runbook, Check it](docs/runbooks/github-apps.md#check-it)).
 
-   These commands were first run on 2026-10-27, and GitHub accepted every field. Read back, each ruleset also holds GitHub's own defaults: `do_not_enforce_on_create: false` in the status-check rule; `required_reviewers: []`, `require_extra_approval_for_unattributed_changes: true` and all three merge methods in the pull-request rule. If GitHub ever rejects a field, set up the same two rulesets in the UI. Keep the rules split the same way: never put the `ci` check in a ruleset that has a bypass actor, and never put Restrict updates in one that has none. `tests/docs/rulesets.test.ts` holds this JSON to those rules.
+   These commands were first run on 2026-10-27, and GitHub accepted every field. Read back, each ruleset also holds GitHub's own defaults: `do_not_enforce_on_create: false` in the status-check rule; `required_reviewers: []`, `require_extra_approval_for_unattributed_changes: true` and all three merge methods in the pull-request rule. If GitHub ever rejects a field, set up the same two rulesets in the UI. Keep the rules split the same way: never put the `ci` check in a ruleset that has a bypass actor, and never put Restrict updates in one that has none. `tests/docs/rulesets.test.ts` holds the files to those rules.
 
 5. **CODEOWNERS:** your own PR adds `.github/CODEOWNERS` with `* @<your-login>`, before either App is installed. `main-review` requires a code owner's review, and with you as the only code owner, no App's approval counts ([GitHub Apps runbook](docs/runbooks/github-apps.md#code-owners-a-second-layer)).
 

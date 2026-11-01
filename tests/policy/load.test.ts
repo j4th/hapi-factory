@@ -76,6 +76,8 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
       "**/.cursor/**": ask,
       "**/.clinerules/**": ask,
       "**/.rules/**": ask,
+      "**/.mcp.json": ask,
+      "**/.vscode/mcp.json": ask,
       ".factory/**": ask,
       ".github/**": ask,
       "mise.toml": ask,
@@ -125,7 +127,9 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
       jev_monthly_usd: 2,
       run_usd: 3,
       hermes_max_turns: 60,
-      enforcement: { hapi_guard: "hard", archon: "hard" },
+      repo_monthly_usd: 25,
+      daily_usd: 10,
+      enforcement: { hapi_guard: "hard", archon: "hard", poller: "hard" },
     });
     expect(p.approvals).toEqual([
       "merge",
@@ -138,11 +142,24 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
   });
 
   test("loads the new limits exactly", () => {
-    expect(p.budgets.enforcement).toEqual({ hapi_guard: "hard", archon: "hard" });
+    expect(p.budgets.enforcement).toEqual({ hapi_guard: "hard", archon: "hard", poller: "hard" });
     expect(p.runs).toEqual({
       max_live: 1,
       retention_days: 14,
       output_limits_mb: { bundle: 256, transcript: 64, decisions: 16, result: 4 },
+      disk: { gb: 20, enforcement: "hard" },
+      poll_interval_s: 120,
+      max_auto_rounds: 3,
+      phases: {
+        verify: true,
+        review: true,
+        coderabbit: false,
+        require_acceptance: true,
+        fix_rounds_before_pr: 1,
+        fix_rounds_on_pr: 1,
+        round_turns: 40,
+        round_usd: 1,
+      },
     });
     // The design screens every bash call by default: the skip list starts empty.
     expect(p.gates).toEqual({
@@ -154,6 +171,69 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
         haiku: { model: "claude-haiku-5-5", input_per_mtok: 0.1, output_per_mtok: 0.5 },
       },
     });
+  });
+
+  test("loads the repo registry and the sidecars exactly", () => {
+    expect(p.repos).toEqual({ installations: { planner: 176015763, factory: 176015322 }, repos: {} });
+    expect(p.sidecars).toEqual({
+      "bun-http": {
+        image: "oven/bun:1.4.4-slim@sha256:1846adf22496bd711036aae8be147e57bdebbaea2e5264e3e0b5af1db187d9a4",
+        command: ["bun", "/data/server.ts"],
+        port: 8080,
+      },
+    });
+  });
+
+  test("a fix round's cap above run_usd fails to load", () => {
+    const text = readFileSync("policy/runs.yaml", "utf8").replace("round_usd: 1.00", "round_usd: 3.50");
+    const dir = policyWith("runs.yaml", text);
+    const e = policyError(dir);
+    expect(e.file).toBe(join(dir, "runs.yaml"));
+    expect(e.issues[0]!.path).toBe("/phases/round_usd");
+    expect(e.message).toContain("phases.round_usd 3.5 is more than budgets.run_usd 3: a fix round must fit in one run's budget");
+  });
+
+  test("zero fix rounds load; a negative one, a poll under 30 s or a 0 GB disk doesn't", () => {
+    const runs = readFileSync("policy/runs.yaml", "utf8");
+    const zero = policyWith("runs.yaml", runs.replace("fix_rounds_on_pr: 1", "fix_rounds_on_pr: 0"));
+    expect(loadPolicy(zero).runs.phases.fix_rounds_on_pr).toBe(0);
+    const cases: [string, string, string][] = [
+      ["fix_rounds_on_pr: 1", "fix_rounds_on_pr: -1", "/phases/fix_rounds_on_pr"],
+      ["poll_interval_s: 120", "poll_interval_s: 10", "/poll_interval_s"],
+      ["gb: 20", "gb: 0", "/disk/gb"],
+    ];
+    for (const [from, to, path] of cases) {
+      const e = policyError(policyWith("runs.yaml", runs.replace(from, to)));
+      expect(e.issues.map((i) => i.path)).toContain(path);
+    }
+  });
+
+  test("repos.yaml takes owner/name keys, positive installation ids and a date", () => {
+    const repos = (installations: string, key: string, registered: string) =>
+      `installations: ${installations}\nrepos:\n  ${key}: { registered: "${registered}" }\n`;
+    const ok = repos("{ planner: 1, factory: 2 }", "example-owner/hapi-sandbox-fortune", "2026-10-31");
+    expect(loadPolicy(policyWith("repos.yaml", ok)).repos).toEqual({
+      installations: { planner: 1, factory: 2 },
+      repos: { "example-owner/hapi-sandbox-fortune": { registered: "2026-10-31" } },
+    });
+    const bad = (text: string) => policyError(policyWith("repos.yaml", text));
+    const good = "example-owner/hapi-sandbox-fortune";
+    let e = bad(repos("{ planner: 1, factory: 2 }", "hapi-sandbox-fortune", "2026-10-31"));
+    expect(e.issues).toContainEqual({ path: "/repos/hapi-sandbox-fortune", message: "invalid key" });
+    e = bad(repos("{ planner: 1, factory: 2 }", "example-owner/..", "2026-10-31"));
+    expect(e.issues.map((i) => i.path)).toContain("/repos/example-owner~1..");
+    e = bad(repos("{ planner: 0, factory: 2 }", good, "2026-10-31"));
+    expect(e.issues.map((i) => i.path)).toContain("/installations/planner");
+    e = bad(repos("{ planner: 1, factory: 2 }", good, "31-10-2026"));
+    expect(e.issues.map((i) => i.path)).toContain("/repos/example-owner~1hapi-sandbox-fortune/registered");
+  });
+
+  test("sidecars.yaml pins each image by digest", () => {
+    const text = readFileSync("policy/sidecars.yaml", "utf8");
+    const bad = (t: string) => policyError(policyWith("sidecars.yaml", t)).issues.map((i) => i.path);
+    expect(bad(text.replace(/@sha256:[0-9a-f]{64}/, ""))).toContain("/sidecars/bun-http/image");
+    expect(bad(text.replace("port: 8080", "port: 70000"))).toContain("/sidecars/bun-http/port");
+    expect(bad(text.replace(/command: \[.*\]/, "command: []"))).toContain("/sidecars/bun-http/command");
   });
 
   test("rejects an unknown enforcement", () => {

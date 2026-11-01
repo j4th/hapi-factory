@@ -87,8 +87,39 @@ export interface Budgets {
   jev_monthly_usd: number;
   run_usd: number;
   hermes_max_turns: number;
-  /** The mode per enforcer for `run_usd`: hapi-guard (Plan 02) and Archon's budget (Plan 03). */
-  enforcement: { hapi_guard: Enforcement; archon: Enforcement };
+  /** Per registered repo, per UTC calendar month. The poller checks it. */
+  repo_monthly_usd: number;
+  /** All repos together, per UTC calendar day. The poller checks it. Central only. */
+  daily_usd: number;
+  /** The mode per enforcer: hapi-guard and Archon's budget for `run_usd`, the poller for the repo and day caps and the round counts. */
+  enforcement: { hapi_guard: Enforcement; archon: Enforcement; poller: Enforcement };
+}
+
+/** What a run does and how many fix rounds it may make, from runs.yaml. An overlay may switch a phase on, never off. */
+export interface Phases {
+  verify: boolean;
+  review: boolean;
+  /** The CodeRabbit CLI in the review container; `flags.coderabbit` is CodeRabbit's PR review. */
+  coderabbit: boolean;
+  /** "Ready to merge" needs the work order's acceptance tests to exist and pass. */
+  require_acceptance: boolean;
+  fix_rounds_before_pr: number;
+  fix_rounds_on_pr: number;
+  round_turns: number;
+  round_usd: number;
+}
+
+/** The repo registry, from repos.yaml. */
+export interface RepoRegistry {
+  installations: { planner: number; factory: number; coderabbit?: number };
+  repos: Record<string, { registered: string }>;
+}
+
+/** One central sidecar, from sidecars.yaml. */
+export interface Sidecar {
+  image: string;
+  command: string[];
+  port: number;
 }
 
 /** The run launcher's limits, from runs.yaml. A repo overlay may only lower them. */
@@ -99,6 +130,13 @@ export interface Runs {
   retention_days: number;
   /** The largest, in MB, each file a run writes may be. */
   output_limits_mb: { bundle: number; transcript: number; decisions: number; result: number };
+  /** The most disk one run's volumes may use. */
+  disk: { gb: number; enforcement: Enforcement };
+  /** Seconds between the poller's passes. Central only. */
+  poll_interval_s: number;
+  /** Automatic runs per work order with no human action between them. */
+  max_auto_rounds: number;
+  phases: Phases;
 }
 
 /** The level-6 gate settings, from gates.yaml. Central only: an overlay can't name it. */
@@ -245,6 +283,10 @@ export interface Policy {
   flags: Flags;
   /** The MCP catalog (spec §10.1), from mcp.yaml. */
   mcp: McpCatalog;
+  /** The repo registry (repos.yaml). */
+  repos: RepoRegistry;
+  /** The central sidecars (sidecars.yaml), by name. */
+  sidecars: Record<string, Sidecar>;
   /**
    * The repo's own settings from its overlay (spec §7). Only `applyOverlay` sets
    * it, and only when the overlay names one of them; `loadPolicy` never does.
@@ -261,6 +303,8 @@ export interface RepoSettings {
   default_risk?: Risk;
   /** The Archon workflow this repo's work orders use by default. */
   workflow?: string;
+  /** The sidecar this repo's runs start, and the repo directory mounted into it. */
+  sidecar?: { name: string; data_dir: string };
 }
 
 /**
@@ -274,13 +318,18 @@ export interface RepoOverlay {
   /** Hosts added to the archon zone. Never a forge host. */
   egress_extra?: string[];
   /** Budgets to lower; each must be at most the base value. */
-  budgets?: Partial<Omit<Budgets, "workspaces" | "enforcement">> & {
+  budgets?: Partial<Omit<Budgets, "workspaces" | "enforcement" | "daily_usd">> & {
     workspaces?: Partial<Record<Workspace, number>>;
     /** Modes to harden: soft may become hard, never the reverse. */
     enforcement?: Partial<Budgets["enforcement"]>;
   };
   /** Run limits to lower; each must be at most the base value. */
-  runs?: Partial<Omit<Runs, "output_limits_mb">> & { output_limits_mb?: Partial<Runs["output_limits_mb"]> };
+  runs?: Partial<Omit<Runs, "output_limits_mb" | "poll_interval_s" | "disk" | "phases">> & {
+    output_limits_mb?: Partial<Runs["output_limits_mb"]>;
+    disk?: Partial<Runs["disk"]>;
+    phases?: Partial<Phases>;
+  };
   default_risk?: Risk;
   workflow?: string;
+  sidecar?: { name: string; data_dir: string };
 }

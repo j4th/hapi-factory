@@ -2,11 +2,11 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "policy-runs.schema.json",
   "title": "policy/runs.yaml",
-  "description": "The run launcher's limits (Plan 02): how many runs may be live, how long finished runs are kept and how large each run output may be. Every key is required: the loader fills no defaults.",
+  "description": "The run engine's limits (Plans 02 and 03): how many runs may be live, how long finished runs are kept, how large each run output and each run's disk may be, how often the poller polls, and which phases and fix rounds a run has. Every key is required: the loader fills no defaults.",
   "type": "object",
   "properties": {
     "max_live": {
-      "description": "Runs that may be live at once; the launcher refuses the next one (no queue until Plan 03's poller).",
+      "description": "Runs that may be live at once; the launcher refuses the next one and the poller waits for a free slot.",
       "$ref": "policy-defs.schema.json#/$defs/count"
     },
     "retention_days": {
@@ -41,12 +41,94 @@
         "result"
       ],
       "additionalProperties": false
+    },
+    "disk": {
+      "description": "The most disk one run's volumes may use.",
+      "type": "object",
+      "properties": {
+        "gb": {
+          "description": "The cap in GB.",
+          "$ref": "policy-defs.schema.json#/$defs/count"
+        },
+        "enforcement": {
+          "description": "hard stops the run when the cap is crossed; soft flags it and lets it finish.",
+          "$ref": "policy-defs.schema.json#/$defs/enforcement"
+        }
+      },
+      "required": [
+        "gb",
+        "enforcement"
+      ],
+      "additionalProperties": false
+    },
+    "poll_interval_s": {
+      "description": "Seconds between the poller's passes over the registered repos, 30 to 3600. Central only.",
+      "type": "integer",
+      "minimum": 30,
+      "maximum": 3600
+    },
+    "max_auto_rounds": {
+      "description": "Automatic runs per work order with no human action between them. The poller counts and enforces it under budgets.enforcement.poller.",
+      "$ref": "policy-defs.schema.json#/$defs/count"
+    },
+    "phases": {
+      "description": "What a run does, and how many fix rounds it may make. An overlay may switch a phase on, never off, and lower the numbers.",
+      "type": "object",
+      "properties": {
+        "verify": {
+          "description": "The verify container runs the repo's gates.",
+          "type": "boolean"
+        },
+        "review": {
+          "description": "The review container reviews the diff.",
+          "type": "boolean"
+        },
+        "coderabbit": {
+          "description": "The CodeRabbit CLI in the review container (flags.coderabbit is CodeRabbit's PR review, a different thing).",
+          "type": "boolean"
+        },
+        "require_acceptance": {
+          "description": "'Ready to merge' needs the work order's acceptance tests (.factory/work/<id>/acceptance/) to exist and pass in the verify container.",
+          "type": "boolean"
+        },
+        "fix_rounds_before_pr": {
+          "description": "Fix rounds a run makes before it opens its PR; 0 makes none.",
+          "$ref": "policy-defs.schema.json#/$defs/rounds"
+        },
+        "fix_rounds_on_pr": {
+          "description": "Fix rounds on an open PR after a review or CodeRabbit finding; 0 makes none.",
+          "$ref": "policy-defs.schema.json#/$defs/rounds"
+        },
+        "round_turns": {
+          "description": "The most agent turns in one fix round.",
+          "$ref": "policy-defs.schema.json#/$defs/count"
+        },
+        "round_usd": {
+          "description": "The most one fix round may spend; at most budgets.run_usd (the loader checks it).",
+          "$ref": "policy-defs.schema.json#/$defs/usd"
+        }
+      },
+      "required": [
+        "verify",
+        "review",
+        "coderabbit",
+        "require_acceptance",
+        "fix_rounds_before_pr",
+        "fix_rounds_on_pr",
+        "round_turns",
+        "round_usd"
+      ],
+      "additionalProperties": false
     }
   },
   "required": [
     "max_live",
     "retention_days",
-    "output_limits_mb"
+    "output_limits_mb",
+    "disk",
+    "poll_interval_s",
+    "max_auto_rounds",
+    "phases"
   ],
   "additionalProperties": false
 }

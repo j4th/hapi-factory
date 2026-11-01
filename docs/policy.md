@@ -18,8 +18,11 @@
 | `protected_paths.yaml` | `policy-protected-paths` | Paths agents can't change freely, with a mode per session kind | Hermes `security.protected_instruction_files`, the hapi-path-guard plugin and a command allowlist; Pi hapi-guard; later, Claude Code permission rules; CI path checks |
 | `commands.yaml` | `policy-commands` | Hermes's command allowlist, as argv-exact rules; the Pi built-in tools workers get | The Hermes `hapi-cmd-allow` hook (default-deny, fail-closed; Plan 04); Archon `allowed_tools` per node |
 | `trusted_sources.yaml` | `policy-trusted-sources` | Source tiers T0–T3, and the hosts each egress zone may reach | The egress proxy allowlists (the real boundary); Hermes's web backend pins and blocklist; Anthropic `allowed_domains` |
-| `budgets.yaml` | `policy-budgets` | Workspace and key caps, the per-run target, Hermes's turn limit | Hermes `max_turns`; Archon `budget` on per-task children; hapi-guard limits; provider key limits (documented, applied by hand or API) |
-| `runs.yaml` | `policy-runs` | The run launcher's limits: live runs, retention, output sizes | The run launcher (Plan 02 Task 7) |
+| `budgets.yaml` | `policy-budgets` | Workspace and key caps, the per-run target, the per-repo and per-day caps, Hermes's turn limit | Hermes `max_turns`; Archon `budget` on per-task children; hapi-guard limits; the poller's repo and day checks; provider key limits (documented, applied by hand or API) |
+| `runs.yaml` | `policy-runs` | The run engine's limits: live runs, retention, output sizes, the disk cap, the poll interval, the automatic-round cap and the phase and round knobs | The run launcher (Plan 02 Task 7); the poller, the harvester and hapi-guard (Plan 03) |
+| `repos.yaml` | `policy-repos` | The repo registry: the GitHub App installation ids and the repos the poller acts on | The poller; `hapi new-repo` adds a repo to it |
+| `sidecars.yaml` | `policy-sidecars` | The central list of sidecars (a pinned image, a command and a port each) that a repo's overlay may name | The run engine, which starts the sidecar a repo names |
+| `github/rulesets/*.json` | none (GitHub's ruleset API body) | The four GitHub rulesets, one file each | `loadPolicy` doesn't load them. `hapi new-repo` posts them, the README and the runbook apply them with `gh api --input`, and `tests/docs/rulesets.test.ts` holds them to their rules |
 | `gates.yaml` | `policy-gates` | The level-6 gates: the bash gate, the result screen and their classifiers | Pi hapi-guard and the gate classifiers (Plan 02 Tasks 3 and 5) |
 | `approvals.yaml` | `policy-approvals` | The fixed short list of actions that always need the operator | Not compiled in Plan 01; later plans enforce it |
 | `roles.yaml` | `policy-roles` | The default model tier per role | With the rosters: Archon tiers and aliases; Hermes model, auxiliary and delegation settings |
@@ -39,7 +42,8 @@ protected_paths:
   # ... and the other agent instruction files at any depth (**/CLAUDE.md, **/.claude/** ...), .factory/**, .github/**, mise.toml and every
   # other mise config file and lockfile at any depth (**/mise.toml, **/.mise.toml, **/mise.*.toml, **/mise/**, **/.tool-versions, **/mise.lock ...), .agents/**,
   # .archon/**, .coderabbit.yaml, .coderabbit.yml, .coderabbit.config.ts, git's own files (**/.git/**, deny everywhere), and gitleaks's
-  # **/.gitleaks.toml and **/.gitleaksignore (exactly spec §8.2)
+  # **/.gitleaks.toml and **/.gitleaksignore, and the MCP configs **/.mcp.json and **/.vscode/mcp.json (exactly spec §8.2, plus design §3.3's two:
+  # Claude Code loads a project's .mcp.json without asking under -p)
 ```
 
 Keys are globs relative to a repo's root. Each entry sets all three modes:
@@ -74,6 +78,8 @@ The error names the problem, with the path JSON-escaped so it prints safely, e.g
 - a guard that isn't TypeScript, such as the Python hapi-path-guard (Plan 04), must implement the same rule and pass the same vectors.
 
 When you change `protected_paths.yaml` or the matching rule, update the vectors in the same change.
+
+**Hermes and the MCP configs.** Hermes's gate keeps only a glob's last segment, so `**/.vscode/mcp.json` protects every `mcp.json` for Hermes, not just the one under `.vscode/`. That is stricter, so it is allowed; the other enforcers match the whole glob.
 
 #### Glob syntax
 
@@ -220,26 +226,69 @@ All amounts are in USD.
 | `run_usd` | 3.00 | Target spend per factory run |
 | `hermes_max_turns` | 60 | Hermes `agent.max_turns` |
 | `enforcement.hapi_guard` | `hard` | What Pi's hapi-guard does when the run crosses `run_usd` (Plan 02 Task 5) |
-| `enforcement.archon` | `hard` | The same for Archon's `factory-task` budget (Plan 03) |
+| `repo_monthly_usd` | 25.00 | Most one registered repo's runs may spend per UTC calendar month. The poller reads it. An overlay may lower it. |
+| `daily_usd` | 10.00 | Most all registered repos together may spend per UTC calendar day. The poller reads it. Central only: an overlay naming it is an unknown key. |
+| `enforcement.archon` | `hard` | The same for Archon's `factory-task` budget (Plan 03). Archon bounds nodes, never dollars: `factory-task`'s `max_work_units` is pinned to its node count whatever this says, so `hard` is the setting that matters there. |
+| `enforcement.poller` | `hard` | What the poller does when a run would cross `repo_monthly_usd` or `daily_usd`, or `runs.max_auto_rounds` or a fix-round count: `hard` refuses the run, `soft` starts it and flags it (`hapi:flagged`). The round counts are hard-only in effect: the poller always stops at them, under this setting. |
 
-`enforcement` is a setting per enforcement point: `hard` stops the run at `run_usd`; `soft` lets it finish and flags it (`hapi:flagged`, spec §13.3). Both ship as `hard` and are required: the loader fills no defaults, so the fail-closed value lives in the YAML. An overlay may harden a mode but never soften it (soft < hard).
+`enforcement` is a setting per enforcement point: `hard` stops the run at `run_usd`; `soft` lets it finish and flags it (`hapi:flagged`, spec §13.3). All three ship as `hard` and are required: the loader fills no defaults, so the fail-closed value lives in the YAML. An overlay may harden a mode but never soften it (soft < hard). An overlay may also lower `repo_monthly_usd`, never raise it.
 
 The monthly caps are enforced at the provider. The operator sets them on the Console workspaces and OpenRouter keys; the [provider-keys runbook](runbooks/provider-keys.md) covers it. An OpenRouter key's cap is set as a limit that resets daily, the monthly cap divided by 31 (the runbook's rule), so a leaked key can spend only one day's share. The workspaces add up to the $200/month credit, and the default workspace is unused.
 
 ### `runs.yaml`
 
-The run launcher's limits (Plan 02 Task 7; [the runs runbook](runbooks/runs.md) covers the launcher, the outputs and retention). Every key is required. An overlay may lower any of them, never raise one.
+The run engine's limits (Plan 02 Task 7 and Plan 03; [the runs runbook](runbooks/runs.md) covers the launcher, the outputs and retention). Every key is required. An overlay may lower any number, never raise one, except `poll_interval_s`, which is central only (an overlay naming it is an unknown key). An overlay may switch a `phases` flag on, never off.
 
 | Key | Value | Meaning |
 |---|---|---|
-| `max_live` | 1 | Live runs at once; the launcher refuses the next (no queue until Plan 03's poller) |
+| `max_live` | 1 | Live runs at once; the launcher refuses the next, and the poller waits for a free slot |
 | `retention_days` | 14 | A run's files are removed this many days after its `harvestedAt`. Plan 02 sets none, so nothing is removed yet (H-206) |
 | `output_limits_mb.bundle` | 256 | The most the result bundle may be, in MB |
 | `output_limits_mb.transcript` | 64 | The most the run transcript may be |
 | `output_limits_mb.decisions` | 16 | The most the decisions log may be |
 | `output_limits_mb.result` | 4 | The most the result summary may be |
+| `disk.gb` | 20 | The most disk one run's volumes may use, in GB (the run engine's disk check) |
+| `disk.enforcement` | `hard` | `hard` stops the run when the cap is crossed; `soft` flags it and lets it finish. An overlay may harden it, never soften it. |
+| `poll_interval_s` | 120 | Seconds between the poller's passes over the registered repos, 30 to 3600. Central only. |
+| `max_auto_rounds` | 3 | Automatic runs per work order with no human action between them. The poller counts and always enforces it, under `budgets.enforcement.poller`. |
+| `phases.verify` | true | The verify container runs the repo's gates |
+| `phases.review` | true | The review container reviews the diff |
+| `phases.coderabbit` | false | The CodeRabbit CLI in the review container. Off until an unattended key exists (H-167) |
+| `phases.require_acceptance` | true | See below |
+| `phases.fix_rounds_before_pr` | 1 | Fix rounds a run makes before it opens its PR. 0 makes none. The poller enforces the count, under `budgets.enforcement.poller`. |
+| `phases.fix_rounds_on_pr` | 1 | Fix rounds on an open PR after a review or CodeRabbit finding. 0 makes none. Enforced the same way. |
+| `phases.round_turns` | 40 | The most agent turns in one fix round; hapi-guard enforces it, under `budgets.enforcement.hapi_guard` |
+| `phases.round_usd` | 1.00 | The most one fix round may spend. At most `budgets.run_usd`: `loadPolicy` and `applyOverlay` refuse a larger one (`phaseIssues`). So lowering `run_usd` below `round_usd` in an overlay needs `round_usd` lowered in the same overlay. hapi-guard enforces it. |
 
-An output file over its `output_limits_mb` cap is not copied out, and the run is recorded `failed`; the run itself is never stopped for it. All counts are whole numbers, at least 1 (`max_live: 0` is rejected).
+An output file over its `output_limits_mb` cap is not copied out, and the run is recorded `failed`; the run itself is never stopped for it. All counts are whole numbers, at least 1 (`max_live: 0` is rejected), except the two fix-round counts, which may be 0.
+
+`phases.coderabbit` is the CodeRabbit CLI in the review container. `flags.coderabbit` is CodeRabbit's PR review, whose automatic fix runs the `fix_rounds_on_pr` cap.
+
+`phases.require_acceptance` is on by default, and an overlay may only switch it on. The acceptance tests live at `.factory/work/<id>/acceptance/`. That path is protected by `.factory/**`, the planner writes the tests, and the planning PR's merge approves them. When the directory exists, the verify container runs it with `bun test ./.factory/work/<id>/acceptance`. With the key on, a work order with no acceptance tests gets at best "Needs your decision", and a failing one makes a draft "Do not merge".
+
+### `repos.yaml`
+
+The repo registry (Plan 03). The poller acts only on a repo listed here. Every key but `installations.coderabbit` is required.
+
+| Key | Meaning |
+|---|---|
+| `installations.planner`, `installations.factory` | The installation id of `hapi-planner` and of `hapi-factory`: the number at the end of `/settings/installations/<id>` (Settings, Applications, Installed GitHub Apps, Configure). Not secret. A positive integer. |
+| `installations.coderabbit` | CodeRabbit's installation id, once it exists. Optional. |
+| `repos` | A map from `owner/name` to `{ registered: "YYYY-MM-DD" }`. A key that isn't `owner/name` (or whose name is `.` or `..`) is rejected. `hapi new-repo` adds an entry as an uncommitted change, which the operator reviews and commits. |
+
+An overlay can't name `repos`: it is central only.
+
+### `sidecars.yaml`
+
+The central list of sidecars (Plan 03, design §3.3). A repo's overlay names one with `sidecar: { name, data_dir }`; it can't bring its own image or command. Each entry under `sidecars` is keyed by a slug and has three required keys:
+
+| Key | Meaning |
+|---|---|
+| `image` | An OCI image pinned by digest (`name[:tag]@sha256:<64 hex>`); a tag alone is rejected |
+| `command` | The argv it runs: a non-empty list of non-empty strings |
+| `port` | The port it listens on, 1 to 65535 |
+
+`bun-http` ships: `oven/bun:1.4.4-slim` pinned by digest, running `bun /data/server.ts` on port 8080. The repo's `data_dir` is mounted at `/data`, so `server.ts` is the repo's own code, which is why `applyOverlay` denies `data_dir/**` to workers. Its server must use Bun's default host, so the run can reach it by its alias.
 
 ### `gates.yaml`
 
@@ -497,22 +546,25 @@ In a JSON Pointer, a `/` inside a key is written `~1` and a `~` is written `~0`.
 
 A target repo can adjust the central policy with an overlay in its `.factory/config.yaml` (spec §7). **An overlay may only tighten policy.** The one exception is `egress_extra`: it may add hosts, and the overlay file is itself protected (`.factory/**`), so adding one goes through a reviewed planning PR.
 
-An overlay has the six keys below. **Any other key is rejected.** Four of them change policy, and those may only tighten it, except for `egress_extra`. The other two, `default_risk` and `workflow`, are repo settings (spec §7). They don't loosen any policy, so the tighten-only rule doesn't apply to them.
+An overlay has the seven keys below. **Any other key is rejected**, `repos`, `sidecars`, `gates`, `budgets.daily_usd` and `runs.poll_interval_s` included. Four of them change policy, and those may only tighten it, except for `egress_extra`. The other three, `default_risk`, `workflow` and `sidecar`, are repo settings (spec §7). They don't loosen any policy, so the tighten-only rule doesn't apply to them.
 
 | Key | What it may do |
 |---|---|
 | `protected_paths` | **Add** a glob, or **raise** a listed glob's modes (allow < ask < deny). An entry may name only some of the three modes. For a glob the base policy lists, the others keep their base value. A **new** glob may name only `ask` or `deny`; naming `allow` is rejected, because under [strictest-wins](#how-globs-combine) it can't change anything and so reads as a loosening attempt. Its unnamed modes are stored as `allow`, which adds no rule. A new glob that overlaps a protected one can tighten files under it but never loosen them. `null` asks to remove the glob, and that is **always rejected**. |
 | `egress_extra` | **Add** hosts to the `archon` zone's allowlist. The rules are the same as for any host. A [**forge host**](#trusted_sourcesyaml) (`github.com`, `githubusercontent.com`, `githubassets.com`, `ghcr.io`, `gitlab.com`, `bitbucket.org`, or a subdomain of one) is rejected, because the Archon zone must never reach the forge (spec §4.3). |
-| `budgets` | **Lower** any budget in `budgets.yaml`. Each value must be at most the base value. `enforcement` modes may be **hardened** (soft to hard), never softened. |
-| `runs` | **Lower** any limit in `runs.yaml` (`max_live`, `retention_days`, `output_limits_mb.*`). Never raise one. |
+| `budgets` | **Lower** any budget in `budgets.yaml` except `daily_usd`, which is central only (`repo_monthly_usd` included). Each value must be at most the base value. `enforcement` modes (`hapi_guard`, `archon`, `poller`) may be **hardened** (soft to hard), never softened. |
+| `runs` | **Lower** any limit in `runs.yaml` (`max_live`, `retention_days`, `max_auto_rounds`, `output_limits_mb.*`, `disk.gb`, and `phases.fix_rounds_before_pr`, `fix_rounds_on_pr`, `round_turns` and `round_usd`), never raise one. `disk.enforcement` may be **hardened**. A `phases` flag (`verify`, `review`, `coderabbit`, `require_acceptance`) may be switched **on**, never off. `poll_interval_s` is central only. After the merge the result must still satisfy `phases.round_usd <= budgets.run_usd`. |
 | `default_risk` | The risk new work orders for this repo start from: `low`, `medium` or `high`. A repo setting, not policy: any value is accepted, `low` included. |
 | `workflow` | The Archon workflow this repo's work orders use by default. A lowercase slug, the same rule as a work order's `workflow` (so `factory-task`, not `Factory_Task` or `factory-`). A repo setting, not policy. `hapi run start` runs only a workflow of hapi's pack (`archon/workflows/hapi/`), never one of Archon's bundled ones. |
+| `sidecar` | `{ name, data_dir }`: the sidecar this repo's runs start and the repo directory mounted into it. `name` must be one `sidecars.yaml` lists (otherwise a `PolicyError` at `/sidecar/name`); `data_dir` is a repo-relative directory with no `*` or `?`. `applyOverlay` adds `<data_dir>/**` as denied to workers (merged with any overlay `protected_paths` entry for it, strictest wins), because the directory holds the code the sidecar runs. A repo setting, not policy. |
 
 The overlay is checked in two stages:
 1. **`loadOverlay(file)`** checks the file against `repo-overlay.schema.json`. That catches unknown keys, bad modes, globs outside the [glob syntax](#glob-syntax) and malformed hosts, and throws a `PolicyError`.
 2. **`applyOverlay(policy, overlay)`** compares the overlay with the base policy. It throws a `PolicyLoosenError` at the **first** change that would loosen policy. The error's `path` is a JSON Pointer into the overlay, and its message names the path or glob as written. **A loosening change is never merged silently.** `applyOverlay` returns a new policy that shares no objects with either input, so changing the result never changes the base policy. It also re-runs the schema check, so an overlay built in code gets the same checks as one read from a file.
 
-`default_risk` and `workflow` are copied to the result's **`repo`** field, `{ default_risk?, workflow? }`, which Plan 03 reads. `repo` is set only when the overlay names one of them; `loadPolicy` never sets it.
+`default_risk`, `workflow` and `sidecar` are copied to the result's **`repo`** field, `{ default_risk?, workflow?, sidecar? }`, which Plan 03 reads. `repo` is set only when the overlay names one of them; `loadPolicy` never sets it.
+
+**`overlayFromText(text, label)`** checks overlay text read as a git blob (H-172) the way `loadOverlay` checks a file, and names `label` (say `abc1234:.factory/config.yaml`) in its `PolicyError`.
 
 ### An accepted overlay
 
@@ -681,7 +733,10 @@ Later plans build on these functions:
 |---|---|---|
 | `loadPolicy(dir): Policy` | `src/policy/load.ts` | Loads and validates `policy/`, `mcp.yaml` included (not the lock). Throws `PolicyError { file, path, message, issues }`. |
 | `loadOverlay(file): RepoOverlay` | `src/policy/overlay.ts` | Loads and schema-checks an overlay. Throws `PolicyError`. |
-| `applyOverlay(p, o): Policy` | `src/policy/overlay.ts` | Tighten-only merge. Throws `PolicyLoosenError { path, message }`. The result's `repo` holds the overlay's `default_risk` and `workflow`. |
+| `overlayFromText(text, label): RepoOverlay` | `src/policy/overlay.ts` | Checks overlay text (a git blob) as `loadOverlay` checks a file; `label` names it in the `PolicyError`. |
+| `applyOverlay(p, o): Policy` | `src/policy/overlay.ts` | Tighten-only merge. Throws `PolicyLoosenError { path, message }`. The result's `repo` holds the overlay's `default_risk`, `workflow` and `sidecar`. |
+| `phaseIssues(budgets, runs): Issue[]` | `src/policy/load.ts` | `phases.round_usd` above `budgets.run_usd`, as an issue at `/phases/round_usd`. `loadPolicy` and `applyOverlay` run it. |
+| `parseYaml(text): unknown` | `src/policy/schema.ts` | Parses YAML text; a duplicate key or bad syntax throws `invalid YAML: ...`. `readYaml` and `overlayFromText` use it. |
 | `matchCommand(rules, argv): {allowed, rule?, reason}` | `src/policy/commands.ts` | Whether `commands.yaml`'s `hermes.allow` rules allow an argv ([how a rule matches](#how-a-rule-matches)) |
 | `commandRuleIssues(rules): Issue[]` | `src/policy/commands.ts` | The command patterns that don't compile. `loadPolicy` runs it. |
 | `forgeDomain(host): string \| undefined` | `src/policy/hosts.ts` | The forge domain a host belongs to, e.g. `raw.githubusercontent.com` → `githubusercontent.com`. Case is ignored, as Squid ignores it, so `GitHub.com` → `github.com`. `FORGE_DOMAINS` lists them. |

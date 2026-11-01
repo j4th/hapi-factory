@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "policy-budgets.schema.json",
   "title": "policy/budgets.yaml",
-  "description": "Spend and turn limits (spec §3, §8.1). Provider-side caps are applied by hand or API; the run and turn caps are compiled into Hermes, Archon and hapi-guard.",
+  "description": "Spend and turn limits (spec §3, §8.1). Provider-side caps are applied by hand or API; the run and turn caps are compiled into Hermes, Archon and hapi-guard; the repo and day caps are checked by the poller.",
   "type": "object",
   "properties": {
     "workspaces": {
@@ -32,8 +32,16 @@
       "description": "Hermes agent.max_turns.",
       "$ref": "policy-defs.schema.json#/$defs/count"
     },
+    "repo_monthly_usd": {
+      "description": "The most one registered repo's runs may spend per UTC calendar month; the poller checks it before it starts a run. An overlay may lower it.",
+      "$ref": "policy-defs.schema.json#/$defs/usd"
+    },
+    "daily_usd": {
+      "description": "The most all registered repos' runs together may spend per UTC calendar day; the poller checks it before it starts a run. Central only.",
+      "$ref": "policy-defs.schema.json#/$defs/usd"
+    },
     "enforcement": {
-      "description": "How each enforcer treats run_usd: hard stops the run, soft flags it and lets it finish. One setting per enforcement point.",
+      "description": "How each enforcer treats a spend limit: hard stops the run (the poller: refuses to start it), soft flags it and lets it finish. One setting per enforcement point.",
       "type": "object",
       "properties": {
         "hapi_guard": {
@@ -43,12 +51,16 @@
         "archon": {
           "description": "Archon's budget on the factory-task workflow's children.",
           "$ref": "policy-defs.schema.json#/$defs/enforcement"
+        },
+        "poller": {
+          "description": "The poller's checks before a run starts: repo_monthly_usd, daily_usd and the round counts in runs.yaml. hard refuses the run; soft starts it and flags it.",
+          "$ref": "policy-defs.schema.json#/$defs/enforcement"
         }
       },
-      "required": ["hapi_guard", "archon"],
+      "required": ["hapi_guard", "archon", "poller"],
       "additionalProperties": false
     }
   },
-  "required": ["workspaces", "openrouter_monthly_usd", "jev_monthly_usd", "run_usd", "hermes_max_turns", "enforcement"],
+  "required": ["workspaces", "openrouter_monthly_usd", "jev_monthly_usd", "run_usd", "hermes_max_turns", "repo_monthly_usd", "daily_usd", "enforcement"],
   "additionalProperties": false
 }

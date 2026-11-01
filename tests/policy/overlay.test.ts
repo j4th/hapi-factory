@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadPolicy, PolicyError } from "../../src/policy/load";
-import { applyOverlay, loadOverlay, PolicyLoosenError } from "../../src/policy/overlay";
+import { applyOverlay, loadOverlay, overlayFromText, PolicyLoosenError } from "../../src/policy/overlay";
 import { effectiveModes } from "../../src/policy/paths";
 import type { RepoOverlay } from "../../src/policy/types";
 
@@ -192,26 +192,101 @@ describe("applyOverlay", () => {
 
   test("an overlay may harden an enforcement but not soften it", () => {
     const soft = structuredClone(p);
-    soft.budgets.enforcement = { hapi_guard: "soft", archon: "soft" };
+    soft.budgets.enforcement = { hapi_guard: "soft", archon: "soft", poller: "soft" };
     const r = applyOverlay(soft, { budgets: { enforcement: { hapi_guard: "hard" } } });
-    expect(r.budgets.enforcement).toEqual({ hapi_guard: "hard", archon: "soft" });
+    expect(r.budgets.enforcement).toEqual({ hapi_guard: "hard", archon: "soft", poller: "soft" });
     // Naming the current mode, or leaving an enforcer out, changes nothing.
     expect(applyOverlay(soft, { budgets: { enforcement: { archon: "soft" } } }).budgets.enforcement).toEqual(soft.budgets.enforcement);
     const e = loosenError(() => applyOverlay(p, { budgets: { enforcement: { hapi_guard: "soft" } } }));
     expect(e.path).toBe("/budgets/enforcement/hapi_guard");
     expect(e.message).toContain("softens budgets.enforcement.hapi_guard from hard to soft");
     expect(loosenError(() => applyOverlay(p, { budgets: { enforcement: { archon: "soft" } } })).path).toBe("/budgets/enforcement/archon");
+    const q = loosenError(() => applyOverlay(p, { budgets: { enforcement: { poller: "soft" } } }));
+    expect(q.path).toBe("/budgets/enforcement/poller");
+    expect(q.message).toContain("softens budgets.enforcement.poller from hard to soft");
   });
 
   test("an overlay may lower max_live and the output limits but not raise them", () => {
     const r = applyOverlay(p, { runs: { retention_days: 7, output_limits_mb: { bundle: 128 } } });
-    expect(r.runs).toEqual({ max_live: 1, retention_days: 7, output_limits_mb: { bundle: 128, transcript: 64, decisions: 16, result: 4 } });
+    expect(r.runs).toEqual({ ...p.runs, retention_days: 7, output_limits_mb: { bundle: 128, transcript: 64, decisions: 16, result: 4 } });
     expect(p.runs.output_limits_mb.bundle).toBe(256);
     const e = loosenError(() => applyOverlay(p, { runs: { max_live: 2 } }));
     expect(e.path).toBe("/runs/max_live");
     expect(e.message).toContain("raises runs.max_live from 1 to 2");
     expect(loosenError(() => applyOverlay(p, { runs: { output_limits_mb: { result: 5 } } })).path).toBe("/runs/output_limits_mb/result");
     expect(loosenError(() => applyOverlay(p, { runs: { retention_days: 30 } })).path).toBe("/runs/retention_days");
+  });
+
+  test("repo_monthly_usd may be lowered; daily_usd and poll_interval_s are central only", () => {
+    expect(applyOverlay(p, { budgets: { repo_monthly_usd: 15 } }).budgets.repo_monthly_usd).toBe(15);
+    const e = loosenError(() => applyOverlay(p, { budgets: { repo_monthly_usd: 30 } }));
+    expect(e.path).toBe("/budgets/repo_monthly_usd");
+    expect(e.message).toContain("raises budgets.repo_monthly_usd from 25 to 30");
+    expect(() => applyOverlay(p, { budgets: { daily_usd: 5 } } as unknown as RepoOverlay)).toThrow("/budgets/daily_usd: unknown key");
+    expect(() => applyOverlay(p, { runs: { poll_interval_s: 60 } } as unknown as RepoOverlay)).toThrow("/runs/poll_interval_s: unknown key");
+  });
+
+  test("the disk cap may be lowered and hardened, never raised or softened", () => {
+    const soft = structuredClone(p);
+    soft.runs.disk.enforcement = "soft";
+    expect(applyOverlay(soft, { runs: { disk: { gb: 10, enforcement: "hard" } } }).runs.disk).toEqual({ gb: 10, enforcement: "hard" });
+    const up = loosenError(() => applyOverlay(p, { runs: { disk: { gb: 40 } } }));
+    expect(up.path).toBe("/runs/disk/gb");
+    expect(up.message).toContain("raises runs.disk.gb from 20 to 40");
+    const down = loosenError(() => applyOverlay(p, { runs: { disk: { enforcement: "soft" } } }));
+    expect(down.path).toBe("/runs/disk/enforcement");
+    expect(down.message).toContain("softens runs.disk.enforcement from hard to soft");
+  });
+
+  test("phases may be switched on and their rounds and caps lowered, never the reverse", () => {
+    const r = applyOverlay(p, { runs: { max_auto_rounds: 2, phases: { coderabbit: true, fix_rounds_on_pr: 0, round_usd: 0.5 } } });
+    expect(r.runs.phases).toEqual({ ...p.runs.phases, coderabbit: true, fix_rounds_on_pr: 0, round_usd: 0.5 });
+    expect(r.runs.max_auto_rounds).toBe(2);
+    for (const k of ["verify", "require_acceptance"] as const) {
+      const e = loosenError(() => applyOverlay(p, { runs: { phases: { [k]: false } } }));
+      expect(e.path).toBe(`/runs/phases/${k}`);
+      expect(e.message).toContain(`switches runs.phases.${k} off`);
+    }
+    expect(loosenError(() => applyOverlay(p, { runs: { phases: { fix_rounds_before_pr: 2 } } })).message).toContain(
+      "raises runs.phases.fix_rounds_before_pr from 1 to 2",
+    );
+    expect(loosenError(() => applyOverlay(p, { runs: { max_auto_rounds: 4 } })).message).toContain("raises runs.max_auto_rounds from 3 to 4");
+    const off = structuredClone(p);
+    off.runs.phases.require_acceptance = false;
+    expect(applyOverlay(off, { runs: { phases: { require_acceptance: true } } }).runs.phases.require_acceptance).toBe(true);
+  });
+
+  test("lowering run_usd below phases.round_usd is refused until round_usd comes down too", () => {
+    try {
+      applyOverlay(p, { budgets: { run_usd: 0.5 } });
+      throw new Error("expected a PolicyError");
+    } catch (e) {
+      if (!(e instanceof PolicyError)) throw e;
+      expect(e.path).toBe("/runs/phases/round_usd");
+    }
+    const r = applyOverlay(p, { budgets: { run_usd: 0.5 }, runs: { phases: { round_usd: 0.5 } } });
+    expect(r.budgets.run_usd).toBe(0.5);
+  });
+
+  test("a sidecar must be one policy/sidecars.yaml lists, and its data dir is protected from workers", () => {
+    const r = applyOverlay(p, { sidecar: { name: "bun-http", data_dir: "smoke" } });
+    expect(r.repo).toEqual({ sidecar: { name: "bun-http", data_dir: "smoke" } });
+    expect(r.protectedPaths["smoke/**"]).toEqual({ interactive: "allow", unattended: "allow", workers: "deny" });
+    expect(effectiveModes(r, "smoke/fortunes.json").workers).toBe("deny");
+    const both = applyOverlay(p, {
+      sidecar: { name: "bun-http", data_dir: "smoke" },
+      protected_paths: { "smoke/**": { interactive: "deny" } },
+    });
+    expect(both.protectedPaths["smoke/**"]).toEqual({ interactive: "deny", unattended: "allow", workers: "deny" });
+    try {
+      applyOverlay(p, { sidecar: { name: "postgres", data_dir: "smoke" } });
+      throw new Error("expected a PolicyError");
+    } catch (e) {
+      if (!(e instanceof PolicyError)) throw e;
+      expect(e.path).toBe("/sidecar/name");
+      expect(e.message).toContain('"postgres" is not a sidecar in policy/sidecars.yaml');
+    }
+    expect(() => applyOverlay(p, { sidecar: { name: "bun-http", data_dir: "smoke/*" } })).toThrow("/sidecar/data_dir");
   });
 
   test("gates is central only: an overlay naming it is an unknown key", () => {
@@ -245,6 +320,20 @@ describe("loadOverlay", () => {
       expect(effectiveModes(p, file)).toEqual({ interactive: "allow", unattended: "allow", workers: "allow" }); // central policy: every repo
     }
     expect(effectiveModes(r, "src/cli.ts")).toEqual({ interactive: "allow", unattended: "allow", workers: "allow" });
+  });
+
+  test("overlayFromText checks text as loadOverlay checks a file, naming the label", () => {
+    const file = "tests/fixtures/overlay-tighten.yaml";
+    expect(overlayFromText(readFileSync(file, "utf8"), file)).toEqual(loadOverlay(file));
+    try {
+      overlayFromText("budgets:\n  run_usdd: 1\n", "abc1234:.factory/config.yaml");
+      throw new Error("expected a PolicyError");
+    } catch (e) {
+      if (!(e instanceof PolicyError)) throw e;
+      expect(e.file).toBe("abc1234:.factory/config.yaml");
+      expect(e.path).toBe("/budgets/run_usdd");
+    }
+    expect(() => overlayFromText("a: 1\na: 2\n", "x")).toThrow("invalid YAML");
   });
 
   let temps: string[] = [];
@@ -296,7 +385,7 @@ describe("loadOverlay", () => {
   });
 
   test("anything other than protected_paths, egress_extra, budgets, default_risk and workflow is rejected", () => {
-    for (const key of ["commands", "trusted_sources", "approvals", "flags", "roles", "rosters"]) {
+    for (const key of ["commands", "trusted_sources", "approvals", "flags", "roles", "rosters", "repos", "sidecars"]) {
       const e = policyError(overlayFile(`${key}: {}\n`));
       expect(e.path).toBe(`/${key}`);
       expect(e.message).toContain("config.yaml");
