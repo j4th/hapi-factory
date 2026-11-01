@@ -16,7 +16,7 @@ import YAML from "yaml";
 import { envFileText } from "../../src/secrets/files";
 import { COPY_SCRIPT, LIST_SCRIPT } from "../../src/run/copyout";
 import { CLEAN_SCRIPT, type FsFacts, type FsProbe, GIB } from "../../src/run/disk";
-import { LOGS_SCRIPT } from "../../src/run/lifecycle";
+import { EXIT_FORMAT, LOGS_SCRIPT } from "../../src/run/lifecycle";
 import { recordDir, type RunRecord, writeRecord } from "../../src/run/records";
 import type { RunDeps } from "../../src/run/spec";
 import { tempDir } from "../secrets/helpers";
@@ -33,8 +33,10 @@ interface Container {
   name: string;
   labels: Record<string, string>;
   running: boolean;
-  /** What `docker inspect --format {{.State.ExitCode}}` prints for it: FakeOptions.exitCode, 0 by default. */
+  /** What `docker inspect --format EXIT_FORMAT` prints for its exit code: FakeOptions.exitCode, 0 by default. */
   exitCode?: number;
+  /** Its `.State.Status`: `running` or `exited` from `running`, unless a test sets another (`created`). */
+  state?: string;
 }
 interface Network {
   labels: Record<string, string>;
@@ -128,7 +130,7 @@ export interface FakeOptions {
   hangs?: (cmd: string[]) => boolean;
   /** The exit code of `timeout <s> docker wait <run>`: 0 (the run exited) or 124 (the deadline came first). */
   waitCode?: number;
-  /** The run container's exit code, as `docker inspect --format {{.State.ExitCode}}` prints it (0 by default). */
+  /** The run container's exit code, as `docker inspect --format EXIT_FORMAT` prints it (0 by default). */
   exitCode?: number;
   /** What `git bundle list-heads` prints. */
   heads?: string;
@@ -204,9 +206,9 @@ export function fakeRun(o: FakeOptions = {}) {
     if (cmd[0] !== "docker") throw new Error(`fake: unexpected command ${joined}`);
     const [, a, b] = cmd;
     if (a === "info" && after(cmd, "--format") === "{{.DockerRootDir}}") return ok(`${DATA_ROOT}\n`);
-    if (a === "inspect" && after(cmd, "--format") === "{{.State.ExitCode}}") {
+    if (a === "inspect" && after(cmd, "--format") === EXIT_FORMAT) {
       const c = world.containers.get(cmd.at(-1)!);
-      return c === undefined ? fail(`Error: No such object: ${cmd.at(-1)}`) : ok(`${c.exitCode ?? o.exitCode ?? 0}\n`);
+      return c === undefined ? fail(`Error: No such object: ${cmd.at(-1)}`) : ok(`${c.state ?? (c.running ? "running" : "exited")} ${c.exitCode ?? o.exitCode ?? 0}\n`);
     }
     if (a === "ps") {
       const all = cmd.includes("-aq") || cmd.includes("-a");

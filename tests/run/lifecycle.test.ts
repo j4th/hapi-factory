@@ -22,7 +22,7 @@ import { COPY_SCRIPT, HELPER_HOST_TIMEOUT_S, HELPER_KILL_AFTER_S, HELPER_TIMEOUT
 import { CLEAN_SCRIPT, GIB, volumeDir } from "../../src/run/disk";
 import { MAX_OUTPUTS, type RunKind } from "../../src/run/kinds";
 import {
-  bundleProblem, FINALIZE_WAIT_S, finalizeRun, guardProblems, LOGS_SCRIPT, reapRuns, rolesProblem, runStart, runStop, runSupervise, type StartOptions, startRun,
+  bundleProblem, EXIT_FORMAT, FINALIZE_WAIT_S, finalizeRun, guardProblems, LOGS_SCRIPT, reapRuns, rolesProblem, runStart, runStop, runSupervise, type StartOptions, startRun,
 } from "../../src/run/lifecycle";
 import { lockHeld, withStackLock } from "../../src/run/locks";
 import { listRecords, PER_RUN_FILES, readRecord, RUN_ID, runKey, withRunLock, withStartLock } from "../../src/run/records";
@@ -1288,17 +1288,23 @@ test("finalize records the container's exit code as Docker recorded it, under th
   // Archon says completed, so the run succeeded: the exit code is evidence for Task 12, not the status.
   expect([done.status, done.exitCode]).toEqual(["succeeded", 3]);
   expect((await readRecord(f.deps.stateDir, ID))!.exitCode).toBe(3);
-  const inspect = f.calls.map((c) => c.cmd).find((c) => c.includes("{{.State.ExitCode}}"))!;
-  expect(inspect).toEqual(["timeout", "-k", String(HELPER_KILL_AFTER_S), String(HELPER_HOST_TIMEOUT_S), "docker", "inspect", "--format", "{{.State.ExitCode}}", N]);
+  const inspect = f.calls.map((c) => c.cmd).find((c) => c.includes(EXIT_FORMAT))!;
+  expect(EXIT_FORMAT).toBe("{{.State.Status}} {{.State.ExitCode}}");
+  expect(inspect).toEqual(["timeout", "-k", String(HELPER_KILL_AFTER_S), String(HELPER_HOST_TIMEOUT_S), "docker", "inspect", "--format", EXIT_FORMAT, N]);
   // Read before the container is removed.
   const cmds = f.calls.map((c) => c.cmd.join(" "));
-  expect(cmds.findIndex((c) => c.includes("{{.State.ExitCode}}"))).toBeLessThan(cmds.indexOf(`docker rm -f ${N}`));
-  const unread: [Parameters<typeof fakeRun>[0], string][] = [[{ failing: ["docker inspect"] }, "fails"], [{ hangs: (c) => c.includes("{{.State.ExitCode}}") }, "hangs"]];
+  expect(cmds.findIndex((c) => c.includes(EXIT_FORMAT))).toBeLessThan(cmds.indexOf(`docker rm -f ${N}`));
+  const unread: [Parameters<typeof fakeRun>[0], string][] = [[{ failing: ["docker inspect"] }, "fails"], [{ hangs: (c) => c.includes(EXIT_FORMAT) }, "hangs"]];
   for (const [o, why] of unread) {
     const g = fakeRun(o);
     const left = await finalizeRun(await seedRun(g, { id: ID, running: false, outputs: completedOutputs() }), g.deps);
     expect([why, left.status, Object.hasOwn(left, "exitCode")]).toEqual([why, "succeeded", false]);
   }
+  // A container that never started (Docker says `created`, and exit code 0) has none to keep.
+  const c = fakeRun();
+  await seedRun(c, { id: ID, running: false, outputs: completedOutputs() });
+  c.world.containers.get(N)!.state = "created";
+  expect(Object.hasOwn(await finalizeRun((await readRecord(c.deps.stateDir, ID))!, c.deps), "exitCode")).toBe(false);
   // A container removed around hapi has no exit code to read.
   const h = fakeRun();
   const gone = await finalizeRun(await seedRun(h, { id: ID, objects: false }), h.deps);

@@ -8,7 +8,7 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { REPO } from "../stack/helpers";
 import { cleanup, tempDir } from "../secrets/helpers";
 
@@ -23,23 +23,32 @@ const REVIEW = read("review.sh");
 const codeOf = (t: string) => t.split("\n").filter((l) => l.trim() !== "" && !/^\s*#/.test(l));
 const code = codeOf(text);
 const HAVE_JQ = Bun.spawnSync(["jq", "--version"], { stdout: "pipe", stderr: "pipe" }).exitCode === 0;
+/** Whether this host lets an unprivileged user make a user and PID namespace, where sh can be PID 1 (some restrict it). */
+const HAVE_PID_NS = Bun.spawnSync(["unshare", "-Urpf", "--mount-proc", "true"], { stdout: "pipe", stderr: "pipe" }).exitCode === 0;
 
-/** verify.sh's and review.sh's sparse patterns: run.sh's three, plus Claude Code's files (spike 09, T19: .claude/ and CLAUDE.md at any depth). */
-const SPARSE = "git -C /work/repo sparse-checkout set --no-cone '/*' '!/.pi/' '!/.agents/' '!/.archon/' '!.claude/' '!CLAUDE.md' '!/.mcp.json'";
-/** Their strip after the workflow, of the same six. */
-const STRIP = 'rm -rf /work/repo/.archon /work/repo/.pi /work/repo/.agents /work/repo/.claude /work/repo/CLAUDE.md /work/repo/.mcp.json || echo "prelude: strip failed" >&2';
+/** verify.sh's and review.sh's sparse patterns: run.sh's three, plus Claude Code's files (spike 09, T19: .claude/, CLAUDE.md and CLAUDE.local.md at any depth). */
+const SPARSE = "git -C /work/repo sparse-checkout set --no-cone '/*' '!/.pi/' '!/.agents/' '!/.archon/' '!.claude/' '!CLAUDE.md' '!CLAUDE.local.md' '!/.mcp.json'";
+/** Their strip after the workflow, of the same seven. */
+const STRIP =
+  'rm -rf /work/repo/.archon /work/repo/.pi /work/repo/.agents /work/repo/.claude /work/repo/CLAUDE.md /work/repo/CLAUDE.local.md /work/repo/.mcp.json || echo "prelude: strip failed" >&2';
 /** review.sh's read-only checkout, .git aside, never following a symlink out of it. */
 const CHMOD = "find /work/repo -path /work/repo/.git -prune -o ! -type l -exec chmod a-w {} +";
 /** review.sh's symlinks, each checked out again as a plain file holding its target's text, before the chmod; a status that isn't clean then ends it. */
 const PLAIN_LINKS = [
   "git -C /work/repo config core.symlinks false",
-  "find /work/repo -path /work/repo/.git -prune -o -type l -exec rm -f {} +",
-  "git -C /work/repo checkout -- .",
+  "links=$(find /work/repo -path /work/repo/.git -prune -o -type l -print)",
+  'if [ -n "$links" ]; then',
+  "  find /work/repo -path /work/repo/.git -prune -o -type l -exec rm -f {} +",
+  "  git -C /work/repo checkout -- .",
+  "fi",
   "st=$(git -C /work/repo status --porcelain)",
   'if [ -n "$st" ]; then echo "prelude: the checkout is not clean once its symlinks are plain files" >&2; exit 1; fi',
 ];
-/** verify.sh's and review.sh's kill of what the workflow left running, right after `set +e`: only as PID 1, the container's init. */
-const KILL = 'if [ "$$" = 1 ]; then kill -s KILL -1 2>/dev/null; fi';
+/**
+ * verify.sh's and review.sh's kill of what the workflow left running, right after `set +e`: only as PID 1, the
+ * container's init, and with `--`, since dash (the image's sh) refuses a bare -1 as an option.
+ */
+const KILL = 'if [ "$$" = 1 ]; then kill -s KILL -- -1 2>/dev/null; fi';
 /**
  * The regions every prelude holds as run.sh does, byte for byte, comments and all, each from its first text to its
  * last: the start, the clone, the checkout and the remote's removal, the CLI's run with its trap and wait up to
@@ -144,11 +153,33 @@ describe("the text of run.sh", () => {
   });
 });
 
-/** The six paths a repo could steer Archon, Pi or Claude Code with, at the clone's root. */
-const STEERING = [".archon", ".pi", ".agents", ".claude", "CLAUDE.md", ".mcp.json"];
+/** The seven paths a repo could steer Archon, Pi or Claude Code with, at the clone's root. */
+const STEERING = [".archon", ".pi", ".agents", ".claude", "CLAUDE.md", "CLAUDE.local.md", ".mcp.json"];
 
-/** A sandbox: the script `script` with its absolute paths moved under `root`, a source repo, and a stand-in bun. */
-function sandbox(script0: string = text) {
+/** The default seed: a README, the steering paths a repo could plant, a nested dir, and links out of the checkout. */
+function seedFiles(root: string, seed: string): void {
+  for (const d of [".archon", ".claude", "sub"]) mkdirSync(join(seed, d), { recursive: true });
+  writeFileSync(join(seed, "README.md"), "hello\n");
+  writeFileSync(join(seed, ".archon", "config.yaml"), "decoy: true\n");
+  // What Claude Code would load from a checkout (spike 09, T19): its settings' hooks, CLAUDE.md, CLAUDE.local.md and an MCP server.
+  writeFileSync(join(seed, ".claude", "settings.json"), '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"touch /tmp/hook"}]}]}}\n');
+  writeFileSync(join(seed, "CLAUDE.md"), "decoy: ask before every edit\n");
+  writeFileSync(join(seed, "CLAUDE.local.md"), "decoy: local\n");
+  writeFileSync(join(seed, ".mcp.json"), '{"mcpServers":{"x":{"command":"sh"}}}\n');
+  writeFileSync(join(seed, "sub", "CLAUDE.md"), "decoy: nested\n");
+  writeFileSync(join(seed, "sub", "CLAUDE.local.md"), "decoy: nested local\n");
+  writeFileSync(join(seed, "sub", "keep.txt"), "kept\n");
+  // Links out of the checkout: to a file of the run's own user (as `x -> /out` would be), to a dir, and to nothing.
+  symlinkSync(join(root, "state", "outside.jsonl"), join(seed, "link"));
+  symlinkSync(join(root, "state"), join(seed, "d"));
+  symlinkSync(join(root, "nowhere"), join(seed, "dangling"));
+}
+
+/**
+ * A sandbox: the script `script` with its absolute paths moved under `root`, a source repo, and a stand-in bun. The
+ * repo's one commit is the seed below, or, with `o.files`, those files alone (`{}`: an empty tree).
+ */
+function sandbox(script0: string = text, o: { files?: Record<string, string> } = {}) {
   const root = tempDir("hapi-prelude-");
   const bin = join(root, "bin");
   for (const d of ["bin", "app", "out", "work", "state", "archon"]) mkdirSync(join(root, d), { recursive: true });
@@ -159,22 +190,16 @@ function sandbox(script0: string = text) {
     return r.stdout.toString().trim();
   };
   const seed = join(root, "seed");
-  for (const d of [".archon", ".claude", "sub"]) mkdirSync(join(seed, d), { recursive: true });
+  mkdirSync(seed);
   git(seed, "init", "-q");
-  writeFileSync(join(seed, "README.md"), "hello\n");
-  writeFileSync(join(seed, ".archon", "config.yaml"), "decoy: true\n");
-  // What Claude Code would load from a checkout (spike 09, T19): its settings' hooks, CLAUDE.md, and an MCP server.
-  writeFileSync(join(seed, ".claude", "settings.json"), '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"touch /tmp/hook"}]}]}}\n');
-  writeFileSync(join(seed, "CLAUDE.md"), "decoy: ask before every edit\n");
-  writeFileSync(join(seed, ".mcp.json"), '{"mcpServers":{"x":{"command":"sh"}}}\n');
-  writeFileSync(join(seed, "sub", "CLAUDE.md"), "decoy: nested\n");
-  writeFileSync(join(seed, "sub", "keep.txt"), "kept\n");
-  // Links out of the checkout: to a file of the run's own user (as `x -> /out` would be), to a dir, and to nothing.
-  symlinkSync(join(root, "state", "outside.jsonl"), join(seed, "link"));
-  symlinkSync(join(root, "state"), join(seed, "d"));
-  symlinkSync(join(root, "nowhere"), join(seed, "dangling"));
+  if (o.files !== undefined) {
+    for (const [f, t] of Object.entries(o.files)) {
+      mkdirSync(dirname(join(seed, f)), { recursive: true });
+      writeFileSync(join(seed, f), t);
+    }
+  } else seedFiles(root, seed);
   git(seed, "add", "-A");
-  git(seed, "commit", "-q", "-m", "A");
+  git(seed, "commit", "-q", "--allow-empty", "-m", "A");
   const sha = git(seed, "rev-parse", "HEAD");
   git(root, "clone", "-q", "--bare", seed, join(root, "src.git"));
   const script = script0
@@ -203,7 +228,7 @@ case "$1 $2" in
   if [ -n "$FAKE_PLANT" ]; then
     mkdir -p "${root}/work/repo/.archon" "${root}/work/repo/.pi" "${root}/work/repo/.agents" "${root}/work/repo/.claude"
     echo "planted: true" > "${root}/work/repo/.archon/config.yaml"
-    echo planted > "${root}/work/repo/CLAUDE.md"; echo '{}' > "${root}/work/repo/.mcp.json"
+    echo planted > "${root}/work/repo/CLAUDE.md"; echo planted > "${root}/work/repo/CLAUDE.local.md"; echo '{}' > "${root}/work/repo/.mcp.json"
   fi
   if [ -n "$FAKE_COMMIT" ]; then
     (cd "${root}/work/repo" && echo more >> README.md && git -c user.name=t -c user.email=t@example.invalid commit -qam B)
@@ -233,7 +258,7 @@ esac
   return { root, sha, start, transcript, logs, RUN_ID };
 }
 
-/** Which of the six steering paths the stand-in CLI's read-back found in the clone. */
+/** Which of the seven steering paths the stand-in CLI's read-back found in the clone. */
 const saw = (s: ReturnType<typeof sandbox>) => readFileSync(join(s.root, "state", "readback.saw"), "utf8").split("\n").filter((l) => l !== "");
 
 describe.skipIf(!HAVE_JQ)("run.sh, run on a sandbox with a stand-in Archon CLI", () => {
@@ -374,7 +399,7 @@ describe.skipIf(!HAVE_JQ)("run.sh, run on a sandbox with a stand-in Archon CLI",
 
 describe("the text of verify.sh and review.sh", () => {
   for (const [name, t] of [["verify.sh", VERIFY], ["review.sh", REVIEW]] as const) {
-    test(`${name} passes sh -n, clones with exactly '/*' '!/.pi/' '!/.agents/' '!/.archon/' '!.claude/' '!CLAUDE.md' '!/.mcp.json', makes no bundle, and keeps run.sh's trap, wait and set +e shape`, () => {
+    test(`${name} passes sh -n, clones with exactly '/*' '!/.pi/' '!/.agents/' '!/.archon/' '!.claude/' '!CLAUDE.md' '!CLAUDE.local.md' '!/.mcp.json', makes no bundle, and keeps run.sh's trap, wait and set +e shape`, () => {
       const r = Bun.spawnSync(["sh", "-n", join(REPO, "stack", "archon", name)], { stdout: "pipe", stderr: "pipe" });
       expect([name, r.exitCode, r.stderr.toString()]).toEqual([name, 0, ""]);
       const c = codeOf(t);
@@ -389,14 +414,14 @@ describe("the text of verify.sh and review.sh", () => {
       const after = c.slice(c.indexOf("set +e") + 1);
       expect(after.at(-1)).toBe('exit "$rc"');
       for (const l of after.slice(0, -1)) expect([l, /\bexit\b/.test(l) || /\bset -[a-z]*e/.test(l)]).toEqual([l, false]);
-      // The six steering paths go after the workflow and before any read-back.
+      // The seven steering paths go after the workflow and before any read-back.
       expect(c.filter((l) => l.startsWith("rm -rf "))).toEqual([STRIP]);
       expect(t.indexOf(STRIP)).toBeGreaterThan(t.indexOf("set +e"));
       expect(t.indexOf(STRIP)).toBeLessThan(t.indexOf("workflow runs --json"));
     });
   }
 
-  test("verify.sh is run.sh with the seven sparse patterns, no bundle, the guarded kill after set +e and the six-path strip; review.sh is verify.sh with its symlinks made plain files and the checkout made read-only right after the remote goes", () => {
+  test("verify.sh is run.sh with the eight sparse patterns, no bundle, the guarded kill after set +e and the seven-path strip; review.sh is verify.sh with its symlinks made plain files and the checkout made read-only right after the remote goes", () => {
     const want = code
       .map((l) => (l.startsWith("git -C /work/repo sparse-checkout set") ? SPARSE : l.startsWith("rm -rf /work/repo/.archon") ? STRIP : l))
       .filter((l) => !l.startsWith("head=") && !l.includes("bundle create"))
@@ -456,6 +481,27 @@ describe("the text of verify.sh and review.sh", () => {
     expect(header(REVIEW)).toContain("egress-review");
     expect(header(REVIEW)).toMatch(/runs none of the repo's code/);
     for (const t of [VERIFY, REVIEW]) expect(header(t)).toContain("tests/run/prelude.test.ts");
+  });
+});
+
+describe.skipIf(!HAVE_PID_NS)("the kill line, as PID 1 in a PID namespace of its own (unshare -Urpf)", () => {
+  // The image's sh is dash, as this host's /bin/sh may be; tests/run/run.int.test.ts runs the same lines in the image.
+  for (const name of ["verify.sh", "review.sh"]) {
+    test(`${name}'s kill line, read from the file, ends a background job the workflow left as PID 1 (dash refuses a bare -1)`, () => {
+      const line = codeOf(read(name)).find((l) => l.includes("kill -s KILL"))!;
+      expect(line).toBe(KILL);
+      const script = `sleep 5 & c=$!; sleep 0.2; ${line}; wait "$c"; echo "pid=$$ status=$?"`;
+      const r = Bun.spawnSync(["unshare", "-Urpf", "--mount-proc", "sh", "-c", script], { stdout: "pipe", stderr: "pipe" });
+      expect([r.exitCode, r.stdout.toString().trim()]).toEqual([0, "pid=1 status=137"]);
+    });
+  }
+
+  test("the bare -1 a dash shell refuses would have killed nothing", () => {
+    const r = Bun.spawnSync(["unshare", "-Urpf", "--mount-proc", "sh", "-c", 'sleep 1 & c=$!; kill -s KILL -1 2>/dev/null; echo "kill=$?"; wait "$c"; echo "status=$?"'], { stdout: "pipe", stderr: "pipe" });
+    const out = r.stdout.toString();
+    // dash: "Illegal option -1", exit 2, and the job runs to its end; a shell that took it would show 137.
+    if (out.includes("kill=2")) expect(out).toContain("status=0");
+    else expect(out).toContain("status=137");
   });
 });
 
@@ -519,6 +565,24 @@ describe.skipIf(!HAVE_JQ)("verify.sh and review.sh, run on a sandbox with a stan
       expect(existsSync(join(s.root, "state", "started"))).toBe(true);
     } finally {
       Bun.spawnSync(["chmod", "-R", "u+w", clone]);
+    }
+  });
+
+  test("review.sh runs on a tree with nothing in its sparse checkout (only paths it leaves out, or none at all): no link, so no checkout, and a clean status", async () => {
+    for (const [what, files] of [
+      ["only left-out paths", { "CLAUDE.md": "x\n", ".archon/config.yaml": "decoy: true\n", ".claude/settings.json": "{}\n" }],
+      ["an empty tree", {}],
+    ] as const) {
+      const s = sandbox(REVIEW, { files });
+      const clone = join(s.root, "work", "repo");
+      try {
+        const p = s.start();
+        expect([what, await p.exited, await new Response(p.stderr).text()]).toEqual([what, 0, expect.not.stringContaining("prelude:")]);
+        expect([what, readdirSync(clone)]).toEqual([what, [".git"]]);
+        expect([what, existsSync(join(s.root, "state", "started"))]).toEqual([what, true]);
+      } finally {
+        Bun.spawnSync(["chmod", "-R", "u+w", clone]);
+      }
     }
   });
 

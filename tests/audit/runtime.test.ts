@@ -195,6 +195,20 @@ describe("runtime.run-container", () => {
     ]) expect(r.detail).toContain(part);
   });
 
+  test("a run's prelude is its PID 1: a definition without --init=false fails, and so does a live run container with an init process (HostConfig.Init)", async () => {
+    const r = await withSpec((argv) => argv.filter((a) => a !== "--init=false"));
+    expect(r.status).toBe("fail");
+    for (const k of ["worker", "verify", "review", "fix"]) expect(r.detail).toContain(`${k}: it doesn't set --init=false: its prelude must be PID 1 whatever the daemon's default`);
+    const w = await cleanWorld();
+    const live = runContainer(w, "aaaaaaaaaaaa", { kind: "verify" });
+    live.HostConfig!.Init = true;
+    w.containers.push(live, runContainer(w, "bbbbbbbbbbbb", { kind: "review" }));
+    const v = await check(w, "runtime.run-container");
+    expect(v.status).toBe("fail");
+    expect(v.detail).toContain("hapi-run-aaaaaaaaaaaa: it runs an init process at PID 1 (HostConfig.Init), so its prelude isn't PID 1");
+    expect(v.detail).not.toContain("hapi-run-bbbbbbbbbbbb");
+  });
+
   test("a live run container's stop timeout must be the definition's", async () => {
     const w = await cleanWorld();
     const live = runContainer(w);
@@ -327,6 +341,12 @@ describe("runtime.run-container", () => {
         ],
         ["a network that isn't internal", "worker", (_, w) => void (w.networks.get(N)!.Internal = false), `network ${N} is not internal: it would have a route out around the proxy`],
         ["a network docker can't find", "worker", (_, w) => void w.networks.delete(N), `its network ${N} could not be inspected (docker network inspect exited 1)`],
+        [
+          "another container under the run's name",
+          "worker",
+          (_, w) => void (w.networks.get(N)!.Containers = { "id-someone-else": { Name: N }, "id-hapi-egress-archon-1": { Name: "hapi-egress-archon-1" } }),
+          `its network ${N} has no endpoint of this container's id under its name`,
+        ],
       ];
       for (const [what, kind, edit, part] of cases) {
         const w = await cleanWorld();
@@ -388,6 +408,20 @@ describe("runtime.run-container", () => {
       // The real runArgs refuses them, so the clean world passes.
       expect((await check(await cleanWorld(), "runtime.run-container")).status).toBe("pass");
     });
+  });
+
+  test("a copy-out or chown helper caught mid-flight (the run labels, but no run's name) is not held to a kind's definition", async () => {
+    const w = await cleanWorld();
+    const helper = runContainer(w, "aaaaaaaaaaaa", { labels: { "org.hapi.run": "" } });
+    helper.Name = "/quirky_name";
+    helper.Mounts = [{ Type: "volume", Source: "/var/lib/docker/volumes/hapi-run-aaaaaaaaaaaa-out/_data", Destination: "/out", RW: false }];
+    helper.HostConfig!.NetworkMode = "none";
+    // A container labelled for a run, under another name, isn't that run's container either.
+    const other = runContainer(w, "bbbbbbbbbbbb");
+    other.Name = "/hapi-run-bbbbbbbbbbbb-copy";
+    w.containers.push(helper, other, runContainer(w, "cccccccccccc"));
+    const r = await check(w, "runtime.run-container");
+    expect([r.status, r.detail]).toEqual(["pass", expect.stringContaining("1 live run containers are as their kind's definition says")]);
   });
 
   test("a stopped run container is not checked", async () => {

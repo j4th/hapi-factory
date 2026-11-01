@@ -788,20 +788,24 @@ async function keepContainerLog(d: RunDeps, rec: RunRecord, out: string): Promis
   return `the container's last log line: ${last.length > LOG_LINE_CHARS ? `${last.slice(0, LOG_LINE_CHARS)}…` : last}`;
 }
 
+/** What finalize asks `docker inspect` for: the container's state, then its exit code. */
+export const EXIT_FORMAT = "{{.State.Status}} {{.State.ExitCode}}";
+
 /**
  * The run container's exit code as Docker recorded it (`docker inspect`, under the helpers' host bound), or undefined
- * when it can't be read. It is never the run's status (a paused run exits 0); the record keeps it for Task 12's
- * cross-check of a verify run, whose results the code it ran could have forged.
+ * when it can't be read, or the container didn't exit: Docker reports 0 for one that was made and never started
+ * (`created`), so only an `exited` container's code is kept. It is never the run's status (a paused run exits 0); the
+ * record keeps it for Task 12's cross-check of a verify run, whose results the code it ran could have forged.
  */
 async function containerExitCode(d: RunDeps, container: string): Promise<number | undefined> {
   let r: Awaited<ReturnType<RunDeps["run"]>>;
   try {
-    r = await d.run(bounded(["docker", "inspect", "--format", "{{.State.ExitCode}}", container]), { env: definedEnv(d.env), inherit: false });
+    r = await d.run(bounded(["docker", "inspect", "--format", EXIT_FORMAT, container]), { env: definedEnv(d.env), inherit: false });
   } catch {
     return undefined;
   }
-  const text = r.stdout.trim();
-  return r.code === 0 && /^-?\d{1,10}$/.test(text) ? Number(text) : undefined;
+  const m = /^(\S+) (-?\d{1,10})$/.exec(r.stdout.trim());
+  return r.code === 0 && m !== null && m[1] === "exited" ? Number(m[2]) : undefined;
 }
 
 /** Archon's status of the run, from out/result.json's `run.status` (`workflow get`), or why it can't be read. */

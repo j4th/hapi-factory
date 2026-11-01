@@ -390,6 +390,20 @@ describe.skipIf(!INT || !ONLINE)("hapi run on a real Docker (a throwaway project
     });
   });
 
+  test("as the run container's PID 1, on the real image (its sh is dash), verify.sh's and review.sh's kill line ends what was left running", async () => {
+    for (const name of ["verify.sh", "review.sh"]) {
+      // The line itself, read from the prelude: a fix to its text is what this checks.
+      const line = readFileSync(join(REPO, "stack", "archon", name), "utf8").split("\n").find((l) => l.includes("kill -s KILL"))!;
+      expect(line).toStartWith('if [ "$$" = 1 ]; then kill -s KILL');
+      const script = `sleep 300 & c=$!; sleep 0.2; ${line}; sleep 0.2; if kill -0 "$c" 2>/dev/null; then echo alive; exit 1; fi; echo killed`;
+      const out = await must([
+        "docker", "run", "--rm", "--pull", "never", "--network", "none", "--read-only", "--user", "1001:1001", "--cap-drop", "ALL", "--init=false",
+        "--label", `org.hapi.int=${p.name}`, "--name", `${p.name}-kill-${name.replace(".sh", "")}`, "--entrypoint", "sh", image, "-c", script,
+      ]);
+      expect([name, out.trim()]).toEqual([name, "killed"]);
+    }
+  }, 120_000);
+
   test("a failing run still yields result.json and transcript.jsonl, status failed", async () => {
     const r = await start(order("0005-test-fail", "hapi-test-sleep"), { pack: PACK });
     expect(r.code).toBe(0);

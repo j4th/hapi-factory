@@ -65,7 +65,7 @@ describe("runArgs", () => {
       "--label", "org.hapi.stack=hapi-factory", "--label", "org.hapi.started-by=hapi", "--label", "org.hapi.dev-override=0", "--label", `org.hapi.build-sha256=${digest}`,
       "--label", "com.docker.compose.project=", "--label", "com.docker.compose.service=", "--label", "com.docker.compose.version=",
       "--user", "1001:1001", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", "--pids-limit", "2048", "--memory", "4g",
-      "--log-driver", "json-file", "--log-opt", "max-size=10m", "--log-opt", "max-file=3", "--stop-timeout", "30", "--network", N,
+      "--log-driver", "json-file", "--log-opt", "max-size=10m", "--log-opt", "max-file=3", "--stop-timeout", "30", "--init=false", "--network", N,
       "--tmpfs", "/tmp:size=1g,uid=1001,gid=1001,mode=1777",
       "--tmpfs", "/home/appuser:size=256m,uid=1001,gid=1001,mode=0700",
       "--tmpfs", "/.archon:size=512m,uid=1001,gid=1001,mode=0700",
@@ -185,6 +185,14 @@ describe("runArgs", () => {
         const service = change(await archon());
         expect(() => runArgs(service, inputs(), fakeRun().deps, [], W)).toThrow(`stack/compose.yaml: archon: ${error}`);
       });
+    }
+  });
+
+  test("every kind runs with --init=false, so its prelude is PID 1 whatever the daemon's default", async () => {
+    const s = await archon();
+    for (const kind of ["worker", "verify", "review", "fix"] as const) {
+      const argv = runArgs(s, inputs(), fakeRun().deps, [], kindProfile(kind));
+      expect([kind, argv.filter((a) => a.startsWith("--init"))]).toEqual([kind, ["--init=false"]]);
     }
   });
 

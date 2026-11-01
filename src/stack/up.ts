@@ -46,16 +46,17 @@
  * nothing has been built or written yet.
  *
  * `down` is `removeRuns` (the run containers, then egress-archon's and
- * egress-review's hold on each run network, then the run networks and volumes), then `docker compose -p hapi
- * down`, by project name, so it needs no compose file or build/: it is kill
- * switch 3 (spec §11.8). It removes the runs holding the run disk's lock
- * (`withStackLock`, src/run/locks.ts; H-210), which a finalize holds while it
- * copies a run out, so no copy-out reads a volume `down` is removing. `down`
- * never waits for that lock: if it is held, or can't be taken at all (no
- * XDG_RUNTIME_DIR, whose tmpfs holds it), `down` says so and removes the runs'
- * containers and networks but leaves their volumes, which the run's finalize
- * or the next reap removes, with their dirs on the run disk. Either way it
- * goes on to `compose down`, and kill switch 3 still takes seconds.
+ * egress-review's hold on each run network, then the run networks and volumes),
+ * then `docker compose -p hapi down`, by project name, so it needs no compose
+ * file or build/: it is kill switch 3 (spec §11.8). It removes the runs holding
+ * the run disk's lock (`withStackLock`, src/run/locks.ts; H-210), which a
+ * finalize holds while it copies a run out, so no copy-out reads a volume
+ * `down` is removing. `down` never waits for that lock: if it is held, or can't
+ * be taken at all (no XDG_RUNTIME_DIR, whose tmpfs holds it), `down` says so
+ * and removes the runs' containers and networks but leaves their volumes, which
+ * the run's finalize or the next reap removes, with their dirs on the run disk.
+ * Either way it goes on to `compose down`, and kill switch 3 still takes
+ * seconds.
  * It does load the whole CLI (`bun run src/cli.ts`), so it needs a checkout
  * that loads (src/ parses, node_modules installed) and a working mise;
  * without them, use kill switch 3b (docs/runbooks/kill-switches.md). Volumes
@@ -292,12 +293,12 @@ async function liveRuns(run: Runner, env: Env, project: string): Promise<string[
  * each labelled network (Docker refuses to remove a network with an endpoint attached, spike 07 finding 13): both
  * `<project>-egress-archon-1` and `<project>-egress-review-1`, since a review run's network has the second and every
  * other kind's the first (src/run/kinds.ts), then the networks, then the volumes. Only what the two labels select,
- * never by name or prefix. It tries every removal and throws at the end naming the ones that failed. A listing that fails (`docker ps`,
- * `network ls`, `volume ls`) throws at once and skips the steps after it: that almost always means the daemon is
- * down, when they would fail too. Either way `down`, kill switch 3, goes on to `compose down`. A disconnect that
- * fails is not an error by itself (the proxy may be gone, or not attached); the network removal after it says
- * whether anything is left. Nor is a removal that fails while nothing it named is still listed: a supervisor
- * finalizing its run removes the same objects, and may have got there first (`not found`).
+ * never by name or prefix. It tries every removal and throws at the end naming the ones that failed. A listing that
+ * fails (`docker ps`, `network ls`, `volume ls`) throws at once and skips the steps after it: that almost always
+ * means the daemon is down, when they would fail too. Either way `down`, kill switch 3, goes on to `compose down`. A
+ * disconnect that fails is not an error by itself (the proxy may be gone, or not attached); the network removal
+ * after it says whether anything is left. Nor is a removal that fails while nothing it named is still listed: a
+ * supervisor finalizing its run removes the same objects, and may have got there first (`not found`).
  *
  * With `o.runId`, only that run's objects (`org.hapi.run=<id>`): `hapi run` finalizes one run, or rolls back a
  * start, this way, disconnecting only `o.egress`, the proxies its kind joined (src/run/kinds.ts `egressOf`), when

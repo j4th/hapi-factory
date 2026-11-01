@@ -95,7 +95,7 @@ export interface Container {
   Config: { Labels: Record<string, string>; Env: string[]; Cmd: string[] | null; Entrypoint: string[] | null; User?: string; StopTimeout?: number };
   Mounts: { Type: string; Source: string; Destination: string; RW: boolean }[];
   NetworkSettings?: { Networks: Record<string, unknown> };
-  HostConfig?: { NetworkMode?: string; PortBindings: Record<string, unknown>; Tmpfs?: Record<string, string>; CapDrop?: string[]; ReadonlyRootfs?: boolean; SecurityOpt?: string[]; PidsLimit?: number; Memory?: number };
+  HostConfig?: { NetworkMode?: string; Init?: boolean; PortBindings: Record<string, unknown>; Tmpfs?: Record<string, string>; CapDrop?: string[]; ReadonlyRootfs?: boolean; SecurityOpt?: string[]; PidsLimit?: number; Memory?: number };
 }
 
 /** A network as `docker network inspect` prints one (the fields the audit reads). */
@@ -530,6 +530,7 @@ export function runContainer(w: World, id = "ab12cd34ef56", over: { labels?: Rec
     NetworkSettings: { Networks: { [name]: { NetworkID: `net-${id}` } } },
     HostConfig: {
       NetworkMode: name,
+      Init: false,
       PortBindings: {},
       Tmpfs: {
         "/tmp": "size=1g,uid=1001,gid=1001,mode=1777",

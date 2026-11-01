@@ -50,7 +50,7 @@ import { loadPolicy } from "../../policy/load";
 import { dataRootOf, diskProblem, GIB, probeFs } from "../../run/disk";
 import { egressOf, KIND_LABEL, type KindProfile, kindProfile, proxyZoneOf, RUN_KINDS, type RunKind } from "../../run/kinds";
 import { RUN_DISK } from "../../run/locks";
-import { APP_HOME, APP_USER, NO_NEW_PRIVILEGES, runArgs, type RunInputs, STOP_GRACE_S } from "../../run/spec";
+import { APP_HOME, APP_USER, NO_NEW_PRIVILEGES, runArgs, type RunInputs, runName, STOP_GRACE_S } from "../../run/spec";
 import { loadManifest, MANIFEST_FILE, manifestEntries } from "../../secrets/manifest";
 import { composeServices } from "../../stack/compose";
 import { HERMES_HOME, proxyEnv, serviceEnvironment } from "../../stack/env";
@@ -61,6 +61,8 @@ import { freshBuilds } from "./generated";
 
 /** A container as `docker inspect` prints it (the fields the audit reads). */
 export interface Container {
+  /** The container's id: its key in `docker network inspect`'s Containers. */
+  Id?: string;
   Name: string;
   State?: { Running?: boolean };
   Path?: string;
@@ -72,6 +74,8 @@ export interface Container {
   HostConfig?: {
     /** `--network`: a run container's is its own network's name. */
     NetworkMode?: string;
+    /** `--init`: true puts docker-init at PID 1, before the prelude. */
+    Init?: boolean | null;
     PortBindings?: Record<string, unknown> | null;
     Tmpfs?: Record<string, string> | null;
     CapDrop?: string[] | null;
@@ -246,8 +250,8 @@ export function kindProblems(c: Container, profile: KindProfile, zoneKeys: Recor
  * How a live run container's network falls short of its kind's: it must be on exactly one network, its own (named as
  * the container is: src/run/spec.ts `runName`, which `createRunObjects` makes), and that network, read with
  * `docker network inspect`, must be internal with a private subnet (src/stack/up.ts `networkProblem`, start's own
- * check) and hold exactly two endpoints: the container and its kind's proxy (`egressOf`: egress-archon, or
- * egress-review for a review). Another network, Docker's default bridge, an extra endpoint, or the other zone's
+ * check) and hold exactly two endpoints: the container (by its id and its name) and its kind's proxy (`egressOf`:
+ * egress-archon, or egress-review for a review). Another network, Docker's default bridge, an extra endpoint, or the other zone's
  * proxy each fail.
  */
 export async function runNetworkProblems(run: AuditRun, c: Container, profile: KindProfile): Promise<string[]> {
@@ -275,6 +279,8 @@ export async function runNetworkProblems(run: AuditRun, c: Container, profile: K
   if (have.length !== want.length || have.some((n, i) => n !== want[i])) {
     problems.push(`its network ${name} holds ${have.length === 0 ? "no endpoint" : have.map(shown).join(", ")}, not exactly ${want.join(" and ")}`);
   }
+  // The endpoint named for the container is the container itself: the network's Containers are keyed by id.
+  if (c.Id !== undefined && net.Containers?.[c.Id]?.Name !== name) problems.push(`its network ${name} has no endpoint of this container's id under its name`);
   return problems;
 }
 
@@ -312,6 +318,8 @@ export interface RunShape {
   memory: number | undefined;
   /** `--stop-timeout`, in seconds; Docker keeps it in `Config.StopTimeout`. */
   stopTimeout: number | undefined;
+  /** `--init`: false (`--init=false`), true, or undefined when the argv says neither, which leaves it to the daemon. */
+  init: boolean | undefined;
   ports: boolean;
 }
 
@@ -338,6 +346,7 @@ export function shapeOf(argv: string[]): RunShape {
     pids: pids === undefined ? undefined : Number(pids),
     memory: mem === null ? undefined : Number(mem[1]) * BYTES[mem[2]!.toLowerCase()]!,
     stopTimeout: stop === undefined ? undefined : Number(stop),
+    init: argv.includes("--init=false") ? false : argv.includes("--init") || argv.includes("--init=true") ? true : undefined,
     ports: argv.some((a) => ["-p", "--publish", "-P", "--publish-all"].includes(a) || a.startsWith("--publish=")),
   };
   for (const v of after("-v")) {
@@ -378,6 +387,7 @@ function definitionProblems(want: RunShape, packDir: string, profile: KindProfil
   if (want.pids === undefined) problems.push("it has no pids limit");
   if (want.memory === undefined) problems.push("it has no memory limit");
   if (want.stopTimeout !== STOP_GRACE_S) problems.push(`its stop timeout is ${want.stopTimeout ?? "Docker's default"}, not ${STOP_GRACE_S}`);
+  if (want.init !== false) problems.push("it doesn't set --init=false: its prelude must be PID 1 whatever the daemon's default");
   return problems;
 }
 
@@ -385,7 +395,8 @@ function definitionProblems(want: RunShape, packDir: string, profile: KindProfil
  * How a live run container falls short of the definition `want`: every tmpfs (Docker lists a `--tmpfs` only in
  * `HostConfig.Tmpfs`), every bind and volume (none missing, none unexpected, each bind read-only), the default pack
  * dir, the environment, no published port, the hardening flags (capabilities dropped, a read-only root,
- * no-new-privileges, the user, the pids and memory limits) and the stop timeout (in `Config.StopTimeout`).
+ * no-new-privileges, the user, the pids and memory limits), the stop timeout (in `Config.StopTimeout`) and no init
+ * process at PID 1 (`HostConfig.Init`).
  */
 export function liveProblems(c: Container, want: RunShape, packDir: string): string[] {
   const problems: string[] = [];
@@ -414,6 +425,8 @@ export function liveProblems(c: Container, want: RunShape, packDir: string): str
   if (want.memory !== undefined && h.Memory !== want.memory) problems.push(`its memory limit is ${h.Memory ?? 0}, not ${want.memory}`);
   const stop = c.Config?.StopTimeout ?? undefined;
   if (want.stopTimeout !== undefined && stop !== want.stopTimeout) problems.push(`its stop timeout is ${stop ?? "Docker's default"}, not ${want.stopTimeout}`);
+  // docker-init at PID 1 would make a verify's or review's guarded kill of what its workflow left a silent no-op.
+  if (h.Init === true) problems.push("it runs an init process at PID 1 (HostConfig.Init), so its prelude isn't PID 1");
   return problems;
 }
 
@@ -455,7 +468,14 @@ export async function runContainer(run: AuditRun): Promise<CheckResult[]> {
   if (static_.length > 0) return [result(id, "fail", `the run definition (runArgs, src/run/spec.ts): ${static_.join("; ")}. ${fix}`)];
 
   const runs = await runContainers(run);
-  const live = "containers" in runs ? runs.containers.filter(isRunning) : [];
+  // A run container is named for its run (`<project>-run-<org.hapi.run>`), as src/stack/up.ts's liveRuns tells one: a
+  // copy-out or chown helper caught mid-flight carries the run labels (a bare org.hapi.run) but no run's name, runs
+  // with --network none and is gone in seconds, so it is no run container to hold to a kind's definition.
+  const isRun = (c: Container) => {
+    const runId = c.Config?.Labels?.["org.hapi.run"];
+    return runId !== undefined && runId !== "" && containerName(c) === runName(PROJECT, runId);
+  };
+  const live = "containers" in runs ? runs.containers.filter((c) => isRunning(c) && isRun(c)) : [];
   const checkedLive: (readonly [Container, string[]])[] = [];
   for (const c of live) {
     // A container's kind is its label; a Plan 02 run container has none, and is a worker's.

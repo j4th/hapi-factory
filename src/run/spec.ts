@@ -44,7 +44,8 @@
  *   CLI takes the value from its own environment (spike 07 finding 16). A
  *   verify run's kind has no zone, so it is given none;
  * - `--stop-timeout STOP_GRACE_S`, so a daemon stop gives the prelude the same
- *   grace `hapi run stop` does;
+ *   grace `hapi run stop` does, and `--init=false`, so the prelude is the
+ *   container's PID 1 whatever the daemon's default;
  * - the kind's prelude as the entrypoint, from `/app`, never the clone (design
  *   §6a items 2 and 4), with the kind's workflow, or the work order's own.
  *
@@ -350,6 +351,9 @@ export function runArgs(
     ...COMPOSE_LABELS.flatMap((k) => ["--label", `${k}=`]),
     ...hardening(service),
     "--stop-timeout", String(STOP_GRACE_S),
+    // The prelude is PID 1, whatever the daemon's default ("init": true would put docker-init there): a verify's and a
+    // review's kill of what the workflow left runs only as PID 1.
+    "--init=false",
     "--network", name,
     ...strings(service.tmpfs ?? [], "tmpfs").flatMap((t) => ["--tmpfs", t]),
     ...[tmpfs(APP_HOME, "256m"), tmpfs("/.archon", "512m"), tmpfs(RUN_PATHS.piDir, "64m")].flatMap((t) => ["--tmpfs", t]),
