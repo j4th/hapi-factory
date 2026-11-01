@@ -58,14 +58,14 @@
 | `src/run/disk.ts`, `src/run/locks.ts`, `src/run/lifecycle.ts`, `src/stack/up.ts` | 4 | The per-run disk cap (H-217), bind-backed volumes, their removal, the lock `down` and finalize share (H-210) |
 | `templates/repo-contract/**/*.tmpl`, `.github/workflows/gates.yml`, `src/newrepo/{render,steps,cli}.ts`, `mise.toml` (`new-repo` task) | 5 | The contract template, the reusable gates workflow, `hapi new-repo` |
 | `src/run/git.ts`, `src/engine/{mirror,discover}.ts` | 6 | Hardened host git, the mirror, work-order discovery and overlap |
-| `src/run/{lifecycle,records,spec}.ts`, `src/generate/{archon,index}.ts` | 7 | `startRun`, record fields, run keys with a round, per-run guard settings and run config, the recorded roster, H-209/H-218/H-219, spend from the record |
+| `src/run/{lifecycle,records,spec}.ts`, `src/generate/{archon,index}.ts` | 7 | `startRun`, record fields, run keys with a round and a retry, per-run guard settings and run config, the recorded roster, H-209/H-218/H-219, spend from the record, a stop that outranks the deadline |
 | `src/run/{kinds,spec,copyout,lifecycle}.ts`, `stack/archon/{verify,review}.sh`, `src/audit/checks/runtime.ts` | 8 | Run kinds (worker, verify, review, fix), their profiles and preludes, the audit per kind |
 | `src/run/sidecar.ts`, `src/secrets/**`, `stack/secrets.yaml`, `stack/compose.yaml`, `src/stack/env.ts`, `src/generate/egress.ts`, `policy/trusted_sources.yaml` | 9 | The review zone (secrets and egress), sidecars on the run's network, `NO_PROXY` |
 | `src/guard/*.ts` | 10 | H-228(a) `AGENTS.md` below the work order, the spend and result records, per-round turns, H-230, H-223 |
 | `archon/workflows/hapi/factory-{task,verify,review}.yaml`, `archon/prompts/*.md`, `stack/archon/Dockerfile`, `src/generate/claude.ts` | 11 | The three workflows, the factory prompt, mise in the image, Claude Code's settings for the review (H-205) |
 | `src/engine/{harvest,evidence,pr}.ts` | 12 | Host gates on the bundle, the outcome and verdict, the push, the PR description and its re-render |
-| `src/engine/{state,pipeline,caps,coderabbit}.ts` | 13 | The work order's state machine, the caps, the CodeRabbit round's filters, rework and the operator's actions |
-| `src/engine/{poll,status}.ts`, `src/engine/cli.ts`, `src/generate/systemd.ts`, `src/stack/up.ts` | 14 | `hapi poll`, `hapi status`, status events and the planning PR's comment, the timer in `up`/`down`/kill switch 3 |
+| `src/engine/{state,pipeline,caps,coderabbit}.ts`, `policy/runs.yaml` (`runs.max_retries`), `src/run/lifecycle.ts` (retention) | 13 | The work order's state machine, the caps, the CodeRabbit round's filters, rework and the operator's actions, a retry's next pass, the stop and timeout routing, retention until a run's month has ended |
+| `src/engine/{poll,status}.ts`, `src/engine/cli.ts`, `src/generate/systemd.ts`, `src/stack/up.ts` | 14 | `hapi poll`, `hapi status`, `hapi retry`, status events and the planning PR's comment, the timer in `up`/`down`/kill switch 3 |
 | `src/audit/checks/*.ts`, README, `docs/**`, threat model, spec notes, register | 15 | New audit checks, runbooks, the threat model, the spec's as-built notes, the register |
 | the sandbox repo, `docs/runbooks/engine.md` (the end-to-end section), spike 09's addendum | 16 | The operator's end-to-end run on the sandbox and its record |
 
@@ -78,7 +78,7 @@ Tasks reference these by name; each is created by the task in brackets and never
 ```ts
 // src/policy/types.ts [Task 2]
 interface Phases { verify: boolean; review: boolean; coderabbit: boolean; require_acceptance: boolean; fix_rounds_before_pr: number; fix_rounds_on_pr: number; round_turns: number; round_usd: number }
-// Runs gains: disk: { gb: number; enforcement: Enforcement }; poll_interval_s: number; max_auto_rounds: number; phases: Phases
+// Runs gains: disk: { gb: number; enforcement: Enforcement }; poll_interval_s: number; max_auto_rounds: number; phases: Phases; max_retries: number (Task 13 adds it)
 // Budgets gains: repo_monthly_usd: number; daily_usd: number; enforcement.poller: Enforcement
 interface RepoRegistry { installations: { planner: number; factory: number; coderabbit?: number }; repos: Record<string, { registered: string }> } // key "<owner>/<name>"
 interface Sidecar { image: string; command: string[]; port: number }  // Policy.sidecars: Record<string, Sidecar>
@@ -116,9 +116,11 @@ function authedGit(token: string): Record<string, string>;  // src/forge/github/
 
 // src/run/records.ts and src/run/kinds.ts [Tasks 7 and 8]
 type RunKind = "worker" | "verify" | "review" | "fix";
-// RunRecord gains, all optional: kind?: RunKind; parent?: string; round?: number; budgetUsd?: number; spendUsd?: number; roster?: string; policyHash?: string
+// RunRecord gains, all optional: kind?: RunKind; parent?: string; round?: number; budgetUsd?: number; spendUsd?: number; roster?: string; policyHash?: string; retry?: number
+//   retry: the engine's pass of the work order: 0 on the first, n after the n-th `hapi retry`; a hand run's record has none (not retryOf, a hand run's --retry-of)
 function runKey(workOrderId: string, sha: string, part?: string): string; // two-part formula unchanged when part is undefined
-interface StartOptions { repoGitDir: string; workOrder: WorkOrder; taskMd?: string; sha: string; public: boolean; kind: RunKind; parent?: string; round?: number; budgetUsd?: number; retryOf?: string; overlay?: RepoOverlay; inputsDir?: string }
+function keyPart(kind: RunKind, round: number, retry?: number): string | undefined; // src/run/records.ts: the key's part, the one formula startRun and ensureRun share
+interface StartOptions { repoGitDir: string; workOrder: WorkOrder; taskMd?: string; sha: string; public: boolean; kind: RunKind; parent?: string; round?: number; retry?: number; budgetUsd?: number; retryOf?: string; overlay?: RepoOverlay; inputsDir?: string }
 function startRun(d: RunDeps, o: StartOptions): Promise<RunRecord>;   // src/run/lifecycle.ts; throws the refusal text
 function spendOfRun(outDir: string, budgetUsd: number): { usd: number; known: boolean };  // src/run/view.ts or src/run/spend.ts
 
@@ -129,9 +131,12 @@ function hardenedGit(d: Pick<RunDeps, "env">, o?: { env?: string[]; git?: string
 interface Discovered { repo: string; id: string; mergeSha: string; workOrder: WorkOrder; taskMd: string; overlay: RepoOverlay | undefined }
 type Phase = "held" | "queued" | "worker" | "verify" | "review" | "fix" | "harvest" | "pr" | "pr-review" | "pr-fix" | "waiting" | "failed" | "merged" | "closed" | "cap-stopped";
 type Verdict = "ready" | "decision" | "do-not-merge";
-interface WorkOrderState { repo: string; id: string; mergeSha: string; planningPr: number | undefined; phase: Phase; runs: string[]; autoRounds: number; reworkRounds: number; pr?: number; prHead?: string; verdict?: Verdict; reasons: string[]; lastHumanAt?: string; updatedAt: string }
-interface StatusEvent { at: string; repo: string; workOrder: string; phase: Phase; run?: string; pr?: number; verdict?: Verdict; reason?: string; usd?: number }
+interface WorkOrderState { repo: string; id: string; mergeSha: string; planningPr: number | undefined; phase: Phase; runs: string[]; autoRounds: number; reworkRounds: number; retry: number; pr?: number; prHead?: string; verdict?: Verdict; reasons: string[]; lastHumanAt?: string; updatedAt: string }
+  // retry: 0 until the operator's first `hapi retry` (Task 14)
+interface StatusEvent { at: string; repo: string; workOrder: string; phase: Phase; run?: string; pr?: number; verdict?: Verdict; reason?: string; usd?: number; retry?: number } // retry only when the work order's is at least 1
 ```
+
+`retry` is required on `WorkOrderState`, so every literal of it in Tasks 12–14's tests and helpers carries `retry: 0` (tsc requires it). No state file exists yet, so nothing has to migrate.
 
 ---
 
@@ -1033,6 +1038,7 @@ The sandbox is `new-repo`'s first user (Task 16). The operator's run in Step 15 
 - `.factory/config.yaml`: `templates/**` gets the same protection as `policy/**`.
 - The template's new npm dev dependency, `@biomejs/biome`.
 - `policy/repos.yaml`: the `coderabbit` installation id (Step 13), the sandbox's registration that `new-repo` writes (Step 15), and the pin in `tests/policy/load.test.ts` that follows them.
+- As built: `.github/workflows/ci.yml`, for the review's fix round 5 only (the operator's OK, 2026-11-01): hapi-factory's own history scan becomes the gates' (H-241, closed; see "As built" after Step 4).
 
 Two steps are stop-class and the operator's: editing `policy/repos.yaml` (Step 13) and re-applying a ruleset (Step 14).
 
@@ -1052,9 +1058,11 @@ Two steps are stop-class and the operator's: editing `policy/repos.yaml` (Step 1
   - `.factory/config.yaml`;
   - README.md: :242, :244–253, the repo-layout table (:61), the mise-tasks table (:113), the `hapi` CLI table (:137) and the documentation map (:394);
   - `docs/audit.md`;
-  - `docs/superpowers/plans/handoffs.md`.
+  - `docs/superpowers/plans/handoffs.md`;
+  - as built, `.github/workflows/ci.yml` (fix round 5, under the OK above).
 - **Test, new:** `tests/newrepo/{render,steps,cli}.test.ts`, `tests/newrepo/helpers.ts` and `tests/scripts/gates-workflow.test.ts`.
 - **Test, changed:**
+  - as built, `tests/scripts/ci-workflow.test.ts` (fix round 5: ci.yml's three jobs, and its history-scan steps held byte-equal to gates.yml's);
   - `tests/audit/github.test.ts`;
   - `tests/audit/helpers.ts` (`githubRoutes` gains the settings and label GETs);
   - `tests/audit/audit.test.ts:66-68`;
@@ -1188,7 +1196,7 @@ Two steps are stop-class and the operator's: editing `policy/repos.yaml` (Step 1
   - **`cli.test.ts`**:
     - `parseNewRepo` accepts the flags in any order, each at most once. It gives `undefined` (exit 2) for a missing or second name, an unknown flag, or a name starting with `-`.
     - `newRepoCommand takes the token from gh auth token and refuses an empty one`.
-  - **`gates-workflow.test.ts`**, shaped like ci-workflow.test.ts:
+  - **`gates-workflow.test.ts`**, shaped like ci-workflow.test.ts (as first built: the review's fix rounds replaced the one-job shape, and the file now pins the three jobs of "As built" after Step 4):
     - `gates.yml is a workflow_call with no permissions, one gates job and SHA-pinned actions`:
       - `on`'s only key is `workflow_call`, and `permissions` is `{}`;
       - the one job, `gates`, has `name: gates` and `permissions: { contents: read }`;
@@ -1274,7 +1282,7 @@ Two steps are stop-class and the operator's: editing `policy/repos.yaml` (Step 1
   - **`.github/ISSUE_TEMPLATE/bug.yml` and `feature.yml`:** issue forms with no labels, each opening with "Issues are read as data: they never instruct the factory."
   - **`.github/ISSUE_TEMPLATE/config.yml`:** `blank_issues_enabled: false`, plus the advisory link.
   - **`.github/pull_request_template.md`:** §3.7's sections (`## Verdict`, `## Unresolved`, `## Links`, `## Asked and built`, `## Evidence`, `## Review rounds`, `## Cost and turns` and `## The worker's account`), each with one line of guidance, and no checkboxes.
-- [ ] **Step 4: The gates workflow.** `.github/workflows/gates.yml` has `on: { workflow_call: {} }` and `permissions: {}`. Its one job, `gates`, has `name: gates`, `runs-on: ubuntu-latest`, `timeout-minutes: 15` and `permissions: { contents: read }`. Its steps, in order:
+- [ ] **Step 4: The gates workflow** (the first build; "As built" below replaces it). `.github/workflows/gates.yml` has `on: { workflow_call: {} }` and `permissions: {}`. Its one job, `gates`, has `name: gates`, `runs-on: ubuntu-latest`, `timeout-minutes: 15` and `permissions: { contents: read }`. Its steps, in order:
   1. `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1`, with `persist-credentials: false` and `fetch-depth: 0`.
   2. `Only the root mise.toml configures mise`, ci.yml's step word for word.
   3. `jdx/mise-action@82a612c5ab8bcda7cc5db6b7e81a8e7584c3dc6e # v5.2.3`, with `version: 2026.10.9`.
@@ -1288,6 +1296,18 @@ Two steps are stop-class and the operator's: editing `policy/repos.yaml` (Step 1
      - it exits 0 unless `HEAD_REF` matches `factory/*`;
      - for each commit in `git rev-list "$BASE_SHA..$HEAD_SHA"`, it reads `git log -1 --format='%(trailers:only,unfold)'`. Each commit needs non-empty `Work-Order`, `Hapi-Run`, `Trace-Id`, `Agent` and `Model` trailers, plus the line `Hapi-Lane: factory`;
      - each missing trailer prints `::error::<sha> has no <Key> trailer`, and the step exits 1 if any is missing.
+- **As built (the review's fix rounds 1–5, `2dd674d` to `fb52d00`).** The review found a PR could turn `ci / gates` green falsely: the scans ran in the job that had just run the PR's code, and gitleaks 8.30.1 fails open in several ways a PR controls. So gates.yml was rebuilt. Steps 1 and 4 above describe the first build; this is what landed, and `tests/scripts/gates-workflow.test.ts` pins it, each hiding case with real gitleaks and a control that shows the hole.
+  - **Three jobs.** `scan` and `check` (each `contents: read`, on its own runner and fresh checkout, `persist-credentials: false`), and the aggregator `gates` (`needs: [scan, check]`, `if: always()`, `permissions: {}`, no checkout), which fails unless both results, passed through `env`, are `success`. `if: always()` is required: GitHub reports a job skipped because a needed job failed as a success. The required context stays `ci / gates` (`CONTRACT_CHECK`, the rulesets and the audit unchanged); `ci / scan` and `ci / check` show beside it, not required. `defaults.run.shell: bash` gives every step pipefail.
+  - **`check`** is the only job that runs the PR's code: ci.yml's two mise steps, mise-action, then `mise install --locked && mise run check`.
+  - **`scan` runs no PR code and no mise.** It runs the plain mise-file scan; refuses a `.gitleaksignore` or `.gitleaks.toml`, a symlink too; installs gitleaks 8.30.1, OSV-Scanner 2.7.0 and zizmor 1.31.1 from release URLs pinned by sha256 in the job's `env`, into `$RUNNER_TEMP/bin` (a test holds the versions to the template's `mise.toml`, the URLs and checksums to its `mise.lock`); and runs each by absolute path under `env -i`, with the gates' own config: gitleaks `--config` a `$RUNNER_TEMP` file holding `[extend] useDefault = true`, OSV-Scanner an empty `--config`, zizmor `--no-config --no-ignores`, online with only `GH_TOKEN` (the job's read-only token) added. The trailer check's git runs under the same `env -i`.
+  - **The history scan fails closed**, one layer per way a PR hid a token, each reproduced first:
+    - `* diff` in `.git/info/attributes`, and `GIT_ATTR_SOURCE` set to git's empty tree, so no committed `.gitattributes` or NUL byte hides a file or makes git write to stderr; a gate first fails unless `/usr/bin/git` is 2.40 or later, since older git ignores `GIT_ATTR_SOURCE`;
+    - `--log-opts "--full-history --all -m --no-mailmap --no-renames --ignore-submodules=none --no-ext-diff --no-textconv"`, which replaces gitleaks's own (its `--diff-filter=tuxdb` skipped type changes): merges' diffs, type changes, a moved file scanned in full, no `.mailmap` or `.gitmodules` read; and `GIT_CONFIG_NOSYSTEM=1`, so the runner's `/etc/gitconfig` can't change what `-m` means;
+    - a dry run of gitleaks's exact git argv, in the same environment, fails on a non-zero exit or any stderr byte, because gitleaks ignores git's exit code and logs some of git's errors as warnings (a test pins the two argv equal);
+    - gitleaks's saved log, read with `grep -a`, fails the step on any ERR line, any WRN line but its findings count, or 0 commits scanned; its raw output and the dry run's stderr print inside a random `::stop-commands::` token, so a file name can't forge a workflow command.
+  - **Residuals, registered:** a PR that edits `.github/workflows/` can forge `ci / gates` (H-239), gitleaks's default path allowlist (H-240), a token outside file contents (H-242).
+  - **hapi-factory's own `ci.yml`** (fix round 5, the operator's OK of 2026-11-01): the same shape, `build` (its old steps), `secrets` and the aggregator `ci`, so the required context stays `ci`. `secrets` runs gates.yml's history-scan steps byte for byte (`tests/scripts/ci-workflow.test.ts` holds them equal) but for `--config .githooks/gitleaks.toml`, and closed H-241. On a PR that config is the PR's own copy (H-246).
+  - **The review's smaller fixes:** `github.rulesets` requires exactly `ci / gates` of a registered repo and exactly `ci` of any other; the template protects `**/osv-scanner.toml`; preflight also covers `policy/github/rulesets/` and refuses a repo already registered; `register` inserts its one line textually; and the runbook and the template's `CONTRIBUTING.md` and `README.md` say never to approve a fork's run, or trust its `ci / gates`, when the PR touches `.github/workflows/`.
 - [ ] **Step 5: `render.ts`.**
   - **`renderTemplate`:**
     - walks `dir` and refuses a non-regular file (`<path>: not a regular file`) or a name without `.tmpl`;
@@ -1383,6 +1403,8 @@ Two steps are stop-class and the operator's: editing `policy/repos.yaml` (Step 1
     - a weekly OpenSSF Scorecard run in the template (§3.3);
     - CI running `smoke` with the sidecar as a service container (§3.3);
     - H-113's `plan/**` half.
+
+    As built: H-235–H-237 are these three, H-238 is ruling m34's template drift, and the review added H-239–H-242 (H-241 closed in fix round 5).
 - [ ] **Step 10: The whole suite.** Run `mise run lint && mise run test`. Expected: PASS, 0 fail. Name any failure.
 - [ ] **Step 11: Commit.** The message ends with the session's attribution lines.
   ```bash
@@ -1582,7 +1604,7 @@ Task 14's poller calls these. It passes `discoverWorkOrders` the ids it already 
     - the first overlap found gives both orders of the pair their reason, and an order that already has a reason keeps it.
 - [ ] **Step 6: Run the tests.** Run `bun test tests/run tests/engine tests/newrepo && node_modules/.bin/tsc --noEmit`. Expected: PASS.
 - [ ] **Step 7: Docs.**
-  - The `--repo` paragraph at `docs/runbooks/runs.md:78`: the source is now the repo's mirror, which the poller keeps. A hand-made bare clone still works for a manual run. Keep the umask note.
+  - The `--repo` bullet in runs.md's `hapi run start` section: its "(H-211 tracks the mirror that replaces this in Plan 03)" becomes "The poller's own runs start from the repo's mirror, which it keeps ([the mirror](#the-mirror)). A hand run still takes a bare clone of your own: the mirror's HEAD is main's tip, not a work order's merge commit, and the poller never picks up a hand run." Keep the umask note.
   - A new section, "The mirror", covering:
     - its path, `${XDG_STATE_HOME:-~/.local/state}/hapi/engine/mirrors/<owner>/<name>.git`;
     - that only `main` and `factory/*` are fetched;
@@ -1601,7 +1623,7 @@ Task 14's poller calls these. It passes `discoverWorkOrders` the ids it already 
 
 ### Task 7: The launcher API, records, per-run settings, H-209/H-218/H-219
 
-`startRun` becomes the launcher's API (design §3.4, §6a item 1). The poller passes it a parsed work order, the mirror and an explicit commit. It gets back the record, or the refusal as a thrown error, so nothing has to scrape stdout. Each run's `hapi-guard.json` and `run-config.yaml` are generated per run from the policy with the repo's overlay applied (H-172, design §3.5 "The repo's overlay"), for the roster recorded in `build/roster`. The record also carries what an eval compares (§3.8): kind, round, budget, roster, policy hash and spend. Spend is read from the guard first (H-229). This task closes H-209, H-218 and H-219. Every kind still runs the worker's container here; Task 8 gives each kind its own.
+`startRun` becomes the launcher's API (design §3.4, §6a item 1). The poller passes it a parsed work order, the mirror and an explicit commit. It gets back the record, or the refusal as a thrown error, so nothing has to scrape stdout. Each run's `hapi-guard.json` and `run-config.yaml` are generated per run from the policy with the repo's overlay applied (H-172, design §3.5 "The repo's overlay"), for the roster recorded in `build/roster`. The record also carries what an eval compares (§3.8): kind, round, budget, roster, policy hash and spend. Spend is read from the guard first (H-229). This task closes H-209, H-218 and H-219. For `hapi retry` (the operator's call of 2026-11-01, m19), every engine run's key also names its pass (`keyPart`), so a retried pass never meets an earlier pass's records, and a `hapi run stop` outranks the run's deadline. Every kind still runs the worker's container here; Task 8 gives each kind its own.
 
 **Protected (ask first):** none. `build/roster` is generated output.
 
@@ -1612,7 +1634,8 @@ Task 14's poller calls these. It passes `discoverWorkOrders` the ids it already 
     - `runStart` (245-323) becomes `startRun` plus a thin CLI wrapper;
     - the wrapper alone keeps `headOf` (186-194);
     - `requestStop` (329-335);
-    - `finalizeLocked` (470-522).
+    - `finalizeLocked` (470-522);
+    - `reapRuns` (639-670), `runStop` (704-726) and the module comment (63-69): the stop outranks the deadline.
   - `src/run/records.ts`: `RunRecord` (37-60), `runKey` (74-76), `asRecord` (81-86), `createRun` (135-149).
   - `src/run/spec.ts`: the binds (271-285), plus `readRoster`.
   - `src/run/cli.ts`: its `StartOptions` (24-34) and `parseStart`'s types (37-63) are renamed `StartFlags`, because `StartOptions` is now the API's name.
@@ -1634,12 +1657,19 @@ export type RunKind = "worker" | "verify" | "review" | "fix";
 export const RUN_KINDS: readonly RunKind[] = ["worker", "verify", "review", "fix"];
 // src/run/records.ts
 export function runKey(workOrderId: string, sha: string, part?: string): string; // sha256 of `${id}\0${sha}`, or `${id}\0${sha}\0${part}`
-// RunRecord gains, all optional: kind?: RunKind; parent?: string; round?: number; budgetUsd?: number; spendUsd?: number; roster?: string; policyHash?: string
+export function keyPart(kind: RunKind, round: number, retry?: number): string | undefined;
+  // undefined: a worker with no retry, which is a hand run: Plan 02's two-part key
+  // `${kind}:${round}`: any other kind with no retry, and every kind at retry 0 (the engine's first pass)
+  // `${kind}:${round}:retry${retry}`: every kind from the first retry on
+// RunRecord gains, all optional: kind?: RunKind; parent?: string; round?: number; budgetUsd?: number; spendUsd?: number; roster?: string; policyHash?: string;
+//   retry?: number (StartOptions.retry whenever it is set: every engine run has it, a hand run never)
 export const PER_RUN_FILES = ["hapi-guard.json", "run-config.yaml", "order.json", "task.md"] as const;
 export function createRun(stateDir: string, rec: RunRecord, runFile: RunFile, files: Record<(typeof PER_RUN_FILES)[number], string>): Promise<void>;
 // src/run/lifecycle.ts
-export interface StartOptions { repoGitDir: string; workOrder: WorkOrder; taskMd?: string; sha: string; public: boolean; kind: RunKind; parent?: string; round?: number; budgetUsd?: number; retryOf?: string; overlay?: RepoOverlay; inputsDir?: string }
+export interface StartOptions { repoGitDir: string; workOrder: WorkOrder; taskMd?: string; sha: string; public: boolean; kind: RunKind; parent?: string; round?: number; retry?: number; budgetUsd?: number; retryOf?: string; overlay?: RepoOverlay; inputsDir?: string }
+  // retry: the engine always passes it (0 on the first pass); hapi run start never does
 export function startRun(d: RunDeps, o: StartOptions): Promise<RunRecord>; // throws the refusal text; a held lock passes lockHeld
+export function reapRuns(deps: RunDeps, o?: { stopping?: string }): Promise<void>; // stopping: the run runStop is about to stop, never stopped at its deadline by this reap
 // src/run/spend.ts
 export function spendOfRun(outDir: string, budgetUsd: number): { usd: number; known: boolean };
 // src/run/spec.ts
@@ -1648,7 +1678,16 @@ export function readRoster(buildDir: string): RosterName; // <buildDir>/roster
 // RunFile gains, optional: kind?: RunKind; round?: number; turns?: number; base?: string // base: the work order's base commit (Task 11's CodeRabbit node: jq -r .base /run/hapi/run.json)
 ```
 - Rules:
-  - **Key part.** The key's `part` is `${kind}:${round}` for every kind but `worker`. A worker keeps the two-part key, so Plan 02's records stay valid.
+  - **Key part.** A run's key is `runKey(order.id, o.sha, keyPart(o.kind, o.round ?? 0, o.retry))`.
+    - A hand run passes no `retry` (`hapi run start` has no flag for it), so its worker keeps Plan 02's two-part key, and Plan 02's records stay valid.
+    - The engine always passes `retry`, so every engine key has a part (`worker:0` on the first pass). A hand run's key never matches one: the poller never takes a hand run as its own, and a hand run never blocks the poller by its key. While live, a hand run holds the one `runs.max_live` slot, as any run does, so the poller's next start waits for it.
+    - From the first retry on, every key names its retry, so a new pass never meets an earlier pass's record under `keyProblem`, whose rules don't change: a key that holds a succeeded record is still always refused.
+  - **Retry.** When set, it must be a whole number of at least 0. The record carries it exactly when `StartOptions` does. The engine passes `retry` and never `retryOf`, which stays the hand run's `--retry-of`.
+  - **A stop outranks the deadline** (the operator's action wins).
+    - `requestStop` records `"stopped"` over an earlier `"timed-out"` while the record is still live. `"timed-out"` never replaces `"stopped"`.
+    - `reapRuns(d, { stopping })` never stops `stopping` at its deadline. It still finalizes it when its container has exited (its own outcome, or the removed-container failure), as for any run. `runStop` passes `{ stopping: id }`, so its own reap never times out the run it is about to stop.
+    - So a stop at or after the deadline records `stopped` whenever it reaches the run while the record is live and no other process holds the run's lock. A run that has ended, or that another process is finalizing (the supervisor at the deadline, or another command's reap), keeps how that process records it: `runStop` prints `run <id> has already ended: <status>`, or fails with `withStoreLock`'s "another command … is using …" text, both as in Plan 02. That gap is registered (H-243(g)).
+    - The finalize's reason for a stop is unchanged: `` stopped by `hapi run stop` ``.
   - **Round.** `round` defaults to 0.
   - **Budget.** It defaults to the work order's `budget.usd` for a worker, and to `min(budget.usd, phases.round_usd)` for every other kind. It may only be lowered.
   - **Turns.** `turns` is `budget.turns`, or `min(budget.turns, phases.round_turns)` for `fix`.
@@ -1664,6 +1703,7 @@ export function readRoster(buildDir: string): RosterName; // <buildDir>/roster
 const rec = await startRun(f.deps, base());
 expect(rec).toEqual(await readRecord(f.deps.stateDir, rec.runId));
 expect([rec.kind, rec.round, rec.budgetUsd, rec.roster, rec.key]).toEqual(["worker", 0, 3, "anthropic", runKey("0003-check-run", SHA)]);
+expect(rec.retry).toBeUndefined(); // a hand run's: no retry, so the two-part key
 expect(rec.policyHash).toBe(createHash("sha256").update(JSON.stringify(loadPolicy(join(REPO, "policy")))).digest("hex"));
 expect(JSON.parse(readFileSync(join(f.deps.stateDir, rec.runId, "run.json"), "utf8"))).toMatchObject({ kind: "worker", round: 0, turns: order.budget.turns, base: SHA });
 ```
@@ -1677,6 +1717,7 @@ expect(JSON.parse(readFileSync(join(f.deps.stateDir, rec.runId, "run.json"), "ut
       - `{ kind: "fix" }` → `a fix run needs its parent (StartOptions.parent), the work order's worker run: its base commit is that run's sha`
       - with `seedRun(f, { id: "0b0c0d0e0f0a", kind: "fix", objects: false })` first, `{ kind: "fix", parent: "0b0c0d0e0f0a" }` → `the parent run 0b0c0d0e0f0a is a fix run, not the work order's worker run: a fix run's base commit is its worker run's sha`
       - with `<buildDir>/roster` removed → `${join(f.deps.buildDir, "roster")} is missing or names no roster (budget, anthropic or portable): \`mise run up\` writes it`
+      - `{ retry: -1 }` and `{ retry: 1.5 }` → `the run's retry <n> is not a whole number of at least 0`
     - `a held start lock throws an error lockHeld recognizes, so the poller tries again next tick`: inside `withStartLock(f.deps, …)`, `lockHeld(await startRun(f.deps, base()).catch((e) => e))` is `true`.
     - `the run's hapi-guard.json and run-config.yaml come from the policy with the repo's overlay, for build/roster's roster (H-172); order.json and task.md are the host's copies, all 0644`. Setup: `<buildDir>/roster` is `budget\n`, and `overlay = { protected_paths: { "secret-dir/**": { interactive: "ask", unattended: "deny", workers: "deny" } } }`. Asserts:
       - `hapi-guard.json === emitPi(applyOverlay(loadPolicy(join(REPO, "policy")), overlay), "budget")["hapi-guard.json"]`, and its `protected_paths["secret-dir/**"]` is `"deny"`;
@@ -1686,12 +1727,22 @@ expect(JSON.parse(readFileSync(join(f.deps.stateDir, rec.runId, "run.json"), "ut
     - `a fix round is keyed fix:<round>, takes its parent's sha as base, and is capped at the round's turns and dollars`. Seed `seedRun(f, { id: "0a0b0c0d0e0f", status: "succeeded", objects: false })` and set `ph = loadPolicy(join(REPO, "policy")).runs.phases`. Then:
       - for `base({ kind: "fix", parent: "0a0b0c0d0e0f", round: 1 })`, the record has `key` `runKey("0003-check-run", SHA, "fix:1")`, `parent` `"0a0b0c0d0e0f"`, `round` 1 and `budgetUsd` `Math.min(3, ph.round_usd)`;
       - `run.json` matches `{ kind: "fix", round: 1, turns: Math.min(order.budget.turns, ph.round_turns), base: SHA }`, where `SHA` is the seeded worker record's `sha`.
+      - It passes no `retry`, so its key stays `fix:1`.
+    - `an engine pass never meets a hand run's key, and a retry's worker starts beside a succeeded worker of the same commit`. Seed `seedRun(f, { id: "0a0b0c0d0e0f", status: "succeeded", objects: false, key: runKey("0003-check-run", SHA) })`, a hand-run worker of `0003-check-run` at `SHA` (`seedRun`'s key otherwise defaults to `"k".repeat(64)`). Then, each case in a fresh fixture with that seed:
+      - `startRun(f.deps, base())` rejects with `run 0a0b0c0d0e0f of work order 0003-check-run at <SHA's first 12> already succeeded: a work order runs once per commit`;
+      - `startRun(f.deps, base({ retry: 0 }))` resolves to a record keyed `runKey("0003-check-run", SHA, "worker:0")`, with `retry` 0;
+      - `startRun(f.deps, base({ retry: 1 }))` resolves to a record keyed `runKey("0003-check-run", SHA, "worker:0:retry1")`, with `retry` 1 and no `retryOf`, equal to `readRecord` of it.
     - `stop refuses a run whose container doesn't exist yet, as in start's creation window, and records nothing (H-218)`. With `seedRun(f, { id: ID, objects: false })`:
       - `await withStartLock(f.deps, () => runStop([ID], f.deps))` is `1`;
       - stderr's last line is `hapi run stop: run ${ID} has no container yet: its start may still be making it, so wait and stop it again; a container removed around hapi is reaped by the next \`hapi run\` command`;
       - `stopRequested` stays undefined.
     - `finalize writes the outcome to record.json before it removes the run's objects (H-219)`: an `onCall` that reads `record.json` with `readFileSync` at the first `docker rm` sees `status` `"succeeded"`.
     - `finalize records the run's spend when it is known`: the outputs `completedOutputs()` plus `decisions.jsonl` holding `{"event":"budget","decision":"allow","rule":"spend","cost_usd":0.42}` give `done.spendUsd === 0.42`.
+  - **`lifecycle.test.ts`, describe `hapi run stop`:** `a stop outranks the deadline while the run is live; a run another process is finalizing keeps how it ends`. Each case in a fresh fixture, with `outputs: completedOutputs()`:
+    - a live run whose record already holds `stopRequested: "timed-out"` (the deadline's stop, in its grace): `runStop([ID], f.deps)` is 0, and the record's `[status, reason, stopRequested]` is `["stopped", "stopped by \`hapi run stop\`", "stopped"]`;
+    - a live run whose deadline passed 1 s ago and whose supervisor is gone (`deadline: new Date(NOW.getTime() - 1000).toISOString()`): the same, and every `docker stop` finds `stopRequested` already `"stopped"` (read by wrapping `f.deps.run`, as the test "the stop is recorded before the container is stopped" does);
+    - never the reverse: a live run holding `stopRequested: "stopped"` whose deadline passed 1 s ago, then `reapRuns(f.deps)`, records `stopped`;
+    - inside `withRunLock(f.deps, ID, …)` (another process finalizing): `runStop([ID], f.deps)` is 1, stderr's last line starts `hapi run stop: another command`, and `stopRequested` is unchanged.
   - **Changes to existing lifecycle tests.**
     - `start validates, locks and writes record.json and run.json, …` (192-248):
       - `run.json` gains `kind: "worker", round: 0, turns: <the order's budget.turns>, base: <the run's sha>`;
@@ -1701,11 +1752,17 @@ expect(JSON.parse(readFileSync(join(f.deps.stateDir, rec.runId, "run.json"), "ut
       - this explicitly flips Task 4's assertion on this test, where the volumes went and the cleanup helper emptied and removed their dirs. Now both `volumeDir(f.deps.diskDir, \`${N}-work\`)` and `volumeDir(f.deps.diskDir, \`${N}-out\`)` still exist, no call ends in `CLEAN_SCRIPT`, and no `docker volume ls` or `docker volume rm` call is made;
       - there is still no `LIST_SCRIPT` call.
   - **`records.test.ts`.**
-    - `a non-worker run's key adds <kind>:<round>; a worker's is the two-part key, unchanged, so Plan 02's records stay valid`:
+    - `a non-worker run's key adds <kind>:<round>; a hand run's key is the two-part key, unchanged, so Plan 02's records stay valid` (it pins `runKey`, not `keyPart`):
       - `runKey(id, SHA)` is the sha256 of `` `${id}\0${SHA}` ``;
       - `runKey(id, SHA, "fix:1")` is the sha256 of `` `${id}\0${SHA}\0fix:1` ``;
       - the set of the two-part key and the keys for `fix:1`, `fix:2` and `verify:0` has size 4.
     - `a record whose kind is no run kind is not one hapi wrote`: `readRecord` throws.
+    - `keyPart: a hand run keeps the two-part key, and every engine key names its kind, its round and, from the first retry on, its retry`:
+      - `keyPart("worker", 0)` is `undefined`, and `keyPart("worker", 0, 0)` is `"worker:0"`;
+      - `keyPart("verify", 0)` and `keyPart("verify", 0, 0)` are `"verify:0"`, and `keyPart("fix", 1)` is `"fix:1"`;
+      - `keyPart("worker", 0, 1)` is `"worker:0:retry1"`, and `keyPart("review", 0, 2)` is `"review:0:retry2"`;
+      - `runKey(id, SHA)` and the keys `runKey(id, SHA, keyPart(k, r, n))` for (worker, 0) and (fix, 1), each at retry 0, 1 and 2, make a set of size 7.
+    - `a record whose retry isn't a whole number of at least 0 is not one hapi wrote`: a `retry` of `-1`, `1.5` or `"1"` makes `readRecord` throw; `retry: 0` reads back.
   - **`spend.test.ts`.** Test `spendOfRun takes the guard's last spend record, then Archon's total_cost_usd, and otherwise counts the run at its full budget, unknown (H-229)`:
     - `decisions.jsonl` holding spend records of 0.10 and then 0.25, a line that isn't JSON, and a `result.json` total of 0.5 gives `{ usd: 0.25, known: true }`;
     - with no decisions, `{ usd: 0.5, known: true }`;
@@ -1718,7 +1775,7 @@ expect(JSON.parse(readFileSync(join(f.deps.stateDir, rec.runId, "run.json"), "ut
     - `index.test.ts`: `FILES` gains `"roster"`. The test becomes `writes the eighteen generated files…`, and the expected text of `roster` is `"anthropic\n"`.
     - `archon.test.ts` (17-27): pin `RUN_PATHS.order` and `RUN_PATHS.task`.
   - **Helpers and the audit.**
-    - `helpers.ts`: `BUILD_FILES` gains `roster: "anthropic\n"`, and `seedRun` spreads the seven new optional fields.
+    - `helpers.ts`: `BUILD_FILES` gains `roster: "anthropic\n"`, and `seedRun` spreads the eight new optional fields (`retry` among them).
     - `tests/audit/helpers.ts`: `runContainer` mounts `/run/hapi/order.json` and `/run/hapi/task.md`.
     - `runtime.test.ts` (60): the dropped-bind cases include `/run/hapi/order.json`.
 - [ ] **Step 2: Run them to see them fail.** Run `bun test tests/run tests/generate/index.test.ts tests/generate/archon.test.ts tests/audit/runtime.test.ts`. Expected: FAIL, with `Cannot find module '../../src/run/spend'` and `Export named 'startRun' not found in module`, plus the argv and `FILES` pins.
@@ -1727,7 +1784,7 @@ expect(JSON.parse(readFileSync(join(f.deps.stateDir, rec.runId, "run.json"), "ut
     1. `reapRuns(d)`;
     2. the two `egress_extra` checks;
     3. the workflow is in the pack (`packNodes`, with the current texts);
-    4. the budget;
+    4. the budget, and `retry` when it is set;
     5. Task 4's disk check;
     6. `archonSecrets`;
     7. `sourceGitDir(o.repoGitDir)`;
@@ -1741,14 +1798,15 @@ expect(JSON.parse(readFileSync(join(f.deps.stateDir, rec.runId, "run.json"), "ut
         - `"order.json": JSON.stringify(order, null, 2) + "\n"`;
         - `"task.md": o.taskMd ?? ""`.
 
-    After those steps it builds the record (with the new fields) and `run.json`, then does admission, `createRun(…, files)`, `createRunObjects` and the rollback under `withStartLock`, exactly as `runStart` does now. It returns the record and prints nothing. Errors from `withStartLock` and `reapRuns` propagate unwrapped.
+    After those steps it builds the record (with the new fields; its key from `keyPart`, and `retry` when `StartOptions` has it) and `run.json`, then does admission (handing `keyProblem` the `retryOf` exactly as given), `createRun(…, files)`, `createRunObjects` and the rollback under `withStartLock`, exactly as `runStart` does now. It returns the record and prints nothing. Errors from `withStartLock` and `reapRuns` propagate unwrapped.
   - **`runStart`.** It keeps its parse, path checks, re-exec and the exit-2 `--budget-usd` check. It then:
     1. runs `loadWorkOrder`;
     2. runs `sourceGitDir(--repo)`, then `headOf`;
     3. reads `task.md` from beside the work-order file, if that file exists;
     4. calls `startRun(d, { repoGitDir, workOrder, taskMd, sha, public, kind: "worker", budgetUsd, retryOf })`, with no overlay (a run started by hand uses central policy);
     5. prints `rec.runId`.
-  - **`requestStop`.** It checks `containerExists` before taking the run lock, and throws the H-218 text when there is no container.
+  - **`requestStop`.** It checks `containerExists` before taking the run lock, and throws the H-218 text when there is no container. Its write: `disk?.status === "live" && (disk.stopRequested === undefined || (why === "stopped" && disk.stopRequested === "timed-out"))`.
+  - **`reapRuns` and `runStop`.** The reap's deadline branch skips `rec.runId === o?.stopping`, and `runStop` calls `reapRuns(d, { stopping: id })`. The module comment (63-69) says why: the operator's stop outranks the deadline.
   - **`finalizeLocked`.** It computes the status and reasons as now, plus `spendUsd` when `spendOfRun(out, disk.budgetUsd ?? 0).known`.
     1. It writes that record first (H-219).
     2. Then it runs `removeRuns`. When the container was gone, it passes Task 4's `volumes: false`, skips Task 4's `removeVolumeDirs`, and adds the H-209 reason (H-209). Every other path keeps Task 4's default (`volumes: true`, then `removeVolumeDirs`).
@@ -1763,7 +1821,7 @@ expect(JSON.parse(readFileSync(join(f.deps.stateDir, rec.runId, "run.json"), "ut
     - `readRoster`: the trimmed content of `<buildDir>/roster`, which must be one of `ROSTERS`.
     - `buildAll`: adds the group `["", { roster: \`${roster}\n\` }]`.
     - `createRun`: writes each of `PER_RUN_FILES` with `flag: "wx"`, then `chmod 0644`, like `run.json`.
-    - `asRecord`: refuses a `kind` that isn't in `RUN_KINDS`.
+    - `asRecord`: refuses a `kind` that isn't in `RUN_KINDS`, and a `retry` that is present and isn't an integer of at least 0.
     - `READ_ONLY_DESTINATIONS`: gains `RUN_PATHS.order` and `RUN_PATHS.task`.
 - [ ] **Step 4: Run them.** Run the Step 2 command. Expected: PASS.
 - [ ] **Step 5: Docs.**
@@ -1772,7 +1830,8 @@ expect(JSON.parse(readFileSync(join(f.deps.stateDir, rec.runId, "run.json"), "ut
     - "The outputs": the run dir now holds `PER_RUN_FILES`;
     - L110: `SPEND` is the guard's ledger spend, else Archon's, else `-`;
     - "Troubleshooting": stop refusing a run that has no container yet (H-218), and the volumes, with their dirs on the run disk, that a removed container keeps (H-209);
-    - a note that `hapi run start` by hand uses central policy, while the poller passes the repo's overlay.
+    - a note that `hapi run start` by hand uses central policy, while the poller passes the repo's overlay;
+    - "`hapi run stop`", one line: a stop outranks the run's deadline, so a run still live past its deadline that you stop is recorded `stopped`. A run that has already ended, or that another command is finalizing, can't be stopped: the command prints `has already ended: <status>` or says another command is using the run, and the run keeps how it ended. Task 14 writes the rest of that section's text with `hapi retry`.
   - `docs/generated-configs.md`:
     - the `build/roster` row in the files table (37-56); the subdirectory count at :26 stays as it is, since `build/roster` sits at the root (Tasks 11 and 14 set that count);
     - the overlay paragraph (:33), and `hapi-guard.json` (:278-311) and run-config (:157-165) generated per run.
@@ -2742,7 +2801,7 @@ Deterministic host code that turns a finished pipeline into a verdict and one fa
   export function harvest(d: HarvestDeps, s: WorkOrderState, h: HarvestInput): Promise<WorkOrderState>;
   // pr.ts
   export interface PrInput { order: Discovered; outcome: Outcome; evidence: Evidence; head: string; stat: { files: number; insertions: number; deletions: number };
-    planningPr: number | undefined; position: HarvestInput["position"]; runs: { id: string; kind: RunKind; round: number }[]; rounds: Round[];
+    planningPr: number | undefined; position: HarvestInput["position"]; runs: { id: string; kind: RunKind; round: number; retry?: number }[]; rounds: Round[];
     roundCap: number; cost: { usd: number; unknown: number; turns: number }; phase: Phase; round: number }
   export function renderPr(i: PrInput): string;
   export function rerenderPr(oldBody: string, i: PrInput): string;
@@ -2769,24 +2828,26 @@ Deterministic host code that turns a finished pipeline into a verdict and one fa
     - `with real git: a push never uses +, and a moved branch is never forced`: to a local bare remote, through a `Runner` that records and calls `runCommand` → `{ pushed: true }`; the argv holds `<head>:refs/heads/factory/0001-skeleton`, no element starting `+` or `--force`, and never the token; the env holds `authedGit("fake-push-token")`'s three entries and `GIT_TERMINAL_PROMPT: "0"`; after another commit lands on the remote branch, pushing a head that doesn't descend from it → `{ moved: "factory/0001-skeleton moved on GitHub (not a fast-forward): not overwritten" }` and the remote ref unchanged.
     - `opening a PR is idempotent: an existing PR for factory/<id> is found and updated, not duplicated` (Review Focus 1): `forgeWorld()`, clean fake `gates`, records seeded with outputs; `harvest` → `writes(ff)` is `["POST /pulls", "POST /issues/1/labels"]`, the POST's body holding `head: "factory/0001-skeleton"`, `base: "main"`, `draft: false`; `harvest` again from the same pre-harvest state (no `pr`: the crash before the state was saved) → still one PR in `ff.prs`, `writes(ff)` gains `["PATCH /pulls/1", "POST /issues/1/labels"]`, and the state has `pr: 1`, `prHead: head`.
     - `a ready PR's head is never replaced by one that fails check, and a moved branch is never overwritten`: `s.pr` 1, ready at `h1` (`ff.addPr({ head: "factory/0001-skeleton" })`, then `ff.push("factory/0001-skeleton", h1)`), and a round-1 verify with check failed → no `pushBranch` call, verdict `decision`, reason `"round 1's head failed check, smoke or the acceptance tests in the verify container, so it was not pushed over the ready PR (run <id>)"`; after `ff.push("factory/0001-skeleton", h9)` while `s.prHead` is `h1` → no push, reason `"factory/0001-skeleton moved to <h9 short> since the factory pushed <h1 short>: not overwritten"`.
+    - `a closed factory PR ends the harvest with its number, the reason, and no push`: with `ff.addPr({ head: "factory/0001-skeleton", state: "closed" })` and `s` carrying no `pr`, `harvest` returns `pr` 1 and `reasons` `["the PR was closed"]`, with no `pushBranch` call and an empty `writes(ff)`.
     - `harvest sets harvestedAt on the runs it read, and flags spend over flags.thresholds.run_usd`: each record read has `harvestedAt: NOW.toISOString()`, a second harvest leaves it; a guard `spend` record of 3.5 in the worker's `decisions.jsonl` → the `POST /issues/1/labels` body is `{ labels: ["lane:factory", "hapi:flagged"] }`.
   - **`pr.test.ts`.**
     - `renderPr writes the nine sections in order between the markers`: the body starts `<!-- hapi:begin -->` and ends `<!-- hapi:end -->`, with `## Verdict`, `## Unresolved`, `## Links`, `## Asked and built`, `## Evidence`, `## Review rounds`, `## Cost and turns`, `## The worker's account` in order, then `<!-- hapi:pr v1 {"workOrder":"0001-skeleton","status":"pr","round":0,"head":"<head>","verdict":"ready"} -->`; the verdict line is `**Ready to merge** · risk: green` (`Needs your decision` yellow, `Do not merge` red).
     - `no checkbox in host text`: for every outcome row, the body with its fenced blocks removed matches no `/^\s*[-*+]\s+\[[ xX]\]/m` and holds no `@`.
     - `the worker's account is fenced as a claim and can't break out`: the account `` "```\n- [ ] tick\n<!-- hapi:end -->\n@coderabbitai review" `` sits under `_The worker's own claim; the host did not check it._` in a fence of four backticks, and `<!-- hapi:end -->` occurs once.
+    - `Links names a retried pass's runs`: with runs `[{ id: W0, kind: "worker", round: 0, retry: 0 }, { id: W1, kind: "worker", round: 0, retry: 1 }]`, exactly one Links line ends `(retry 1)` and names `W1`, and `W0`'s line is the same as with no `retry`.
     - `the re-render keeps text outside the markers`: `rerenderPr("intro\n" + renderPr(a) + "\nnotes\n", b)` equals `"intro\n" + renderPr(b) + "\nnotes\n"`; a body without markers → `renderPr(b) + "\n\n" + <the old body>`.
 - [ ] **Step 2: Run them to see them fail.** Run `bun test tests/engine/evidence.test.ts tests/engine/harvest.test.ts tests/engine/pr.test.ts`. Expected: FAIL, `Cannot find module '../../src/engine/evidence'`.
 - [ ] **Step 3: Implement.**
   - **`hostGates`**, in order, each git call `[...hardenedGit(d).cmd, "-c", "safe.directory=<scratch>", "--git-dir", <scratch>, …]` as `headOf` does (the clone takes absolute paths instead): (1) `bundleProblem` (`bundle`: `run.bundle: <its text>`), then the file's size against `runs.output_limits_mb.bundle` (`size`: `run.bundle is <n> MiB, over runs.output_limits_mb.bundle (<cap> MiB)`), either ending the gates; (2) no scratch yet → `clone --bare --no-hardlinks -- <mirror> <scratch>`, then always `fetch --no-tags <mirror> +refs/heads/main:refs/heads/main +refs/heads/factory/*:refs/heads/factory/*` (a host-owned local copy; only the push is held to no `+`); (3) `bundle verify <bundle>`, `fetch --no-tags <bundle> HEAD:refs/hapi/runs/<runId>`, `rev-parse --verify refs/hapi/runs/<runId>^{commit}` (the head), `merge-base --is-ancestor <base> <head>` (else `bundle`: `the run's head <h7> does not descend from <b7>`); (4) `diff --name-only -z --no-renames <base> <head>`; (5) per file, `effectiveModes(policy, f).workers !== "allow"` → `protected` (a throw → `<f> can't be checked against protected paths: <message>`), then no piece glob `globMatches` it → `scope`; paths print through `sanitizeTerminal`, at most 20 per gate, then `… and <n> more`; (6) every entry of the scratch made readable by all, as Task 6's mirror is (a run container's uid reads it).
   - **`push`** runs `git --git-dir <scratch> -c safe.directory=<scratch> -c core.hooksPath=/dev/null -c core.fsmonitor=false push --porcelain <remote> <head>:refs/heads/factory/<id>` itself, not through `hardenedGit` (whose `env -i` would drop the token and whose `o.env` is argv), with env `{ PATH, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0", ...authedGit(token) }`. A `!` porcelain line whose summary holds `rejected` is `moved`; any other failure throws `git push to factory/<id> failed (exit <n>): <stderr's first line through redactSecrets with { TOKEN: token }>`.
-  - **`harvest`**, in order: `policy = policyOf(d.central, h.order)`; `gates = await d.gates(h.order, h.run)`; the evidence from each record's `join(recordDir(d.run.stateDir, id), "out")` (a verify or review record whose `sha` isn't the head counts as absent), the account redacted with `await d.secrets()`; `outcome(e, policy.runs.phases)`; the PR, `s.pr ? forge.pr(s.pr) : forge.findPr("factory/<id>")` (a closed one: return `{ ...s, reasons: ["the PR was closed"] }`). No push, verdict `decision`, when the PR's `headSha` isn't `s.prHead` (with `s.prHead` set: the moved reason), or when the PR is ready and the outcome is a draft (the not-pushed reason); else `d.pushBranch({ scratch, remote: "https://github.com/<repo>.git", id, head, token: await d.token("push") })`, `moved` → `decision` with its text. Then the body: `editPrBody(n, rerenderPr(pr.body, i))` and `markReady(n)` when the PR is a draft and the outcome isn't, or `openPr({ head: "factory/<id>", base: "main", title, body: renderPr(i), draft })`; then `addLabels(n, ["lane:factory"])` every time, with `"hapi:flagged"` when `flags.on_flag` has `label_pr` and the runs' summed `spendOfRun` passes `flags.thresholds.run_usd` or `s.reworkRounds` passes `flags.thresholds.review_rounds`; then `harvestedAt` on each record read, read-modify-write under `withRunLock`, never overwritten. It returns `{ ...s, pr, prHead, verdict, reasons, updatedAt }`: `prHead` the head pushed, or unchanged; the phase unchanged (Task 13 moves it). The title is `<id>: <task.md's first "# " heading>`, sanitized, with `@`, `<` and `>` dropped, at most 72 characters. `PrInput`'s `stat` is `diff --numstat -z --no-renames <mergeSha> <head>` in the scratch, `roundCap` is `fix_rounds_before_pr + fix_rounds_on_pr`, `cost.turns` sums each run's `turnsOfRun` (the last `spend` record's `turns`, Task 10's ledger count; a run without one adds 0), never a count of records, so a hard stop's extra spend record adds no turn, and `cost.unknown` counts the runs whose `spendOfRun` isn't known.
+  - **`harvest`**, in order: `policy = policyOf(d.central, h.order)`; `gates = await d.gates(h.order, h.run)`; the evidence from each record's `join(recordDir(d.run.stateDir, id), "out")` (a verify or review record whose `sha` isn't the head counts as absent), the account redacted with `await d.secrets()`; `outcome(e, policy.runs.phases)`; the PR, `s.pr ? forge.pr(s.pr) : forge.findPr("factory/<id>")` (a closed one: return `{ ...s, pr: pr.number, reasons: ["the PR was closed"] }`: it is this work order's own `factory/<id>`, so the order leaves with its PR set, Task 13 sends it to `pr`, and `pr`'s first check settles it `closed`, never `failed`, so `hapi retry` never needs a text match). No push, verdict `decision`, when the PR's `headSha` isn't `s.prHead` (with `s.prHead` set: the moved reason), or when the PR is ready and the outcome is a draft (the not-pushed reason); else `d.pushBranch({ scratch, remote: "https://github.com/<repo>.git", id, head, token: await d.token("push") })`, `moved` → `decision` with its text. Then the body: `editPrBody(n, rerenderPr(pr.body, i))` and `markReady(n)` when the PR is a draft and the outcome isn't, or `openPr({ head: "factory/<id>", base: "main", title, body: renderPr(i), draft })`; then `addLabels(n, ["lane:factory"])` every time, with `"hapi:flagged"` when `flags.on_flag` has `label_pr` and the runs' summed `spendOfRun` passes `flags.thresholds.run_usd` or `s.reworkRounds` passes `flags.thresholds.review_rounds`; then `harvestedAt` on each record read, read-modify-write under `withRunLock`, never overwritten. It returns `{ ...s, pr, prHead, verdict, reasons, updatedAt }`: `prHead` the head pushed, or unchanged; the phase unchanged (Task 13 moves it). The title is `<id>: <task.md's first "# " heading>`, sanitized, with `@`, `<` and `>` dropped, at most 72 characters. `PrInput`'s `stat` is `diff --numstat -z --no-renames <mergeSha> <head>` in the scratch, `roundCap` is `fix_rounds_before_pr + fix_rounds_on_pr`, `cost.turns` sums each run's `turnsOfRun` (the last `spend` record's `turns`, Task 10's ledger count; a run without one adds 0), never a count of records, so a hard stop's extra spend record adds no turn, and `cost.unknown` counts the runs whose `spendOfRun` isn't known.
   - **The readers** never throw: a missing or bad file is `broken`, `none` or `not-reviewed`. They read Task 11's files strictly (an extra key is malformed):
     - `verify.json` has exactly `{ "check": { "exit": <int>, "tail": <string> }, "smoke": { "exit": <int>, "tail": <string> } | null, "acceptance": { "exit": <int>, "tail": <string> } | null }`: all three keys present, `null` meaning not run (smoke) or no acceptance tests under `.factory/work/<id>/acceptance/`; exit 0 passes. Each `tail` is the change's own output, checked to be a string and otherwise unused by the harvester.
     - The review is the `review` node's structured output inside `result.json`, at `REVIEW_OUTPUT_AT` (T19's path; a JSON string there is parsed once, as T19 records it). It is checked with `ajv` against `REVIEW_SCHEMA`: `{ "verdict": "ready" | "needs-work" | "blocked", "findings": [{ "severity": "critical" | "major" | "minor", "path", "summary" }], "criteria": [{ "criterion", "mark": "met" | "partly" | "unmet", "evidence" }] }`, no other key at any level, strings capped at 2,000 characters and findings at 50. There is no `review.json`.
     - `coderabbit.ndjson` is read in order: (1) every non-empty line parses as JSON, else malformed; (2) the last line is Task 11's closing `{"type":"hapi",…}` line (none → `"coderabbit.ndjson has no closing hapi line"`; a `hapi` line anywhere else, or one without exactly an integer `exit` or a string `skipped`, is malformed): `skipped` → `"the CodeRabbit CLI step was skipped: <why>"` (`sanitizeTerminal`, at most 200 characters), an `exit` other than 0 (passed) or 2 (blocked by `--gate major`) → `"the CodeRabbit CLI exited <n>"`; (3) the rest is the CLI's `--agent` stream (a skip is a non-`finding` line holding `review_skipped`; unverified is any number above 0 in a `complete` key holding `unverified`), whose `critical` and `major` findings are the open ones.
     - The account runs from the first `/^#{1,6}\s*Account\b/` line to the line before the first `RESULT:` line or the next heading of its level or higher. `finalMessage` reads the steps `implement`, `implement-retry` and `fix` unless told otherwise, so a fix run's account and question check work as a worker's do.
   - **`outcome`** applies the acceptance rules (the operator's 2026-10-31 change): a verify that ran with `acceptance: "failed"` is a draft `do-not-merge` whatever `require_acceptance` says; with `phases.require_acceptance` on and `acceptance: "none"`, the best verdict is `decision`; with verify off, the verify-off reason (which names the acceptance tests) already caps it at `decision`.
-  - **`renderPr`**: Unresolved lists `outcome.reasons`, then a CodeRabbit `not-reviewed` why, then "Check this yourself" (the account is a claim; CI's `ci` check on the head is GitHub's own run); Links names the work order (k of n), `Part of #<planning PR>`, the siblings ("independent; merge in any order") and each run id with its kind and round; Asked and built quotes `task.md`'s first paragraph, `<files> files, +<insertions> −<deletions>` and "Rollback: revert this PR's merge commit"; Evidence is a table of gate, head commit, command and result (the host gates, `mise run check`, `mise run smoke`, `bun test ./.factory/work/<id>/acceptance` or "no acceptance tests", the independent review, CodeRabbit's CLI); Review rounds lists each `Round` by stage. The review's findings and criteria, CodeRabbit's findings, the `task.md` quote and the account each go through `fence(text)` (sanitized, `<!--` → `< !--` and `-->` → `-- >`, fenced one backtick longer than its longest run of backticks and at least three, the account capped at 6,000 characters), so no model text and no `@` is ever outside a fence.
+  - **`renderPr`**: Unresolved lists `outcome.reasons`, then a CodeRabbit `not-reviewed` why, then "Check this yourself" (the account is a claim; CI's `ci` check on the head is GitHub's own run); Links names the work order (k of n), `Part of #<planning PR>`, the siblings ("independent; merge in any order") and each run id with its kind and round, ending ` (retry <n>)` for a run whose record has `retry` of at least 1; Asked and built quotes `task.md`'s first paragraph, `<files> files, +<insertions> −<deletions>` and "Rollback: revert this PR's merge commit"; Evidence is a table of gate, head commit, command and result (the host gates, `mise run check`, `mise run smoke`, `bun test ./.factory/work/<id>/acceptance` or "no acceptance tests", the independent review, CodeRabbit's CLI); Review rounds lists each `Round` by stage. The review's findings and criteria, CodeRabbit's findings, the `task.md` quote and the account each go through `fence(text)` (sanitized, `<!--` → `< !--` and `-->` → `-- >`, fenced one backtick longer than its longest run of backticks and at least three, the account capped at 6,000 characters), so no model text and no `@` is ever outside a fence.
 - [ ] **Step 4: Run the tests.** Run the Step 2 command. Expected: PASS.
 - [ ] **Step 5: Docs.** Create `docs/runbooks/engine.md` with two sections (Tasks 13 and 15 add the rest): "The harvester" (the host gates and their texts, the four verdicts and what each lets the operator do, the acceptance tests' part in them: where they live, `.factory/work/<id>/acceptance/`, the planner's and approved by the planning PR's merge; `runs.phases.require_acceptance` capping a work order without them at "Needs your decision"; a failing one making a draft "Do not merge"; the never-forced push, `harvestedAt`) and "The factory PR" (the nine sections, the markers, editing below `<!-- hapi:end -->` survives every re-render, no checkboxes, the account as a claim; what the harvester reads: `verify.json`'s shape, the review's structured output in `result.json` with its findings `{ severity, path, summary }`, and `coderabbit.ndjson` with its closing `hapi` line). `handoffs.md`, `## Plan 03 Run engine`, with the next free H-id: `flags.thresholds.interventions` is not counted by the harvester (nothing records an intervention until Plan 04's Hermes).
 - [ ] **Step 6: Run everything.** Run `mise run lint && mise run test`. Expected: PASS, the whole suite.
@@ -2803,17 +2864,17 @@ git commit -m "feat(engine): the harvester: host gates on the bundle, the verdic
 
 ### Task 13: The work order's state machine, caps, the CodeRabbit round, rework and the operator's actions
 
-The persisted state machine that moves one work order from merged to settled, one step per call, so a crash at any point resumes without a second run or PR (design §3.4, §3.5, §3.6, §3.9; spec §5.2 and AC-16 as the design changes them; H-166(c), H-183(c)). It holds every cap before every automatic run (the repo's month, the day, unknown spend at full budget, automatic rounds since the last human action), starts the one CodeRabbit round only from CodeRabbit's own review of the head commit, starts rework only from a human maintainer's label, and lets the operator win every race.
+The persisted state machine that moves one work order from merged to settled, one step per call, so a crash at any point resumes without a second run or PR (design §3.4, §3.5, §3.6, §3.9; spec §5.2 and AC-16 as the design changes them; H-166(c), H-183(c)). It holds every cap before every automatic run (the repo's month, the day, unknown spend at full budget, automatic rounds since the last human action), starts the one CodeRabbit round only from CodeRabbit's own review of the head commit, starts rework only from a human maintainer's label, and lets the operator win every race. For `hapi retry` (the operator's call of 2026-11-01, m19) it also gives a failed work order its next pass at the same merge commit, at most `runs.max_retries` times, counts rounds and heads within the current pass, routes every run that timed out or was stopped, and keeps each run's record until its month has ended, so the monthly cap never loses one to retention.
 
-**Protected (ask first):** none.
+**Protected (ask first):** `policy/runs.yaml` (the new `max_retries` key and the header's central-only line; the `retention_days` comment; and the GB→GiB comment in `policy/runs.yaml`, a one-word fix the controller bundles here) and `policy/schemas/policy-runs.schema.json` (`max_retries`'s property and `required`, the schema's description, and `retention_days`'s description). The controller asks when the task starts.
 
 **Files:**
 - Create: `src/engine/caps.ts`, `src/engine/coderabbit.ts`, `src/engine/pipeline.ts`
-- Modify: `src/engine/state.ts` (Task 12's types file: the functions below), `tests/engine/helpers.ts` (`pipelineDeps`), `docs/runbooks/engine.md` (the section "The pipeline"), `docs/superpowers/plans/handoffs.md` (Step 5's deferrals)
-- Test: `tests/engine/{state,caps,coderabbit,pipeline}.test.ts`. No existing test changes.
+- Modify: `src/engine/state.ts` (Task 12's types file: the functions below), `tests/engine/helpers.ts` (`pipelineDeps`), `docs/runbooks/engine.md` (the section "The pipeline"), `docs/superpowers/plans/handoffs.md` (Step 5's deferrals); `src/policy/types.ts`, `policy/runs.yaml`, `policy/schemas/policy-runs.schema.json` and `docs/policy.md` (`runs.max_retries`); `src/run/lifecycle.ts` (`reapRuns`' retention, :656-667, and the module comment, :70-73) and `docs/runbooks/runs.md` ("Retention")
+- Test: `tests/engine/{state,caps,coderabbit,pipeline}.test.ts`. Changed: `tests/policy/{load,overlay}.test.ts` and `tests/run/helpers.ts` (its policy literal, :323) for `max_retries`; `tests/run/view.test.ts` ("retention (reapRuns)") for the retention.
 
 **Interfaces:**
-- Consumes: Task 12's `HarvestDeps`, `harvest`, `policyOf`, `scratchPath`, `quoteUntrusted`, `reviewResult`, `codeRabbitResult`, `verifyResult`, `Round`, and its test helpers (`ORDER`, `forgeWorld`, `writes`); `startRun`, `StartOptions`, `runKey(workOrderId, sha, part?)`, `spendOfRun` (Task 7), and `RunFile.base` (Task 7: the parent worker run's `sha`, which the review's `coderabbit` node reads from `/run/hapi/run.json`, so no input carries a base); `RUN_INPUTS` (Task 8's `src/run/kinds.ts`: `{ order: "order.json", task: "task.md", diff: "diff.patch", verify: "verify.json", findings: "findings.md" }`, bound read-only at `/run/hapi/inputs/`); `Forge`, `PrInfo`, `ReviewComment`, `Permission`, `githubForge`, and `CODERABBIT` (`{ userId, appId }`, `src/forge/github/forge.ts`) (Task 3), and in tests `fakeForge`, `OPERATOR`, `FACTORY_BOT` and `CODERABBIT_BOT` (`tests/forge/helpers.ts`, Task 3); `Discovered`, `mirrorPath` (Task 6); `hardenedGit` (Task 6); `listRecords`, `readRecord`, `writeRecord`, `recordDir`, `lockHeld` (`src/run/records.ts`); `withStoreLock(store, what, fn, { env })` (`src/secrets/store-files.ts:247`, keyed by `store` alone, as `withRunLock` uses it); `Env`, `definedEnv` (`src/stack/up.ts`); `APPS` (`src/forge/github/app-token.ts:48`).
+- Consumes: Task 12's `HarvestDeps`, `harvest`, `policyOf`, `scratchPath`, `quoteUntrusted`, `reviewResult`, `codeRabbitResult`, `verifyResult`, `Round`, and its test helpers (`ORDER`, `forgeWorld`, `writes`); `startRun`, `StartOptions`, `runKey(workOrderId, sha, part?)`, `keyPart(kind, round, retry?)`, `spendOfRun` (Task 7), and `RunFile.base` (Task 7: the parent worker run's `sha`, which the review's `coderabbit` node reads from `/run/hapi/run.json`, so no input carries a base); `RUN_INPUTS` (Task 8's `src/run/kinds.ts`: `{ order: "order.json", task: "task.md", diff: "diff.patch", verify: "verify.json", findings: "findings.md" }`, bound read-only at `/run/hapi/inputs/`); `Forge`, `PrInfo`, `ReviewComment`, `Permission`, `githubForge`, and `CODERABBIT` (`{ userId, appId }`, `src/forge/github/forge.ts`) (Task 3), and in tests `fakeForge`, `OPERATOR`, `FACTORY_BOT` and `CODERABBIT_BOT` (`tests/forge/helpers.ts`, Task 3); `Discovered`, `mirrorPath` (Task 6); `hardenedGit` (Task 6); `listRecords`, `readRecord`, `writeRecord`, `recordDir`, `lockHeld` (`src/run/records.ts`); `withStoreLock(store, what, fn, { env })` (`src/secrets/store-files.ts:247`, keyed by `store` alone, as `withRunLock` uses it); `Env`, `definedEnv` (`src/stack/up.ts`); `APPS` (`src/forge/github/app-token.ts:48`).
 - Produces:
   ```ts
   // state.ts
@@ -2824,6 +2885,10 @@ The persisted state machine that moves one work order from merged to settled, on
   export function listStates(engineDir: string, repo?: string): Promise<WorkOrderState[]>; // defined here only; Task 14 imports it. No repo: every repo's
   export function withOrderLock<T>(engineDir: string, s: Pick<WorkOrderState, "repo" | "id">, env: Env, fn: () => Promise<T>): Promise<T>; // withStoreLock(statePath(…), "engine-order", …)
   export function transition(s: WorkOrderState, to: Phase, o: { at: string; reason?: string; run?: string; usd?: number }): { state: WorkOrderState; event: StatusEvent };
+  export const WORK_ORDER_ID: RegExp; // the work-order schema's id pattern, /^[0-9]{4,}-[a-z0-9]+(?:-[a-z0-9]+)*$/ (policy/schemas/work-order.schema.json)
+  export function retryProblem(s: WorkOrderState, maxRetries: number): string | undefined; // why `hapi retry` refuses s, or undefined; maxRetries is the central policy's runs.max_retries
+  export function retryState(s: WorkOrderState, at: string): { state: WorkOrderState; event: StatusEvent }; // the next pass, queued
+  // src/policy/types.ts: Runs gains max_retries: number
   // caps.ts
   export function capProblem(d: Pick<HarvestDeps, "run" | "engineDir">, repo: string, policy: Policy, budgetUsd: number): Promise<{ refuse: string } | { warn: string } | undefined>;
   export function autoRoundsProblem(s: WorkOrderState, max: number): string | undefined;
@@ -2842,15 +2907,41 @@ The persisted state machine that moves one work order from merged to settled, on
     // production: start = (o) => startRun(d.run, o); emit = Task 14's collector, which holds the events in memory for the poller to append after writeState
   export function advance(d: PipelineDeps, s: WorkOrderState, order: Discovered): Promise<WorkOrderState>;
   ```
-  - **The caller's contract.** Task 14 wraps each call in `withOrderLock(engineDir, s, env, …)`: it calls `advance`, then `writeState`s what it returns, and only when `advance` resolves (an error leaves the state file's bytes unchanged, Review Focus 4). `advance` doesn't lock or write the state, and never writes `events.jsonl`. Each call makes at most one transition and starts at most one run, and it hands that transition's event to the injected `d.emit` before it returns. Task 14's production `emit` only collects; the poller appends the collected events to `events.jsonl` after `writeState` succeeds, so each event is written once, by one writer.
+  - **The caller's contract.** Task 14 wraps each call in `withOrderLock(engineDir, s, env, …)`: it calls `advance`, then `writeState`s what it returns, and only when `advance` resolves (an error leaves the state file's bytes unchanged, Review Focus 4). `advance` doesn't lock or write the state, and never writes `events.jsonl`. Each call makes at most one transition and starts at most one run, and it hands that transition's event to the injected `d.emit` before it returns. Task 14's production `emit` only collects; the poller appends the collected events to `events.jsonl` after `writeState` succeeds, so each event is written once, by the holder of the poll lock (a tick, or `hapi retry`: Task 14).
   - **`operator`** is the repo owner's login (`new-repo` makes repos only on a personal account, design §3.2), matched with `type: "User"` and not `viaApp` on issue comments and label events, which carry a login. `Review` and `ReviewComment` carry only a user id, so any review or review comment not by `CODERABBIT.userId` turns the automatic round off, and counts as the operator's (for `lastHumanAt` and `maintainerComments`) only when its id is the one the operator's own comments or label events show. hapi's Apps are `type: "Bot"` with login `${APPS.factory.name}[bot]` or `${APPS.planner.name}[bot]`; no user can hold a `[bot]` login.
+  - **The policy key, `runs.max_retries`** (protected; always hard, central only):
+    - `policy/runs.yaml`, after `max_auto_rounds`: `max_retries: 2          # times the operator may queue a failed work order again (hapi retry); the command refuses one more; always hard: never softened by budgets.enforcement.poller; central only; 0 turns hapi retry off`. The header's "poll_interval_s is central only." becomes "poll_interval_s and max_retries are central only."
+    - `policy-runs.schema.json`: `max_retries`, `$ref` `rounds` (a whole number of at least 0), with that text as its description; `required` gains it; the schema's description gains "and how many times the operator may queue a failed work order again".
+    - `repo-overlay.schema.json`: unchanged. Its `runs` object is `additionalProperties: false`, so `applyOverlay` refuses `runs.max_retries` as an unknown key, as it does `poll_interval_s`. (An overlay couldn't usefully lower it anyway: the overlay is read at the work order's merge commit, so a lower value on main would never reach a merged work order.)
+    - `src/policy/types.ts`: `Runs` gains `max_retries: number` with a one-line comment, and `RepoOverlay.runs`' `Omit` gains `"max_retries"`.
+    - `docs/policy.md`: a `runs` table row after `max_auto_rounds`; the section's lead sentence and the overlay table's `runs` row name `max_retries` as central only, beside `poll_interval_s`.
+  - **Retention keeps a run until its month has ended** (the operator's call of 2026-11-01). The monthly cap reads each listed run's record, and Plan 02's retention deletes the record with the run's dir `retention_days` (14) after its harvest, so from about the 15th the month's sum would lose its early runs and a repo could spend up to about three times its cap. So a harvested run's dir goes only when its `harvestedAt` is more than `retention_days` ago *and* its `startedAt` is before the current UTC month. The record already is the run's durable spend entry, so this adds no file, writer or format; the cost is disk, a run's outputs kept up to about a month after its harvest. What retention still misses is H-244. Comment-only protected edits: `policy/runs.yaml`'s `retention_days` comment becomes "a run's files are removed this many days after its harvestedAt, and never before the UTC month it started in has ended (the poller's monthly cap reads them)", dropping its stale "Plan 02 sets none, so nothing is removed yet (H-206)", and `policy-runs.schema.json`'s `retention_days` description says the same.
 
-- [ ] **Step 1: Write the failing tests.** `pipelineDeps(o)` in `tests/engine/helpers.ts`: `run` from `fakeRun()`, a temp `engineDir`, `central` = `loadPolicy("policy")`, Task 12's `forgeWorld()` (`ff`, and `forge(purpose)` = `githubForge({ repo: ff.repo, token: "fake-<purpose>-token", fetch: ff.fetch })`, so the `pr` and `checks` forges are two clients of one world), fake `gates` (clean unless told; head `h<round>` padded to 40 hex) and `pushBranch` (it calls `ff.push`), a fake `start` that writes a `live` record whose `key` is Task 7's `runKey` (`part` `<kind>:<round>` but for the worker) and records each `StartOptions`, `finish(runId, status, outs)` to end one, `emit` collecting events, `operator: "example-owner"` (Task 3's `OPERATOR`), `public: true`. The users beyond Task 3's are `SOMEONE = { id: 4242, login: "someone", type: "User" }`, `IMPOSTOR = { id: 999, login: "coderabbitai", type: "User" }` and `MAINT = { id: 5, login: "maint", type: "User" }`, with `ff.collaborators.set("maint", "triage")`. `fakeForge` stamps its first comment, event or review at 2026-11-01T00:00:01Z, after `fakeRun`'s `NOW`.
-  - **`state.test.ts`.** `writeState writes 0600 by temp and rename, and readState reads it back`; `a malformed state file throws, naming it` (an unknown phase, a missing `runs`); `newState holds with verdict decision, or queues`: `newState(ORDER, 3, at, "overlaps 0002-x")` → `{ phase: "held", verdict: "decision", reasons: ["overlaps 0002-x"], planningPr: 3, runs: [], autoRounds: 0, reworkRounds: 0, updatedAt: at }`, and with no `held` → `phase: "queued"`, no `verdict`, `reasons: []`; `listStates lists one repo's states, or every repo's`: states for two repos → `listStates(engineDir, ORDER.repo)` holds only that repo's, `listStates(engineDir)` both, a missing dir `[]`; `transition appends one StatusEvent with the phase, run, PR, verdict and reason` (`{ at, repo: "example-owner/sandbox", workOrder: "0001-skeleton", phase: "verify", run: <id>, pr, verdict, reason }`); it changes only `phase` and `updatedAt` (= `at`).
+- [ ] **Step 1: Write the failing tests.** `pipelineDeps(o)` in `tests/engine/helpers.ts`: `run` from `fakeRun()`, a temp `engineDir`, `central` = `loadPolicy("policy")`, Task 12's `forgeWorld()` (`ff`, and `forge(purpose)` = `githubForge({ repo: ff.repo, token: "fake-<purpose>-token", fetch: ff.fetch })`, so the `pr` and `checks` forges are two clients of one world), fake `gates` (clean unless told; head `h<round>` padded to 40 hex) and `pushBranch` (it calls `ff.push`), a fake `start` that writes a `live` record keyed `runKey(id, sha, keyPart(kind, round, retry))`, carrying `retry`, and records each `StartOptions`, `finish(runId, status, outs)` to end one, `emit` collecting events, `operator: "example-owner"` (Task 3's `OPERATOR`), `public: true`. The users beyond Task 3's are `SOMEONE = { id: 4242, login: "someone", type: "User" }`, `IMPOSTOR = { id: 999, login: "coderabbitai", type: "User" }` and `MAINT = { id: 5, login: "maint", type: "User" }`, with `ff.collaborators.set("maint", "triage")`. `fakeForge` stamps its first comment, event or review at 2026-11-01T00:00:01Z, after `fakeRun`'s `NOW`. Every `WorkOrderState` literal carries `retry: 0` unless a test names another.
+  - **The policy tests.** `tests/policy/load.test.ts`'s `loads the new limits exactly`: `p.runs` gains `max_retries: 2`. `tests/policy/overlay.test.ts`'s central-only test is renamed `repo_monthly_usd may be lowered; daily_usd, poll_interval_s and max_retries are central only` and gains `expect(() => applyOverlay(p, { runs: { max_retries: 0 } } as unknown as RepoOverlay)).toThrow("/runs/max_retries: unknown key")`. `tests/run/helpers.ts`'s policy literal gains `max_retries: 2`.
+  - **`state.test.ts`.** `writeState writes 0600 by temp and rename, and readState reads it back`; `a malformed state file throws, naming it` (an unknown phase, a missing `runs`, and a `retry` of `-1`, `1.5` or none, each giving `<path> is not a work order's state: retry`); `newState holds with verdict decision, or queues`: `newState(ORDER, 3, at, "overlaps 0002-x")` → `{ phase: "held", verdict: "decision", reasons: ["overlaps 0002-x"], planningPr: 3, runs: [], autoRounds: 0, reworkRounds: 0, retry: 0, updatedAt: at }`, and with no `held` → `phase: "queued"`, no `verdict`, `reasons: []`; `listStates lists one repo's states, or every repo's`: states for two repos → `listStates(engineDir, ORDER.repo)` holds only that repo's, `listStates(engineDir)` both, a missing dir `[]`; `transition appends one StatusEvent with the phase, run, PR, verdict and reason` (`{ at, repo: "example-owner/sandbox", workOrder: "0001-skeleton", phase: "verify", run: <id>, pr, verdict, reason }`); it changes only `phase` and `updatedAt` (= `at`), and the event carries `retry` only when the state's `retry` is at least 1 (`retry: 2` gives `retry: 2`; `retry: 0` gives no key).
+    - `WORK_ORDER_ID is the work-order schema's id pattern`: `WORK_ORDER_ID.source` equals `properties.id.pattern` of `policy/schemas/work-order.schema.json`, read as JSON.
+    - `retryProblem refuses all but a failed work order with no PR and retries left`, one row each, with `maxRetries` 2 unless named:
+      - `phase: "waiting"` → `work order 0001-skeleton is waiting, not failed: only a failed work order is retried (docs/runbooks/engine.md, Troubleshooting)`, and the same text for `queued`, `held`, `cap-stopped`, `merged` and `closed`;
+      - `phase: "failed", pr: 4` → `work order 0001-skeleton has PR #4: a PR is reworked with the hapi:rework label, not retried`;
+      - `phase: "failed", retry: 2` → `work order 0001-skeleton has been retried 2 times, and runs.max_retries is 2: plan the work again under a new work order id`;
+      - `phase: "failed", retry: 0` with `maxRetries` 0 → the same text with `0 times` and `is 0`;
+      - `phase: "failed", retry: 1, reasons: ["worker run 0a0b0c0d0e0f ended failed: preflight exited 1"]` → `undefined`.
+    - `retryState queues the next pass and records the operator's action`. From `{ phase: "failed", retry: 0, autoRounds: 2, reworkRounds: 0, runs: [W0, V0], verdict: "do-not-merge", reasons: ["worker run W0 ended timed-out: the run passed its deadline"], updatedAt: t0 }`:
+      - the state is the input with `phase: "queued"`, `retry: 1`, `autoRounds: 0`, `reasons: []` and `updatedAt: at`, and without `verdict` and `prHead`; `runs`, `reworkRounds`, `mergeSha`, `planningPr` and `lastHumanAt` are unchanged;
+      - the event is `{ at, repo: "example-owner/sandbox", workOrder: "0001-skeleton", phase: "queued", retry: 1, reason: "the operator retried it (retry 1) after: worker run W0 ended timed-out: the run passed its deadline" }`;
+      - with `reasons: []`, the reason ends `after: no reason recorded`.
   - **`caps.test.ts`.**
     - `caps at the boundary`: records this month for the repo's work orders spending $11.00 and a run budget of $4.00 against `repo_monthly_usd: 15` → undefined; $11.01 → `{ refuse: "this month's spend on example-owner/sandbox ($11.0100) plus the run's budget ($4.0000) would pass budgets.repo_monthly_usd ($15.00): no new run for it until 2026-11-01" }`; the day the same across every record against `daily_usd: 10`: $6.01 and $4.00 → `{ refuse: "today's spend ($6.0100) plus the run's budget ($4.0000) would pass budgets.daily_usd ($10.00): nothing new starts until 2026-10-30 (UTC)" }`; `enforcement.poller: soft` gives the same text as `{ warn }`.
     - `an unknown spend counts at the run's full budget, and only this month's and today's runs count`: a live run with no spend record counts its `budgetUsd`; a record from 2026-09-30T23:59Z counts toward neither.
     - `autoRoundsProblem`: `autoRounds` 3 with max 3 → `"3 automatic runs since the last human action (runs.max_auto_rounds: 3): waiting for the operator"`; 2 → undefined.
+    - `a run harvested more than retention_days ago still counts toward this month`: a state of `0001-skeleton` lists one record, started 2026-10-02T00:00Z, harvested 2026-10-02T01:00Z, with a known spend of $11.01. After `await reapRuns(d.run)`, the record still exists, and `capProblem(d, ORDER.repo, <the policy with repo_monthly_usd 15>, 4)` is the `$11.0100` refusal of `caps at the boundary`.
+  - **`tests/run/view.test.ts`, describe `retention (reapRuns)`:** `retention keeps a harvested run until its startedAt's UTC month has ended, so the poller's monthly cap still counts it`. With `NOW` at 2026-10-29T12:00Z:
+    - a run started at `2026-10-01T00:30:00.000Z` and harvested at `2026-10-01T01:00:00.000Z`, 28 days ago, keeps its dir, and nothing is printed;
+    - a run started at `2026-09-30T23:30:00.000Z` and harvested at `2026-10-01T01:00:00.000Z` loses it, with the existing line `hapi run: removed run <id>: harvested 2026-10-01T01:00:00.000Z, more than runs.retention_days (14) ago`;
+    - a run whose `startedAt` doesn't parse, harvested 28 days ago, keeps its dir, as a bad `harvestedAt` does.
+
+    The three existing retention tests pass unchanged: their runs started 400 days ago.
   - **`coderabbit.test.ts`** (`forgeWorld()` worlds through `githubForge`, as above; the PR is `ff.addPr({ head: "factory/0001-skeleton" })` at the head `hh…`, and `s` a state at `pr-review` with `pr: 1`, `prHead` the head):
     - `a CodeRabbit reply in a thread, or a finding on an older commit, never counts` (Review Focus 2): a root comment by `CODERABBIT_BOT` with the marker and `**Major** · **Functional Correctness**`, in a review by `CODERABBIT_BOT` on the head → counted; a reply (`inReplyTo` set) by `CODERABBIT_BOT`, a root on an older `commitId`, one whose review is by another user, one by `IMPOSTOR` (user 999, CodeRabbit's login text), one `**Minor**`, one without the marker, and a root whose thread holds a reply by `SOMEONE` (user 4242) → none counted.
     - `crFindings reads check runs with the checks forge and reviews with the pr forge`: the GETs of `…/commits/<head>/check-runs` carry `fake-checks-token`, and those of `…/pulls/1/reviews` and `…/pulls/1/comments` carry `fake-pr-token` (from `ff.calls`' `authorization` headers).
@@ -2859,24 +2950,49 @@ The persisted state machine that moves one work order from merged to settled, on
     - `a comment from anyone but the operator, the Apps and CodeRabbit turns the automatic round off` (Review Focus 2): `othersOnPr` is undefined for comments by `OPERATOR` (`example-owner`, User), `FACTORY_BOT` (`hapi-factory[bot]`, Bot) and `CODERABBIT_BOT`; a comment by `SOMEONE` → `"someone commented on #1, so the automatic CodeRabbit round is off: the PR is the operator's"`; a review by `SOMEONE` → `"user 4242 reviewed #1, so the automatic CodeRabbit round is off: the PR is the operator's"`; and in `pipeline.test.ts`, at `pr` with such a comment, `advance` → `waiting` with that reason and no `start`.
     - `a label by an App never triggers rework`: `hapi:rework` `labeled` (`ff.label`) with `viaApp: true`, or by `FACTORY_BOT` (`type: "Bot"`), or by a user whose permission is `read` → `reworkRequest` undefined; by `MAINT` with `triage` → `{ at, by: "maint" }`; one at or before `since` (the newest run's start) → undefined.
   - **`pipeline.test.ts`.**
-    - `every transition`, one row each, asserting the phase, the one emitted event and the `StartOptions` (`kind`, `round`, `sha`, `repoGitDir`, `parent`, `budgetUsd`, the `inputsDir` file names, each a `RUN_INPUTS` value): `queued` → `worker` (worker, round 0, `mergeSha`, the mirror, `budgetUsd` 3: the order's, within `budgets.run_usd`, no `inputsDir`); worker live → no change, no event; worker `failed` → `failed` with its reason; gates refuse → `failed` with their details; gates pass → `verify` (round 0, head, the scratch, `parent` the worker's id, no `inputsDir` and no `run.bundle`: the scratch already holds the bundle's commits); verify passed → `review` (`RUN_INPUTS`' `order.json`, `task.md`, `diff.patch` and `verify.json`, no `run.bundle` and no base file, `parent` the worker's id, `budgetUsd` `Math.min(3, phases.round_usd)`); verify failed (check, smoke or acceptance) → `harvest`; review `needs-work` with no PR → `fix` (round 1, the head, the scratch, `findings.md` alone, each finding in `quoteUntrusted` naming its `severity` and `path`, `budgetUsd` `Math.min(3, phases.round_usd)`); with the order's `budget.usd` 0.50, below `round_usd`, the review and the fix get `budgetUsd` 0.50, which Task 7 accepts; review `ready`, or `fix_rounds_before_pr: 0` → `harvest`; fix succeeded and passing → `verify` round 1; fix failed or refused → `harvest` of the worker's head when no PR exists, or `waiting` with `decision` and `"round <k>'s fix run failed: <its reason>; the PR is unchanged"` (or `"round <k>'s fix run was refused by the host gates: <details>; the PR is unchanged"`) when one does; `harvest` → `pr`; `pr` → `pr-review`, or `waiting` with `fix_rounds_on_pr: 0`; `pr-review` check pending → no change; findings → `pr-fix` (on `prHead`); none → `waiting`; `waiting` with a triage maintainer's `hapi:rework` → `fix` (on the PR's head, from the mirror, `findings.md` holding the maintainers' comments, `reworkRounds` 1, `prHead` the PR's head); the PR merged → `merged`, closed → `closed`, from any PR-time phase; `held` → unchanged. With `phases.verify: false`, gates pass → `review`; with `phases.review: false`, verify passed → `harvest`.
+    - `every transition`, one row each, asserting the phase, the one emitted event and the `StartOptions` (`kind`, `round`, `sha`, `repoGitDir`, `parent`, `budgetUsd`, the `inputsDir` file names, each a `RUN_INPUTS` value, and `retry: 0`, which the engine always passes): `queued` → `worker` (worker, round 0, `mergeSha`, the mirror, `budgetUsd` 3: the order's, within `budgets.run_usd`, no `inputsDir`); worker live → no change, no event; worker `failed`, and worker `timed-out` (two rows) → `failed`, with `reasons[0]` `worker run <id> ended <status>: <its reason>`; gates refuse → `failed` with their details; gates pass → `verify` (round 0, head, the scratch, `parent` the worker's id, no `inputsDir` and no `run.bundle`: the scratch already holds the bundle's commits); verify passed → `review` (`RUN_INPUTS`' `order.json`, `task.md`, `diff.patch` and `verify.json`, no `run.bundle` and no base file, `parent` the worker's id, `budgetUsd` `Math.min(3, phases.round_usd)`); verify failed (check, smoke or acceptance) → `harvest`; review `needs-work` with no PR → `fix` (round 1, the head, the scratch, `findings.md` alone, each finding in `quoteUntrusted` naming its `severity` and `path`, `budgetUsd` `Math.min(3, phases.round_usd)`); with the order's `budget.usd` 0.50, below `round_usd`, the review and the fix get `budgetUsd` 0.50, which Task 7 accepts; review `ready`, or `fix_rounds_before_pr: 0` → `harvest`; fix succeeded and passing → `verify` round 1; fix failed, timed out or refused → `harvest` of the worker's head when no PR exists, or `waiting` with `decision` and `"round <k>'s fix run ended <status>: <its reason>; the PR is unchanged"` (or `"round <k>'s fix run was refused by the host gates: <details>; the PR is unchanged"`) when one does; `harvest` → `pr`; `harvest` finding `factory/<id>`'s PR closed → `pr` with that PR, then `closed` on the next advance, with no push and no `start`; `pr` → `pr-review`, or `waiting` with `fix_rounds_on_pr: 0`; `pr-review` check pending → no change; findings → `pr-fix` (on `prHead`); none → `waiting`; `waiting` with a triage maintainer's `hapi:rework` → `fix` (on the PR's head, from the mirror, `findings.md` holding the maintainers' comments, `reworkRounds` 1, `prHead` the PR's head); the PR merged → `merged`, closed → `closed`, from any PR-time phase; `held` → unchanged. With `phases.verify: false`, gates pass → `review`; with `phases.review: false`, verify passed → `harvest`.
     - `advance resumes a work order after a crash between phases without a second run or PR` (Review Focus 1): saved state at `worker`, the worker run succeeded; `advance` starts the verify run; then, from the saved state again (the crash lost the new one), `advance` → `verify` with that run's id once in `runs` and `start` called once; the same at `harvest` → one `"POST /pulls"` in `writes(ff)`, then `"PATCH /pulls/1"` on the replay, and one PR in `ff.prs`.
     - `an operator action during an automatic fix run wins, and a moved head is never overwritten` (Review Focus 3): in `pr-fix` with the run live, a comment by `OPERATOR` (`ff.comment(1, OPERATOR, "taking this")`) → `waiting`, verdict `decision`, reason `"the operator acted during the automatic fix round (commented on #1): its result is not pushed"`, `lastHumanAt` the comment's time, `autoRounds` 0, and no `start` or `pushBranch` call on later advances once the run finishes; a label by the operator (`labeled #1 <label>`) and the branch moving to `h9` (`ff.push("factory/0001-skeleton", h9)`; `factory/0001-skeleton moved to <h9 short>`) the same; a close → `closed`; a `hapi:rework` label during the round → `waiting`, then a rework on the next advance; in a rework chain the branch moving before harvest → no `pushBranch`, `decision`, Task 12's moved reason.
     - `a run whose budget would cross the repo's monthly cap is not started, and the status comment says so` (Review Focus 5): `queued`, month spend $14.00, `repo_monthly_usd` 15, budget $3.00 → `cap-stopped`, no `start`, the event's `reason` the cap text; with `now` moved to 2026-11-01 → `worker`; mid-pipeline, month spend $14.50 and the review's budget $1.00 (`Math.min(3, round_usd)`), the review is blocked: the phase stays `review` with the reason, and the run starts once the cap clears.
     - `the automatic-round cap counts runs since the last human action`: with `fix_rounds_on_pr: 2`, the worker, a pre-PR fix and a PR fix make `autoRounds` 3, and the second PR fix is refused → `waiting` with `autoRoundsProblem`'s text; starting a rework sets it to 0 and `lastHumanAt` to the label's time.
-- [ ] **Step 2: Run them to see them fail.** Run `bun test tests/engine/state.test.ts tests/engine/caps.test.ts tests/engine/coderabbit.test.ts tests/engine/pipeline.test.ts`. Expected: FAIL, `Cannot find module '../../src/engine/caps'` (and `statePath` not exported).
-- [ ] **Step 3: Implement.**
-  - **State files:** `readState` checks every Shared-types field's type and `phase` against the fifteen, throwing `<path> is not a work order's state: <field>`; `writeState` and `listStates` follow `writeRecord` and `listRecords` (`listStates` reads `orders/<owner>/<name>/*.json`, or every repo's dir when `repo` is undefined, sorted by repo then id). `newState` sets `verdict: "decision"` only when held, so a held work order reads as "Needs your decision" from its first tick.
+    - `an operator's hapi run stop ends the work order's automatic work: with no PR it fails, with a PR it waits, and nothing is pushed`. Each ended run has status `stopped` and reason `` stopped by `hapi run stop` ``:
+      - the worker W0 → `failed`, with `reasons[0]` `` worker run <W0> ended stopped: stopped by `hapi run stop` ``;
+      - before any PR, a fix F1 (W0 succeeded, its gates pass) → `failed` with `` fix run <F1> ended stopped: … ``, never `harvest`; a verify V0 → `failed` with `` verify run <V0> ended stopped: … ``, and the same for a review R0;
+      - with PR #1, a PR fix in round 1 → `waiting`, verdict `decision`, reason `` round 1's fix run ended stopped: stopped by `hapi run stop`; the PR is unchanged ``; the same for a verify in round 1;
+      - in every case: no `pushBranch` call, no `"POST /pulls"` in `writes(ff)`, and no `start` on later advances;
+      - `timed-out` is unchanged: a pre-PR fix that ended `timed-out` → `harvest` of the worker's head, as a failed one. That is an automatic timeout: a `hapi run stop` at or after the deadline records `stopped` (Task 7).
+    - `a hand run's record never becomes the engine's worker`: seed a `succeeded` worker record with no `retry`, keyed `runKey(id, mergeSha)`, as `hapi run start` would make it. Then `queued` → `worker`: `start` is called once, with `retry: 0`, its record keyed `runKey(id, mergeSha, "worker:0")`, and the hand run's id is not in `runs`.
+    - `a worker that ended timed-out fails the work order, so its repo's queue moves`: `worker` with W0 finished `timed-out` (reason `the run passed its deadline`) → `failed`, with `reasons[0]` `worker run <W0> ended timed-out: the run passed its deadline`. `failed` isn't in Task 14's `ACTIVE`, so the repo's next queued order can start, and the tick never advances it again (it is `SETTLED`).
+    - `a retried work order runs a fresh pass keyed retry<n>, never reusing the failed pass's runs`, one row per way into `failed`, each starting from `retryState(<the failed state>, at).state`:
+      1. W0 ended `failed` → `advance` → `worker`. `start` is called once, with `{ kind: "worker", round: 0, retry: 1, sha: mergeSha, repoGitDir: <the mirror> }` and no `retryOf`; `runs` is `[W0, W1]` and `autoRounds` 1.
+      2. W0 `succeeded` and the gates refused its bundle → the same, although `runKey(id, mergeSha, "worker:0")` holds a succeeded record.
+      3. The pass-0 harvest gave no PR (the gates refused the harvested head). Then, on retry 1: verify's `parent` is W1, and review is keyed `runKey(id, <W1's head>, "review:0:retry1")`; with `fix_rounds_before_pr: 1` and pass 0 already holding one fix, a `needs-work` review still starts a fix, round 1, keyed `fix:1:retry1`, its inputs dir `fix-1-retry1/`; and that fix is staged `before-pr`, although pass 0's runs carry `harvestedAt`.
+      - A replay from the saved `queued` state at retry 1, after W1 started (the crash lost the new `worker` state), → `worker` with W1 once in `runs`, and `start` called once in total.
+    - `a retried work order's spend still counts toward the repo's month`: pass 0's runs are finished records started 2026-10-02T00:00:00.000Z, earlier this month, so the day's sum (`daily_usd` 10) doesn't count them. They spend $12.50 in all, `repo_monthly_usd` is 15 (as Review Focus 5's test sets it), and the worker's budget is $3.00 (`Math.min(3, budgets.run_usd)`). After the retry, `advance` → `cap-stopped`, with no `start` and the reason `this month's spend on example-owner/sandbox ($12.5000) plus the run's budget ($3.0000) would pass budgets.repo_monthly_usd ($15.00): no new run for it until 2026-11-01`.
+- [ ] **Step 2: Run them to see them fail.** Run `bun test tests/engine/state.test.ts tests/engine/caps.test.ts tests/engine/coderabbit.test.ts tests/engine/pipeline.test.ts tests/policy/load.test.ts tests/policy/overlay.test.ts tests/run/view.test.ts`. Expected: FAIL, `Cannot find module '../../src/engine/caps'` (and `statePath` not exported), plus `max_retries` and the kept run.
+- [ ] **Step 3: Implement.** One definition first: **the current pass** is the runs in `s.runs` whose record's `retry ?? 0` equals `s.retry`. Every engine record carries `retry` (Task 7), so the `?? 0` only spares test seeds that leave it out, and no hand run is ever in `s.runs`. Every rule below that says "the pass" means these runs.
+  - **State files:** `readState` checks every Shared-types field's type and `phase` against the fifteen, throwing `<path> is not a work order's state: <field>`; `writeState` and `listStates` follow `writeRecord` and `listRecords` (`listStates` reads `orders/<owner>/<name>/*.json`, or every repo's dir when `repo` is undefined, sorted by repo then id). `newState` sets `verdict: "decision"` only when held, so a held work order reads as "Needs your decision" from its first tick. `readState` checks that `retry` is a whole number of at least 0, `newState` sets `retry: 0`, and `transition` puts `retry: s.retry` on its event when it is at least 1.
+  - **`retryProblem(s, maxRetries)`**, in order, each giving Step 1's text, else `undefined`; it reads nothing but its arguments:
+    1. `phase` isn't `failed`;
+    2. `pr` is set (a failed state never has one today; this keeps a retry from ever pushing to a PR's branch);
+    3. `s.retry` is at least `maxRetries`. Always hard, like the round counts: `budgets.enforcement.poller` never softens it.
+  - **`retryState(s, at)`.** The state is `{ ...s, phase: "queued", retry: s.retry + 1, autoRounds: 0, reasons: [], updatedAt: at }`, without `verdict` and `prHead`, and the event is Step 1's.
+    - `updatedAt` puts the order at the back of its repo's queue, so it takes a fair turn; `runs` keeps every pass's runs, so their spend still counts.
+    - `reworkRounds` stays as it is: it rises only on a PR, so it is 0 on any state a retry accepts, and resetting it could hide `hapi:flagged`'s rework threshold if that ever changed.
+    - `lastHumanAt` stays as it is: it means the operator acted on the PR, and setting it would switch off the next pass's CodeRabbit round.
+    - `autoRounds` restarts at the retry, a human action, so a work order makes at most `max_auto_rounds` automatic worker and fix runs per pass, and `max_retries + 1` passes: 9 such runs at the defaults.
+    - Only Task 14's `retryCommand` calls it: nothing retries on its own.
   - **Caps:**
     - The month and the day are UTC calendar ones, taken from each record's `startedAt`.
-    - The repo's spend sums the runs that the repo's states list (`listStates(engineDir, repo)`). The day's spend sums every record in `d.run.stateDir`.
+    - The repo's spend sums the runs that the repo's states list (`listStates(engineDir, repo)`), every pass's. The day's spend sums every record in `d.run.stateDir`. A record that retention has removed is skipped (`readRecord` returns `undefined`), never thrown on: retention never removes a run before the UTC month it started in has ended, so a listed run with no record is from an earlier month and counts toward neither sum.
     - Each run counts `spendOfRun(join(recordDir(stateDir, id), "out"), rec.budgetUsd ?? policy.budgets.run_usd).usd`, which is its budget when the spend isn't known, a live run included.
     - `spent + budgetUsd > cap` trips the cap, and `policy.budgets.enforcement.poller` chooses `refuse` or `warn`. Money prints `$` with four decimals, caps with two.
+  - **Retention** (`reapRuns`, `src/run/lifecycle.ts:656-667`): a run is removed only when, as now, it isn't live and its `harvestedAt` is more than `retention_days` ago, and also its `startedAt` parses to a time before `Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)`. Anything else keeps it. The module comment (:70-73) gains why: the poller's monthly cap reads every run of the month from its record.
   - **Starting a run** (`ensureRun`, private):
-    - The key is `runKey(id, sha)` for the worker, else `runKey(id, sha, "<kind>:<round>")`. A record with that key (newest by `startedAt`) is the step's run: it is added to `runs` if missing, and nothing starts.
+    - The key is `runKey(id, sha, keyPart(kind, round, s.retry))`, so `worker:0` on the first pass. A record with that key (newest by `startedAt`) is the step's run: it is added to `runs` if missing, and nothing starts.
     - Else `capProblem` with the run's budget (`Math.min(order.budget.usd, budgets.run_usd)` for the worker, `Math.min(order.budget.usd, phases.round_usd)` for review and fix, so Task 7 never refuses it as above the order's, and 0 for verify), then `autoRoundsProblem(s, runs.max_auto_rounds)` for a worker or automatic fix. `phases` is the overlaid policy's (`policyOf`).
     - A `refuse` keeps the phase (`queued` → `cap-stopped`; `cap-stopped` retries each tick) with the reason, emitted only when it changed. A `warn` starts the run and puts the text in the event.
-    - Then, for a review or fix run only, the inputs dir `<engineDir>/inputs/<owner>/<name>/<id>/<kind>-<round>/` (0755, files 0644), then `d.start({ repoGitDir, workOrder, taskMd, sha, public: d.public, kind, parent: <the worker run's id>, round, budgetUsd, overlay, inputsDir })` (no `inputsDir` for a worker or verify run), then `autoRounds + 1` for a worker or automatic fix.
+    - Then, for a review or fix run only, the inputs dir `<engineDir>/inputs/<owner>/<name>/<id>/<kind>-<round>/` (`<kind>-<round>-retry<n>/` from the first retry on; 0755, files 0644), then `d.start({ repoGitDir, workOrder, taskMd, sha, public: d.public, kind, parent: <the pass's worker run's id>, round, retry: s.retry, budgetUsd, overlay, inputsDir })` (`retry` always, 0 included, and never `retryOf`; no `inputsDir` for a worker or verify run), then `autoRounds + 1` for a worker or automatic fix.
     - A throw from `start` other than `lockHeld` keeps the phase, with its text as the reason. `lockHeld` propagates, and the tick retries.
   - **Inputs**, named by Task 8's `RUN_INPUTS` (no names of this task's own):
     - verify gets no inputs dir and no `run.bundle`: its source, the scratch, already holds the bundle's commits;
@@ -2884,16 +3000,20 @@ The persisted state machine that moves one work order from merged to settled, on
     - a fix gets `RUN_INPUTS.findings` alone.
   - **Sources and heads:**
     - The worker starts on `mergeSha` from `mirrorPath`.
-    - Verify, review and fixes start from `scratchPath` on the current head. With no PR, that is the head of the newest succeeded worker or fix run whose `d.gates` pass. With a PR, it is only the newest fix run's head (its chain's own), so a fix the operator overtook is never harvested later.
+    - Verify, review and fixes start from `scratchPath` on the current head. With no PR, that is the head of the pass's newest succeeded worker or fix run whose `d.gates` pass. With a PR, it is only the pass's newest fix run's head (its chain's own), so a fix the operator overtook is never harvested later.
     - A rework starts from the mirror on the PR's `headSha` (Task 14 fetched `factory/*`) and sets `prHead` to it.
-    - Rounds: the worker is 0, the k-th fix is k, and verify and review take the round of the head they check.
+    - Rounds: the worker is 0, the pass's k-th fix is k, and verify and review take the round of the head they check. "The worker run", every later run's parent, is the pass's.
+  - **Every pass, on purpose** (what the work order cost): `HarvestInput.runs` (the PR's Links, and Cost and turns), `hapi:flagged`'s summed spend, the status row's cost and the repo's month read every run in `s.runs`; the day reads every record, as before. `HarvestInput.rounds` (the PR's "Review rounds") reads the pass only: an earlier pass that never had a PR isn't part of the PR's history.
   - **Routing:**
+    - **A stopped run, of any kind**, ends the work order's automatic work; this rule comes first. `stopped` comes only from `hapi run stop`, which Task 7 lets outrank the deadline. With no PR the work order goes to `failed` with `<kind> run <id> ended stopped: <its reason>`; with a PR, to `waiting`, verdict `decision`, with `round <k>'s <kind> run ended stopped: <its reason>; the PR is unchanged`. It never reaches `harvest`, a push or another run, unless a maintainer's `hapi:rework` label is pending on its PR, which `waiting` still starts.
+    - **A worker** that ended `failed` or `timed-out` → `failed` with `worker run <id> ended <status>: <reason ?? "no reason recorded">`. Otherwise it would sit in `worker`, an `ACTIVE` phase, holding its repo's queue where `hapi retry` can't reach it.
+    - A verify or review that ended `failed` or `timed-out` is routed as now: its reader turns a missing output into `broken` or `none`.
     - After verify: `review` when `verifyResult` ran with nothing `failed` (check, smoke and acceptance) and `phases.review` is on, else `harvest`.
-    - After review with no PR: a fix when the review says `needs-work` or the CLI has a `critical` or `major` finding, and fewer than `fix_rounds_before_pr` fixes ran; else `harvest`.
-    - After a fix that failed or was refused: `harvest` with no PR, else `waiting` (the texts above).
+    - After review with no PR: a fix when the review says `needs-work` or the CLI has a `critical` or `major` finding, and fewer than `fix_rounds_before_pr` of the pass's fixes ran; else `harvest`.
+    - After a fix that failed, timed out or was refused: `harvest` with no PR, else `waiting` (the texts above).
     - After `harvest`: a state with no `pr` → `failed` with its reasons, else `pr`.
   - **Stages, from the records:**
-    - The first harvest is the earliest `harvestedAt` among the work order's runs. Fix runs started before it are `before-pr`. After it, the newest `reworkRounds` fix runs are `rework` and the rest `on-pr` (no automatic round runs once a human acted).
+    - The first harvest is the earliest `harvestedAt` among the pass's runs. Fix runs started before it are `before-pr`. After it, the newest `reworkRounds` fix runs are `rework` and the rest `on-pr` (no automatic round runs once a human acted).
     - `pr` → `pr-review` only when `on-pr` rounds < `phases.fix_rounds_on_pr`, `lastHumanAt` is unset, `reworkRounds` is 0 and `othersOnPr` is undefined. A review once a PR exists goes to `harvest`.
   - **At the top of every PR-time phase** (`pr`, `pr-review`, `pr-fix`, `waiting`, and `verify`, `review`, `harvest` once a PR exists):
     - `forge.pr(s.pr)`: merged → `merged`, closed → `closed`.
@@ -2918,7 +3038,11 @@ The persisted state machine that moves one work order from merged to settled, on
   - the caps and their texts;
   - the CodeRabbit round's filters, and what turns it off;
   - rework by label: who may ask, and what the run is given;
-  - that the operator's action always wins.
+  - that the operator's action always wins;
+  - in the phase table's `failed` row: what leads there (a worker that failed, timed out or was stopped; refused gates; a harvest with nothing to push; any run stopped before the PR); that a `hapi run stop` of a live run ends the work order's automatic work (`failed` with no PR, `waiting` with one), even past its deadline, while a stop after the run has ended changes nothing (runs.md's "`hapi run stop`"); that a retry is a fresh pass from the worker at the same merge commit, its keys naming the retry; and a link to Task 15's Troubleshooting row;
+  - in the caps text, one line: a run's record is kept until its month is over, because the monthly cap reads it.
+
+  Also `docs/runbooks/runs.md`, "Retention": a run's directory is deleted once its `harvestedAt` is more than `retention_days` ago and the UTC month it started in has ended, because the poller's monthly cap reads it; "nothing is deleted in Plan 02" goes into the past tense, since the harvester sets `harvestedAt`. `docs/policy.md`: the `retention_days` row says the same, and the `max_retries` rows of the policy key above.
 
   Add two deferrals to `handoffs.md` under `## Plan 03 Run engine`, each with the next free H-id:
   - (a) The PR round doesn't yet drop a finding that the in-run fix round declined, and doesn't end when a declined finding is raised again. A finding has no stable id, so this needs a fingerprint on file, title and lines.
@@ -2927,7 +3051,11 @@ The persisted state machine that moves one work order from merged to settled, on
 - [ ] **Step 7: Commit** (when the operator asks; the personal-strings check on the staged diff and the message first).
 
 ```bash
-git add src/engine/state.ts src/engine/caps.ts src/engine/coderabbit.ts src/engine/pipeline.ts tests/engine/helpers.ts tests/engine/state.test.ts tests/engine/caps.test.ts tests/engine/coderabbit.test.ts tests/engine/pipeline.test.ts docs/runbooks/engine.md docs/superpowers/plans/handoffs.md
+git add src/engine/state.ts src/engine/caps.ts src/engine/coderabbit.ts src/engine/pipeline.ts src/policy/types.ts src/run/lifecycle.ts \
+  policy/runs.yaml policy/schemas/policy-runs.schema.json \
+  tests/engine/helpers.ts tests/engine/state.test.ts tests/engine/caps.test.ts tests/engine/coderabbit.test.ts tests/engine/pipeline.test.ts \
+  tests/policy/load.test.ts tests/policy/overlay.test.ts tests/run/helpers.ts tests/run/view.test.ts \
+  docs/policy.md docs/runbooks/engine.md docs/runbooks/runs.md docs/superpowers/plans/handoffs.md
 git commit -m "feat(engine): the work order's state machine, the caps, the CodeRabbit round and rework (H-166(c), H-183(c))"
 ```
 
@@ -2942,7 +3070,7 @@ This task makes the factory start itself (design §3.4). `hapi poll` runs every 
 - checks every open factory PR;
 - fails that repo's tick closed on any forge error (Review Focus 4).
 
-The task also adds the status view (§3.8): `events.jsonl`, a status comment on the planning PR that is edited in place, and `hapi status`. And it puts the timer into `up`, `down` and kill switch 3. A tick writes to GitHub only through Task 13's `advance` and the status comment.
+The task also adds the status view (§3.8): `events.jsonl`, a status comment on the planning PR that is edited in place, and `hapi status`. And it puts the timer into `up`, `down` and kill switch 3. A tick writes to GitHub only through Task 13's `advance` and the status comment. It also adds `hapi retry <owner>/<name> <id>` (the operator's call of 2026-11-01, m19): from the operator's own terminal, it puts a `failed` work order with no PR back at the end of its repo's queue, under the poll lock, and a later tick starts its next pass. It reads only hapi's local state and the central policy.
 
 **Protected (ask first):** none. The units are generated into `build/systemd/`, and the service runs the existing `hapi` mise task.
 
@@ -2965,6 +3093,7 @@ The task also adds the status view (§3.8): `events.jsonl`, a status comment on 
   - `docs/generated-configs.md`
   - `docs/runbooks/stack.md` §4
   - `docs/runbooks/kill-switches.md` (:9, 3a, 3b, the Stops bullet)
+  - `docs/runbooks/runs.md` (`hapi retry` beside `--retry-of`, and the poller's runs under "`hapi run stop`")
   - `docs/superpowers/plans/handoffs.md`
 
 **Interfaces:**
@@ -2977,14 +3106,15 @@ The task also adds the status view (§3.8): `events.jsonl`, a status comment on 
   - **Task 12:** `runGates` and `push`. In tests, `ORDER` (tests/engine/helpers.ts).
   - **Task 13:**
     - `advance(d, s, order)` and `PipelineDeps`;
-    - from state.ts, `newState` (a held state gets `verdict: "decision"`), `writeState`, `listStates(engineDir, repo?)` and `withOrderLock(engineDir, s, env, fn)`;
+    - from state.ts, `newState` (a held state gets `verdict: "decision"`), `readState`, `writeState`, `listStates(engineDir, repo?)`, `withOrderLock(engineDir, s, env, fn)`, and `WORK_ORDER_ID`, `retryProblem` and `retryState`;
     - its caller's contract: the poller holds `withOrderLock`, calls `advance`, then `writeState`s what it returns, only on success;
-    - `advance` reports each transition through the injected `emit`. Here `emit` only collects, and the poller appends what it collected to `events.jsonl` after the write. So the poller is the file's only writer, and nothing appends a separate per-phase event.
+    - `advance` reports each transition through the injected `emit`. Here `emit` only collects, and the poller appends what it collected to `events.jsonl` after the write. So only the holder of the poll lock writes the file (a tick, or `hapi retry`), and nothing appends a separate per-phase event.
   - **Existing code:**
     - `readRecord`, `recordDir` and `lockHeld` (records.ts:89, :78, :223)
     - `reapRuns` (lifecycle.ts:546), `runDeps` (run/cli.ts:159) and `withStoreLock` (store-files.ts:247)
     - `parseOwnerRepo` (app-token.ts:317)
-    - `sanitizeTerminal`, `redactSecrets`, `applyOverlay`, `notice`, `hashComment`, `currentUserOverride`, `definedEnv`, `HAPI_CHECKOUT` and `HAPI_MISE`
+    - `sanitizeTerminal`, `redactSecrets`, `applyOverlay`, `loadPolicy`, `notice`, `hashComment`, `currentUserOverride`, `definedEnv`, `HAPI_CHECKOUT` and `HAPI_MISE`
+    - in tests, `matchCommand` (`src/policy/commands.ts:113`)
 - Produces:
   ```ts
   // src/engine/poll.ts (TokenPurpose is Task 3's; newState, writeState, listStates and withOrderLock are Task 13's)
@@ -3002,13 +3132,14 @@ The task also adds the status view (§3.8): `events.jsonl`, a status comment on 
   export interface RepoTick { repo: string; created: string[]; moved: string[]; comments: string[]; problems: string[]; error?: string }
   export interface TickReport { skipped?: string; reap?: string; repos: RepoTick[] }
   export function pollTick(d: PollDeps): Promise<TickReport>;  export function formatTick(r: TickReport): string[];
+  export function withPollLock<T>(engineDir: string, env: Env, fn: () => Promise<T>): Promise<T>; // withStoreLock(engineDir, "poll", fn, { env: definedEnv(env) }); pollTick's step 1 holds it, and so does hapi retry
   // src/engine/status.ts; StatusMark is status/<owner>/<name>/<planning-pr>.json
   export const VERDICT_TEXT: Record<Verdict, string>; // "Ready to merge", "Needs your decision", "Do not merge"
   export interface StatusRow { state: WorkOrderState; usd: number; known: boolean }  export interface StatusMark { commentId: number; sha256: string; final: boolean }
   export function rowsOf(stateDir: string, states: WorkOrderState[], runUsd: number): Promise<StatusRow[]>;  export function appendEvent(engineDir: string, e: StatusEvent): Promise<void>;
   export function renderStatus(rows: StatusRow[], caps: { monthlyUsd: number; dailyUsd: number }, problems: DiscoverProblem[]): string;  export function renderFinal(rows: StatusRow[]): string;
   export function statusTable(rows: StatusRow[]): string;
-  export function upsertStatusComment(forge: Forge, planningPr: number, body: string, finalBody: string | undefined, file: string): Promise<string[]>;
+  export function upsertStatusComment(forge: Forge, planningPr: number, body: string, finalBody: string | undefined, file: string, settled: boolean): Promise<string[]>; // settled: there is a row and every row is SETTLED
   // src/engine/cli.ts (engineDirOf is Task 6's)
   export const POLL_USAGE = "usage: hapi poll [--once]";  export const STATUS_USAGE = "usage: hapi status [<owner>/<name>]";
   export function pipelineDepsOf(run: RunDeps, policy: Policy, engineDir: string, repo: string, t: Tick, emit: PipelineDeps["emit"]): Promise<PipelineDeps>;
@@ -3016,6 +3147,8 @@ The task also adds the status view (§3.8): `events.jsonl`, a status comment on 
   export function pollDeps(run: RunDeps, over?: Partial<PollDeps>): Promise<PollDeps>;
   export function pollCommand(args: string[], deps?: { run?: Partial<RunDeps>; poll?: Partial<PollDeps>; sleep?: (ms: number) => Promise<void> }): Promise<number>;
   export function statusCommand(args: string[], deps?: { run?: Partial<RunDeps>; engineDir?: string }): Promise<number>;
+  export const RETRY_USAGE = "usage: hapi retry <owner>/<name> <work-order-id>";
+  export function retryCommand(args: string[], deps?: { run?: Partial<RunDeps>; engineDir?: string }): Promise<number>;
   // src/generate/systemd.ts, src/run/lifecycle.ts, src/stack/up.ts
   export function emitSystemd(p: Policy): Record<string, string>; // "hapi-poll.service", "hapi-poll.timer"
   export function asHapi(words: readonly string[], args: string[], partial: Partial<RunDeps>, body: (d: RunDeps) => Promise<number>): Promise<number>;
@@ -3039,7 +3172,7 @@ The task also adds the status view (§3.8): `events.jsonl`, a status comment on 
     - No event is written, and `second` has no `error`.
     - A second tick sends requests again (the world's `calls` grows), and the bytes still don't change.
   - `a tick with nothing to do makes no forge write`. There is one `merged` state, and its status mark is current (`final: true`, with the `sha256` of the body the tick renders). Then: no world records a call, the mints are exactly `[{ purpose: "mirror", revoked: true }]`, the mark's bytes are unchanged, and no event is written.
-  - `a newly merged work order gets a queued state with its planning PR, and one event`. The state is `{ phase: "queued", planningPr: 3, runs: [], autoRounds: 0, reworkRounds: 0, reasons: [] }`. The event is `{ repo, workOrder, phase: "queued", at }`. A second tick creates nothing, and its `discover` was given `known` holding the new id.
+  - `a newly merged work order gets a queued state with its planning PR, and one event`. The state is `{ phase: "queued", planningPr: 3, runs: [], autoRounds: 0, reworkRounds: 0, retry: 0, reasons: [] }`. The event is `{ repo, workOrder, phase: "queued", at }`. A second tick creates nothing, and its `discover` was given `known` holding the new id.
   - `two work orders of one merge whose pieces overlap are both held, each with the overlap reason`. Each is `held`, with `verdict: "decision"` (Task 13's `newState`) and `reasons[0]` from `overlapProblem`. A recording `advance` never sees either.
   - `one pipeline per repo: a queued work order waits while another is in verify, a cap-stopped one heads the queue, and the oldest queued one starts when none is active`:
     - With `0001` in `verify` and `0002` queued, a recording `advance` sees only `0001`.
@@ -3052,10 +3185,12 @@ The task also adds the status view (§3.8): `events.jsonl`, a status comment on 
   - `a work order that can't be read is a problem in the tick report and its planning PR's status comment, and is never advanced`:
     - `o.problems` gives the sandbox `{ path: ".factory/work/0004-bad/order.yaml", reason: "invalid YAML: bad indentation" }`. No state is written for `0004-bad`, the repo's `problems` is `[".factory/work/0004-bad/order.yaml: invalid YAML: bad indentation"]`, and planning PR #3's comment holds that problem's row.
     - A stated `0001` in `pr` whose `readOrder` throws (`o.unreadable`) is the same: a problem naming `.factory/work/0001-skeleton-and-crack-cookie/order.yaml`, and the recording `advance` never sees it.
-  - `a tick while another holds the poll lock skips and touches nothing`: the report is `{ skipped: "another tick holds the poll lock", repos: [] }`, with no mint.
+  - `a tick while another holds the poll lock skips and touches nothing`: with the lock taken by `withPollLock(engineDir, run.env, …)`, the report is `{ skipped: "another tick holds the poll lock", repos: [] }`, with no mint.
+  - `a retried work order waits its turn in the queue`: with `0001` in `retryState(<failed 0001>, t2).state` and `0002` queued at `t1 < t2`, a recording `advance` sees only `0002`; with `0002` merged, it then sees only `0001`.
   - **`status.test.ts`.** `the status comment is one row per work order, the plan's total against the caps, a hidden marker, and no checkbox`. The rows are:
     - `0001-skeleton-and-crack-cookie`: `waiting`, `ready`, runs `ab12cd34ef56` then `cd34ef56ab12`, `autoRounds: 2`, `pr: 12`, $1.234, known;
-    - `0002-search-fortunes`: `held`, `decision`, `reasons: ["pieces overlap 0003-fortune-of-the-day: src/tools/index.ts"]`, no run or PR, $0.
+    - `0002-search-fortunes`: `held`, `decision`, `reasons: ["pieces overlap 0003-fortune-of-the-day: src/tools/index.ts"]`, no run or PR, $0;
+    - `0003-fortune-of-the-day`: `queued`, `retry: 1`, runs `ef56ab12cd34`, no PR, $0.40, known.
 
     With caps `{ monthlyUsd: 15, dailyUsd: 10 }` and no problems (`[]`), `renderStatus` returns exactly:
     ```text
@@ -3066,20 +3201,33 @@ The task also adds the status view (§3.8): `events.jsonl`, a status comment on 
     |---|---|---|---|---|---|
     | `0001-skeleton-and-crack-cookie` | waiting: Ready to merge | `cd34ef56ab12` | #12 | 2 automatic, 0 rework | $1.23 |
     | `0002-search-fortunes` | held: Needs your decision (pieces overlap 0003-fortune-of-the-day: src/tools/index.ts) | — | — | 0 automatic, 0 rework | $0.00 |
+    | `0003-fortune-of-the-day` | queued | `ef56ab12cd34` | — | 0 automatic, 0 rework, retry 1 | $0.40 |
 
-    Total: $1.23, against this repo's cap of $15.00 a month and $10.00 a day for all repos. The poller edits this comment in place; `hapi status` shows the same.
+    Total: $1.63, against this repo's cap of $15.00 a month and $10.00 a day for all repos. The poller edits this comment in place; `hapi status` shows the same.
     ```
   - `a reason can't break the table`: `a|b\nc` renders as `a\|b c`.
   - `an unknown spend shows the budget it counts at`: the cell reads `$2.00 (budget: spend unknown)`.
   - `a work order that can't run gets a row in a second table`. With the problem `{ path: ".factory/work/0004-bad/order.yaml", reason: "invalid YAML: bad | indentation" }`, the body gains, after the first table and a blank line, `**Can't run** (fix each in a new planning PR)`, `| Work order file | Why |`, `|---|---|` and `` | `.factory/work/0004-bad/order.yaml` | invalid YAML: bad \| indentation | ``. With no rows, the first table is left out.
-  - `the status comment is created once, then edited only when its body changes`. Over `githubForge` and a `fakeForge()` world holding planning PR #3, the first upsert sends one `POST …/issues/3/comments`. The mark is `{ commentId: 1000, sha256, final: false }` (the world's first id), with mode 0600. The same body sends no request; a new body sends one `PATCH …/issues/comments/1000`.
-  - `once every work order has settled, and no problem is open, one final comment is posted, and never again`.
+  - `the status comment is created once, then edited only when its body changes`. Over `githubForge` and a `fakeForge()` world holding planning PR #3, with `settled` false on each call, the first upsert sends one `POST …/issues/3/comments`. The mark is `{ commentId: 1000, sha256, final: false }` (the world's first id), with mode 0600. The same body sends no request; a new body sends one `PATCH …/issues/comments/1000`.
+  - `once every work order has settled, and no problem is open, one final comment is posted, and none again until a work order leaves the settled phases`:
+    - with every row settled, one `POST …/issues/3/comments` of the final body, and the mark's `final` is true;
+    - the row back in `queued`, as `hapi retry` leaves it: a `PATCH` of the status comment, no `POST`, the mark's `final` false, and `reopened` among the actions;
+    - settled again: exactly one more final `POST`; another tick: none.
+  - `a problem after the final comment reopens nothing`: every row settled and the final comment posted, then a problem appears: the status comment is edited, the mark stays `final: true`, and `reopened` isn't among the actions. When the problem clears, no second final comment is posted.
   - `hapi status prints the rows from local state only, sanitized`: a `\x1b[2J` in a reason is stripped, and `fakeRun` records no call.
   - **`cli.test.ts`:**
     - `hapi poll --once runs one tick, and exits 1 only when a repo failed`.
     - `hapi poll ticks again every runs.poll_interval_s`: `sleep` records `120000`, then throws.
-    - `usage errors exit 2 and run nothing`: `poll --twice`, `status a/b c/d` and `status x`.
-    - `as another user, hapi poll re-execs as hapi`, with the argv `["sudo","-u","hapi","-H","--","sh","-c",reexecScript("hapi"),"hapi-stack","poll","--once"]`.
+    - `usage errors exit 2 and run nothing`: `poll --twice`, `status a/b c/d` and `status x`; and `retry`, `retry a/b`, `retry a/b 0001-x extra`, `retry notarepo 0001-x`, `retry a/.. 0001-x`, `retry a/b ../x`, `retry a/b 0001-X` and an 81-character id, each printing `RETRY_USAGE` with no re-exec.
+    - `as another user, hapi poll re-execs as hapi`, with the argv `["sudo","-u","hapi","-H","--","sh","-c",reexecScript("hapi"),"hapi-stack","poll","--once"]`; and `hapi retry` the same, with `"retry","example-owner/hapi-sandbox-fortune","0001-skeleton-and-crack-cookie"` after `"hapi-stack"`.
+    - `hapi retry queues a failed work order under the poll lock, appends one event, and calls no forge or docker`. Seed the sandbox's `0001-skeleton-and-crack-cookie` as `failed` with `reasons: ["worker run 0a0b0c0d0e0f ended failed: preflight exited 1"]`. Then: exit 0; `readState` gives `queued` with `retry` 1; `events.jsonl` has exactly one new line, Task 13's retry event; stdout's line is `hapi retry: example-owner/hapi-sandbox-fortune 0001-skeleton-and-crack-cookie is queued again (retry 1), with 0 of the repo's work orders ahead of it: a poll tick starts its worker at <mergeSha's first 12> once none is ahead and the caps allow`; `fakeRun` records no call, and no token is minted.
+    - `hapi retry counts the work orders ahead of it`: with `0002-search-fortunes` also `queued`, and `0003-fortune-of-the-day` in `pr` with a PR, the line says `with 1 of the repo's work orders ahead of it` (a work order with a PR never holds the queue).
+    - `hapi retry refuses while a tick holds the poll lock, past runs.max_retries, or for anything but a failed work order, and changes nothing`. Each exits 1 with the state file's bytes unchanged and no new line in `events.jsonl`:
+      - inside `withPollLock(engineDir, env, …)`: stderr is `hapi retry: <withStoreLock's text>: run hapi retry again when the tick ends`;
+      - a `waiting` state: `retryProblem`'s text; a second `hapi retry` after a success: `… is queued, not failed …`;
+      - a `failed` state at `retry: 2`: `… has been retried 2 times, and runs.max_retries is 2: …` (the shipped policy's 2; `retryProblem`'s own rows cover 0).
+    - `hapi retry: an unregistered repo or an unknown work order exits 1`: `example-owner/nope` → `example-owner/nope isn't registered in policy/repos.yaml`; `example-owner/hapi-sandbox-fortune 0009-none` → `example-owner/hapi-sandbox-fortune has no work order 0009-none: \`hapi status example-owner/hapi-sandbox-fortune\` lists them`; neither creates the engine dir.
+    - `hapi retry is never in Hermes's allowlist`: with `rules = loadPolicy("policy").commands.hermes.allow`, `matchCommand(rules, ["hapi", "retry", "example-owner/hapi-sandbox-fortune", "0001-skeleton-and-crack-cookie"]).allowed`, `matchCommand(rules, ["hapi", "retry"]).allowed` and the mise form, `matchCommand(rules, ["mise", "run", "hapi", "--", "retry", "example-owner/hapi-sandbox-fortune", "0001-skeleton-and-crack-cookie"]).allowed`, are each `false`. So a later broad `hapi` or `mise` rule in `policy/commands.yaml` fails CI.
     - `pipelineDepsOf binds the repo owner as operator, the repo's visibility, both zones' secrets and the tick's two forges`. For `example-owner/hapi-sandbox-fortune`:
       - `operator` is `example-owner`;
       - `public` is true over a public `fakeForge` world, and false over `fakeForge({ private: true })`;
@@ -3121,11 +3269,13 @@ The task also adds the status view (§3.8): `events.jsonl`, a status comment on 
     - Cells escape `|` and turn newlines into spaces.
     - `renderStatus` puts the problems in a second table after the first (Step 1's text), and leaves the first out when there are no rows.
     - `renderFinal` is `<!-- hapi:status-final v1 -->`, then `This plan has settled: <n> merged, <n> closed, <n> failed. Total: $<x>.`
-    - `upsertStatusComment` writes the mark through a temp file and a rename (0600, directories 0700). It returns its actions (`created`, `edited`, `final`).
+    - `upsertStatusComment` writes the mark through a temp file and a rename (0600, directories 0700). It returns its actions (`created`, `edited`, `final`, `reopened`).
+    - `statusTable`'s Rounds cell is `<a> automatic, <r> rework`, followed by `, retry <n>` when `retry` is at least 1.
+    - With `settled` false and a mark saying `final: true`, `upsertStatusComment` rewrites the mark with `final: false`, makes no forge call for that, and adds `reopened`; the status body is upserted as usual. With `settled` true and `finalBody` `undefined` (a problem is open), the mark is left as it is. So "one final comment" means one each time the plan settles, and an earlier final comment stays as it was.
   - **`emitSystemd`.** It puts `hashComment(notice(…, ["policy/runs.yaml"]))` above each unit. `KillMode=process` gets a comment saying why: startRun's detached `hapi run supervise` processes live in this cgroup, and the default `control-group` mode kills them when the oneshot exits.
   - **`buildAll`.** It gains `["systemd", emitSystemd(p)]`.
 - [ ] **Step 4: Implement `pollTick`.**
-  1. Create `engineDir` (0700), and run the whole tick under `withStoreLock(engineDir, "poll", …)`. A `lockHeld` error returns the skipped report.
+  1. Create `engineDir` (0700), and run the whole tick under `withPollLock(engineDir, d.run.env, …)`. A `lockHeld` error returns the skipped report.
   2. Call `reapRuns(d.run)`. An error from it becomes `report.reap`.
   3. For each repo, in sorted order, build a `Tick`: `token(p)` mints once per purpose, `forge(p)` is `d.forge(repo, await token(p))` (so `pr` and `checks` are two tokens, each with only its purpose's permissions), and `isPublic()` is `!(await (await forge("pr")).repoInfo()).private`, asked at most once. Then, in a `try`:
      1. Call `fetchMirror` with the `mirror` token (its binding runs `ensureMirror` first, so the first tick makes the mirror). Then `listStates(engineDir, repo)` (Task 13's), then `discover(repo, <the ids of those states>, problems)`, so discovery never re-keys a work order that has state.
@@ -3142,7 +3292,7 @@ The task also adds the status view (§3.8): `events.jsonl`, a status comment on 
      6. For each planning PR that the repo's states or problems name, call `upsertStatusComment(await tick.forge("pr"), …)`:
         - The body is `renderStatus(rowsOf(…), caps, <that PR's problems>)`.
         - The caps (`repo_monthly_usd` and `daily_usd`) come from `applyOverlay(policy, overlay).budgets`. The overlay is that of the PR's first state by id, through `readOrder` (memoized in the tick; one planning PR's work orders share its merge commit, so they share one `.factory/config.yaml`). They come from the central policy when the PR has no state or the read throws.
-        - The final body is `renderFinal` once there is a row, every row is `SETTLED`, and the PR has no problem.
+        - The final body is `renderFinal` once there is a row, every row is `SETTLED`, and the PR has no problem; `settled` is passed as there is a row and every row is `SETTLED`.
 
      The `catch` sets `error` to the message's first line, passed through `redactSecrets` with the repo's tokens, and stops work on that repo.
 
@@ -3175,7 +3325,16 @@ The task also adds the status view (§3.8): `events.jsonl`, a status comment on 
     - `discover` to `discoverWorkOrders(md, repo, known, problems)`, `readOrder` to `readWorkOrder(md, repo, id, mergeSha)`, and `planningPr` to `planningPrOf(md, repo, mergeSha)`;
     - `problemPr` to the first line of Task 6's first-adding `log --first-parent --diff-merges=first-parent --diff-filter=A --format=%H --reverse refs/heads/main -- <path>` (through `hardenedGit` on `mirrorPath`), then `planningPrOf`, or `undefined` when there is none;
     - `advance` to `engineAdvance`.
-  - **Registration.** `register("poll", …)` and `register("status", …)`.
+  - **`retryCommand`.** Usage first: it exits 2 and prints `RETRY_USAGE`, before any re-exec, unless there are exactly two arguments, the first accepted by `parseOwnerRepo` and the second matching `WORK_ORDER_ID` within 80 characters. Then `asHapi(["retry"], …)`; a throw prints `hapi retry: <message>` and exits 1. In order:
+    1. The registry check, with `statusCommand`'s lookup and text, before any path is built.
+    2. `withPollLock(engineDir, d.env, …)`. It fails at once while a tick holds it, and that `lockHeld` error is rethrown as `<its text>: run hapi retry again when the tick ends`. Only the poll lock: every other writer of a state file takes its order lock inside it, so holding it shuts them all out.
+    3. `readState`. `undefined` is `<repo> has no work order <id>: \`hapi status <repo>\` lists them`; a malformed file gives `readState`'s own text.
+    4. `retryProblem(s, central.runs.max_retries)`.
+    5. `retryState(s, d.now().toISOString())`, then `writeState`, then `appendEvent` of its one event.
+    6. `k` is the number of the repo's other states (`listStates(engineDir, repo)`) that have no `pr` and whose phase is in `ACTIVE` or `QUEUE`. Then Step 1's stdout line, and exit 0.
+
+    `engineDir` is `deps.engineDir ?? engineDirOf(d.env)`, and `central` is `loadPolicy(join(d.root, "policy"))`. It runs no git, mints no token, makes no forge or docker call, and starts nothing.
+  - **Registration.** `register("poll", …)`, `register("status", …)` and `register("retry", (args) => retryCommand(args), "Queue a failed work order again: a poll tick starts a fresh pass from its worker, at the same merge commit, when its turn in the repo's queue comes (as hapi)")`.
   - **`stackUp`.** Unless `who.override` is set:
     - Before the live-run check, it runs `systemctl --user stop ...POLL_UNITS`. Any exit code other than 0 or `SYSTEMCTL_NOT_LOADED` throws `could not stop the poller timer (<command> exited <n>: <stderr line>); nothing was built or started`.
     - Every `systemctl` call runs with `composeEnv` plus T20's ruling's env: `XDG_RUNTIME_DIR`, and `DBUS_SESSION_BUS_ADDRESS` (by default `unix:path=$XDG_RUNTIME_DIR/bus`).
@@ -3184,7 +3343,12 @@ The task also adds the status view (§3.8): `events.jsonl`, a status comment on 
   - **`stackDown`.** It stops `POLL_UNITS` first. A failure there is collected the same way as `leftover`.
 - [ ] **Step 6: Run the tests.** Run `bun test tests/engine/ tests/generate/ tests/stack/up.test.ts tests/run/`. Expected: PASS.
 - [ ] **Step 7: Docs.**
-  - **README.** The CLI table gains `poll [--once]` and `status [<owner>/<name>]`.
+  - **README.** The CLI table gains `poll [--once]`, `status [<owner>/<name>]` and `retry <owner>/<name> <id>`.
+  - **`runs.md`**, by heading:
+    - "What a run is", the bullet "A failed run starts over": its sentence about `--retry-of` gains "(a hand run). A work order the poller runs is retried with `hapi retry`, which queues a fresh pass ([the engine runbook](engine.md))".
+    - "`hapi run start`", the `--retry-of` bullet: "for a hand run only".
+    - "`hapi run stop`" gains a paragraph, "A run the poller started": stopping it while it is live ends its work order's automatic work, even past the run's deadline. With no PR yet, the work order becomes `failed` (`` <kind> run <id> ended stopped: stopped by `hapi run stop` ``), and `hapi retry` can queue it again later; with a PR, it goes to `waiting` with `Needs your decision`, and the PR is unchanged. Of that work order, a stop leads to no push, no PR and no other run, unless a maintainer's `hapi:rework` label, added since the stopped run started, is pending on its PR: that still starts its rework. It doesn't halt the repo: the repo's next queued work order can start on the next tick. If the command prints `run <id> has already ended: <status>`, or says another command is using the run, the run had already ended, on its own or at its deadline, and the stop changed nothing: the work order follows that status. To pause the poller for every repo, stop its timer ([the engine runbook, "Stopping everything"](engine.md#stopping-everything)); there is no per-repo halt. [Kill switch 3](kill-switches.md#3-stop-the-stack) stops the timer too, but it also removes live runs, which end `failed`, not `stopped`: after `mise run up`, a pre-PR fix, verify or review removed that way goes on to the harvest and its PR, so stop such a run with `hapi run stop` first if its work order must not reach a PR.
+    - "Troubleshooting": the rows for `` run <id> of work order ... is live` / `already succeeded` / `ended failed: pass --retry-of <id>` `` and for `` reason` says `the run's container was removed before the run was finalized` `` each add "For a work order the poller runs, use `hapi retry` instead."
   - **`generated-configs.md`.** The `--out` row's count (line 26, "seven" after Task 11) becomes "eight", adding `systemd/`. Both units go in the files table. A new `build/systemd/` section explains each line and the runtime link, which a reboot clears, like the tmpfs env files.
   - **`stack.md` §4.** Add `up`'s first and last steps, `down`'s first step, and the dev bypass's manual `poll --once`.
   - **`kill-switches.md`:**
@@ -3192,7 +3356,7 @@ The task also adds the status view (§3.8): `events.jsonl`, a status comment on 
     - 3a stops the timer first.
     - The 3b script exports `DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"`, and runs `systemctl --user stop hapi-poll.timer hapi-poll.service;` before `docker ps`.
     - In 3c, "later, the poller and harvester timers (Plan 03)" becomes "the poller's timer".
-  - **The register.** Add a new Plan 04 item: `commands.yaml`'s `hapi-status` rule takes `[<run-id>]`, but the command takes `[<owner>/<name>]`.
+  - **The register.** Add a new Plan 04 item: `commands.yaml`'s `hapi-status` rule takes `[<run-id>]`, but the command takes `[<owner>/<name>]`. Beside it, H-245 (added with m19) already holds that `hapi retry` stays out of Hermes's allowlist and that event readers handle a retry: check it matches what was built.
 - [ ] **Step 8: Run everything.** Run `mise run lint && mise run test`. Expected: PASS, 0 fail.
 - [ ] **Step 9 (operator, after Plan 03's PR merges; Task 16 Step 4 runs it).**
   ```bash
@@ -3207,8 +3371,8 @@ The task also adds the status view (§3.8): `events.jsonl`, a status comment on 
   ```bash
   git add src/engine/ src/generate/systemd.ts src/generate/index.ts src/run/lifecycle.ts src/run/view.ts src/stack/up.ts src/cli.ts \
     tests/engine/ tests/generate/systemd.test.ts tests/generate/index.test.ts tests/stack/up.test.ts README.md \
-    docs/generated-configs.md docs/runbooks/stack.md docs/runbooks/kill-switches.md docs/superpowers/plans/handoffs.md
-  git commit -m "feat(engine): the poller, its timer, the status comment and hapi status (H-090)"
+    docs/generated-configs.md docs/runbooks/stack.md docs/runbooks/kill-switches.md docs/runbooks/runs.md docs/superpowers/plans/handoffs.md
+  git commit -m "feat(engine): the poller, its timer, the status comment, hapi status and hapi retry (H-090)"
   ```
 
 ---
@@ -3295,7 +3459,16 @@ This task finishes Plan 03's docs and records. It adds the three audit checks no
   3. **The pipeline** (Task 13's). Its table covers every phase, and its parts cover the caps' texts, the CodeRabbit round's filters, rework by label and the operator winning. Add only what it lacks of:
      - a maintainer posts a comment first, then adds the `hapi:rework` label;
      - what counts as an operator action;
-     - a `cap-stopped` work order heads its repo's queue.
+     - a `cap-stopped` work order heads its repo's queue;
+     - a part, "A failed work order": the ways in (Task 13's `failed` row); that the poller never retries; `hapi retry` in runs.md's form, as the block below; what it refuses (Task 13's texts, `runs.max_retries` among them, and a held poll lock); when it starts: at the back of its repo's queue, so a tick starts it once no work order of that repo is running before its PR, none is queued ahead of it, and the caps allow (a cap that trips makes it `cap-stopped`, which starts on its own when the cap clears, perhaps at the month's turn); `hapi status` shows `retry <n>` in Rounds; and that every pass spends under the same caps, at most `runs.max_retries` passes after the first.
+       ```bash
+       OWNER="$(gh api user --jq .login)"
+       sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
+         export XDG_RUNTIME_DIR PATH="$HOME/.local/bin:$PATH"; \
+         cd "$HOME/hapi-factory" && mise run hapi -- retry "$1" "$2" && \
+         mise run hapi -- status "$1"' \
+         hapi-retry "$OWNER/<name>" <work-order-id>
+       ```
   4. **Acceptance tests and the verify container** (new):
      - The planner writes behaviour-level tests at `.factory/work/<id>/acceptance/` in the planning PR. `.factory/**` keeps workers out of them, and the operator's merge approves them.
      - The verify container holds no key of any kind. It joins `egress-archon` so it can install from the bundle's `bun.lock` with `bun ci --frozen-lockfile --ignore-scripts`, and it never reuses the worker's `node_modules`. Only the registries matter: the zone's model APIs are useless without a key.
@@ -3308,12 +3481,15 @@ This task finishes Plan 03's docs and records. It adds the three audit checks no
      - The three verdicts, each mapped to one of the operator's three moves.
      - With `phases.require_acceptance`, `Ready to merge` needs the planner's acceptance tests to be present and passing. With none, the best verdict is `Needs your decision`, and a failing one makes the PR a draft `Do not merge`.
      - A draft can't be merged.
-  8. **The status comment, `hapi status` and `events.jsonl`** (new), including the comment's "Can't run" table.
+  8. **The status comment, `hapi status` and `events.jsonl`** (new), including the comment's "Can't run" table, a retried row's Rounds cell, the retry event and `retry` on later events, and the final comment posted again when a retried plan settles again.
   9. **The caps** (new). Design §3.9's table, with each policy key and what tripping it does. The refusal texts stay in "The pipeline", linked from here.
   10. **Stopping everything** (new).
       - Kill switch 3, which stops the timer first.
       - `systemctl --user stop hapi-poll.timer` on its own.
       - The Console limit, the one stop no worker can get around.
+      - `hapi run stop <id>` of a live run ends that run's work order's automatic work (`failed` with no PR, `waiting` with one) and lets the repo's queue move; a stop after the run has ended changes nothing (runs.md's "`hapi run stop`").
+      - There is no per-repo halt: stopping the timer pauses every repo.
+      - Kill switch 3 also removes live runs, which end `failed`, so after `mise run up` a pre-PR fix, verify or review removed that way goes on to the harvest and its PR: `hapi run stop` it first if its work order must not reach a PR.
   11. **Troubleshooting** (new), as a table:
       - a tick that fails closed (a 5xx, a rate limit, an expired token): the next tick retries;
       - a work order the poller can't read (in the journal and the status comment's "Can't run" table): fix it in a new planning PR;
@@ -3323,7 +3499,8 @@ This task finishes Plan 03's docs and records. It adds the three audit checks no
       - `Needs your decision` with "the work order has no acceptance tests": its planning PR carried none under `.factory/work/<id>/acceptance/`;
       - a verify run that can't install: the bundle's `bun.lock` is out of date, or a registry isn't on `egress-archon`'s allowlist;
       - a deleted status comment: remove `status/<owner>/<name>/<n>.json`, as hapi;
-      - no timer after a reboot: run `mise run up`.
+      - no timer after a reboot: run `mise run up`;
+      - `failed`: read the reason in `hapi status`. If the cause was outside the work order (a rate limit, a timeout, a container removed by `mise run down`, a flaky preflight, your own `hapi run stop`), fix it, then `hapi retry`. A failure caused by the work order's own content, or `has been retried <n> times, and runs.max_retries is <n>`, needs a new id in a new planning PR; so does a closed `factory/<id>` PR, which shows as `closed`. A `hapi run start` by hand is never picked up by the poller.
 
   Task 16 adds "End to end on the sandbox" after Troubleshooting.
 - [ ] **Step 7: README.**
@@ -3337,7 +3514,8 @@ This task finishes Plan 03's docs and records. It adds the three audit checks no
   - **AC-16** (:262). Its run-engine half becomes enforced: runs start only from:
     - merges, through the poller;
     - a maintainer's `hapi:rework` label, where the label event's actor is a human with triage permission, not an App;
-    - at most one automatic CodeRabbit run per PR, on CodeRabbit's own review of the head commit (design §3.6, which changes spec §5.2).
+    - at most one automatic CodeRabbit run per PR, on CodeRabbit's own review of the head commit (design §3.6, which changes spec §5.2);
+    - the operator's `hapi retry`, from their own terminal as hapi, which only queues a failed work order again at the same merge commit, at most `runs.max_retries` times; the run still starts through the poller, within the caps.
 
     Plan 04's half stays with H-162.
   - **IS-9** (:316) gains the node bound (`max_work_units`; H-204, H-229) and the poller's caps.
@@ -3365,13 +3543,13 @@ This task finishes Plan 03's docs and records. It adds the three audit checks no
     - a crashed tick's tokens stay valid until their hour runs out.
 - [ ] **Step 9: Spec notes and the design.** Add one `> **As built (noted <commit date>, H-NNN):**` note to the parent spec under each section below, linking Plan 03's design. Leave the text before each note as it is.
   - §4.2: no `archon trigger fire`; the poller calls the launcher; three containers per run (H-183).
-  - §5.2: the one automatic CodeRabbit run, and the label-actor check (H-166).
+  - §5.2: the one automatic CodeRabbit run, and the label-actor check (H-166); and the operator's `hapi retry`, which queues a failed work order again (m19).
   - §5.3: one run, one PR and one commit per piece; independent work orders, with no stacking (H-090).
   - §5.4: `preflight` refuses fan-out (H-234).
   - §6: the key is the work order's id plus the merge commit that first added it (H-183).
   - §7: `templates/repo-contract/`, the `.tmpl` files, `new-repo` in Plan 03, and the SHA pin (H-178).
   - §9.2: the three workflows, and `max_work_units` rather than `max_spend_usd` (H-229).
-  - §9.4: the poller, the mirror and the harvester (H-161).
+  - §9.4: the poller, the mirror and the harvester (H-161); and `hapi retry`, the poller's only restart of a failed work order, which the operator queues (m19).
   - §9.6: the CodeRabbit CLI in the review container, or off (H-167); the PR round, confirmed by its check run (H-166).
   - §13: status events and eval fields (H-233); merge commits keep each piece's trailers (H-113).
   - §15: steps 3–5 done on the sandbox (H-161).
@@ -3387,6 +3565,8 @@ This task finishes Plan 03's docs and records. It adds the three audit checks no
     - `phases.require_acceptance` ships `true` in `policy/runs.yaml`;
     - while it is on, `acceptance: null` caps the verdict at `Needs your decision`; a non-zero `acceptance.exit` always makes a draft `Do not merge`;
     - link `src/engine/harvest.ts`'s `outcome`.
+
+  The m19 fold-in (2026-11-01) already edited the design's §3.4, §3.6, the CodeRabbit round's lead-in, §3.8's event list, §3.9's Retries row and §8 item 7 in place, so they get no note. If the build differs from that text, add the note as usual.
 - [ ] **Step 10: The register.** For each id in the design's Register line, run `git log --oneline main..HEAD --grep '<id>'`.
   - **If a commit fixed it:** move the item to Closed, as `| **<id>** <what closed it> | the commit that closed it (\`<subject>\`) |`.
   - **If nothing fixed it, or it was only partly fixed:** keep it open, and add a `**Plan 03 (<date>):**` sentence saying what landed and where the rest goes. This covers:
@@ -3395,6 +3575,7 @@ This task finishes Plan 03's docs and records. It adds the three audit checks no
     - H-207, still refused;
     - H-220, H-221 and H-222, if no task touched them.
   - **H-167:** record Task 1's answer.
+  - **H-213:** add "**Plan 03 (<date>):** a failed work order's next attempt is `hapi retry`, a fresh pass from the worker at the same merge commit, at most `runs.max_retries` times (design §3.4, §3.6); resume is still not built." m19 itself gets no register id: Plan 03 builds it.
   - **Deferrals:** give each deferral from Plan 03's ledger rulings and task reports the next free id, in its plan's section.
 - [ ] **Step 11: Run everything.**
   ```bash
@@ -3525,6 +3706,25 @@ Along the way, the run exercises CodeRabbit's round, one rework and the status c
   - the phases run `worker → verify → review → harvest → pr`, with at most one `fix`;
   - the PR has two commits with trailers, and §3.7's description;
   - its Evidence shows the acceptance tests' result from the verify container, and the verdict is `Ready to merge` only if they passed.
+
+  **If a row says `failed`:** paste back `hapi status`, `hapi run list` and the row's reason, then stop.
+  - **If the cause was outside the work order** (a rate limit, a timeout, `mise run down`, a flaky preflight), the controller says so, and the operator runs, from their own terminal:
+    ```bash
+    OWNER="$(gh api user --jq .login)"
+    sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
+      export XDG_RUNTIME_DIR PATH="$HOME/.local/bin:$PATH"; \
+      cd "$HOME/hapi-factory" && mise run hapi -- retry "$1" "$2" && \
+      mise run hapi -- status "$1"' \
+      hapi-retry "$OWNER/hapi-sandbox-fortune" 0001-skeleton-and-crack-cookie
+    ```
+    For planning PR 2, the last argument is `0002-search-fortunes` or `0003-fortune-of-the-day`. Paste back both outputs. Expected:
+    - `hapi retry: <owner>/hapi-sandbox-fortune 0001-skeleton-and-crack-cookie is queued again (retry 1), with <k> of the repo's work orders ahead of it: …`;
+    - the row `queued`, with `retry 1` in Rounds;
+    - with `k` 0 (as for 0001 in planning PR 1), Step 6's watch shows `worker` within 120 s. With `k` 1 (planning PR 2, its sibling still running or queued), it starts once the sibling has opened its PR or settled. If a cap trips, the row says `cap-stopped` with the cap's text instead.
+
+    Then keep watching, as above.
+  - **If the work order itself is wrong**, stop and report it. It needs a new id in a new planning PR, and the old id stays `failed`.
+  - Each attempt spends against the overlay's $15.
 - [ ] **Step 7 (operator): CodeRabbit, then one rework.**
   1. Wait until the status comment says `waiting`. It gets there after CodeRabbit's round 0 and at most one automatic fix run.
   2. Run these, with the PR number filled in:
@@ -3550,6 +3750,7 @@ Along the way, the run exercises CodeRabbit's round, one rework and the status c
   Paste back the audit summary and both totals. Expected: the audit result is as in Step 4, and the total is under $15.
 - [ ] **Step 11: Record it.**
   - **The tables.** From the pasted output, fill in engine.md's run table, its pass-criteria table (the acceptance-test row from each `Ready to merge` PR's verify run), and spike 09's "Live check" addendum: the run ids, phases, spend, verdicts, CodeRabbit outcomes and rounds.
+  - **Retries.** The run table lists every pass's runs, with their retry. The pass-criteria table records criterion 3 ("exactly one run … with nobody touching anything") as failed for each work order that was retried, with the retry as its evidence; criterion 8 stays reachable under the same id. Each retry, its cause and its spend go in spike 09's addendum.
   - **H-168.** For each factory PR, the number of findings at major and above, and of minor ones, and how many were fixed, declined or raised again.
   - **Failures.** Each point that failed, and each cap that tripped without saying so, becomes a new register item.
 - [ ] **Step 12: Run everything.** Run `mise run lint && mise run test`. Expected: PASS.
@@ -3578,6 +3779,7 @@ Along the way, the run exercises CodeRabbit's round, one rework and the status c
   - §4: Task 16.
   - §7 verify early: Task 1, Task 3 (App permissions) and Task 5's operator run (the installation step, the required check's name).
   - The acceptance tests the operator adopted after approval: Tasks 2, 5, 11, 12 and 16.
+  - The next attempt at a failed work order (`hapi retry`, §3.4, §3.6, §3.9's Retries row, §8 item 7): Tasks 7, 12, 13 and 14, docs in 6, 15 and 16.
 - **Consistency:** two independent passes over all sixteen tasks. The first found about thirty mismatches between tasks; the second found eleven more. All are fixed; the plan writer's rulings are recorded in the controller's ledger at execution start.
 - **Review Focus:** five failure modes, seven tests. Each test name appears verbatim in its task.
 - **Proportion:** the plan is long, about four times Plan 02's length for about one and a half times its scope (sixteen tasks against eleven), because it pins many cross-task interfaces and exact test assertions. Code blocks are about a third of it, mostly signatures. An implementer reads only their own task. It was not trimmed further, to avoid dropping decisions.
@@ -3585,12 +3787,18 @@ Along the way, the run exercises CodeRabbit's round, one rework and the status c
   - The verify container joins the archon zone's proxy, still with no keys, so it can install from the lockfile itself. It never reuses the worker's `node_modules` (§3.5).
   - Fix runs get the inputs directory for their findings (the review gets order, task, diff and verify).
   - hapi-factory's `.factory/config.yaml` protects `templates/**` like `policy/**` (Task 5, a protected change).
+  - `hapi retry` (m19, the operator's call of 2026-11-01): Tasks 6, 7 and 12–16.
+  - `runs.max_retries`, a protected, central-only policy key, always hard (Task 13).
+  - A `hapi run stop` of a live run ends its work order's automatic work (Task 13), and outranks the run's deadline (Task 7).
+  - Retention keeps a run until the UTC month it started in has ended, so the monthly cap never loses one (Task 13, comment-only protected edits).
+  - As built, Task 5's gates are three jobs, and hapi-factory's own ci.yml took the same shape for its history scan (the operator's OK, 2026-11-01).
 - **Operator steps, in order:**
   - Task 1: CodeRabbit's unattended key.
   - Task 3: the `hapi-factory` App's permissions.
   - Task 4: the disk filesystem, and the live `ENOSPC` check.
   - Task 5: `gh auth refresh -s workflow`, CodeRabbit's installation id, `main-review`'s re-apply, and making the sandbox with `hapi new-repo`.
+  - Task 13: the protected-file OK for `runs.max_retries`, the retention comments and the GB→GiB comment in `policy/runs.yaml`.
   - Task 14: `mise run up` installs the timer.
-  - Task 16: the Console limit, the planning PRs' merges, a rework label, the factory PRs' merges and the strict audit.
+  - Task 16: the Console limit, the planning PRs' merges, a rework label, the factory PRs' merges and the strict audit; and `hapi retry`, only if a work order fails for a cause outside it.
 - **Protected OKs:** each task's **Protected (ask first)** line names its files. The controller asks once per task, before the implementer edits any of them.
 
