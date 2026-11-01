@@ -183,7 +183,7 @@ Two residuals go to the threat model: the repo's `bunfig.toml` preload for the w
 - **The real Squid behind the alias** (finding 13): egress through `egress-archon` on a run's network, its refusals, and what a recreated `egress-archon` does to a live run.
 - **Whether Pi writes `models-store.json` in a paid, online run** (spike 08, finding 9), which decides whether Task 7 can bind it read-only.
 
-Task 11's paid check runs as hapi on the rootless daemon, with the real `egress-archon` and a live model, so it exercises all four. Its runbook section says what to look for.
+Task 11's paid check runs as hapi on the rootless daemon, with the real `egress-archon` and a live model, so it exercises all four. Its runbook section says what to look for. **Settled live on 2026-10-31**, all but the proxy's refusals and a recreated `egress-archon` during a live run: [spike 08's live check](08-guard-hooks-offline.md#live-check-2026-10-31).
 
 ## Consequences
 

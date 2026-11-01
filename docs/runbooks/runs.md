@@ -76,12 +76,12 @@ sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
 Expected: it prints the run id (twelve hex digits) and returns. The run is going; `watch` follows it.
 
 - **`--repo`** is where the run's clone comes from. Pass a **bare clone**, not a working checkout. The launcher binds the source's git dir into the container read-only, and a working checkout's `.git/config` is then readable by the run: an `http.extraheader`, or a token in a remote URL, would be visible to a worker. A bare clone of the repo has none. Make one as hapi: `git clone --bare <url> "$HOME/repos/example.git"`, with a URL that needs no credential. The run starts from the source's `HEAD`, so that is the commit the work is cut from (H-211 tracks the mirror that replaces this in Plan 03). The source must be world-readable (made under `umask 022`), because the container reads it as another uid.
-- **`--work-order`** is a work order file (`order.yaml`), validated on the host before anything starts ([docs/policy.md](../policy.md#work-orders)). A work order with a non-empty `egress_extra` is refused: a per-run proxy for it doesn't exist yet (H-088, H-207).
+- **`--work-order`** is a work order file (`order.yaml`), validated on the host before anything starts ([docs/policy.md](../policy.md#work-orders)). A work order with a non-empty `egress_extra` is refused: a per-run proxy for it doesn't exist yet (H-088, H-207). Its `workflow` must be one of hapi's pack (`archon/workflows/hapi/`): Archon also finds its own bundled workflows by name, which hapi doesn't review, so `start` refuses any other name, and refuses a pack with a node that sets `pi.enableExtensions: false`, which would drop hapi-guard.
 - **`--budget-usd`** only lowers the work order's `budget.usd`. A value above it is a usage error.
 - **`--public`** is [the public flag](#the-public-flag).
 - **`--retry-of <run-id>`** names the last run of the same work order and commit, which ended without succeeding. A run is keyed by the work order's id and the source commit: a key with a live or a succeeded run is refused, and one whose last run ended another way is refused unless `--retry-of` names that run. So a re-fire is safe.
 
-**What it refuses**, in this order, with an error that names the fix: a work order that fails validation or names `egress_extra`; no archon env file (run `mise run up` first); a source that isn't a git repo or has no commit; a key already run; a second live run for the same repo (one per repo, H-090); more live runs than `max_live` in `policy/runs.yaml` (1 by default). A step that fails after that removes everything `start` made. A supervisor that starts and then dies is reaped by the next `hapi run start` or `hapi run stop`; `hapi run stop <id>` is the direct fix. `list` and `watch` never reap.
+**What it refuses**, in this order, with an error that names the fix: a work order that fails validation or names `egress_extra`; a workflow that isn't in hapi's pack, or a pack with a node that drops hapi-guard; no archon env file (run `mise run up` first); a source that isn't a git repo or has no commit; a key already run; a second live run for the same repo (one per repo, H-090); more live runs than `max_live` in `policy/runs.yaml` (1 by default). A step that fails after that removes everything `start` made. A supervisor that starts and then dies is reaped by the next `hapi run start` or `hapi run stop`; `hapi run stop <id>` is the direct fix. `list` and `watch` never reap.
 
 **The deadline** is the work order's `budget.minutes`. A detached `hapi run supervise <id>` waits for the container to end or the deadline, stops it at the deadline, then finalizes the run: copy-out, checks, removal and the record. You never run `supervise` yourself.
 
@@ -195,7 +195,7 @@ Once this branch has landed on `main`, and before the first run. Each step runs 
      --repo <owner>/<name> --strict --github-token-file <file>' | grep -v '^pass'
    ```
 
-   Expected: two lines, the `mcp.tool-hashes` fail and `hapi audit: 14 pass, 1 fail, 0 skip` (not yet run live on the real host).
+   Expected: two lines, the `mcp.tool-hashes` fail and `hapi audit: 14 pass, 1 fail, 0 skip` (as the operator's rollout got on 2026-10-31). mise then prints `[audit] ERROR task failed`: `--strict` exits non-zero on the one fail.
 
 5. **Remove the old Archon volumes, once.** The long-lived Archon container is gone, and its two volumes are left over, holding the old Archon's run database and Claude Code state. Nothing reads them, and the factory keeps nothing in them. The operator removes them. The old container is gone after the `down` in step 2, so nothing uses them and the stack can stay up:
 
@@ -213,7 +213,7 @@ The first run that spends real money, and the one that shows hapi-guard, the egr
 
 **Cost.** A few cents of Anthropic credit for Run A (one Haiku 5.5 node at low effort, capped at $0.25 by the work order and the workflow), a fraction of a cent for Run B (capped at $0.0001, so it stops after its first request), about as much as Run A for Run C (the same node, and its gates' Haiku calls, a fraction of a cent, also on Anthropic credit), and, if Jev answers Run A's bash gate, a few tenths of a cent of OpenRouter credit. If a command here is not what you expected, stop and do not retry: every run is capped, but each retry spends again.
 
-**Before you start**, the rollout above is done (steps 1 to 3, so hapi's checkout has this branch, `mise run setup` has run, and `mise run up` has brought the stack up) and `hapi run list` shows no live run. `jq` must be installed on the host. Every block runs **on the host, from your own terminal, as yourself**, handing one script to hapi's `sh`, as above. The runs' files are under `${XDG_STATE_HOME:-~/.local/state}/hapi/runs/<run-id>/` in hapi's home.
+**Before you start**, the rollout above is done (steps 1 to 3, so hapi's checkout has this branch, `mise run setup` has run, and `mise run up` has brought the stack up) and `hapi run list` shows no live run. `jq` must be installed on the host. Jev answers the public runs' gates from OpenRouter credit: with none, its call fails with `jev: openrouter HTTP 402.` in the gate record's `classifier.error`, and Haiku answers instead (`haiku true`), so add a little credit first if the check is to settle Jev. Every block runs **on the host, from your own terminal, as yourself**, handing one script to hapi's `sh`, as above. The runs' files are under `${XDG_STATE_HOME:-~/.local/state}/hapi/runs/<run-id>/` in hapi's home.
 
 ### 1. A throwaway repository
 
@@ -310,6 +310,15 @@ sudo -u hapi -H -- sh -c 'exec jq -r "$1" \
     | @tsv' 0123456789ab
 ```
 
+Why a classifier didn't answer first, when a gate line says `haiku true` or `default`: the gate records' `classifier.error`, one line that `decide()` keeps free of secrets and state text, and each call's time:
+
+```bash
+sudo -u hapi -H -- sh -c 'exec jq -r "$1" \
+  "${XDG_STATE_HOME:-$HOME/.local/state}/hapi/runs/$2/out/decisions.jsonl"' \
+  hapi-jq 'select(.event == "gate") | [.rule, (.classifier.error // "-"),
+    ((.classifier.latency_ms // "-") | tostring)] | @tsv' 0123456789ab
+```
+
 The files that came out, to see the modes and owner:
 
 ```bash
@@ -396,6 +405,9 @@ sudo -u hapi -H -- sh -c 'rm -rf "$HOME/hapi-check-work" "$HOME/hapi-check-repo.
 |---|---|
 | `hapi run start: .../archon.env is missing: run `mise run up` first` | The archon zone's env file is written by `hapi secrets resolve`, which `up` runs. Run `mise run up`, then start the run. |
 | `cannot read .../archon.env ... run hapi run as the user that ran `mise run up``  | The file is in another user's runtime directory. Run `hapi run` as hapi, as above. |
+| `the work order's workflow "<name>" is not in hapi's pack` | The work order names a workflow that isn't a file of `archon/workflows/hapi/`, such as one of Archon's bundled ones. A run may use only the pack's workflows. Name one of them. |
+| `hapi's pack has a problem: ... sets pi.enableExtensions: false` | A pack workflow turns Pi's extensions off in a node, which would drop hapi-guard there. Remove the setting. |
+| A gate record's `classifier.error` is `jev: openrouter HTTP 402.` | The OpenRouter account or key is out of credit, so Jev didn't answer and Haiku did (`via haiku`, `fallback true`). Add credit to OpenRouter. |
 | `egress_extra isn't supported yet` | The work order names extra egress hosts. A per-run proxy for them doesn't exist (H-088, H-207). Remove `egress_extra`. |
 | `... is not a git repository with a .git dir, nor a bare one` | `--repo` names a linked worktree or a path that isn't a repo. Pass a checkout's main working directory, or better, a bare clone. |
 | `cannot read the commit HEAD names` | The source has no commit checked out (`HEAD` doesn't resolve). Pass a repo with a commit. |

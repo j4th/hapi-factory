@@ -252,7 +252,7 @@ The level-6 gate settings (Plan 02 Tasks 3 and 5). Every key is required. The fi
 | `result_screen.enabled` | true | Screen what a tool returns before the worker reads it |
 | `result_screen.tools` | `[bash, read]` | The tools whose results are screened (`bash`, `read`) |
 | `max_state_chars` | 6000 | The most characters of run state a classifier is shown. A result over it is never classified: it gets the decision file's fallback with `truncated: true`, so the result screen wraps it. With 6000, that covers most `read`s of a real source file and long bash output. |
-| `classifiers.jev.model` | `~typesafe/jev-latest` | Jev's OpenRouter model id (Task 11 confirms it passes the `hapi-jev` guardrail) |
+| `classifiers.jev.model` | `~typesafe/jev-latest` | Jev's OpenRouter model id. It passes the `hapi-jev` guardrail: the paid check (2026-10-31) got `via: jev`, `fallback: false` ([spike 08's live check](spikes/08-guard-hooks-offline.md#live-check-2026-10-31)) |
 | `classifiers.jev.unknown_call_usd` | 0.001 | Cost charged to the run for a Jev call with unknown usage |
 | `classifiers.haiku.model` | `claude-haiku-5-5` | The fallback classifier, used when `flags.jev.fallback` is `haiku` |
 | `classifiers.haiku.input_per_mtok` | 0.1 | USD per million input tokens (Anthropic first-party rate, prompts up to 100K tokens) |
@@ -506,7 +506,7 @@ An overlay has the six keys below. **Any other key is rejected.** Four of them c
 | `budgets` | **Lower** any budget in `budgets.yaml`. Each value must be at most the base value. `enforcement` modes may be **hardened** (soft to hard), never softened. |
 | `runs` | **Lower** any limit in `runs.yaml` (`max_live`, `retention_days`, `output_limits_mb.*`). Never raise one. |
 | `default_risk` | The risk new work orders for this repo start from: `low`, `medium` or `high`. A repo setting, not policy: any value is accepted, `low` included. |
-| `workflow` | The Archon workflow this repo's work orders use by default. A lowercase slug, the same rule as a work order's `workflow` (so `factory-task`, not `Factory_Task` or `factory-`). A repo setting, not policy. |
+| `workflow` | The Archon workflow this repo's work orders use by default. A lowercase slug, the same rule as a work order's `workflow` (so `factory-task`, not `Factory_Task` or `factory-`). A repo setting, not policy. `hapi run start` runs only a workflow of hapi's pack (`archon/workflows/hapi/`), never one of Archon's bundled ones. |
 
 The overlay is checked in two stages:
 1. **`loadOverlay(file)`** checks the file against `repo-overlay.schema.json`. That catches unknown keys, bad modes, globs outside the [glob syntax](#glob-syntax) and malformed hosts, and throws a `PolicyError`.
@@ -582,7 +582,7 @@ The schema is `policy/schemas/work-order.schema.json`. **Every field is required
 |---|---|
 | `id` | At least 4 digits, a hyphen, then a lowercase slug, e.g. `0002-search-partners-tool`. At most 80 characters. It names the directory and the `factory/<id>` branch. |
 | `lane` | `planning`, `factory` or `direct` (spec §5.1) |
-| `workflow` | A lowercase slug: an Archon workflow name |
+| `workflow` | A lowercase slug: the `name` of a workflow in hapi's pack (`archon/workflows/hapi/`). `hapi run start` refuses any other, Archon's bundled ones included |
 | `risk` | `low`, `medium` or `high` |
 | `roles.implement`, `roles.review` | A tier: `small`, `medium` or `large`. A model id is rejected. |
 | `budget` | `usd` greater than 0; `turns` and `minutes` whole numbers, at least 1 |

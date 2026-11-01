@@ -225,7 +225,7 @@ No `models.json` entry carries an `anthropic-beta` header: Pi sends the beta its
 
 ## `build/pi/models-store.json` and `settings.json`
 
-- **`models-store.json`** is exactly `{}`, with no `$comment`: Pi reads the file as its own model store, and a non-empty object might be taken as a catalog overlay. The run container binds it read-only over Pi's own store, which closes the planted-store vector offline; the pins and the guard's `session_start` check stay as defence in depth (spike 08, finding 9). Whether Pi needs to write it in a paid, online run is checked in Plan 02 Task 11. `tests/generate/index.test.ts`'s notice test exempts it, with a comment saying why.
+- **`models-store.json`** is exactly `{}`, with no `$comment`: Pi reads the file as its own model store, and a non-empty object might be taken as a catalog overlay. The run container binds it read-only over Pi's own store, which closes the planted-store vector offline; the pins and the guard's `session_start` check stay as defence in depth (spike 08, finding 9). Pi didn't write it in the paid check's online runs (Plan 02 Task 11, 2026-10-31; [spike 08's live check](spikes/08-guard-hooks-offline.md#live-check-2026-10-31)). `tests/generate/index.test.ts`'s notice test exempts it, with a comment saying why.
 - **`settings.json`** is Pi's settings file with nothing set: only the `$comment` notice. A repo's `.pi/settings.json` is stripped before a run (H-181).
 
 ## `build/pi/extensions/hapi-guard.js` and `build/decide/hapi-decide.js`

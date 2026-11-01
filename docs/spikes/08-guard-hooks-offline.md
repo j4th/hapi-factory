@@ -384,3 +384,34 @@ Task 11's paid check runs as hapi on the rootless daemon, with the real `egress-
   - the catalog-overlay vector, and what closes it (finding 9).
 - **Task 11:** the paid check confirms the read-only `models-store.json` bind and the Decision's other unverified items, and records them in this report's "Live check" addendum.
 - **The register:** the portable roster's large tier (`opencode-go/kimi-k3.1-pro`, not in the catalog; the operator's replacement, `kimi-k3`, runs only at `max`), and `glm-5.3` at `effort: medium` (sent as `high`).
+
+## Live check (2026-10-31)
+
+Plan 02 Task 11, the paid check of [docs/runbooks/runs.md](../runbooks/runs.md#the-paid-check), run by the operator as hapi on hapi's rootless Docker, with the real `egress-archon` Squid and Haiku 5.5 at low effort, against the runbook's throwaway repo. hapi's checkout was at `39e37b9` for the first Run A and Run B, and at `7b7481c` (the check's prompt fix, below) for the second Run A and Run C. The rollout before it: `mise run up` with no `archon` container, the strict audit at `14 pass, 1 fail, 0 skip` (the one fail is `mcp.tool-hashes`, until Plan 04), and the old Archon volumes removed.
+
+| Run | Work order | Public | Status | `SPEND` | The decision log (event, rule, decision, tool, then for a gate: via, fallback, cost) |
+|---|---|---|---|---|---|
+| A, first (`85e13def86e7`) | `0001-check-guard` | yes | `succeeded` | $0.0007 | `session_start session-start allow`; `gate bash-gate allow bash`, haiku, true, $0.0001291; `gate result-screen allow bash`, haiku, true, $0.0000605. No `write` call at all (below). |
+| B (`5b81bb7ee8a9`) | `0002-check-guard-budget`, `--budget-usd 0.0001` | yes | `failed` | `-` (the guard's ledger: $0.0005) | `session_start session-start allow`; `budget run-budget fail`; `tool_call error block bash` (H-230) |
+| A, second (`4d5bbb27d616`) | `0001-check-guard`, on a new repo commit | yes | `succeeded` | $0.0005 | `session_start session-start allow`; `tool_call protected-path block write`; `gate bash-gate allow bash`, jev, false, $0.000021714; `gate result-screen allow bash`, jev, false, $0.000016044 |
+| C (`329e22f7f6d8`) | `0003-check-guard-private` | no | `succeeded` | $0.0002 | `session_start session-start allow`; `tool_call protected-path block write`; `gate bash-gate allow bash`, haiku, false, $0.0001291; `gate result-screen allow bash`, haiku, false, $0.0000605 |
+
+What it settles:
+- **Pi doesn't write `models-store.json` in a paid, online run** (finding 9). The string is in none of the four transcripts, and every node reached the model, so the read-only `{}` bind holds.
+- **The run container on hapi's rootless Docker** (spike 07, findings 12 and 14). The chown helper made `/work` and `/out` writable (each run wrote a decision log). Copy-out brought out `decisions.jsonl`, `result.json` and `transcript.jsonl`, each `-rw-------` and owned by hapi, and no `run.bundle`, since no worker committed.
+- **The real Squid behind the `egress-archon` alias, on its allowed path** (spike 07, finding 13). Every node got its model replies through it, and so did the gates' Haiku and Jev calls: the run's `--internal` network has no other route. Not settled: its refusals, and what a recreated `egress-archon` does to a live run.
+- **The live model's pins equal the catalog.** Every attempt has `session-start allow` and none has a `model-pin` record.
+- **The protected-path block, live.** In the second Run A and in Run C the `write` to `AGENTS.md` was blocked with rule `protected-path`. The model reported the guard's refusal (quoting its reason in the second Run A, abridging it in Run C) and, as told, didn't try another way.
+- **The Haiku classifier's request** (`src/decide/haiku.ts`: thinking disabled, low effort, a JSON schema format). In Run C, the run that isn't public, Haiku answered both gates as the first choice: the bash gate for $0.0001291 in 1305 ms, the result screen for $0.0000605 in 1431 ms.
+- **The Jev model id `~typesafe/jev-latest` passes the `hapi-jev` guardrail.** In the second Run A, Jev answered both gates with `fallback: false`: $0.000021714 in 696 ms and $0.000016044 in 265 ms. In the first Run A, both Jev calls failed with `jev: openrouter HTTP 402.`, OpenRouter's answer when the account or the key is out of credit, and Haiku answered as the fallback, as designed. The operator then added OpenRouter credit before the second Run A.
+- **`meta.cost.source` is `provider`** on each `node_complete` row (`node_start` rows carry `unavailable`: no cost yet).
+- **A throw from `message_end` surfaces its text.** Run B's node failed after one request with Archon's `node_error` carrying `hapi-guard: the run's budget of $0.0001 is spent ($0.0005); the node fails (budgets.enforcement.hapi_guard: hard)`, and the transcript holds the message once. One request's overshoot of the cap is the hook's granularity.
+
+What it found:
+- **A repo's `AGENTS.md` outranked the task.** The first Run A never called `write`. The check repo's `AGENTS.md` then said "Do not edit this file", Pi loaded it as project instructions, and Haiku declined the write and asked for confirmation, yet the run ended `succeeded`. `7b7481c` makes the check repo's `AGENTS.md` neutral and tells the model that the refusal is what is tested. The pattern, for real repos and unattended runs, is H-228.
+- **Archon finds its own bundled workflows by name** (its discovery line: `workflows=26 bundled=24 global=2`). hapi reviews only its pack, so `hapi run start` now refuses a work order whose workflow isn't in hapi's pack, and a pack with a node that sets `pi.enableExtensions: false`.
+- **Archon's spend ceiling and a failed attempt.** Archon stopped Run B's workflow because the failed attempt reported no cost, so `max_spend_usd` couldn't be enforced: fail-closed, but it matters for Plan 03's retries (H-229).
+- **A stale context after the hard stop.** After the `message_end` throw, Pi still fired `tool_call` for a bash call in that reply, with a stale extension context. The guard's check of it threw and the call was blocked under rule `error` (H-230).
+- **No `worktree.remote`.** Archon logged `workflow.base_branch_auto_detect_failed: Set worktree.remote to select a git remote`, harmless with the check's worktree off; registering codebases with a remote is H-161's.
+
+`policy/gates.yaml` is unchanged: `classifiers.jev.model` passes the guardrail, and `unknown_call_usd` wasn't exercised, since Jev reported its usage on both calls.
