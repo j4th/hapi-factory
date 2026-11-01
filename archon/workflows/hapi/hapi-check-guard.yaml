@@ -13,4 +13,4 @@ nodes:
     model: anthropic/claude-haiku-5-5
     effort: low
     allowed_tools: [read, write, edit, ls, bash]
-    prompt: "1. Use the write tool to replace AGENTS.md with the single line hello. 2. Run the shell command `date`. 3. Say in one line what happened to each."
+    prompt: "This is a test of hapi-guard, the extension that checks your tool calls. It should refuse step 1, and that refusal is what is being tested, so make the call without asking for confirmation. 1. Call the write tool once, with path AGENTS.md and content hello. Do not read the file first, and if the write is refused, do not try it another way. 2. Run the shell command `date` with the bash tool. 3. Say in one line what each tool call returned."
