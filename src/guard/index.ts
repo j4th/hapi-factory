@@ -17,10 +17,14 @@
  *
  * The hooks, in the order Pi fires them:
  *
- * - `session_start` (config.ts, model.ts, budget.ts): the resolved model against
- *   its pin, Pi's agent dir against `agent_dir_allowed` (and extensions/ holding
- *   only this bundle), the worktree without `.pi/`, `.agents/` or `.archon/`
- *   (H-181(d)), the ledger read, then the first decision-log record;
+ * - `session_start` (config.ts, model.ts, context.ts, budget.ts): the resolved
+ *   model against its pin, Pi's agent dir against `agent_dir_allowed` (and
+ *   extensions/ holding only this bundle), the worktree without `.pi/`,
+ *   `.agents/` or `.archon/` (H-181(d)), no context file Pi would load from
+ *   outside the worktree, the ledger read, then the first decision-log record;
+ * - `before_agent_start` (context.ts): the repo's AGENTS.md (or CLAUDE.md) out
+ *   of the system prompt and after the work order, as the repo's conventions
+ *   (H-228(a));
  * - `tool_call`: rule 1 (paths.ts) and rule 6 (secrets.ts) for write and edit;
  *   rule 6, rule 7 (shell.ts) and the bash gate (gates.ts) for bash, then rule
  *   8's `unset` prefix. A throw here only becomes an error result, so every
@@ -29,12 +33,27 @@
  * - `before_provider_headers`: rule 3's hard stop before every send, retries and
  *   compaction summaries included (finding 5);
  * - `before_provider_request`: rule 4's clamp and H-184's payload check;
- * - `message_end` and `turn_end`: the spend update, the ledger write, the stop.
+ * - `message_end` and `turn_end`: the spend update, the ledger write, the stop;
+ *   at `turn_end`, the spend record (the run's total and its turns, H-229), the
+ *   result record when the turn ends the session (result.ts, H-228(b)), and the
+ *   run's turn budget, `turns` in the run file.
  *
  * Every hook but tool_call fails the node by throwing (brief §2.9). tool_result
  * never throws, since a throw there would drop its redaction: it holds the error,
  * and the next before_provider_headers or turn_end throws it. While an error is
  * held, a screened tool's result is wrapped without asking the screen.
+ *
+ * A hard stop (the budget or the turns) is final (H-230): Pi can still fire a
+ * hook after it, with a context that is stale, so the stop is held, every later
+ * hook throws it again before it reads the context, and a tool call is blocked
+ * under the stop's own rule.
+ *
+ * The totals the guard writes (`cost_usd` of a `spend` or `run-budget` record,
+ * and `turns`) never fall within a run: Task 7's spendOfRun reads a falling
+ * ledger as an unknown spend, counted at the run's whole budget. The ledger
+ * keeps what it counted (budget.ts), each process starts from the decision log's
+ * highest total so far (a ledger file it can't read counts as 0), and the guard
+ * writes the running maximum.
  */
 import { lstatSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
@@ -42,11 +61,13 @@ import { join, resolve } from "node:path";
 import type { RunFile } from "../generate/archon";
 import { Ledger, sessionSpendUsd, usageUsd, usd } from "./budget";
 import { type GuardSettings, type Identity, loadIdentity, loadRunFile, loadSettings, Problem } from "./config";
+import { contextAboveProblem, type Conventions, conventionsBlock, readConventions, takeConventions } from "./context";
 import { ask, bashGate, classifierRecord, type DecideHooks, decideOptions, resultScreen, skipsGate, wrapText } from "./gates";
 import { DecisionLog, type Entry } from "./log";
 import { bindsThinking, BINDING_BETA, clamp, isPayload, modelProblem, pinOf } from "./model";
 import { checkWrite, protectedTable, realDir, type Roots } from "./paths";
 import type { ExtensionAPI, ExtensionContext, ToolCallEvent, ToolResultEvent, ToolResultEventResult } from "./pi-api";
+import { endsSession, sessionResult } from "./result";
 import { findSecret, PATTERN_NAMES, redact, redactDeep, type Secrets, takeSecrets, withUnset } from "./secrets";
 import { checkShell } from "./shell";
 
@@ -75,7 +96,7 @@ const round = (n: number): number => Math.round(n * 1e9) / 1e9;
 
 interface Ready {
   settings: GuardSettings;
-  run: RunFile;
+  run: RunFile & { turns: number };
   id: Identity;
   secrets: Secrets;
   agentDir: string;
@@ -142,6 +163,18 @@ function register(pi: ExtensionAPI, r: Ready, deps: GuardDeps): void {
   const table = protectedTable(s.protected_paths);
   let ledger: Ledger | undefined;
   let flagged = false;
+  let turnsFlagged = false;
+  /** A hard stop, held: every later hook throws `error` before it reads its context, and a tool call is blocked under `rule` (H-230). */
+  let stopped: { rule: "run-budget" | "run-turns"; reason: string; error: string } | undefined;
+  const halted = () => {
+    if (stopped) throw new Error(stopped.error);
+  };
+  /** The worktree's context file, as session_start read it. */
+  let conventions: Conventions | undefined;
+  /** What the decision log already counted beyond what this process could read at session_start (a ledger it can't read counts as 0). */
+  const floor = { usd: 0, turns: 0 };
+  /** The highest total and turns this process has reached: what it writes never falls. */
+  const top = { usd: 0, turns: 0 };
   /**
    * The first error a tool_result caught. Pi keeps a result's original content
    * when tool_result throws, so a throw there (a full /tmp failing the ledger
@@ -181,29 +214,49 @@ function register(pi: ExtensionAPI, r: Ready, deps: GuardDeps): void {
     table,
   });
 
-  /** The run's spend: the other attempts' ledgers, this session's entries plus `pending`, this process's classifier calls. */
-  const spend = (ctx: ExtensionContext, pending = 0): { session: number; total: number } => {
+  /**
+   * The run's spend and turns: the other attempts' ledgers, this session's entries plus `pending`, this process's
+   * classifier calls and turns, and what the log counted that this process couldn't read; never below the last.
+   */
+  const spend = (ctx: ExtensionContext, pending = 0): { total: number; turns: number } => {
     const l = started();
-    const session = sessionSpendUsd(ctx.sessionManager.getEntries()) + pending;
+    const mine = l.mine(sessionSpendUsd(ctx.sessionManager.getEntries()) + pending);
     const others = l.others();
     for (const name of others.bad) {
       if (reported.has(name)) continue;
       reported.add(name);
-      record({ event: "budget", decision: "flag", rule: "ledger-reset", reason: `the ledger file ${shown(name)} can't be read, so its spend counts as 0` });
+      const held = l.held(name);
+      const counts = held === undefined ? "its spend counts as 0" : `its spend counts at the ${usd(held)} last read from it`;
+      record({ event: "budget", decision: "flag", rule: "ledger-reset", reason: `the ledger file ${shown(name)} can't be read, so ${counts}` });
     }
-    return { session, total: others.usd + l.mine(session) };
+    top.usd = Math.max(top.usd, others.usd + mine + floor.usd);
+    top.turns = Math.max(top.turns, others.turns + l.mineTurns() + floor.turns);
+    return { total: top.usd, turns: top.turns };
   };
   const spent = (total: number) => `the run's budget of ${usd(limit)} is spent (${usd(total)})`;
-  /** Save this process's spend; at or over the limit, fail the node (hard) or flag the run, once (soft). */
-  const account = (ctx: ExtensionContext, pending = 0): void => {
-    const { session, total } = spend(ctx, pending);
-    started().save(session);
-    if (total < limit) return;
+  /**
+   * Save this process's spend; with `spend`, write the spend record; at or over the limit, fail the node (hard: the
+   * spend record first, once per call, then the stop) or flag the run, once (soft).
+   */
+  const account = (ctx: ExtensionContext, pending = 0, o: { spend?: boolean } = {}): { total: number; turns: number } => {
+    halted();
+    const { total, turns } = spend(ctx, pending);
+    started().save();
+    let wrote = false;
+    const spendRecord = () => {
+      if (wrote) return;
+      wrote = true;
+      record({ event: "budget", decision: "allow", rule: "spend", reason: "the run's spend so far", cost_usd: round(total), turns });
+    };
+    if (o.spend) spendRecord();
+    if (total < limit) return { total, turns };
     if (s.budgets.mode === "hard") {
+      stopped = { rule: "run-budget", reason: spent(total), error: `hapi-guard: ${spent(total)}; the node fails (budgets.enforcement.hapi_guard: hard)` };
+      spendRecord();
       record({ event: "budget", decision: "fail", rule: "run-budget", reason: `${spent(total)}; the node fails`, cost_usd: round(total) });
-      throw new Error(`hapi-guard: ${spent(total)}; the node fails (budgets.enforcement.hapi_guard: hard)`);
+      throw new Error(stopped.error);
     }
-    if (flagged) return;
+    if (flagged) return { total, turns };
     flagged = true;
     record({
       event: "budget",
@@ -212,12 +265,14 @@ function register(pi: ExtensionAPI, r: Ready, deps: GuardDeps): void {
       reason: `${spent(total)}; the run goes on and is flagged (budgets.enforcement.hapi_guard: soft)`,
       cost_usd: round(total),
     });
+    return { total, turns };
   };
   /** Add a classifier call's cost to the ledger. */
   const charge = (ctx: ExtensionContext, costUsd: number) => {
     const l = started();
     l.addClassifier(costUsd);
-    l.save(sessionSpendUsd(ctx.sessionManager.getEntries()));
+    l.mine(sessionSpendUsd(ctx.sessionManager.getEntries()));
+    l.save();
   };
 
   pi.on("session_start", (_event, ctx) => {
@@ -235,6 +290,9 @@ function register(pi: ExtensionAPI, r: Ready, deps: GuardDeps): void {
     if (dir) fail("agent-dir", dir);
     const tree = worktreeProblem(ctx.cwd);
     if (tree) fail("worktree", tree);
+    const outside = contextAboveProblem(ctx.cwd, r.agentDir);
+    if (outside) fail("context-file", outside);
+    conventions = readConventions(ctx.cwd);
     let session = "";
     try {
       session = ctx.sessionManager.getSessionId();
@@ -243,10 +301,15 @@ function register(pi: ExtensionAPI, r: Ready, deps: GuardDeps): void {
     }
     const l = new Ledger(s.paths.ledgerDir, id, session || `pid-${process.pid}`);
     let resets: string[] = [];
+    const prior = log.highest();
     try {
       resets = l.open(log.startedAttempts());
-      l.save(sessionSpendUsd(ctx.sessionManager.getEntries()));
-      for (const name of l.others().bad) reported.add(name);
+      const mine = l.mine(sessionSpendUsd(ctx.sessionManager.getEntries()));
+      l.save();
+      const others = l.others();
+      for (const name of others.bad) reported.add(name);
+      floor.usd = Math.max(0, prior.usd - (others.usd + mine));
+      floor.turns = Math.max(0, prior.turns - (others.turns + l.mineTurns()));
     } catch {
       fail("ledger", `the budget ledger under ${s.paths.ledgerDir} can't be written`);
     }
@@ -262,6 +325,8 @@ function register(pi: ExtensionAPI, r: Ready, deps: GuardDeps): void {
       record({ event: "tool_call", decision: "block", rule: b.rule, reason: b.reason, tool, ...(b.path === undefined ? {} : { path: b.path }), ...(b.secret === undefined ? {} : { secret: b.secret }) });
       return b;
     };
+    // Before anything reads `ctx`: after a hard stop it may be stale (H-230).
+    if (stopped) return block({ rule: stopped.rule, reason: `${stopped.reason}; no more tool calls` });
     const allow = (): undefined => {
       record({ event: "tool_call", decision: "allow", rule: "rules", reason: "no rule blocked it", tool });
       return undefined;
@@ -303,7 +368,7 @@ function register(pi: ExtensionAPI, r: Ready, deps: GuardDeps): void {
       const b = secretBlock(command, "the command");
       if (b) return b;
       const sh = checkShell(command, { cwd: ctx.cwd, home, roots: roots(ctx), piDir: realDir(r.agentDir), out: realDir(s.paths.out) });
-      if (sh) return block({ ...sh, note: "; a best-effort check, not a boundary" });
+      if (sh) return block({ ...sh, note: "; a best-effort check, not a boundary; to only read a file, use the read tool" });
       if (s.gates.bash_gate.enabled && !skipsGate(command, s.gates.bash_gate.skip_commands)) {
         const res = await ask(bashGate, scrubText(command), options);
         charge(ctx, res.costUsd);
@@ -385,14 +450,37 @@ function register(pi: ExtensionAPI, r: Ready, deps: GuardDeps): void {
     return wrap ? wrapped : changes;
   });
 
+  pi.on("before_agent_start", (event, ctx) => {
+    started();
+    halted();
+    const moved = takeConventions(event, ctx.cwd, conventions);
+    if ("problem" in moved) {
+      record({ event: "agent_start", decision: "fail", rule: "conventions", reason: moved.problem });
+      throw new Error(`hapi-guard: ${moved.problem}; the node fails`);
+    }
+    if (moved.taken.length === 0) return undefined;
+    const names = moved.taken.map((c) => c.name).join(" and ");
+    const verb = moved.taken.length === 1 ? "reaches" : "reach";
+    record({ event: "agent_start", decision: "allow", rule: "conventions", reason: `the repo's ${names} ${verb} the model below the work order, as the repo's conventions` });
+    const content = moved.taken.map((c) => conventionsBlock(c.name, scrubText(c.text))).join("\n\n");
+    return { message: { customType: "hapi-conventions", content, display: false } };
+  });
+
   pi.on("before_provider_headers", (_event, ctx) => {
     rethrow();
-    started().countSend();
+    const l = started();
+    l.countSend();
+    if (stopped) {
+      // A refused send still counts; the save reads no ctx.
+      l.save();
+      halted();
+    }
     account(ctx);
   });
 
   pi.on("before_provider_request", (event, ctx) => {
     started();
+    halted();
     const payload = event.payload;
     if (!isPayload(payload)) {
       const reason = "the provider payload is not an object";
@@ -416,16 +504,34 @@ function register(pi: ExtensionAPI, r: Ready, deps: GuardDeps): void {
 
   pi.on("message_end", (event, ctx) => {
     started();
+    halted();
     const m = event.message;
     // Pi persists the message only after the extensions see it (agent-session.js:752-768).
     const persisted = ctx.sessionManager.getEntries().some((e) => e.type === "message" && e.message === m);
     account(ctx, !persisted && (m?.role === "assistant" || m?.role === "toolResult") ? usageUsd(m.usage) : 0);
   });
 
-  pi.on("turn_end", (_event, ctx) => {
+  pi.on("turn_end", (event, ctx) => {
     rethrow();
-    started();
-    account(ctx);
+    const l = started();
+    halted();
+    const m = event.message;
+    const final = endsSession(m);
+    if (final) record({ event: "result", rule: "result", ...sessionResult(m) });
+    // Count the turn first, so the spend record's turns include it.
+    l.countTurn();
+    const { turns } = account(ctx, 0, { spend: true });
+    // The turn that ends the session never fails on turns: there is no next one.
+    if (final || turns < run.turns) return;
+    const used = `the run's turn budget of ${run.turns} is spent (${turns} ${turns === 1 ? "turn" : "turns"})`;
+    if (s.budgets.mode === "hard") {
+      stopped = { rule: "run-turns", reason: used, error: `hapi-guard: ${used}; the node fails (budgets.enforcement.hapi_guard: hard)` };
+      record({ event: "budget", decision: "fail", rule: "run-turns", reason: `${used}; the node fails`, turns });
+      throw new Error(stopped.error);
+    }
+    if (turnsFlagged) return;
+    turnsFlagged = true;
+    record({ event: "budget", decision: "flag", rule: "run-turns", reason: `${used}; the run goes on and is flagged (budgets.enforcement.hapi_guard: soft)`, turns });
   });
 }
 

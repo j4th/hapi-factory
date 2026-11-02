@@ -20,10 +20,18 @@ export interface Usage {
   cost: { total: number };
 }
 
-/** An agent message (user, assistant, toolResult, ...). Assistant and toolResult messages may carry usage. */
+/**
+ * An agent message (user, assistant, toolResult, ...). Assistant and toolResult messages may carry usage. An
+ * assistant message's `content` is `(TextContent | ThinkingContent | ToolCall)[]` (a:364): `{ type: "text", text }`
+ * (a:246-250), `{ type: "thinking", thinking }` (a:251-259), `{ type: "toolCall", id, name, arguments }` (a:265-278).
+ * Its `stopReason` is a:376's `StopReason`, `"pending" | "stop" | "length" | "toolUse" | "error" | "aborted" |
+ * "deferred"` (a:301; spike 09, finding 4).
+ */
 export interface AgentMessage {
   role: string;
   usage?: Usage;
+  stopReason?: string;
+  content?: ({ type: string; text?: string } & Record<string, unknown>)[];
 }
 
 /**
@@ -107,6 +115,36 @@ export interface ToolResultEventResult {
   structuredContent?: unknown;
 }
 
+/** One context file Pi loaded (core/system-prompt.d.ts:45-48). */
+export interface ContextFile {
+  path: string;
+  content: string;
+}
+
+/**
+ * t:720-742, BeforeAgentStartEventBase with its two variants (`messageType` "user", with `prompt`, or "custom").
+ * `systemPrompt` is rendered from `systemPromptOptions` on every read, and the options are mutable: a handler's
+ * change to `contextFiles` is what Pi renders for the run (runner.js:1121-1164; spike 09, finding 1). Pi fires it
+ * once per prompt, before the first request.
+ */
+export interface BeforeAgentStartEvent {
+  type: "before_agent_start";
+  readonly systemPrompt: string;
+  /** NormalizedBuildSystemPromptOptions (core/system-prompt.d.ts:37-50), the fields the guard touches. */
+  systemPromptOptions: { cwd?: string; contextFiles?: ContextFile[] } & Record<string, unknown>;
+  messageType: "user" | "custom";
+}
+
+/**
+ * t:1125-1129. `message` is pushed after the user's prompt as a `custom` message, which Pi sends as a user message
+ * (core/messages.js:89-96); `systemPrompt` would replace the whole prompt. A throw fails the node before any request
+ * (spike 09, `hook-throw`).
+ */
+export interface BeforeAgentStartEventResult {
+  message?: { customType: string; content: string; display: boolean; details?: unknown };
+  systemPrompt?: string;
+}
+
 /** t:693-696. Mutating `payload` in place reaches the wire (spike 08, finding 4). */
 export interface BeforeProviderRequestEvent {
   type: "before_provider_request";
@@ -137,6 +175,8 @@ export type Handler<E, R = undefined> = (event: E, ctx: ExtensionContext) => R |
 /** t:1186-1256, the methods the guard calls (`on`) and the two it must never call. */
 export interface ExtensionAPI {
   on(event: "session_start", handler: Handler<SessionStartEvent>): unknown;
+  /** t:1207. */
+  on(event: "before_agent_start", handler: Handler<BeforeAgentStartEvent, BeforeAgentStartEventResult>): unknown;
   on(event: "tool_call", handler: Handler<ToolCallEvent, ToolCallEventResult>): unknown;
   on(event: "tool_result", handler: Handler<ToolResultEvent, ToolResultEventResult>): unknown;
   on(event: "before_provider_request", handler: Handler<BeforeProviderRequestEvent, unknown>): unknown;

@@ -10,11 +10,14 @@ import { cleanupAll, gatesOff, setup } from "./harness";
 
 afterEach(cleanupAll);
 
+/** What every rule 7 reason ends with, inside its "(rule shell-write...)". */
+const NOTE = "; a best-effort check, not a boundary; to only read a file, use the read tool";
+
 /**
  * [command, blocked]. The worktree holds AGENTS.md, .github/workflows/ci.yml, .git/{objects,hooks}, src/a.ts,
  * notes.md, app.log, pkg/CLAUDE.md, node_modules/bun-types/CLAUDE.md (bun-types ships one), and the links
  * link.md -> AGENTS.md, obj -> .git/objects, wf -> .github/workflows and hook -> obj/../hooks/pre-push (dangling),
- * x.md, and CLAUDE.md -> notes.md (a protected name over an unprotected file).
+ * x.md, CLAUDE.md -> notes.md (a protected name over an unprotected file), and loop -> loop (a symlink loop).
  */
 const VECTORS: [string, boolean][] = [
   // Redirection: >, >>, and the fd and &> forms, attached or not.
@@ -81,6 +84,57 @@ const VECTORS: [string, boolean][] = [
   // The working directory follows cd.
   ["cd .github && echo x > workflows/ci.yml", true],
   ["cd src; rm ../AGENTS.md", true],
+  // cd's options are parsed; a later word is checked against every directory the command may be in (H-223(b)).
+  ["cd -- .github && echo x > workflows/ci.yml", true],
+  ["cd -P .github && echo x > workflows/ci.yml", true],
+  ["test -d src && cd src; echo x > .github/workflows/ci.yml", true],
+  ["(cd src); echo x > .github/workflows/ci.yml", true],
+  ["cd src | cat; echo x > .github/workflows/ci.yml", true],
+  ["cd src || true; echo x > .github/workflows/ci.yml", true],
+  ["cd -x src && ls", true],
+  ["cd - && ls", false],
+  ["mkdir -p dist && cd dist && cp ../x.md .", false],
+  // A file command counts only at the command position, and only its targets count (H-223(a)).
+  ["grep -n install AGENTS.md", false],
+  ["cp AGENTS.md /tmp/agents.md", false],
+  ["cp -t /tmp AGENTS.md", false],
+  ["dd if=AGENTS.md of=/tmp/x", false],
+  ["cp --target-directory=.github/workflows notes.md", true],
+  ["env rm AGENTS.md", true],
+  ["find . -name x | xargs rm AGENTS.md", true],
+  // The command position is past the shell's reserved words, and past a wrapper's options and their values.
+  ["if true; then rm AGENTS.md; fi", true],
+  ["for f in a; do rm AGENTS.md; done", true],
+  ["{ rm AGENTS.md; }", true],
+  ["! rm AGENTS.md", true],
+  ["nohup rm AGENTS.md", true],
+  ["command rm AGENTS.md", true],
+  ["timeout 5 rm AGENTS.md", true],
+  ["xargs -n 1 rm AGENTS.md", true],
+  ["sudo -u root rm AGENTS.md", true],
+  ["timeout -s KILL 5s rm AGENTS.md", true],
+  ["function f { rm AGENTS.md; }", true],
+  ["sudo -u root grep -rn rm AGENTS.md", false],
+  ["xargs -I {} grep install {}", false],
+  ["find . -name AGENTS.md -exec rm {} \\;", true],
+  ["rm -- -x AGENTS.md", true],
+  ["cd src > AGENTS.md", true],
+  // A copy's target, and the file it makes in a target directory; ln with one operand makes ./<name>.
+  ["cp src/a.ts .github/", true],
+  ["cp src/a.ts pkg/CLAUDE.md", true],
+  ["cp notes.md pkg", false],
+  ["cp pkg/CLAUDE.md src", true],
+  ["cp pkg/CLAUDE.md x2.md", false],
+  ["ln -s /tmp/elsewhere/AGENTS.md", true],
+  ["install -d src/x .github/y", true],
+  ["sed -i -e s/a/b/ AGENTS.md", true],
+  ["sed -f fix.sed -i AGENTS.md", true],
+  ["cd /tmp && echo x > a.txt", false],
+  // An in-place edit's script is no target; a ".." after a missing dir, and a symlink loop, block (H-223(c)).
+  ["sed -i 's/../X/' notes.md", false],
+  ["perl -pi -e 's/../X/' notes.md", false],
+  ["echo x > nothere/../x.md", true],
+  ["echo x > loop", true],
   // Allowed: no write indicator, or none of them names a protected path.
   ["cat AGENTS.md", false],
   ["cat AGENTS.md | grep -n agents", false],
@@ -135,6 +189,7 @@ test("the vector table: each command blocks or allows as listed", async () => {
   symlinkSync("obj/../hooks/pre-push", join(h.work, "hook"));
   writeFileSync(join(h.work, "x.md"), "x\n");
   symlinkSync("notes.md", join(h.work, "CLAUDE.md"));
+  symlinkSync("loop", join(h.work, "loop"));
   await h.start();
   const got: [string, boolean][] = [];
   for (const [command] of VECTORS) got.push([command, (await h.tool("bash", { command }))?.block === true]);
@@ -146,10 +201,28 @@ test("a block names the path and the rule; the log records it", async () => {
   await h.start();
   expect(await h.tool("bash", { command: "echo x > AGENTS.md" })).toEqual({
     block: true,
-    reason: "hapi-guard: this command writes to the protected path AGENTS.md (rule shell-write; a best-effort check, not a boundary)",
+    reason: `hapi-guard: this command writes to the protected path AGENTS.md (rule shell-write${NOTE})`,
   });
   const r = h.log().at(-1);
   expect([r.event, r.decision, r.rule, r.tool, r.path]).toEqual(["tool_call", "block", "shell-write", "bash", "AGENTS.md"]);
+});
+
+test("an option-led cd and a symlink loop block with their own reasons", async () => {
+  const h = setup({ settings: gatesOff });
+  symlinkSync("loop", join(h.work, "loop"));
+  await h.start();
+  expect(await h.tool("bash", { command: "cd -x src && ls" })).toEqual({
+    block: true,
+    reason: `hapi-guard: this command's cd -x can't be followed, so where its later words land can't be known (rule shell-write${NOTE})`,
+  });
+  expect(await h.tool("bash", { command: "echo x > loop" })).toEqual({
+    block: true,
+    reason: `hapi-guard: this command names loop, which goes through too many levels of symbolic links (rule shell-write${NOTE})`,
+  });
+  expect(await h.tool("bash", { command: "echo x > nothere/../x.md" })).toEqual({
+    block: true,
+    reason: `hapi-guard: this command names nothere/../x.md, which goes through ${join(h.work, "nothere")}, which doesn't exist, and then "..", so where it lands can't be known (rule shell-write${NOTE})`,
+  });
 });
 
 test("a shell write into Pi's agent dir, the guard's ledger or the decision log's dir blocks too", async () => {
@@ -159,7 +232,7 @@ test("a shell write into Pi's agent dir, the guard's ledger or the decision log'
   expect((await h.tool("bash", { command: `rm -rf ${h.ledgerDir}` }))?.block).toBe(true);
   expect(await h.tool("bash", { command: `echo '{}' >> ${join(h.out, "decisions.jsonl")}` })).toEqual({
     block: true,
-    reason: `hapi-guard: this command writes into hapi-guard's decision log dir (${h.out}) (rule shell-write; a best-effort check, not a boundary)`,
+    reason: `hapi-guard: this command writes into hapi-guard's decision log dir (${h.out}) (rule shell-write${NOTE})`,
   });
   expect((await h.tool("bash", { command: `truncate -s 0 ${h.out}/decisions.jsonl` }))?.block).toBe(true);
   expect((await h.tool("bash", { command: `echo x > ${join(h.tmp, "scratch.txt")}` }))?.block).toBeUndefined();
