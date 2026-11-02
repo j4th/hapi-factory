@@ -52,6 +52,8 @@ function fakes(
     sidecarImages?: string[];
     /** Exit code of `docker pull`. */
     pullCode?: number;
+    /** Images `docker image inspect` finds here already (none by default). */
+    images?: string[];
   } = {},
 ) {
   const steps: string[] = [];
@@ -78,6 +80,7 @@ function fakes(
       if (cmd.at(-1) === "down") return { code: o.downCode ?? 0, stdout: "" };
       if (cmd.slice(-2).join(" ") === "build archon") return { code: o.buildCode ?? 0, stdout: "" };
       if (cmd[1] === "pull") return { code: o.pullCode ?? 0, stdout: "" };
+      if (cmd[1] === "image" && cmd[2] === "inspect") return (o.images ?? []).includes(cmd.at(-1)!) ? { code: 0, stdout: "sha256:0123\n", stderr: "" } : { code: 1, stdout: "", stderr: `Error response from daemon: No such image: ${cmd.at(-1)}` };
       return { code: 0, stdout: "" };
     },
   };
@@ -142,6 +145,7 @@ describe("hapi stack up", () => {
       "build budget",
       "resolve",
       [...COMPOSE, "build", "archon"].join(" "),
+      `docker image inspect --format {{.Id}} ${SIDECAR_IMAGE}`,
       `docker pull ${SIDECAR_IMAGE}`,
       [...COMPOSE, "up", "--no-start", "--build"].join(" "),
       "docker network inspect",
@@ -151,7 +155,7 @@ describe("hapi stack up", () => {
     expect(inspect.cmd.slice(3)).toEqual(["hapi_hermes-net", "hapi_archon-net", "hapi_research-net", "hapi_review-net"]);
     expect(ZONE_NETWORKS).toEqual(["hermes-net", "archon-net", "research-net", "review-net"]);
     expect(out.at(-1)).toBe(
-      "the stack is up (Compose project hapi): egress-hermes, egress-archon, egress-research, egress-review, hermes (archon is built, and a container of it starts per run; 1 sidecar image is pulled, and a sidecar starts with a run that smokes)",
+      "the stack is up (Compose project hapi): egress-hermes, egress-archon, egress-research, egress-review, hermes (archon is built, and a container of it starts per run; 1 sidecar image is here (1 pulled), and a sidecar starts with a run that smokes)",
     );
     // Compose gets the caller's env (XDG_RUNTIME_DIR for the env files) and the labels' values.
     const up = f.calls.at(-1)!;
@@ -439,6 +443,25 @@ describe("hapi stack up", () => {
     expect(pull.env).toMatchObject({ XDG_RUNTIME_DIR: "/run/user/1001", HAPI_STARTED_BY: "hapi" });
     // No sidecar in policy: no pull.
     const g = fakes({ sidecarImages: [] });
+    expect(await stackUp([], g.deps)).toBe(0);
+    expect(g.steps.some((st) => st.startsWith("docker pull"))).toBe(false);
+  });
+
+  test("a sidecar image already here by its digest reference isn't pulled again, so an offline up works once it has been; one that isn't is", async () => {
+    const { out } = capture();
+    const other = `example/postgres:17@sha256:${"c".repeat(64)}`;
+    const f = fakes({ sidecarImages: [SIDECAR_IMAGE, other], images: [SIDECAR_IMAGE] });
+    expect(await stackUp([], f.deps)).toBe(0);
+    const inspects = f.calls.filter((c) => c.cmd[1] === "image" && c.cmd[2] === "inspect");
+    expect(inspects.map((c) => [c.cmd, c.inherit])).toEqual([
+      [["docker", "image", "inspect", "--format", "{{.Id}}", SIDECAR_IMAGE], false],
+      [["docker", "image", "inspect", "--format", "{{.Id}}", other], false],
+    ]);
+    expect(inspects.every((c) => c.env.HAPI_STARTED_BY === "hapi")).toBe(true);
+    expect(f.calls.filter((c) => c.cmd[1] === "pull").map((c) => c.cmd)).toEqual([["docker", "pull", other]]);
+    expect(out.at(-1)).toContain("2 sidecar images are here (1 pulled)");
+    // Every one here: no pull at all, and a pull that would fail (offline) is never tried.
+    const g = fakes({ sidecarImages: [SIDECAR_IMAGE, other], images: [SIDECAR_IMAGE, other], pullCode: 1 });
     expect(await stackUp([], g.deps)).toBe(0);
     expect(g.steps.some((st) => st.startsWith("docker pull"))).toBe(false);
   });

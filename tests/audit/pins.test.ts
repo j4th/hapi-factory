@@ -97,7 +97,8 @@ describe("pins.versions", () => {
       writeFileSync(join(root, ".config", "git", "config"), "");
     });
     expect(r.status).toBe("pass");
-  });
+    // One whole audit per case: near bun's 5 s default on a loaded host, so it gets 30 s.
+  }, 30_000);
 
   test("a mise tool in table form is read by its version", async () => {
     const r = await pins((root) => replace(root, "mise.toml", /^gitleaks = "[^"]+"/m, 'gitleaks = { version = "latest" }'));
@@ -200,7 +201,8 @@ describe("pins.versions", () => {
       expect([line, r.status]).toEqual([line, status]);
       if (says !== undefined) expect([line, r.detail]).toEqual([line, expect.stringContaining(says)]);
     }
-  });
+    // One whole audit per case, 39 of them: near bun's 5 s default on a loaded host, so it gets 30 s.
+  }, 30_000);
 
   test("a comment line inside a continued RUN is dropped first, as Docker drops it: never read as packages, never ending the RUN", async () => {
     let r = await pins((root) => append(root, "stack/archon/Dockerfile", "RUN apt-get install -y \\\n    # the pinned tools\n    curl=8.5.0-2ubuntu10.6 \\\n  # and one more\n    jq=1.7.1-3build1\n"));

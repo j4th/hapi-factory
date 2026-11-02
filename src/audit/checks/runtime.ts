@@ -22,10 +22,10 @@
  *   kind's proxy and, when it says it has one (`org.hapi.sidecar`), its smoke
  *   sidecar (`runNetworkProblems`). A live sidecar (`classify`: named
  *   `<run>-sidecar`, labelled `org.hapi.kind=sidecar`) is held to its policy
- *   sidecar's definition, `sidecarArgs` (src/run/sidecar.ts), picked by its
- *   image, which policy/sidecars.yaml must pin (`sidecarProblems`): no key, its
- *   data read-only, its run's network alone, policy's limits; and each policy
- *   sidecar's definition is checked with no Docker needed.
+ *   sidecar's definition, `sidecarArgs` (src/run/sidecar.ts), for the policy
+ *   sidecar its run names, whose pinned image it must run (`sidecarProblems`):
+ *   no key, its data read-only, its run's network alone, policy's limits; and
+ *   each policy sidecar's definition is checked with no Docker needed.
  * - runtime.hermes-no-yolo: Hermes's effective approval settings: no `--yolo`
  *   in its argv, no HERMES_YOLO_MODE or HERMES_YOLO in its env, HERMES_HOME
  *   where hapi puts it, and in the config mounted read-only at
@@ -567,13 +567,13 @@ function sidecarDefinitionProblems(want: RunShape, s: Sidecar): string[] {
 }
 
 /**
- * How a live sidecar (`classify`) falls short: its image must be one policy/sidecars.yaml pins (`Config.Image`, as
- * `docker run` was given it), and it is held to that sidecar's definition (`sidecarShape`: every tmpfs, mount and
- * hardening flag, its HOME and PORT, policy's limits), runs policy's command in /data, adds no capability and isn't
- * privileged, holds no
- * env name any zone holds, carries no Compose label but blank ones and no helper label, and is on its run's network
- * alone as `hapi-sidecar`. Its run's container, named for it, must exist (running or not, among `all`) and say it has
- * this sidecar (`SIDECAR_LABEL`).
+ * How a live sidecar (`classify`) falls short. Its policy sidecar is the one its run names (`SIDECAR_LABEL` on its
+ * run's container, named for it and found among `all`, running or not), never one picked by its image, which two
+ * sidecars may share: so its run must exist and name a sidecar policy/sidecars.yaml lists. Its image (`Config.Image`,
+ * as `docker run` was given it) must be that sidecar's pin, and it is held to that sidecar's definition
+ * (`sidecarShape`: every tmpfs, mount and hardening flag, its HOME and PORT, policy's limits). It runs policy's
+ * command in /data, adds no capability and isn't privileged, holds no env name any zone holds, carries no Compose
+ * label but blank ones and no helper label, and is on its run's network alone as `hapi-sidecar`.
  */
 export function sidecarProblems(
   c: Container,
@@ -586,12 +586,21 @@ export function sidecarProblems(
   const v = c.Config?.Labels?.["org.hapi.run"] ?? "";
   const run = runName(PROJECT, v);
   const image = c.Config?.Image ?? "";
+  const shownImage = image === "" ? "(no image)" : shown(image);
+  // An image no policy sidecar pins, whichever its run names.
+  if (!Object.values(sidecars).some((s) => s.image === image)) problems.push(`runs ${shownImage}, which policy/sidecars.yaml doesn't list`);
   const any = new Set(Object.values(zoneKeys).flat());
-  const keys = [...envOf(c).keys()].filter((n) => any.has(n)).sort().map((n) => `${n} is set: a sidecar holds no key`);
-  const named = Object.entries(sidecars).find(([, s]) => s.image === image);
-  if (named === undefined) return [`runs ${image === "" ? "(no image)" : shown(image)}, which policy/sidecars.yaml doesn't list`, ...keys];
-  const [name, s] = named;
-  problems.push(...liveProblems(c, sidecarShape(s, v, ctx), ""), ...keys);
+  problems.push(...[...envOf(c).keys()].filter((n) => any.has(n)).sort().map((n) => `${n} is set: a sidecar holds no key`));
+  const owner = all.find((x) => containerName(x) === run && x.Config?.Labels?.["org.hapi.run"] === v);
+  const declared = owner === undefined ? undefined : declaredSidecar(owner);
+  if (owner === undefined) problems.push(`its run's container ${run} doesn't exist`);
+  else if (declared === undefined) problems.push(`its run ${run} carries no ${SIDECAR_LABEL} label: the run started no sidecar`);
+  else if (!Object.hasOwn(sidecars, declared)) problems.push(`its run ${run} names the sidecar ${shown(declared)}, which policy/sidecars.yaml doesn't list`);
+  const s = declared !== undefined && Object.hasOwn(sidecars, declared) ? sidecars[declared]! : undefined;
+  // With no policy sidecar to hold it to, it has failed already; with one, it is that sidecar, flag for flag.
+  if (s === undefined) return problems;
+  if (image !== s.image && problems.every((p) => !p.startsWith(`runs ${shownImage},`))) problems.push(`runs ${shownImage}, not policy's ${declared} image ${s.image}`);
+  problems.push(...liveProblems(c, sidecarShape(s, v, ctx), ""));
   const have = [c.Path ?? "", ...(c.Args ?? [])];
   if (have.length !== s.command.length || have.some((w, i) => w !== s.command[i])) problems.push(`it runs ${have.map(shown).join(" ")}, not ${s.command.join(" ")}`);
   if (c.Config?.WorkingDir !== "/data") problems.push(`its working dir is ${shown(c.Config?.WorkingDir || "(the image's)")}, not /data`);
@@ -609,13 +618,6 @@ export function sidecarProblems(
   const on = Object.keys(nets).sort();
   if (on.length !== 1 || on[0] !== run) problems.push(`it is on ${on.length === 0 ? "no network" : on.map(shown).join(", ")}, not on its run's network ${run} alone`);
   if (!(nets[run]?.Aliases ?? []).includes(SIDECAR_ALIAS)) problems.push(`it is not ${SIDECAR_ALIAS} on ${run}`);
-  const owner = all.find((x) => containerName(x) === run && x.Config?.Labels?.["org.hapi.run"] === v);
-  if (owner === undefined) problems.push(`its run's container ${run} doesn't exist`);
-  else {
-    const declared = declaredSidecar(owner);
-    if (declared === undefined) problems.push(`its run ${run} carries no ${SIDECAR_LABEL} label: the run started no sidecar`);
-    else if (declared !== name) problems.push(`its run ${run} names the sidecar ${shown(declared)}, not ${name}, whose image this is`);
-  }
   return problems;
 }
 

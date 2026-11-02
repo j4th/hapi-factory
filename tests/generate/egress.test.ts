@@ -60,11 +60,12 @@ test("the review zone allows exactly .api.anthropic.com, .app.coderabbit.ai, .cl
     q.trustedSources.zones.review.hosts.push(host);
     expect(() => emitEgress(q)).toThrow(`review zone: ${JSON.stringify(host)} is a forge host (${forgeDomain(host)}); the review zone has no forge route (design §3.5)`);
   }
-  // Through a tier only the review zone (of the allowlisted, forge-free ones) lists: T2, here.
-  const viaTier = structuredClone(p);
-  viaTier.trustedSources.zones.review.tiers = ["T2"];
-  viaTier.trustedSources.tiers.T2.hosts.push("github.com");
-  expect(() => emitEgress(viaTier)).toThrow(/review zone: "github\.com" is a forge host/);
+  // A tier at all is refused there, as the schema's maxItems: 0 refuses it: a tier would add a registry, or a forge.
+  for (const tiers of [["T0"], ["T1"], ["T0", "T1"]] as const) {
+    const tiered = structuredClone(p);
+    tiered.trustedSources.zones.review.tiers = [...tiers];
+    expect(() => emitEgress(tiered)).toThrow(`review zone: it lists tiers (${tiers.length}), where it may list none: its allowlist is its own hosts alone (design §3.5)`);
+  }
 });
 
 test("egress archon allowlist is exact and denies by default", () => {

@@ -349,7 +349,7 @@ One Squid config per egress zone (spec §10, §11.4). Each zone's containers sit
 
 **Every host is checked before it is written**, because hosts are pasted into `squid.conf` and the proxy is the boundary. The generator checks again what the schema enforces, so a policy built in code that skipped the schema can't get past it:
 - Each host is lowercased, as Squid matches domains case-insensitively, and must then be a plain domain name (`isHostname`, `src/policy/hosts.ts`). Anything else throws, such as a host holding a space or a newline, which could otherwise add a directive like `http_access allow all`.
-- Each zone's tiers must be source tiers (`T0` to `T3`), because their names go into a comment.
+- Each zone's tiers must be source tiers (`T0` to `T3`), because their names go into a comment, and the `review` zone may list none (the schema's `maxItems: 0`, again).
 - A forge host in the `archon` or the `review` zone throws, in any case (`forgeDomain`, so `GitHub.com` counts), from its hosts or a tier's: neither zone has a forge route (spec §4.3, design §3.5).
 - `openWeb` on any zone but `research` throws.
 

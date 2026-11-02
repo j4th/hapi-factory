@@ -23,8 +23,9 @@
  * with no config of its own (`hardenedGit`) and exported blob by blob, never with `git archive`, whose symlink
  * members could redirect a later member's write on the host. Only regular files (mode 100644 or 100755) are
  * exported, each as 0644 in 0755 dirs; a symlink or a submodule in the data dir refuses the run, and so does a data
- * dir with no file, or one over policy's caps (`data_files`, `data_mb`). Everything is read and checked before
- * anything is written, so a refused export writes nothing. It goes in the run's record dir (`SIDECAR_DATA`), bound
+ * dir with no file, or one over policy's caps (`data_files`, `data_mb`, checked as the listing is read). So is a
+ * name a plain file in /data couldn't have. Everything is read and checked before anything is written, so a refused
+ * export writes nothing. It goes in the run's record dir (`SIDECAR_DATA`), bound
  * read-only at /data.
  */
 import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
@@ -85,6 +86,8 @@ export async function startSidecar(d: RunDeps, rec: RunRecord, s: Sidecar, dataD
 const shown = (p: string) => p.replace(/[^\x20-\x7e]/g, "?").slice(0, 200);
 
 const MIB = 1024 * 1024;
+/** A character no exported file's name may hold: C0 controls, DEL, C1 controls (policy-defs' repoPath), and U+FFFD. */
+const UNSAFE_NAME = /[\u0000-\u001f\u007f-\u009f\ufffd]/;
 const OID = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
 
 /**
@@ -108,6 +111,7 @@ export async function exportSidecarData(
   const tree = await d.run([...at, "ls-tree", "-r", "-z", "-l", "--full-tree", sha, "--", prefix], { env: git.env, inherit: false });
   if (tree.code !== 0) throw new Error(`cannot list ${dataDir} at ${sha} in ${gitDir} (git ls-tree exited ${tree.code}): ${(tree.stderr ?? "").trim().split("\n")[0] || "(no error output)"}`);
   const entries: { path: string; oid: string; size: number }[] = [];
+  let bytes = 0;
   for (const row of tree.stdout.split("\0").filter((r) => r !== "")) {
     const tab = row.indexOf("\t");
     const path = row.slice(tab + 1);
@@ -118,15 +122,18 @@ export async function exportSidecarData(
     if (type !== "blob" || (mode !== "100644" && mode !== "100755") || !OID.test(oid ?? "") || !/^\d+$/.test(size ?? "")) {
       throw new Error(`${shown(path)}: not a regular file in the sidecar's data dir; only regular files are exported`);
     }
-    // A name a file in /data couldn't have as git wrote it: a control character, text that isn't UTF-8, or a . or .. part.
+    // A name a file in /data couldn't have as git wrote it: a control character (C0, DEL or C1, as policy's repoPath
+    // refuses), U+FFFD (the decoder's stand-in for bytes that aren't UTF-8), or an empty, . or .. part.
     const rel = path.slice(prefix.length);
-    if (/[\u0000-\u001f\u007f�]/.test(rel) || rel.split("/").some((part) => part === "" || part === "." || part === "..")) {
+    if (UNSAFE_NAME.test(rel) || rel.split("/").some((part) => part === "" || part === "." || part === "..")) {
       throw new Error(`${shown(path)}: a name the sidecar's data dir can't hold; only plain file names are exported`);
     }
     entries.push({ path, oid: oid!, size: Number(size) });
+    bytes += Number(size);
+    // The caps as the listing is read: past either, the rest of it isn't looked at.
+    if (entries.length > limits.data_files || bytes > limits.data_mb * MIB) throw new Error(over);
   }
   if (entries.length === 0) throw new Error(`${dataDir} holds no file at ${sha}`);
-  if (entries.length > limits.data_files || entries.reduce((n, e) => n + e.size, 0) > limits.data_mb * MIB) throw new Error(over);
 
   // Every blob read and checked before anything is written.
   const blobs: { rel: string; bytes: Uint8Array }[] = [];
@@ -136,9 +143,12 @@ export async function exportSidecarData(
     if (r.stdout.length !== e.size) throw new Error(`${shown(e.path)} at ${sha} read back ${r.stdout.length} bytes, not the ${e.size} git listed: nothing was exported`);
     blobs.push({ rel: e.path.slice(prefix.length), bytes: r.stdout });
   }
-  // A fresh dir of hapi's: nothing in it is a link, so a write lands where its path says.
-  await mkdir(dest, { mode: 0o755 });
+  // A fresh dir of hapi's: nothing in it is a link, so a write lands where its path says. One already there (this
+  // call didn't make it) is refused and left as it is.
+  let made = false;
   try {
+    await mkdir(dest, { mode: 0o755 });
+    made = true;
     await chmod(dest, 0o755);
     for (const b of blobs) {
       const file = join(dest, b.rel);
@@ -150,7 +160,7 @@ export async function exportSidecarData(
     const dirs = new Set(blobs.flatMap((b) => b.rel.split("/").slice(0, -1).map((_, i, parts) => join(dest, ...parts.slice(0, i + 1)))));
     for (const dir of dirs) await chmod(dir, 0o755);
   } catch (e) {
-    await rm(dest, { recursive: true, force: true });
+    if (made) await rm(dest, { recursive: true, force: true });
     throw new Error(`the sidecar's data could not be written to ${dest} (${(e as NodeJS.ErrnoException).code ?? (e as Error).message}): nothing was exported`);
   }
 }

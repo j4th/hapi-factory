@@ -285,7 +285,7 @@ The central list of sidecars (Plan 03, design §3.3). A repo's overlay names one
 
 | Key | Meaning |
 |---|---|
-| `image` | An OCI image pinned by digest (`name[:tag]@sha256:<64 hex>`); a tag alone is rejected. `mise run up` pulls it, by that reference |
+| `image` | An OCI image pinned by digest (`name[:tag]@sha256:<64 hex>`); a tag alone is rejected. `mise run up` pulls it by that reference, unless it is here already |
 | `command` | The argv it runs: a non-empty list of non-empty strings |
 | `port` | The port it listens on, 1 to 65535 (set as `PORT`, Bun's default port) |
 | `limits` | Fail-closed defaults, a starting point to tune, central only (an overlay can't change them) and always hard, each a whole number of at least 1: `pids` (`docker run --pids-limit`) and `memory_mb` (`--memory`, in MiB), which Docker enforces on the sidecar's container; `data_files` and `data_mb` (MiB), the most files and bytes its data dir may hold at the run's commit, which the run engine enforces on the export, refusing the run when there is more |

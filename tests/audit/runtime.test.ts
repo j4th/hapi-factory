@@ -442,17 +442,39 @@ describe("runtime.run-container", () => {
     const VALUE = ["fake", "audit", "sidecar", "key", "0123456789"].join("-");
     const R = "aaaaaaaaaaaa";
     const RUN = `hapi-run-${R}`;
-    /** A clean world with a live run of `kind` that has a sidecar, and the sidecar, both changed by `edit`. */
-    async function withSidecar(kind: Kind = "verify", edit: (sc: Container, run: Container, w: World) => void = () => {}) {
+    /**
+     * One clean world per test, which each case resets to the stack's own containers and then gives a live run of
+     * `kind` that has a sidecar, and the sidecar, both changed by `edit`. Only runtime.run-container runs (`ctx.only`),
+     * so a case costs one check, not a whole audit and a fresh world.
+     */
+    async function sidecarWorld() {
       const w = await cleanWorld();
-      const run = runContainer(w, R, { kind, sidecar: "bun-http" });
-      const sc = sidecarContainer(R);
-      edit(sc, run, w);
-      w.containers.push(run, sc);
-      return check(w, "runtime.run-container");
+      w.ctx.only = ["runtime.run-container"];
+      const stack = [...w.containers];
+      const withSidecar = async (kind: Kind = "verify", edit: (sc: Container, run: Container, w: World) => void = () => {}) => {
+        w.containers = [...stack];
+        w.networks = new Map();
+        const run = runContainer(w, R, { kind, sidecar: "bun-http" });
+        const sc = sidecarContainer(R);
+        edit(sc, run, w);
+        w.containers.push(run, sc);
+        return check(w, "runtime.run-container");
+      };
+      return { w, withSidecar };
+    }
+    /** Each case's `edit` fails the sidecar's check, naming `part` against the sidecar or its run, and never shows VALUE. */
+    async function failsEach(cases: [what: string, edit: (sc: Container, run: Container, w: World) => void, part: string][]) {
+      const { withSidecar } = await sidecarWorld();
+      for (const [what, edit, part] of cases) {
+        const r = await withSidecar("verify", edit);
+        expect([what, r.status]).toEqual([what, "fail"]);
+        expect([what, r.detail.includes(`${RUN}-sidecar: `) || r.detail.includes(`${RUN}: `), r.detail.includes(part)]).toEqual([what, true, true]);
+        expect([what, r.detail.includes(VALUE)]).toEqual([what, false]);
+      }
     }
 
     test("a run that has a sidecar, and its sidecar, pass: the run's network holds exactly the run, its proxy and its sidecar", async () => {
+      const { withSidecar } = await sidecarWorld();
       for (const kind of ["worker", "verify", "fix"] as const) {
         const r = await withSidecar(kind);
         expect([kind, r.status, r.detail]).toEqual([kind, "pass", expect.stringContaining("1 live run containers are as their kind's definition says")]);
@@ -464,20 +486,13 @@ describe("runtime.run-container", () => {
         delete w.networks.get(RUN)!.Containers[`id-sidecar-${R}`];
       });
       expect([stopped.status, stopped.detail]).toEqual(["pass", expect.not.stringContaining("smoke sidecars")]);
-    });
+    }, 30_000);
 
-    test("a live sidecar is held to its own shape: a policy image, read-only, /data read-only, no secret; an image policy doesn't list fails", async () => {
-      const cases: [what: string, edit: (sc: Container, run: Container, w: World) => void, part: string][] = [
+    test("a live sidecar runs policy's image, by digest, and its hardening: read-only, every capability dropped and none added, not privileged, no new privileges, 1001, policy's limits", async () => {
+      await failsEach([
         ["an image policy doesn't list", (sc) => void (sc.Config.Image = `example/evil:1@sha256:${"e".repeat(64)}`), `runs example/evil:1@sha256:${"e".repeat(64)}, which policy/sidecars.yaml doesn't list`],
         ["the policy's image by tag alone", (sc) => void (sc.Config.Image = "oven/bun:1.4.4-slim"), "runs oven/bun:1.4.4-slim, which policy/sidecars.yaml doesn't list"],
         ["a writable root", (sc) => void (sc.HostConfig!.ReadonlyRootfs = false), "its root filesystem is not read-only"],
-        ["/data writable", (sc) => void (sc.Mounts[0]!.RW = true), "/data is not mounted read-only"],
-        ["no /data", (sc) => void (sc.Mounts = []), "nothing is mounted at /data"],
-        ["another mount", (sc) => void sc.Mounts.push({ Type: "bind", Source: "/srv", Destination: "/srv", RW: false }), "/srv is mounted but the run definition has no such mount"],
-        ["a zone's key", (sc) => void sc.Config.Env.push(`ANTHROPIC_API_KEY=${VALUE}`), "ANTHROPIC_API_KEY is set: a sidecar holds no key"],
-        ["CodeRabbit's key", (sc) => void sc.Config.Env.push(`CODERABBIT_API_KEY=${VALUE}`), "CODERABBIT_API_KEY is set: a sidecar holds no key"],
-        ["another port", (sc) => setEnv(sc, "PORT", "9090"), "PORT is not 8080"],
-        ["a published port", (sc) => void (sc.HostConfig!.PortBindings = { "8080/tcp": [{ HostPort: "8080" }] }), "it publishes a port"],
         ["root", (sc) => void (sc.Config.User = "0:0"), "it runs as 0:0, not 1001:1001"],
         ["no capability dropped", (sc) => void (sc.HostConfig!.CapDrop = []), "it does not drop ALL capabilities"],
         ["a capability added", (sc) => void (sc.HostConfig!.CapAdd = ["CAP_NET_RAW"]), "it adds NET_RAW, where a sidecar adds none"],
@@ -485,9 +500,26 @@ describe("runtime.run-container", () => {
         ["no no-new-privileges", (sc) => void (sc.HostConfig!.SecurityOpt = []), "no-new-privileges:true is not set"],
         ["policy's pids limit raised", (sc) => void (sc.HostConfig!.PidsLimit = 4096), "its pids limit is 4096, not 128"],
         ["policy's memory raised", (sc) => void (sc.HostConfig!.Memory = 4 * 1024 ** 3), `its memory limit is ${4 * 1024 ** 3}, not ${512 * 1024 ** 2}`],
+      ]);
+    }, 30_000);
+
+    test("a live sidecar's data is read-only at /data, its one mount, and it holds no key, publishes no port and runs policy's command there", async () => {
+      await failsEach([
+        ["/data writable", (sc) => void (sc.Mounts[0]!.RW = true), "/data is not mounted read-only"],
+        ["no /data", (sc) => void (sc.Mounts = []), "nothing is mounted at /data"],
+        ["another mount", (sc) => void sc.Mounts.push({ Type: "bind", Source: "/srv", Destination: "/srv", RW: false }), "/srv is mounted but the run definition has no such mount"],
+        ["a writable /tmp of another size", (sc) => void (sc.HostConfig!.Tmpfs = { "/tmp": "size=1g" }), "the tmpfs at /tmp has options size=1g, not size=64m,uid=1001,gid=1001,mode=0700"],
+        ["a zone's key", (sc) => void sc.Config.Env.push(`ANTHROPIC_API_KEY=${VALUE}`), "ANTHROPIC_API_KEY is set: a sidecar holds no key"],
+        ["CodeRabbit's key", (sc) => void sc.Config.Env.push(`CODERABBIT_API_KEY=${VALUE}`), "CODERABBIT_API_KEY is set: a sidecar holds no key"],
+        ["another port", (sc) => setEnv(sc, "PORT", "9090"), "PORT is not 8080"],
+        ["a published port", (sc) => void (sc.HostConfig!.PortBindings = { "8080/tcp": [{ HostPort: "8080" }] }), "it publishes a port"],
         ["another command", (sc) => void (sc.Args = ["/data/other.ts"]), "it runs bun /data/other.ts, not bun /data/server.ts"],
         ["another working dir", (sc) => void (sc.Config.WorkingDir = "/"), "its working dir is /, not /data"],
-        ["a writable /tmp of another size", (sc) => void (sc.HostConfig!.Tmpfs = { "/tmp": "size=1g" }), "the tmpfs at /tmp has options size=1g, not size=64m,uid=1001,gid=1001,mode=0700"],
+      ]);
+    }, 30_000);
+
+    test("a live sidecar is on its run's network alone as hapi-sidecar, carries no Compose or helper label, and its run exists and names it", async () => {
+      await failsEach([
         ["another network too", (sc) => void (sc.NetworkSettings!.Networks.bridge = {}), `it is on bridge, ${RUN}, not on its run's network ${RUN} alone`],
         ["no hapi-sidecar alias", (sc) => void (sc.NetworkSettings!.Networks[RUN] = { Aliases: [] }), `it is not hapi-sidecar on ${RUN}`],
         ["a Compose label", (sc) => void (sc.Config.Labels["com.docker.compose.project"] = "hapi"), "it carries com.docker.compose.project=hapi: a sidecar is no service of the Compose project"],
@@ -495,14 +527,37 @@ describe("runtime.run-container", () => {
         ["a run that names no sidecar", (_, run) => void delete run.Config.Labels["org.hapi.sidecar"], `its run ${RUN} carries no org.hapi.sidecar label: the run started no sidecar`],
         ["a run that names another", (_, run) => void (run.Config.Labels["org.hapi.sidecar"] = "postgres"), `${RUN}: carries org.hapi.sidecar=postgres, which policy/sidecars.yaml doesn't list`],
         ["no run container", (_, run) => void (run.Name = "/somewhere_else"), `its run's container ${RUN} doesn't exist`],
-      ];
-      for (const [what, edit, part] of cases) {
-        const r = await withSidecar("verify", edit);
-        expect([what, r.status]).toEqual([what, "fail"]);
-        expect([what, r.detail.includes(`${RUN}-sidecar: `) || r.detail.includes(`${RUN}: `), r.detail.includes(part)]).toEqual([what, true, true]);
-        expect([what, r.detail.includes(VALUE)]).toEqual([what, false]);
-      }
-    });
+      ]);
+    }, 30_000);
+
+    test("the policy sidecar a live one is held to is the one its run names, not the first with its image: two sidecars of one image, with other limits, are told apart", async () => {
+      const dir = join(tempDir("hapi-audit-sidecars-"), "policy");
+      cpSync(join(REPO, "policy"), dir, { recursive: true });
+      const text = readFileSync(join(dir, "sidecars.yaml"), "utf8");
+      const big = `  bun-big:\n    image: ${SIDECAR_IMAGE}\n    command: ["bun", "/data/server.ts"]\n    port: 8080\n    limits: { pids: 256, memory_mb: 1024, data_files: 256, data_mb: 16 }\n`;
+      writeFileSync(join(dir, "sidecars.yaml"), `${text}${big}`);
+      const { w, withSidecar } = await sidecarWorld();
+      w.ctx.policyDir = dir;
+      // The run names bun-big; the sidecar has bun-big's limits: it passes, though bun-http (listed first) has its image too.
+      const asBig = (sc: Container, run: Container) => {
+        run.Config.Labels["org.hapi.sidecar"] = "bun-big";
+        sc.HostConfig!.PidsLimit = 256;
+        sc.HostConfig!.Memory = 1024 ** 3;
+      };
+      expect((await withSidecar("verify", asBig)).status).toBe("pass");
+      // With bun-http's limits under a run that names bun-big, it fails against bun-big's.
+      const small = await withSidecar("verify", (_, run) => void (run.Config.Labels["org.hapi.sidecar"] = "bun-big"));
+      expect([small.status, small.detail.includes("its pids limit is 128, not 256"), small.detail.includes(`its memory limit is ${512 * 1024 ** 2}, not ${1024 ** 3}`)]).toEqual(["fail", true, true]);
+      // And bun-big's limits under a run that names bun-http fail against bun-http's.
+      const named = await withSidecar("verify", (sc) => void (sc.HostConfig!.PidsLimit = 256));
+      expect([named.status, named.detail.includes("its pids limit is 256, not 128")]).toEqual(["fail", true]);
+      // Another policy sidecar's image under a run that names bun-http is not bun-http's.
+      const other = `example/postgres:17@sha256:${"c".repeat(64)}`;
+      const pg = `  postgres:\n    image: ${other}\n    command: ["postgres"]\n    port: 5432\n    limits: { pids: 128, memory_mb: 512, data_files: 256, data_mb: 16 }\n`;
+      writeFileSync(join(dir, "sidecars.yaml"), `${text}${big}${pg}`);
+      const swapped = await withSidecar("verify", (sc) => void (sc.Config.Image = other));
+      expect([swapped.status, swapped.detail.includes(`runs ${other}, not policy's bun-http image ${SIDECAR_IMAGE}`)]).toEqual(["fail", true]);
+    }, 30_000);
 
     test("the run's network holds its sidecar exactly when the run says it has one: none declared and one there, one declared and none there, or an endpoint that isn't its sidecar each fail", async () => {
       const N = RUN;
@@ -594,12 +649,13 @@ describe("runtime.run-container", () => {
         ["no kind label", (sc) => void delete sc.Config.Labels["org.hapi.kind"], `${RUN}-sidecar: carries org.hapi.run=${R} but is neither`],
         ["another run's id", (sc) => void (sc.Config.Labels["org.hapi.run"] = "bbbbbbbbbbbb"), `${RUN}-sidecar: carries org.hapi.run=bbbbbbbbbbbb but is neither`],
       ];
+      const { withSidecar } = await sidecarWorld();
       for (const [what, edit, part] of cases) {
         const r = await withSidecar("verify", edit);
         expect([what, r.status, r.detail.includes(part)]).toEqual([what, "fail", true]);
       }
       expect(SIDECAR_IMAGE).toMatch(/@sha256:[0-9a-f]{64}$/);
-    });
+    }, 30_000);
   });
 
   describe("what a container labelled org.hapi.run is: a run's own, a hapi helper, or a stray, which fails", () => {

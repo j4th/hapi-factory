@@ -115,7 +115,8 @@ const SOURCE_TIERS: readonly string[] = defs.$defs.sourceTier.enum;
  *   Anything else, such as a host holding a space or a newline, could add a
  *   squid.conf directive (`http_access allow all`);
  * - a forge host in the archon zone (spec §4.3) or the review zone (design §3.5),
- *   in any case: neither has a forge route.
+ *   in any case: neither has a forge route;
+ * - any tier in the review zone, whose allowlist is its own hosts alone.
  */
 function checkedHosts(p: Policy, zone: ZoneName): string[] {
   const z = p.trustedSources.zones[zone];
@@ -124,6 +125,10 @@ function checkedHosts(p: Policy, zone: ZoneName): string[] {
   }
   for (const tier of z.tiers) {
     if (!SOURCE_TIERS.includes(tier)) throw new Error(`${zone} zone: unknown source tier ${JSON.stringify(tier)}`);
+  }
+  // The schema's maxItems: 0, again: a tier would add its hosts (a registry, say) to the review container's allowlist.
+  if (zone === "review" && z.tiers.length > 0) {
+    throw new Error(`review zone: it lists tiers (${z.tiers.length}), where it may list none: its allowlist is its own hosts alone (design §3.5)`);
   }
   const hosts = new Set<string>();
   for (const host of zoneHosts(p, zone) as unknown[]) {

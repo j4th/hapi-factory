@@ -11,6 +11,9 @@
  * - `inputs/` (0755, its files 0644), for a review or a fix: the host's copy of
  *   the inputs dir the caller named (its kind's `RUN_INPUTS` files alone,
  *   ./kinds.ts `inputFiles`), bound read-only at `RUN_PATHS.inputs`;
+ * - `sidecar/` (0755, its files 0644), for a run with a smoke sidecar: its
+ *   data, exported from the run's commit (./sidecar.ts `exportSidecarData`)
+ *   and bound read-only into the sidecar at /data;
  * - `out/`: the outputs copy-out brought back (./copyout.ts), 0600 each.
  * Nothing a run writes lands here but through copy-out.
  *
@@ -32,8 +35,8 @@
  * Liveness is Docker's, never a pid that could be reused: a run is live while
  * a container named `runName` with both its labels is running (`isLive`,
  * `liveRuns`). A helper container (the volume chown, copy-out, the run disk's
- * cleanup) carries the labels too, so `down` finds it, but not a run's name,
- * so it never counts.
+ * cleanup) and a run's smoke sidecar carry the labels too, so `down` finds
+ * them, but not a run's name, so they never count.
  */
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { constants } from "node:fs";

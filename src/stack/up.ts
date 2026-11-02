@@ -30,9 +30,10 @@
  *    into $XDG_RUNTIME_DIR/hapi/env/<zone>.env, all or nothing. A missing
  *    secret, a provider failure or a missing pinned age stops here.
  * 4. `docker compose build archon` (a profile-only service is built only when
- *    named, spike 07 finding 17), then `docker pull` of every sidecar image
- *    policy/sidecars.yaml pins by digest (a run starts its sidecar with
- *    `--pull never`, src/run/sidecar.ts), then `docker compose up --no-start
+ *    named, spike 07 finding 17), then `docker pull` of each sidecar image
+ *    policy/sidecars.yaml pins by digest that `docker image inspect` doesn't
+ *    find here already (a run starts its sidecar with `--pull never`,
+ *    src/run/sidecar.ts), then `docker compose up --no-start
  *    --build`: build the images, create the networks and containers, start
  *    nothing.
  * 5. Check the zone networks Docker made (`networkProblems`): internal, and
@@ -399,11 +400,16 @@ export async function stackUp(args: string[], deps: StackDeps = {}): Promise<num
   // A profile-only service is built only when named (spike 07, finding 17): `up --no-start --build` skips archon.
   const built = await compose(["build", "archon"]);
   if (built.code !== 0) throw new Error(`docker compose build archon failed (exit ${built.code}); nothing was started`);
-  // A run's sidecar is started with --pull never, so its pinned image must be here first (design §3.3).
+  // A run's sidecar is started with --pull never, so its pinned image must be here first (design §3.3). One already
+  // here by its digest reference isn't pulled again, so an offline `up` works once each has been pulled.
   const sidecarImages = (deps.sidecarImages ?? (() => policySidecarImages()))();
+  let pulls = 0;
   for (const image of sidecarImages) {
+    const here = await run(["docker", "image", "inspect", "--format", "{{.Id}}", image], { env: composeEnv, inherit: false });
+    if (here.code === 0) continue;
     const pulled = await run(["docker", "pull", image], { env: composeEnv, inherit: true });
     if (pulled.code !== 0) throw new Error(`docker pull ${image} failed (exit ${pulled.code}); nothing was started`);
+    pulls++;
   }
   const created = await compose(["up", "--no-start", "--build"]);
   if (created.code !== 0) throw new Error(`docker compose up --no-start failed (exit ${created.code}); nothing was started`);
@@ -426,7 +432,7 @@ export async function stackUp(args: string[], deps: StackDeps = {}): Promise<num
   if (up.code !== 0) {
     throw new Error(`the stack did not come up healthy (docker compose exit ${up.code}): see \`docker compose -p ${PROJECT} ps\` and \`docker compose -p ${PROJECT} logs <service>\` (docs/runbooks/stack.md#troubleshooting)`);
   }
-  const pulled = sidecarImages.length === 1 ? "1 sidecar image is pulled" : `${sidecarImages.length} sidecar images are pulled`;
+  const pulled = `${sidecarImages.length === 1 ? "1 sidecar image is" : `${sidecarImages.length} sidecar images are`} here (${pulls} pulled)`;
   console.log(
     `the stack is up (Compose project ${PROJECT}): egress-hermes, egress-archon, egress-research, egress-review, hermes (archon is built, and a container of it starts per run; ${pulled}, and a sidecar starts with a run that smokes)`,
   );

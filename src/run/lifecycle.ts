@@ -257,8 +257,9 @@ export async function zoneSecrets(zone: "archon" | "review", env: RunDeps["env"]
 
 /**
  * The values text a run of `kind` wrote is redacted with, by name: the archon zone's, and for a review the review
- * zone's too. Where both zones hold a name with different values (each zone has its own ANTHROPIC_API_KEY), the
- * review's is named `<NAME> (review zone)`, so neither value is lost. Fails closed: a zone file it can't read throws.
+ * zone's too. Both zones map ANTHROPIC_API_KEY and CLAUDE_API_KEY to the one hapi-factory key (stack/secrets.yaml),
+ * so those values match and are named once; a name the two zones hold with different values (should the review's
+ * key ever be its own) has the review's named `<NAME> (review zone)`, so neither value is lost. Fails closed: a zone file it can't read throws.
  * `hapi run watch` and a kept container log (`keepContainerLog`) both use it.
  */
 export async function redactionValues(env: RunDeps["env"], kind: RunKind): Promise<Record<string, string>> {

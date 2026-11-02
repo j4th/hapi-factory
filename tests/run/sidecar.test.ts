@@ -14,6 +14,7 @@ import { SIDECAR_ALIAS } from "../../src/stack/env";
 import { PROJECT_LABEL, runCommand } from "../../src/stack/up";
 import { caught, cleanup, tempDir } from "../secrets/helpers";
 import { REPO } from "../stack/helpers";
+import { fakeRun, SHA } from "./helpers";
 
 afterEach(cleanup);
 
@@ -180,5 +181,122 @@ describe("exportSidecarData, with real git", () => {
     ]);
     expect(calls[1]!.slice(-3)).toEqual(["cat-file", "blob", expect.stringMatching(/^[0-9a-f]{40}$/)]);
     expect(calls).toHaveLength(2);
+  });
+});
+
+describe("exportSidecarData's refusals of what git lists", () => {
+  /** A dest beside a fresh record dir, as start has it. */
+  const destIn = (tmp: string) => {
+    mkdirSync(join(tmp, "record"), { mode: 0o700 });
+    return join(tmp, "record", "sidecar");
+  };
+  /** Deps whose `ls-tree` prints `listing` and whose `cat-file blob <oid>` prints `blobs[oid]` (exit 128 for another). */
+  const stub = (listing: string, blobs: Record<string, Uint8Array> = {}) => ({
+    run: async () => ({ code: 0, stdout: listing, stderr: "" }),
+    runBytes: async (cmd: string[]) => {
+      const b = blobs[cmd.at(-1)!];
+      return b === undefined ? { code: 128, stdout: new Uint8Array(), stderr: "fatal: bad object" } : { code: 0, stdout: b, stderr: "" };
+    },
+    env: { PATH: "/usr/bin:/bin" },
+  });
+  const OID = "a".repeat(40);
+  const row = (path: string, size: number, mode = "100644", type = "blob") => `${mode} ${type} ${OID} ${String(size).padStart(7)}\t${path}\0`;
+  const ch = (code: number) => String.fromCharCode(code);
+
+  test("a name a plain file in /data couldn't have is refused, and nothing is written: a .. or . part, an empty part, a control character (C0, DEL or C1) or U+FFFD", async () => {
+    const names: [path: string, shown: string][] = [
+      ["smoke/../x", "smoke/../x"],
+      ["smoke/./x", "smoke/./x"],
+      ["smoke//x", "smoke//x"],
+      ["smoke/x/", "smoke/x/"],
+      [`smoke/a${ch(0x1b)}b`, "smoke/a?b"],
+      [`smoke/a${ch(0x7f)}b`, "smoke/a?b"],
+      [`smoke/a${ch(0x85)}b`, "smoke/a?b"],
+      [`smoke/a${ch(0xfffd)}b`, "smoke/a?b"],
+    ];
+    for (const [path, shown] of names) {
+      const f = fakeRun({ tree: { "smoke/ok.txt": "ok\n", [path]: "x\n" } });
+      const dest = destIn(f.tmp);
+      const e = await caught(exportSidecarData(f.deps, "/srv/src/.git", SHA, "smoke", dest, LIMITS));
+      expect([JSON.stringify(path), e.message]).toEqual([JSON.stringify(path), `${shown}: a name the sidecar's data dir can't hold; only plain file names are exported`]);
+      expect([JSON.stringify(path), existsSync(dest)]).toEqual([JSON.stringify(path), false]);
+      // Refused from the listing: no blob was read.
+      expect([JSON.stringify(path), f.calls.some((c) => c.cmd.includes("cat-file"))]).toEqual([JSON.stringify(path), false]);
+    }
+    // The control: a plain name, through the same fake, is exported.
+    const ok = fakeRun({ tree: { "smoke/ok.txt": "ok\n", "smoke/sub/a-b_c.d.json": "{}\n" } });
+    const dest = destIn(ok.tmp);
+    await exportSidecarData(ok.deps, "/srv/src/.git", SHA, "smoke", dest, LIMITS);
+    expect(readFileSync(join(dest, "sub", "a-b_c.d.json"), "utf8")).toBe("{}\n");
+  });
+
+  test("an entry outside the data dir, a row that isn't one, a blob that reads back another size, or one git can't read is refused, and nothing is written", async () => {
+    const tmp = tempDir("hapi-sidecar-stub-");
+    const cases: [what: string, deps: ReturnType<typeof stub>, message: string][] = [
+      ["an entry outside the data dir", stub(row("smoke/a.txt", 3) + row("other/x", 3), { [OID]: new Uint8Array(3) }), "git ls-tree printed an entry outside smoke (other/x): nothing was exported"],
+      ["a row with no tab", stub("100644 blob nothing-here\0"), "git ls-tree printed an entry outside smoke (100644 blob nothing-here): nothing was exported"],
+      ["a size that isn't a number", stub(row("smoke/a.txt", 3).replace("      3", "      -")), "smoke/a.txt: not a regular file in the sidecar's data dir; only regular files are exported"],
+      ["a tree entry", stub(row("smoke/d", 0, "040000", "tree")), "smoke/d: not a regular file in the sidecar's data dir; only regular files are exported"],
+      ["a blob that reads back longer", stub(row("smoke/a.txt", 3), { [OID]: new Uint8Array(5) }), `smoke/a.txt at ${SHA} read back 5 bytes, not the 3 git listed: nothing was exported`],
+      ["a blob that reads back shorter", stub(row("smoke/a.txt", 3), { [OID]: new Uint8Array(1) }), `smoke/a.txt at ${SHA} read back 1 bytes, not the 3 git listed: nothing was exported`],
+      ["a blob git can't read", stub(row("smoke/a.txt", 3)), `cannot read smoke/a.txt at ${SHA} in /srv/src/.git (git cat-file exited 128): nothing was exported`],
+    ];
+    for (const [i, [what, deps, message]] of cases.entries()) {
+      const dest = join(tmp, `dest-${i}`);
+      expect([what, (await caught(exportSidecarData(deps, "/srv/src/.git", SHA, "smoke", dest, LIMITS))).message]).toEqual([what, message]);
+      expect([what, existsSync(dest)]).toEqual([what, false]);
+    }
+  });
+
+  test("the caps are checked as the listing is read: past either, the rest isn't looked at, and no blob is read", async () => {
+    const reads: string[] = [];
+    const deps = { ...stub(row("smoke/a", 1) + row("smoke/b", 1) + row("smoke/c", 1) + row("smoke/link", 4, "120000")), runBytes: async (cmd: string[]) => (reads.push(cmd.at(-1)!), { code: 0, stdout: new Uint8Array(1), stderr: "" }) };
+    const tmp = tempDir("hapi-sidecar-cap-");
+    // The third file is past two: the symlink after it is never reached.
+    expect((await caught(exportSidecarData(deps, "/g", SHA, "smoke", join(tmp, "a"), { data_files: 2, data_mb: 1 }))).message).toBe("smoke holds more than 2 files or 1 MiB: the sidecar's data is at most that");
+    // One file over the byte cap: refused at that row.
+    const big = stub(row("smoke/big", 1024 * 1024 + 1) + row("smoke/link", 4, "120000"));
+    expect((await caught(exportSidecarData(big, "/g", SHA, "smoke", join(tmp, "b"), { data_files: 2, data_mb: 1 }))).message).toBe("smoke holds more than 2 files or 1 MiB: the sidecar's data is at most that");
+    expect([reads, existsSync(join(tmp, "a")), existsSync(join(tmp, "b"))]).toEqual([[], false, false]);
+  });
+
+  test("a dest that is already there is refused with the module's message and left as it was", async () => {
+    const f = fakeRun({ tree: { "smoke/a.txt": "a\n" } });
+    const dest = destIn(f.tmp);
+    mkdirSync(dest);
+    writeFileSync(join(dest, "keep"), "someone else's\n");
+    expect((await caught(exportSidecarData(f.deps, "/srv/src/.git", SHA, "smoke", dest, LIMITS))).message).toBe(`the sidecar's data could not be written to ${dest} (EEXIST): nothing was exported`);
+    expect([readdirSync(dest), readFileSync(join(dest, "keep"), "utf8")]).toEqual([["keep"], "someone else's\n"]);
+  });
+
+  test("with real git: a name holding a newline (a tree git mktree makes; no checkout could) is refused, and nothing is written", async () => {
+    const tmp = tempDir("hapi-sidecar-mktree-");
+    const bare = join(tmp, "repo.git");
+    const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: tmp, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" };
+    const git = async (args: string[]) => {
+      const r = await runCommand(["git", "-c", "user.email=t@example.invalid", "-c", "user.name=t", "-c", "commit.gpgSign=false", "--git-dir", bare, ...args], { env, inherit: false });
+      if (r.code !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+      return r.stdout.trim();
+    };
+    /** `git mktree -z` of `entries` (mode type oid name), fed from a file. */
+    const mktree = async (entries: string[]) => {
+      const input = join(tmp, `mktree-${Math.random().toString(36).slice(2)}`);
+      writeFileSync(input, entries.map((e) => `${e}\0`).join(""));
+      const r = await runCommand(["sh", "-c", 'exec git --git-dir "$1" mktree -z < "$2"', "sh", bare, input], { env, inherit: false });
+      if (r.code !== 0) throw new Error(`git mktree: ${r.stderr}`);
+      return r.stdout.trim();
+    };
+    await runCommand(["git", "init", "-q", "--bare", bare], { env, inherit: false });
+    const blobFile = join(tmp, "blob");
+    writeFileSync(blobFile, "data\n");
+    const blob = await git(["hash-object", "-w", blobFile]);
+    const smoke = await mktree([`100644 blob ${blob}\tok.txt`, `100644 blob ${blob}\tbad\nname.txt`]);
+    const root = await mktree([`040000 tree ${smoke}\tsmoke`]);
+    const sha = await git(["commit-tree", root, "-m", "a newline in a name"]);
+    mkdirSync(join(tmp, "record"), { mode: 0o700 });
+    const dest = join(tmp, "record", "sidecar");
+    const d = { run: runCommand, runBytes, env: { PATH: env.PATH } };
+    expect((await caught(exportSidecarData(d, bare, sha, "smoke", dest, LIMITS))).message).toBe("smoke/bad?name.txt: a name the sidecar's data dir can't hold; only plain file names are exported");
+    expect(existsSync(dest)).toBe(false);
   });
 });

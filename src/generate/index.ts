@@ -7,7 +7,7 @@
  *   build/pi/models.json, models-store.json, settings.json, hapi-guard.json
  *   build/pi/extensions/hapi-guard.js   (bundled from src/guard/index.ts)
  *   build/decide/hapi-decide.js         (bundled from src/decide/cli.ts)
- *   build/egress/{hermes,archon,research}.squid.conf
+ *   build/egress/{hermes,archon,research,review}.squid.conf
  *   build/mcp/{hermes,research}.mcp.json
  *   build/roster                        (the roster's name: each run's own guard settings and run config are made for it)
  *
