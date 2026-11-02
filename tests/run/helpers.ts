@@ -386,6 +386,7 @@ export const BUILD_FILES: Record<string, string> = {
   "archon/gitconfig": "[user]\n",
   "archon/empty.env": "# empty\n",
   "archon/archon.env": "PI_OFFLINE=1\n",
+  "claude/managed-settings.json": "{}\n",
   roster: "anthropic\n",
 };
 

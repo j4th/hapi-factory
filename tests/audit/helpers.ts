@@ -438,7 +438,8 @@ export async function cleanWorld(o: { repos?: boolean; workflows?: Record<string
     digest,
     containers,
     networks: new Map(),
-    archonValidate: { code: 0, out: readJson("archon-validate-v0.12.1.json") },
+    // As 0.12.1 exited with the pack bound (re-captured 2026-11-01): 1, for the pack nodes' custom-alias lint alone.
+    archonValidate: { code: 1, out: readJson("archon-validate-v0.12.1.json") },
     enableExtensions: { code: 0, out: "true" },
     hermes: { defaults, issues: [], config_version: 0, latest_config_version: 51, effective: hermesMerge(defaults, ours) },
     images: new Set([ARCHON_IMAGE, HERMES_IMAGE]),
@@ -483,7 +484,7 @@ export type Kind = "worker" | "verify" | "review" | "fix";
  * here, not read from `runArgs` or `kindProfile`, so the check's expectation is checked against an independent list:
  * - worker and fix: run.sh, the work order's workflow, egress-archon; a fix's inputs dir too;
  * - verify: verify.sh, factory-verify, egress-archon, no inputs;
- * - review: review.sh, factory-review, egress-review, its inputs dir.
+ * - review: review.sh, factory-review, egress-review, its inputs dir, and Claude Code's managed settings (Task 11).
  * It is on its own network, named as it is, which this adds to `w.networks`: internal, on a private subnet, and
  * holding the container and its kind's proxy (`hapi-egress-archon-1`, or `hapi-egress-review-1` for a review).
  */
@@ -548,6 +549,7 @@ export function runContainer(w: World, id = "ab12cd34ef56", over: { labels?: Rec
       bind("/state/runs/task.md", "/run/hapi/task.md"),
       bind("/srv/src/.git", "/src/repo.git"),
       ...(kind === "review" || kind === "fix" ? [bind("/state/runs/inputs", "/run/hapi/inputs")] : []),
+      ...(kind === "review" ? [bind("/srv/build/claude/managed-settings.json", "/etc/claude-code/managed-settings.json")] : []),
       { Type: "volume", Source: `/var/lib/docker/volumes/${name}-work/_data`, Destination: "/work", RW: true },
       { Type: "volume", Source: `/var/lib/docker/volumes/${name}-out/_data`, Destination: "/out", RW: true },
     ],

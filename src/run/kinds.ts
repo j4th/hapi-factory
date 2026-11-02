@@ -15,11 +15,15 @@
  * - `review` holds the review zone's keys, behind egress-review, and runs none of the repo's code: review.sh makes
  *   its checkout read-only, and `factory-review` runs only a read-only review session and CodeRabbit's CLI. So it
  *   gets no smoke sidecar; every other kind does, when its work order smokes and its repo names one (./sidecar.ts).
+ *   Its one extra bind is Claude Code's managed settings (src/generate/claude.ts), from the build, which hold the
+ *   review session to its reads and deny it /proc (Task 11).
  *
  * No container fetches a bundle: every kind's source is `StartOptions.repoGitDir`, which must hold the run's commit.
  * A worker's is the repo's mirror; a verify, review or fix run's is the harvester's checked copy of the mirror with
  * the bundle's commits fetched into it (Task 12), but a rework fix's (Task 13) is the mirror at the PR's head.
  */
+import { join, resolve } from "node:path";
+import { CLAUDE_MANAGED_PATH } from "../generate/claude";
 import type { Runs } from "../policy/types";
 import type { RunDeps } from "./spec";
 
@@ -65,13 +69,18 @@ export interface KindProfile {
    * kind but review, which runs none of the repo's code.
    */
   sidecar: boolean;
-  /** More read-only binds, each through `mountable`: every kind's is empty here (Task 11 gives review's one). */
+  /**
+   * More read-only binds, each through `mountable`, each a file of the build that startRun checks is there first
+   * (docker would bind an empty dir in a missing one's place): only review has one, Claude Code's managed settings.
+   */
   extraBinds: (d: Pick<RunDeps, "buildDir">) => [src: string, dst: string][];
   /** The files copy-out reads from `/out`, in order, each capped by its limit in `runs.output_limits_mb`; any other name is reported. */
   outputs: readonly { name: string; limit: keyof Runs["output_limits_mb"] }[];
 }
 
 const none = (): [string, string][] => [];
+/** The review's: build/claude/managed-settings.json at Claude Code's managed path. */
+const claudeSettings = (d: Pick<RunDeps, "buildDir">): [string, string][] => [[join(resolve(d.buildDir), "claude", "managed-settings.json"), CLAUDE_MANAGED_PATH]];
 
 /** A worker's and a fix's outputs: Archon's record, the transcript, the guard's decisions and the bundle of the commits. */
 const WORKER_OUTPUTS = [
@@ -95,17 +104,23 @@ const PROFILES: Readonly<Record<RunKind, KindProfile>> = Object.freeze({
     kind: "fix", zone: "archon", egress: "egress-archon", prelude: "run.sh", workflow: undefined, inputs: true,
     inputFiles: { required: [RUN_INPUTS.findings], allowed: [RUN_INPUTS.findings] }, sidecar: true, extraBinds: none, outputs: WORKER_OUTPUTS,
   }),
-  // Its results are verify.json, held to result.json's limit; it commits nothing, so it leaves no bundle, and it runs no model, so no decisions.
+  // Its results are verify.json, and the acceptance run's junit report (Task 12 reads its completeness), both held to
+  // result.json's limit; it commits nothing, so it leaves no bundle, and it runs no model, so no decisions.
   verify: freeze({
     kind: "verify", zone: undefined, egress: "egress-archon", prelude: "verify.sh", workflow: "factory-verify", inputs: false, inputFiles: NO_INPUTS, sidecar: true, extraBinds: none,
-    outputs: [{ name: "result.json", limit: "result" }, { name: "transcript.jsonl", limit: "transcript" }, { name: "verify.json", limit: "result" }],
+    outputs: [
+      { name: "result.json", limit: "result" },
+      { name: "transcript.jsonl", limit: "transcript" },
+      { name: "verify.json", limit: "result" },
+      { name: "acceptance.junit.xml", limit: "result" },
+    ],
   }),
   // Its verdict and findings are the review node's structured output in its result.json and transcript (Tasks 11, 12):
   // there is no review.json. decisions.jsonl is a Pi-run review's (the portable roster); coderabbit.ndjson is CodeRabbit's CLI's.
   review: freeze({
     kind: "review", zone: "review", egress: "egress-review", prelude: "review.sh", workflow: "factory-review", inputs: true,
     // verify.json is absent when runs.phases.verify is off (design §3.5: every phase is a knob).
-    inputFiles: { required: [RUN_INPUTS.diff], allowed: [RUN_INPUTS.diff, RUN_INPUTS.verify] }, sidecar: false, extraBinds: none,
+    inputFiles: { required: [RUN_INPUTS.diff], allowed: [RUN_INPUTS.diff, RUN_INPUTS.verify] }, sidecar: false, extraBinds: claudeSettings,
     outputs: [
       { name: "result.json", limit: "result" },
       { name: "transcript.jsonl", limit: "transcript" },

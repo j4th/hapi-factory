@@ -333,8 +333,9 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
     expect(r.small.model).toBe("anthropic/claude-haiku-5-5");
   });
 
-  test("budget roster is Haiku 5.5 on every tier", () => {
-    for (const spec of Object.values(p.rosters.budget)) expect(spec.model).toMatch(/(^|\/)claude-haiku-5-5$/);
+  test("budget roster is Haiku 5.5 on every tier but review's, which is Sonnet 5.5", () => {
+    // Haiku on every tier but review's, Sonnet, so a review runs on another model than implement's (Plan 03 Task 11).
+    expect(Object.fromEntries(Object.entries(p.rosters.budget).map(([t, spec]) => [t, spec.model]))).toEqual({ small: "anthropic/claude-haiku-5-5", medium: "claude-sonnet-5-5", large: "anthropic/claude-haiku-5-5" });
   });
 
   test("portable roster uses only zero-retention OpenCode Go models, with review on a different family", () => {

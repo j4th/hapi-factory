@@ -205,6 +205,7 @@ Every image is pinned by tag and digest (spec §11.6). The digests were read wit
 | Archon | `stack/archon/Dockerfile` | `ghcr.io/coleam00/archon:0.12.1` | `sha256:eea19d4d79420de36ecd68695e6839d4d65cc7b4f7b25a55311bcf07027cf409` | 2026-10-17 |
 | uv (copied into the Archon image) | `stack/archon/Dockerfile` | `ghcr.io/astral-sh/uv:0.13.5` | `sha256:32a7bb39b496babbd997b0a39a4d66c126bdaf5661b302bf6f06abda8deca6ff` | 2026-10-22 |
 | Node (copied into the Archon image) | `stack/archon/Dockerfile` | `node:24.22.1-trixie-slim` | `sha256:43b9ba1142b8dcf33fa8f922ca1be85714adc444e0586c7cf7726daaeabc1bea` | 2026-10-21 |
+| mise (copied into the Archon image) | `stack/archon/Dockerfile` | `jdxcode/mise:2026.10.9` | `sha256:07fc362c08135a926cbb1466470d9af10e89c9aa92859831c0ded2f2249bae7d` | read for Plan 03 Task 1 (spike 09, T18) |
 | curl (the integration tests' throwaway client) | `tests/stack/helpers.ts` | `curlimages/curl:8.23.0` | `sha256:11e64e28c5f58c8d93ee95fcf22ac055f48b0bc440e0ce7d8013bbb5ad6aa8ac` | 2026-10-20 |
 | Bun (the `bun-http` smoke sidecar; `mise run up` pulls it) | `policy/sidecars.yaml` | `oven/bun:1.4.4-slim` | `sha256:1846adf22496bd711036aae8be147e57bdebbaea2e5264e3e0b5af1db187d9a4` | read for Plan 03 Task 1 (spike 09, T18) |
 
@@ -213,6 +214,8 @@ A few notes on these images:
 - **The Squid tag names the Ubuntu package line (7.2), but the binary reports Squid 7.7.** The `_edge` tags are the only ones Canonical publishes for 26.04.
 - **The Archon image needs no `archon provider add pi`.** It runs Archon from source, where Pi is an in-process provider on the SDK Archon embeds. The build checks that this SDK is 1.3.0 (spec §9.3). The release binaries are the ones that need `provider add`.
 - **The Archon image bakes in Node 24.22.1, uv 0.13.5 and Python 3.14.9,** the versions `mise.toml` pins, so a run needs no GitHub egress. uv installs Python and checks it against the checksum uv embeds. At run time, `UV_PYTHON_DOWNLOADS=never`.
+- **It bakes in mise 2026.10.9 and the repo contract's tools** (Plan 03 Task 11, H-208): `bun@1.4.2`, `gitleaks@8.30.1`, `osv-scanner@2.7.0` and `zizmor@1.31.1`, the `[tools]` of `templates/repo-contract/mise.toml.tmpl` (`tests/stack/compose.test.ts` holds the two equal), installed by `mise install` at build time into `/opt/hapi/mise`, read-only at run time. Its settings for a run are image-level `ENV` lines, never the run's environment: `MISE_TRUSTED_CONFIG_PATHS=/work/repo`, `MISE_OFFLINE=1`, `MISE_LOCKED=1` (install only what the repo's `mise.lock` locks) and `MISE_SHIMS_DIR=/tmp/mise-shims` (mise rebuilds its shims after an install, and the data dir is read-only). The auto-installs stay on: off, `mise run` would quietly fall back to the image's own Bun (spike 09, T18). A repo that pins a tool or version the image lacks fails at preflight, `the toolchain the repo pins is not in the run image`. To add or bump a tool, change the template and this `RUN mise install` line together.
+- **It bakes in CodeRabbit's CLI 0.9.1** (`cr` and `coderabbit`), for the review's CodeRabbit step: `ADD --checksum=sha256:9558e02f…80bc` of `https://cli.coderabbit.ai/releases/0.9.1/coderabbit-linux-x64.zip`, the SHA-256 the release's `SHA256SUMS` lists; that file's signature verifies with the release key in CodeRabbit's install script (checked 2026-11-01). The image has no `unzip`, so Python unpacks it. To bump it, read the new release's `SHA256SUMS` and `SHA256SUMS.sig`, verify the signature, and update the URL and checksum together. `pins.versions` fails an `ADD` of a URL with no `--checksum=sha256:`.
 
 **To upgrade an image:**
 
@@ -341,7 +344,7 @@ It does start a second Hermes, with fake keys, so allow for its memory (up to 4 
 | Other integration tests | What they prove |
 |---|---|
 | `tests/secrets/sops.int.test.ts` | The whole key lifecycle on the real sops and age, and now also these: <br>- the store stays mode `0600` after each real `sops rotate` (add-machine, revoke, recover); <br>- decoy gpg-agent sockets in each machine's `HOME` and `XDG_RUNTIME_DIR` are never dialled; <br>- sops 3.13.3 reads its default key file as well as `SOPS_AGE_KEY_FILE` (the control: it fails without it), which is why `checkSopsKeys` checks that file; <br>- sops leaves `""` unencrypted, which `sopsFileProblem` allows. |
-| `tests/generate/policy-build.int.test.ts` | `mise run policy:build -- --roster budget --out <dir>` passes its flags through mise: it writes the nineteen files with the budget roster. An unknown roster exits non-zero and writes nothing. |
+| `tests/generate/policy-build.int.test.ts` | `mise run policy:build -- --roster budget --out <dir>` passes its flags through mise: it writes the twenty files with the budget roster. An unknown roster exits non-zero and writes nothing. |
 
 #### How the read-only checks work
 

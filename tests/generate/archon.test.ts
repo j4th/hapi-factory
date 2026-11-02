@@ -39,6 +39,9 @@ test("RUN_PATHS holds the run container's fixed paths", () => {
   expect(RUN_PATHS.inputs).toBe("/run/hapi/inputs");
   const review: RunFile = { ...engine, kind: "review", round: 0, coderabbit: false };
   expect(Object.keys(review)).toHaveLength(12);
+  // Task 11: the commit the run starts from (factory-task's gates hold HEAD to it), and the smoke sidecar's port when the repo names one.
+  const smoked: RunFile = { ...engine, sha: "b".repeat(40), sidecar_port: 8080 };
+  expect(Object.keys(smoked)).toHaveLength(13);
 });
 
 test("config.yaml holds assistants.pi.enableExtensions: true for every roster (H-181(b))", () => {
@@ -146,12 +149,23 @@ test("archon env is plain KEY=value lines, comments and blank lines, each key on
 
 test("archon tiers come from the selected roster", () => {
   const c = config(p, "budget");
-  for (const tier of TIERS) expect(modelId(c.tiers[tier].model)).toBe("claude-haiku-5-5");
+  // Haiku on every Pi tier; the review's tier is Sonnet, so a review runs on another model than implement's (Task 11).
+  for (const tier of ["small", "large"] as const) expect(modelId(c.tiers[tier].model)).toBe("claude-haiku-5-5");
   expect(c.tiers).toEqual({
     small: { provider: "pi", model: "anthropic/claude-haiku-5-5", effort: "low" },
-    medium: { provider: "claude", model: "claude-haiku-5-5", effort: "medium" },
+    medium: { provider: "claude", model: "claude-sonnet-5-5", effort: "medium" },
     large: { provider: "pi", model: "anthropic/claude-haiku-5-5", effort: "low" },
   });
+});
+
+test("@review is a claude-provider alias on the anthropic and budget rosters, on another model than @implement's: factory-review's node is Claude Code's", () => {
+  for (const roster of ["anthropic", "budget"] as const) {
+    const c = YAML.parse(emitArchon(p, roster)["run-config.yaml"]!);
+    expect([roster, c.aliases["@review"].provider]).toEqual([roster, "claude"]);
+    expect([roster, modelId(c.aliases["@review"].model) === modelId(c.aliases["@implement"].model)]).toEqual([roster, false]);
+  }
+  // portable has no claude tier: a review there is refused at start (H-249).
+  expect(YAML.parse(emitArchon(p, "portable")["run-config.yaml"]!).aliases["@review"].provider).toBe("pi");
 });
 
 test("archon defaults to the anthropic roster; portable runs every tier on Pi", () => {

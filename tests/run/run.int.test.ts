@@ -338,7 +338,8 @@ describe.skipIf(!INT || !ONLINE)("hapi run on a real Docker (a throwaway project
         expect(said).toContain("uid=1001");
         expect(said).toContain("CapEff:\t0000000000000000");
         expect(said).toContain("NoNewPrivs:\t1");
-        expect(posture).toMatch(/^archon=0\.12\.1 pi=1\.3\.0 node=v24\.22\.1 uv=uv 0\.13\.5\b.* python=Python 3\.14\.9$/m);
+        // mise last (Task 11, H-208): the repo contract's toolchain, from the image.
+        expect(posture).toMatch(/^archon=0\.12\.1 pi=1\.3\.0 node=v24\.22\.1 uv=uv 0\.13\.5\b.* python=Python 3\.14\.9 mise=2026\.10\.9 linux-x64 \(2026-10-13\)$/m);
         // `<url> <the proxy's answer to the CONNECT> <the origin's>`.
         const codes = (url: string) => said.find((l) => l.startsWith(`${url} `))?.split(" ").slice(1).map(Number);
         const [tunnel, origin] = codes("https://api.anthropic.com/") ?? [];

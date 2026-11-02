@@ -12,9 +12,11 @@
  *   a service built here, which must have `pull_policy: build` (so nothing
  *   pulls a registry image of that name) and whose Dockerfile is checked.
  * - each Dockerfile: every `FROM` and `COPY --from=` image by digest (an
- *   earlier stage's name is fine), and every package a `RUN` installs by
- *   name (apt-get, apt, apk, pip, uv, npm, bun, pnpm, yarn, go) at an exact
- *   version, behind any BuildKit flag, wrapper or shell keyword.
+ *   earlier stage's name is fine), every package a `RUN` installs by
+ *   name (apt-get, apt, apk, pip, uv, npm, bun, pnpm, yarn, go, mise) at an
+ *   exact version, behind any BuildKit flag, wrapper or shell keyword, and
+ *   every `ADD` of a URL (or a git remote) with its SHA-256
+ *   (`--checksum=sha256:<64 hex>`), so a download is the one reviewed.
  */
 import type { Dirent } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
@@ -77,6 +79,8 @@ function words(segment: string): string[] {
   return [...segment.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)].map((m) => m[1] ?? m[2] ?? m[3]!);
 }
 
+/** A mise tool at an exact version: `<tool>@<x.y.z>`, the tool optionally with its backend (`aqua:owner/name@1.2.3`). */
+const MISE_EXACT = /^[A-Za-z0-9][A-Za-z0-9._:/-]*@v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?$/;
 const PIP_EXACT = /^[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[A-Za-z0-9,._-]*\])?==[A-Za-z0-9.+!_-]+$/;
 const NPM_EXACT = /^(?:@[A-Za-z0-9._-]+\/)?[A-Za-z0-9._-]+@v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
 
@@ -112,6 +116,11 @@ function installAt(w: string[]): { installer: string; pkgs: string[]; ok: (p: st
   }
   if (cmd === "bun" || cmd === "pnpm" || cmd === "yarn") return found(`${cmd} add`, at(["add"]), (p) => NPM_EXACT.test(p));
   if (cmd === "go") return found("go install", at(["install"]), (p) => /@v\d+\.\d+\.\d+/.test(p));
+  // mise: `mise install bun@1.4.2`; a bare tool, @latest, a prefix (`@2`) or a range resolves to whatever is newest.
+  if (cmd === "mise") {
+    const f = at(["install"], ["use"]);
+    return f === undefined ? undefined : found(`mise ${f.sub}`, f, (p) => MISE_EXACT.test(p));
+  }
   return undefined;
 }
 
@@ -218,6 +227,7 @@ export async function pinsVersions(run: AuditRun): Promise<CheckResult[]> {
 
   let froms = 0;
   let packages = 0;
+  let downloads = 0;
   for (const file of [...dockerfiles].sort()) {
     const text = await readFile(join(root, file), "utf8");
     for (const { kind, image, stages } of dockerfileImages(text)) {
@@ -226,6 +236,16 @@ export async function pinsVersions(run: AuditRun): Promise<CheckResult[]> {
       if (!DIGEST.test(image)) problems.push(`${file}: ${kind === "FROM" ? `FROM ${image}` : `COPY --from=${image}`} is not pinned by digest`);
     }
     for (const { op, args } of instructions(text)) {
+      if (op === "ADD") {
+        const words = args.split(/\s+/);
+        const sources = words.filter((w) => !w.startsWith("--")).slice(0, -1);
+        const checksum = words.some((w) => /^--checksum=sha256:[0-9a-f]{64}$/.test(w));
+        for (const src of sources.filter((s) => /^(?:https?|git):\/\/|^git@|\.git(?:#.*)?$/.test(s))) {
+          downloads++;
+          if (!checksum) problems.push(`${file}: ADD ${src} has no --checksum=sha256:<64 hex digits>, so whatever it serves that day is built in`);
+        }
+        continue;
+      }
       if (op !== "RUN") continue;
       let command = args.replace(RUN_FLAGS, "");
       if (command.startsWith("[")) {
@@ -248,7 +268,7 @@ export async function pinsVersions(run: AuditRun): Promise<CheckResult[]> {
     result(
       id,
       "pass",
-      `${tools.length} mise tools, ${images} images, ${froms} FROM/COPY --from images and ${packages} installed package${packages === 1 ? "" : "s"} are pinned (exact versions, digests); ${dockerfiles.size} services are built here, never pulled`,
+      `${tools.length} mise tools, ${images} images, ${froms} FROM/COPY --from images, ${packages} installed package${packages === 1 ? "" : "s"} and ${downloads} download${downloads === 1 ? "" : "s"} are pinned (exact versions, digests, checksums); ${dockerfiles.size} services are built here, never pulled`,
     ),
   ];
 }

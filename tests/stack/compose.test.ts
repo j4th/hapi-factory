@@ -129,6 +129,39 @@ describe("pins", () => {
     expect(svc("egress-archon").image).toMatch(/^ubuntu\/squid:[\d.]+-\d\d\.\d\d_\w+@sha256:/);
   });
 
+  test("the run image carries mise by digest, the repo contract's tools at their pins, and CodeRabbit's CLI by checksum (H-208; spike 09, T18)", () => {
+    const docker = readFileSync(join(REPO, "stack", "archon", "Dockerfile"), "utf8");
+    const lines = docker.split("\n");
+    const froms = lines.filter((l) => l.startsWith("FROM "));
+    // mise's stage, by tag and digest, before the archon FROM, which stays last.
+    const mise = froms.findIndex((l) => /^FROM jdxcode\/mise:2026\.10\.9@sha256:[0-9a-f]{64} AS mise$/.test(l));
+    expect(mise).toBeGreaterThan(-1);
+    expect(mise).toBeLessThan(froms.length - 1);
+    expect(froms.at(-1)).toMatch(/^FROM ghcr\.io\/coleam00\/archon:0\.12\.1@/);
+    expect(docker).toContain("COPY --from=mise /usr/local/bin/mise /usr/local/bin/mise");
+    // Every tool the template's mise.toml pins is installed at that version (Bun.TOML.parse, as mise reads it).
+    const template = Bun.TOML.parse(readFileSync(join(REPO, "templates", "repo-contract", "mise.toml.tmpl"), "utf8")) as { tools: Record<string, string> };
+    const install = lines.find((l) => l.startsWith("RUN mise install "))!;
+    expect(Object.keys(template.tools).length).toBeGreaterThan(0);
+    for (const [name, version] of Object.entries(template.tools)) expect([name, install.split(/\s+/).includes(`${name}@${version}`)]).toEqual([name, true]);
+    expect(docker).toContain("RUN mise --version | grep -q '^2026\\.10\\.9 '");
+    // mise's settings are the image's ENV lines, never the run's environment (ARCHON_ENV is unchanged).
+    const env = (name: string) => new RegExp(`^ENV (?:.*\\s)?${name}=`, "m");
+    const settings = { MISE_DATA_DIR: "/opt/hapi/mise", MISE_CACHE_DIR: "/opt/hapi/mise-cache", MISE_TRUSTED_CONFIG_PATHS: "/work/repo", MISE_OFFLINE: "1", MISE_LOCKED: "1", MISE_SHIMS_DIR: "/tmp/mise-shims" };
+    for (const [name, value] of Object.entries(settings)) {
+      expect([name, env(name).test(docker.replace(/\\\n\s*/g, " "))]).toEqual([name, true]);
+      expect([name, docker.replace(/\\\n\s*/g, " ").includes(`${name}=${value}`)]).toEqual([name, true]);
+      expect([name, ARCHON_ENV.some(([n]) => n === name)]).toEqual([name, false]);
+    }
+    // Never the auto-installs at 0: mise run would fall back to the image's own Bun without a word (T18 finding 5).
+    for (const name of ["MISE_EXEC_AUTO_INSTALL", "MISE_TASK_RUN_AUTO_INSTALL", "MISE_NOT_FOUND_AUTO_INSTALL"]) expect([name, docker.includes(name)]).toEqual([name, false]);
+    // The install runs before the settings that make mise read-only and offline.
+    expect(docker.indexOf("RUN mise install ")).toBeLessThan(docker.indexOf("MISE_OFFLINE=1"));
+    // CodeRabbit's CLI 0.9.1 (the review's CodeRabbit node), checked against its signed release's SHA-256.
+    expect(docker).toMatch(/^ADD --checksum=sha256:[0-9a-f]{64} https:\/\/cli\.coderabbit\.ai\/releases\/0\.9\.1\/coderabbit-linux-x64\.zip /m);
+    expect(docker).toContain('test "$(HOME=/tmp/coderabbit-home CODERABBIT_CLI_DISABLE_AUTO_UPDATE=1 CR_CLI_TELEMETRY_DISABLED=1 cr --version)" = 0.9.1');
+  });
+
   test("the built images get fixed local names, so a test project reuses them instead of making one per run", () => {
     expect(svc("hermes").image).toBe("hapi-factory/hermes:v0.22.5");
     expect(svc("archon").image).toBe("hapi-factory/archon:0.12.1");

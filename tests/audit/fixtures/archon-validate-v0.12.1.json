@@ -1,6 +1,39 @@
 {
  "results": [
   {
+   "workflowName": "factory-task",
+   "valid": false,
+   "issues": [
+    {
+     "level": "error",
+     "nodeId": "implement",
+     "field": "model",
+     "message": "Node 'implement' uses custom model alias '@implement', which is not portable for global workflows",
+     "hint": "Use small, medium, large, or a literal provider model string. Reserve @custom aliases for project workflows."
+    },
+    {
+     "level": "error",
+     "nodeId": "fix",
+     "field": "model",
+     "message": "Node 'fix' uses custom model alias '@implement', which is not portable for global workflows",
+     "hint": "Use small, medium, large, or a literal provider model string. Reserve @custom aliases for project workflows."
+    }
+   ]
+  },
+  {
+   "workflowName": "factory-review",
+   "valid": false,
+   "issues": [
+    {
+     "level": "error",
+     "nodeId": "review",
+     "field": "model",
+     "message": "Node 'review' uses custom model alias '@review', which is not portable for global workflows",
+     "hint": "Use small, medium, large, or a literal provider model string. Reserve @custom aliases for project workflows."
+    }
+   ]
+  },
+  {
    "workflowName": "archon-attention",
    "valid": true,
    "issues": []
@@ -121,6 +154,11 @@
    "issues": []
   },
   {
+   "workflowName": "factory-verify",
+   "valid": true,
+   "issues": []
+  },
+  {
    "workflowName": "hapi-check-guard",
    "valid": true,
    "issues": []
@@ -132,9 +170,9 @@
   }
  ],
  "summary": {
-  "total": 26,
-  "valid": 26,
-  "errors": 0,
+  "total": 29,
+  "valid": 27,
+  "errors": 2,
   "warnings": 0
  }
 }

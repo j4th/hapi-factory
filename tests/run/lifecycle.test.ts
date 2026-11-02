@@ -320,7 +320,7 @@ describe("hapi run start: the order of steps", () => {
     const dir = join(f.deps.stateDir, id);
     expect(JSON.parse(readFileSync(join(dir, "run.json"), "utf8"))).toEqual({
       run_id: id, work_order: "0003-check-run", traceparent: TRACEPARENT, budget_usd: 1.5, public: true, workflow: "hapi-check-run", started_at: NOW.toISOString(),
-      kind: "worker", round: 0, turns: 10, base: SHA,
+      kind: "worker", round: 0, turns: 10, base: SHA, sha: SHA,
     });
     const gitDir = realpathSync(join(f.repo, ".git"));
     expect(await readRecord(f.deps.stateDir, id)).toEqual({
@@ -550,9 +550,9 @@ describe("startRun", () => {
         onRoster("portable"),
       ],
       [
-        "a review on the budget roster, whose claude tier runs implement's model",
-        (a) => ({ ...roles(a, "small", "medium"), kind: "review", parent: P }),
-        "the work order's roles.review is medium, whose model in the budget roster, claude-haiku-5-5, is roles.implement's (small) too: a review must run on another model than the work it reviews",
+        "a review whose claude tier runs implement's model too",
+        (a) => ({ ...roles(a, "medium", "medium"), kind: "review", parent: P }),
+        "the work order's roles.review is medium, whose model in the budget roster, claude-sonnet-5-5, is roles.implement's (medium) too: a review must run on another model than the work it reviews",
         onRoster("budget"),
       ],
       ["a round of -1", () => ({ round: -1 }), "the run's round -1 is not a whole number of at least 0"],
@@ -609,12 +609,13 @@ describe("startRun", () => {
     expect(rolesProblem("review", { implement: "large", review: "large" }, anthropic, "anthropic")).toBe(
       "the work order's roles.review is large, a pi tier in the anthropic roster: the review runs in Claude Code, so it must name a claude tier",
     );
-    expect(rolesProblem("review", { implement: "large", review: "medium" }, budget, "budget")).toBe(
-      "the work order's roles.review is medium, whose model in the budget roster, claude-haiku-5-5, is roles.implement's (large) too: a review must run on another model than the work it reviews",
+    // The budget roster's review tier is Sonnet (Task 11), so its review runs on another model than its Haiku implement.
+    for (const implement of ["small", "large"] as const) expect([implement, rolesProblem("review", { implement, review: "medium" }, budget, "budget")]).toEqual([implement, undefined]);
+    expect(rolesProblem("review", { implement: "medium", review: "medium" }, budget, "budget")).toBe(
+      "the work order's roles.review is medium, whose model in the budget roster, claude-sonnet-5-5, is roles.implement's (medium) too: a review must run on another model than the work it reviews",
     );
-    // So no review runs on portable (no claude tier) or budget (Haiku on every tier) yet (H-249).
+    // So no review runs on portable (no claude tier) yet (H-249).
     for (const review of ["small", "medium", "large"] as const) expect(rolesProblem("review", { implement: "large", review }, portable, "portable")).toContain("a pi tier in the portable roster");
-    for (const implement of ["small", "large"] as const) expect(rolesProblem("review", { implement, review: "medium" }, budget, "budget")).toContain("is roles.implement's");
     // A verify runs no model, and a fix runs implement's, which its worker was checked for.
     for (const kind of ["verify", "fix"] as const) expect([kind, rolesProblem(kind, { implement: "medium", review: "small" }, portable, "portable")]).toEqual([kind, undefined]);
   });
@@ -825,6 +826,62 @@ describe("startRun", () => {
       const before = ids(f);
       expect((await caught(startRun(f.deps, review()))).message).toBe(`${join(f.xdg, "hapi", "env", "review.env")} is missing: run \`mise run up\` first`);
       expect([changes(f.calls), ids(f)]).toEqual([[], before]);
+    });
+
+    test("a review run whose budget is below the review node's own dollar cap is refused: Claude Code holds the review to that cap alone (ruling b2(5), H-259)", async () => {
+      capture();
+      const { f, review } = await kinded();
+      const before = ids(f);
+      const cap = POLICY.runs.phases.round_usd;
+      const e = await caught(startRun(f.deps, review({ budgetUsd: cap / 2 })));
+      expect(e.message).toBe(
+        `a review run's budget, ${cap / 2}, is below its review node's own cap, factory-review's maxBudgetUsd (${cap}): Claude Code holds the review to that cap alone, so a lower budget can't be kept (H-259); give the review at least ${cap}, or lower the node's cap`,
+      );
+      expect([changes(f.calls), ids(f)]).toEqual([[], before]);
+      // At the cap, it starts.
+      expect((await startRun(f.deps, review({ budgetUsd: cap }))).budgetUsd).toBe(cap);
+      // A pack whose review node has no cap is refused too: the review would have no dollar bound at all.
+      const g = await kinded();
+      const pack = g.f.deps.packDir;
+      const yaml = readFileSync(join(pack, "factory-review.yaml"), "utf8");
+      writeFileSync(join(pack, "factory-review.yaml"), yaml.replace(/^ {4}maxBudgetUsd: .*\n/m, ""));
+      expect((await caught(startRun(g.f.deps, g.review()))).message).toBe(`factory-review's review node in hapi's pack (${pack}) has no maxBudgetUsd: a review run's dollars are bounded by it alone`);
+    });
+
+    test("a review run whose build has no Claude Code managed settings is refused, never run without them: docker would bind an empty dir in their place (fail-closed)", async () => {
+      capture();
+      const { f, review } = await kinded();
+      const file = join(f.deps.buildDir, "claude", "managed-settings.json");
+      rmSync(file);
+      const before = ids(f);
+      expect((await caught(startRun(f.deps, review()))).message).toBe(`${file} is not a file: a review run binds it at /etc/claude-code/managed-settings.json (\`mise run up\` writes it)`);
+      expect([changes(f.calls), ids(f)]).toEqual([[], before]);
+      // A dir in its place is refused the same way.
+      mkdirSync(file);
+      expect((await caught(startRun(f.deps, review()))).message).toBe(`${file} is not a file: a review run binds it at /etc/claude-code/managed-settings.json (\`mise run up\` writes it)`);
+      // A worker binds none, so it starts.
+      expect((await startRun(f.deps, (await kinded()).base())).kind).toBe("worker");
+    });
+
+    test("startRun writes the sidecar's port into run.json when the overlay names one (factory-task's preflight probes it)", async () => {
+      capture();
+      const SIDECAR: RepoOverlay = { sidecar: { name: "bun-http", data_dir: "smoke" } };
+      const a = await kinded();
+      const rec = await startRun(a.f.deps, a.base({ overlay: SIDECAR }));
+      expect(runJson(a.f, rec.runId).sidecar_port).toBe(POLICY.sidecars["bun-http"]!.port);
+      expect(POLICY.sidecars["bun-http"]!.port).toBe(8080);
+      for (const [what, overlay] of [["no overlay", undefined], ["an overlay without a sidecar", {}]] as const) {
+        const b = await kinded();
+        const r = await startRun(b.f.deps, b.base(overlay === undefined ? {} : { overlay }));
+        expect([what, "sidecar_port" in runJson(b.f, r.runId)]).toEqual([what, false]);
+      }
+    });
+
+    test("run.json's sha is the commit the run starts from, for every kind; its base is the work order's worker's", async () => {
+      capture();
+      const a = await kinded();
+      const rec = await startRun(a.f.deps, a.review({ sha: SHA2 }));
+      expect([runJson(a.f, rec.runId).sha, runJson(a.f, rec.runId).base]).toEqual([SHA2, SHA]);
     });
 
     test("a fix or review run needs an inputs dir holding its kind's inputs alone (a fix's findings.md; a review's diff.patch, and verify.json), copied into its run dir 0755 with 0644 files; a worker or verify run takes none", async () => {

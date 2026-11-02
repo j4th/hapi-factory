@@ -229,7 +229,7 @@ All amounts are in USD.
 | `enforcement.hapi_guard` | `hard` | What Pi's hapi-guard does when the run crosses `run_usd` (Plan 02 Task 5) |
 | `repo_monthly_usd` | 25.00 | Most one registered repo's runs may spend per UTC calendar month. The poller reads it. An overlay may lower it. |
 | `daily_usd` | 10.00 | Most all registered repos together may spend per UTC calendar day. The poller reads it. Central only: an overlay naming it is an unknown key. |
-| `enforcement.archon` | `hard` | The same for Archon's `factory-task` budget (Plan 03). Archon bounds nodes, never dollars: `factory-task`'s `max_work_units` is pinned to its node count whatever this says, so `hard` is the setting that matters there. |
+| `enforcement.archon` | `hard` | The same for Archon's `factory-task` budget (Plan 03). Archon bounds nodes, never dollars: `factory-task`'s `max_work_units` is pinned to its node count whatever this says (ruling m7), so it is **hard-only** for `factory-task`, and `tests/run/workflows.test.ts` holds it `hard`. `soft` isn't applied there yet (H-257). |
 | `enforcement.poller` | `hard` | What the poller does when a run would cross `repo_monthly_usd` or `daily_usd`: `hard` refuses the run, `soft` starts it and flags it (`hapi:flagged`). It applies to those two spend caps only; the round counts in `runs.yaml` are always hard. |
 
 `enforcement` is a setting per enforcement point: `hard` stops the run at `run_usd`; `soft` lets it finish and flags it (`hapi:flagged`, spec §13.3). All three ship as `hard` and are required: the loader fills no defaults, so the fail-closed value lives in the YAML. An overlay may harden a mode but never soften it (soft < hard). An overlay may also lower `repo_monthly_usd`, never raise it.

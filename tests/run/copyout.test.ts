@@ -37,11 +37,11 @@ describe("copyOut", () => {
   test("each kind copies out only its own outputs, each within its limit", async () => {
     // Every name any kind may leave, each over a 1 MB cap, in every kind's volume.
     const big = file(new Uint8Array(1 * MB + 1));
-    const all = ["result.json", "transcript.jsonl", "decisions.jsonl", "run.bundle", "verify.json", "coderabbit.ndjson"];
+    const all = ["result.json", "transcript.jsonl", "decisions.jsonl", "run.bundle", "verify.json", "acceptance.junit.xml", "coderabbit.ndjson"];
     const want = {
       worker: ["result.json", "transcript.jsonl", "decisions.jsonl", "run.bundle"],
       fix: ["result.json", "transcript.jsonl", "decisions.jsonl", "run.bundle"],
-      verify: ["result.json", "transcript.jsonl", "verify.json"],
+      verify: ["result.json", "transcript.jsonl", "verify.json", "acceptance.junit.xml"],
       review: ["result.json", "transcript.jsonl", "decisions.jsonl", "coderabbit.ndjson"],
     } as const;
     for (const kind of RUN_KINDS) {

@@ -249,7 +249,8 @@ describe("runArgs", () => {
       for (const k of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]) want = splice(want, [`${k}=http://egress-archon:3128`], [`${k}=http://egress-review:3128`]);
       for (const k of ["NO_PROXY", "no_proxy"]) want = splice(want, [`${k}=localhost,127.0.0.1,::1,hapi-sidecar`], [`${k}=localhost,127.0.0.1,::1`]);
       want = splice(want, ["-e", "ANTHROPIC_API_KEY", "-e", "HAPI_JEV_OPENROUTER_API_KEY"], ["-e", "ANTHROPIC_API_KEY", "-e", "CLAUDE_API_KEY"]);
-      want = splice(want, [SOURCE], [SOURCE, "-v", inputsBind]);
+      // Claude Code's managed settings, from the build, read-only at its managed path (Task 11; spike 09, T19).
+      want = splice(want, [SOURCE], [SOURCE, "-v", inputsBind, "-v", `${join(f.deps.buildDir, "claude", "managed-settings.json")}:/etc/claude-code/managed-settings.json:ro`]);
       want = [...want.slice(0, -10), ...tail("review.sh", "factory-review")];
       const review = runArgs(s, inputs(), f.deps, ["CLAUDE_API_KEY", "ANTHROPIC_API_KEY"], kindProfile("review"));
       expect(review).toEqual(want);

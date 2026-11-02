@@ -14,7 +14,7 @@ const WORKER_OUTPUTS = [
   { name: "run.bundle", limit: "bundle" },
 ];
 
-/** design §3.5's table, as Task 8 writes it, with Task 9's `sidecar`: each kind's profile without its extraBinds. */
+/** design §3.5's table, as Task 8 writes it, with Task 9's `sidecar` and Task 11's junit: each kind's profile without its extraBinds. */
 const TABLE = {
   worker: { kind: "worker", zone: "archon", egress: "egress-archon", prelude: "run.sh", workflow: undefined, inputs: false, inputFiles: { required: [], allowed: [] }, sidecar: true, outputs: WORKER_OUTPUTS },
   fix: {
@@ -23,7 +23,8 @@ const TABLE = {
   },
   verify: {
     kind: "verify", zone: undefined, egress: "egress-archon", prelude: "verify.sh", workflow: "factory-verify", inputs: false, inputFiles: { required: [], allowed: [] }, sidecar: true,
-    outputs: [{ name: "result.json", limit: "result" }, { name: "transcript.jsonl", limit: "transcript" }, { name: "verify.json", limit: "result" }],
+    // Task 11: the acceptance run's junit report, which Task 12 reads for its completeness.
+    outputs: [{ name: "result.json", limit: "result" }, { name: "transcript.jsonl", limit: "transcript" }, { name: "verify.json", limit: "result" }, { name: "acceptance.junit.xml", limit: "result" }],
   },
   review: {
     kind: "review", zone: "review", egress: "egress-review", prelude: "review.sh", workflow: "factory-review", inputs: true,
@@ -45,8 +46,8 @@ describe("kindProfile", () => {
     for (const k of RUN_KINDS) {
       const { extraBinds, ...rest } = kindProfile(k);
       expect([k, rest]).toEqual([k, TABLE[k] as unknown as typeof rest]);
-      // Task 11 gives review its one extra bind; here every kind's is empty.
-      expect([k, extraBinds({ buildDir: "/b" })]).toEqual([k, []]);
+      // Review's one extra bind is Claude Code's managed settings (Task 11), from the build; every other kind's is empty.
+      expect([k, extraBinds({ buildDir: "/b" })]).toEqual([k, k === "review" ? [["/b/claude/managed-settings.json", "/etc/claude-code/managed-settings.json"]] : []]);
     }
     expect(MAX_OUTPUTS).toBe(4);
     expect(MAX_OUTPUTS).toBe(Math.max(...RUN_KINDS.map((k) => kindProfile(k).outputs.length)));

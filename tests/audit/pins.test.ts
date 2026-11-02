@@ -32,7 +32,8 @@ describe("pins.versions", () => {
   test("the committed mise.toml, compose.yaml and Dockerfiles pass", async () => {
     const r = await pins();
     expect(r.status).toBe("pass");
-    expect(r.detail).toMatch(/\d+ mise tools, \d+ images, \d+ FROM\/COPY --from images and 1 installed package/);
+    // uv's Python and the repo contract's four tools through mise (Task 11), and CodeRabbit's CLI by checksum.
+    expect(r.detail).toMatch(/\d+ mise tools, \d+ images, \d+ FROM\/COPY --from images, 5 installed packages and 1 download are pinned/);
   });
 
   test("a mise tool at latest, a range or a prefix fails, naming it", async () => {
@@ -146,6 +147,31 @@ describe("pins.versions", () => {
       ["RUN DEBIAN_FRONTEND=noninteractive apt-get install -y tini", "fail", "apt-get install tini has no version"],
       ["RUN go install golang.org/x/tools/gopls@latest", "fail", "go install golang.org/x/tools/gopls@latest has no version"],
       ["RUN install -m 0755 /tmp/x /usr/local/bin/x", "pass"],
+      // mise (Task 11): a tool at an exact version is pinned; a bare one, @latest, a prefix or a range isn't.
+      ["RUN mise install bun@1.4.2 zizmor@1.31.1", "pass"],
+      ["RUN mise install bun", "fail", "mise install bun has no version"],
+      ["RUN mise install gitleaks@latest", "fail", "mise install gitleaks@latest has no version"],
+      ["RUN mise install osv-scanner@2", "fail", "mise install osv-scanner@2 has no version"],
+      ["RUN mise use -g aqua:zizmorcore/zizmor@1.31.1", "pass"],
+      ["RUN mise use -g node", "fail", "mise use node has no version"],
+      ["RUN mise install --locked", "pass"],
+    ];
+    for (const [line, status, says] of cases) {
+      const r = await pins((root) => append(root, "stack/archon/Dockerfile", `${line}\n`));
+      expect([line, r.status]).toEqual([line, status]);
+      if (says !== undefined) expect([line, r.detail]).toEqual([line, expect.stringContaining(says)]);
+    }
+  });
+
+  test("an ADD of a URL needs its SHA-256 (--checksum=sha256:<64 hex>): without it, whatever the URL serves that day is built in (Task 11)", async () => {
+    const sum = "a".repeat(64);
+    const cases: [string, "pass" | "fail", string?][] = [
+      [`ADD --checksum=sha256:${sum} https://example.com/x.zip /tmp/x.zip`, "pass"],
+      ["ADD https://example.com/x.zip /tmp/x.zip", "fail", "ADD https://example.com/x.zip has no --checksum=sha256:"],
+      ["ADD --checksum=sha256:abc https://example.com/x.zip /tmp/x.zip", "fail", "ADD https://example.com/x.zip has no --checksum=sha256:"],
+      ["ADD --chmod=0755 http://example.com/x /usr/local/bin/x", "fail", "ADD http://example.com/x has no --checksum=sha256:"],
+      ["ADD git@github.com:o/r.git /src", "fail", "ADD git@github.com:o/r.git has no --checksum=sha256:"],
+      ["ADD ./local.txt /tmp/local.txt", "pass"],
     ];
     for (const [line, status, says] of cases) {
       const r = await pins((root) => append(root, "stack/archon/Dockerfile", `${line}\n`));
@@ -207,7 +233,8 @@ describe("pins.versions", () => {
   test("a comment line inside a continued RUN is dropped first, as Docker drops it: never read as packages, never ending the RUN", async () => {
     let r = await pins((root) => append(root, "stack/archon/Dockerfile", "RUN apt-get install -y \\\n    # the pinned tools\n    curl=8.5.0-2ubuntu10.6 \\\n  # and one more\n    jq=1.7.1-3build1\n"));
     expect(r.status).toBe("pass");
-    expect(r.detail).toContain("3 installed packages");
+    // The Dockerfile's own five, and these two.
+    expect(r.detail).toContain("7 installed packages");
 
     // The package after the comment is still part of the RUN, so its missing version is seen.
     r = await pins((root) => append(root, "stack/archon/Dockerfile", "RUN apt-get install -y \\\n    # a comment\n    curl\n"));

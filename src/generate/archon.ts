@@ -82,6 +82,18 @@ export interface RunFile {
   turns?: number;
   /** The work order's base commit, the one its worker run started from (Task 11's CodeRabbit node: `jq -r .base /run/hapi/run.json`). */
   base?: string;
+  /**
+   * The commit this run starts from, its checkout's HEAD before any node runs: a worker's is its base, a fix's the
+   * head it fixes. factory-task's gates hold HEAD to it, so a worker that commits for itself is caught: the run
+   * commits each piece, after the gates. Absent in a run file from before Plan 03 Task 11.
+   */
+  sha?: string;
+  /**
+   * The smoke sidecar's port, when the overlaid policy's `repo.sidecar` names one (policy/sidecars.yaml's `port`):
+   * factory-task's preflight probes `http://hapi-sidecar:<port>/` before the work starts, so a smoke that can't
+   * reach its sidecar fails there, not after the session has spent its budget.
+   */
+  sidecar_port?: number;
   /** A review run's alone: whether its CodeRabbit step runs, the overlaid policy's `runs.phases.coderabbit`. */
   coderabbit?: boolean;
 }

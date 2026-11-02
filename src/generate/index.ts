@@ -4,6 +4,7 @@
  *
  *   build/hermes/config.yaml
  *   build/archon/config.yaml, run-config.yaml, archon.env, empty.env, gitconfig
+ *   build/claude/managed-settings.json  (Claude Code's managed settings, bound into a review run alone)
  *   build/pi/models.json, models-store.json, settings.json, hapi-guard.json
  *   build/pi/extensions/hapi-guard.js   (bundled from src/guard/index.ts)
  *   build/decide/hapi-decide.js         (bundled from src/decide/cli.ts)
@@ -21,6 +22,7 @@ import { loadPolicy } from "../policy/load";
 import { o11yEnabled } from "../policy/mcp";
 import type { Policy, RosterName } from "../policy/types";
 import { emitArchon } from "./archon";
+import { emitClaude } from "./claude";
 import { emitEgress } from "./egress";
 import { notice, REPO_ROOT, slashComment } from "./header";
 import { emitHermes } from "./hermes";
@@ -109,6 +111,7 @@ export async function buildAll(p: Policy, outDir: string, opts: BuildOptions = {
     ["pi", withBundle(emitPi(p, roster), "extensions/hapi-guard.js", GUARD_ENTRY)],
     ["egress", emitEgress(p)],
     ["mcp", emitMcp(p)],
+    ["claude", emitClaude(p)],
     ["decide", withBundle({}, "hapi-decide.js", DECIDE_ENTRY)],
     // One bare word, with no notice: `hapi run start` reads it (src/run/spec.ts `readRoster`) to make each run's own files.
     ["", { roster: `${roster}\n` }],

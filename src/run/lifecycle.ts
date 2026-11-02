@@ -42,16 +42,23 @@
  *     against the roster, for the run's kind (`rolesProblem`, ruling m16: a
  *     worker's implement on a pi tier; a review's on a claude tier, with
  *     another model than implement's), the budget against its kind's cap
- *     (`runs.phases.round_usd` for every kind but `worker`), and a review's
+ *     (`runs.phases.round_usd` for every kind but `worker`), a review's budget
+ *     against its review node's own dollar cap (`factory-review`'s
+ *     `maxBudgetUsd`, which Claude Code holds the review to: a lower budget
+ *     can't be kept, so it is refused, ruling b2(5), H-259), and a review's
  *     CodeRabbit key when `phases.coderabbit` is on (step 6). The sidecar
  *     the run starts comes from it too: the overlay's `sidecar`, for a kind
- *     that may have one (./kinds.ts `sidecar`) whose work order smokes;
+ *     that may have one (./kinds.ts `sidecar`) whose work order smokes, and
+ *     its port goes in run.json (`sidecar_port`) whenever the overlay names one;
  * 11. the parent, for every kind but `worker`: the work order's worker run, whose
  *     sha is the run's base commit (`RunFile.base`);
  * 12. the inputs dir (`StartOptions.inputsDir`): a review and a fix need one, a
  *     worker and a verify take none, and it holds only regular files, its kind's
  *     inputs (./kinds.ts `inputFiles`; ./records.ts `inputsProblem`): a fix's
  *     findings.md, a review's diff.patch and verify.json; never a bundle;
+ * 12a. the kind's extra binds (./kinds.ts `extraBinds`: a review's Claude Code
+ *     managed settings), each a file of the build: docker would bind an empty
+ *     dir in a missing one's place, and the review would run without them;
  * 13. the run's own files (./records.ts `PER_RUN_FILES`): its `hapi-guard.json`
  *     and run config, generated from that policy for that roster, and the host's
  *     copies of its work order and task text; and the container's argv
@@ -150,6 +157,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import YAML from "yaml";
 import { packNodes } from "../audit/checks/tools";
 import { parseOwnerRepo } from "../forge/github/app-token";
 import { emitArchon, type RunFile } from "../generate/archon";
@@ -434,7 +442,8 @@ const modelName = (model: string) => model.slice(model.lastIndexOf("/") + 1);
  * - a review runs in Claude Code, so `roles.review` must name a claude tier, and one whose model isn't
  *   implement's (compared without the vendor): a model reviewing its own work is no second opinion;
  * - a verify runs no model, and a fix runs implement's, which its worker was checked for.
- * So no review runs on the portable roster (every tier is Pi) or the budget one (every tier is Haiku): H-249.
+ * So no review runs on the portable roster (every tier is Pi): H-249. The budget roster's review tier is Sonnet, its
+ * Pi tiers Haiku (Task 11).
  */
 export function rolesProblem(kind: RunKind, roles: WorkOrder["roles"], roster: Roster, name: RosterName): string | undefined {
   if (kind === "worker") {
@@ -471,6 +480,27 @@ function overlaid(central: Policy, overlay: RepoOverlay): Policy {
     if (e instanceof PolicyLoosenError) throw new Error(`${OVERLAY_LABEL}: ${e.message}`);
     throw e;
   }
+}
+
+/**
+ * The review node's own dollar cap: `maxBudgetUsd` on `factory-review`'s `review` node in the pack, which Claude
+ * Code holds the session to (spike 09, T19: `assistants.claude` has no budget key, so no per-run layer can lower it).
+ * Throws when the pack's review node has none.
+ */
+async function reviewNodeCap(packDir: string): Promise<number> {
+  let doc: unknown;
+  try {
+    doc = YAML.parse(await readFile(join(packDir, "factory-review.yaml"), "utf8"));
+  } catch {
+    doc = undefined;
+  }
+  const nodes = (doc as { nodes?: unknown } | undefined)?.nodes;
+  const review = Array.isArray(nodes) ? (nodes as { id?: unknown; maxBudgetUsd?: unknown }[]).find((n) => n?.id === "review") : undefined;
+  const cap = review?.maxBudgetUsd;
+  if (typeof cap !== "number" || !Number.isFinite(cap) || cap <= 0) {
+    throw new Error(`factory-review's review node in hapi's pack (${packDir}) has no maxBudgetUsd: a review run's dollars are bounded by it alone`);
+  }
+  return cap;
 }
 
 /** The work order's worker run that a run of another kind names as its parent: see `StartOptions.parent`. */
@@ -544,16 +574,33 @@ export async function startRun(d: RunDeps, o: StartOptions): Promise<StartedRun>
   const sc = profile.sidecar && order.verify.smoke ? applied.repo?.sidecar : undefined;
   const sidecarSpec = sc === undefined ? undefined : applied.sidecars[sc.name];
   if (sc !== undefined && sidecarSpec === undefined) throw new Error(`${OVERLAY_LABEL} names the sidecar ${JSON.stringify(sc.name)}, which policy/sidecars.yaml doesn't list`);
+  const named = applied.repo?.sidecar;
+  const sidecarPort = named === undefined ? undefined : applied.sidecars[named.name]?.port;
   // A worker may spend the work order's budget; every later kind one round's, at most (design §3.9).
   const cap = o.kind === "worker" ? order.budget.usd : Math.min(order.budget.usd, phases.round_usd);
   if (o.budgetUsd !== undefined && o.budgetUsd > cap) {
     throw new Error(`the run's budget ${o.budgetUsd} is above a ${o.kind} run's cap, the smaller of the work order's budget.usd (${order.budget.usd}) and runs.phases.round_usd (${phases.round_usd}): it may only lower it`);
+  }
+  const budgetUsd = o.budgetUsd ?? cap;
+  // The review session's dollars are its node's maxBudgetUsd alone, a fixed number in the pack: a run budget below it
+  // would let the session spend more than the caps reserved for it, so it is refused (ruling b2(5)).
+  if (o.kind === "review") {
+    const node = await reviewNodeCap(d.packDir);
+    if (budgetUsd < node) {
+      throw new Error(
+        `a review run's budget, ${budgetUsd}, is below its review node's own cap, factory-review's maxBudgetUsd (${node}): Claude Code holds the review to that cap alone, so a lower budget can't be kept (H-259); give the review at least ${node}, or lower the node's cap`,
+      );
+    }
   }
   const base = o.kind === "worker" ? o.sha : (await parentOf(d, o)).sha;
   if (profile.inputs && o.inputsDir === undefined) throw new Error(`a ${o.kind} run needs an inputs dir (StartOptions.inputsDir): ${INPUTS_FOR[o.kind]}`);
   if (!profile.inputs && o.inputsDir !== undefined) throw new Error(`a ${o.kind} run takes no inputs dir${NO_INPUTS[o.kind] ?? ""}`);
   const inputs = o.inputsDir === undefined ? undefined : await inputsProblem(o.inputsDir, profile);
   if (inputs !== undefined) throw new Error(inputs);
+  for (const [src, dst] of profile.extraBinds(d)) {
+    const st = await lstat(src).catch(() => undefined);
+    if (st === undefined || !st.isFile()) throw new Error(`${src} is not a file: a ${o.kind} run binds it at ${dst} (\`mise run up\` writes it)`);
+  }
 
   // The run's own files: the guard's settings and Archon's run layer, from the overlaid policy for build/roster's
   // roster, with the work order's tiers for implement and review; and the host's copies of the order and its task.
@@ -568,7 +615,6 @@ export async function startRun(d: RunDeps, o: StartOptions): Promise<StartedRun>
   if (service === undefined) throw new Error("stack/compose.yaml has no archon service: the run container is made from it");
 
   const runId = newRunId();
-  const budgetUsd = o.budgetUsd ?? cap;
   const runInputs: RunInputs = { runId, repo, sha: o.sha, workOrder: order, public: o.public, budgetUsd, packDir: d.packDir, ...(sc === undefined ? {} : { sidecar: sc.name }) };
   const argv = runArgs(service, runInputs, d, Object.keys(secrets), profile);
   const started = d.now();
@@ -589,7 +635,9 @@ export async function startRun(d: RunDeps, o: StartOptions): Promise<StartedRun>
   };
   const runFile: RunFile = {
     run_id: runId, work_order: order.id, traceparent: order.trace.traceparent, budget_usd: budgetUsd, public: o.public, workflow, started_at: rec.startedAt,
-    kind: o.kind, round, turns: o.kind === "fix" ? Math.min(order.budget.turns, phases.round_turns) : order.budget.turns, base,
+    kind: o.kind, round, turns: o.kind === "fix" ? Math.min(order.budget.turns, phases.round_turns) : order.budget.turns, base, sha: o.sha,
+    // factory-task's preflight probes the sidecar on this port when the work order smokes (Task 11).
+    ...(sidecarPort === undefined ? {} : { sidecar_port: sidecarPort }),
     // A review's CodeRabbit node runs only when the overlaid policy says so (Task 11 reads it).
     ...(o.kind === "review" ? { coderabbit: phases.coderabbit } : {}),
   };
