@@ -28,8 +28,11 @@ export type Tier = "small" | "medium" | "large";
 /** A trusted-source tier (spec §10). */
 export type SourceTier = "T0" | "T1" | "T2" | "T3";
 
-/** An egress zone: one per container network with its own proxy. */
-export type ZoneName = "hermes" | "archon" | "research";
+/**
+ * An egress zone: one per container network with its own proxy. `review` is the review container's (design §3.5):
+ * a review run is a run container of the archon service, joined to egress-review instead of egress-archon.
+ */
+export type ZoneName = "hermes" | "archon" | "research" | "review";
 
 export interface Zone {
   /** The source tiers this zone may reach. Their hosts join the zone's allowlist. */
@@ -120,6 +123,12 @@ export interface Sidecar {
   image: string;
   command: string[];
   port: number;
+  /**
+   * Its limits, each a fail-closed default to tune, and always hard: the container's (`docker run --pids-limit`,
+   * `--memory`, which Docker enforces) and the caps on the data exported to it from the run's commit
+   * (src/run/sidecar.ts `exportSidecarData`, which refuses the run when they are crossed). Central only.
+   */
+  limits: { pids: number; memory_mb: number; data_files: number; data_mb: number };
 }
 
 /** The run launcher's limits, from runs.yaml. A repo overlay may only lower them. */

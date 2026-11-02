@@ -180,6 +180,8 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
         image: "oven/bun:1.4.4-slim@sha256:1846adf22496bd711036aae8be147e57bdebbaea2e5264e3e0b5af1db187d9a4",
         command: ["bun", "/data/server.ts"],
         port: 8080,
+        // Fail-closed defaults (ruling m47(5)): the container's limits, and the caps on its data's export.
+        limits: { pids: 128, memory_mb: 512, data_files: 256, data_mb: 16 },
       },
     });
   });
@@ -234,6 +236,24 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
     expect(bad(text.replace(/@sha256:[0-9a-f]{64}/, ""))).toContain("/sidecars/bun-http/image");
     expect(bad(text.replace("port: 8080", "port: 70000"))).toContain("/sidecars/bun-http/port");
     expect(bad(text.replace(/command: \[.*\]/, "command: []"))).toContain("/sidecars/bun-http/command");
+  });
+
+  test("sidecars.yaml sets each sidecar's limits, every one a whole number of at least 1, and nothing else", () => {
+    const text = readFileSync("policy/sidecars.yaml", "utf8");
+    const bad = (t: string) => policyError(policyWith("sidecars.yaml", t)).issues.map((i) => i.path);
+    for (const [from, to, path] of [
+      ["pids: 128", "pids: 0", "/sidecars/bun-http/limits/pids"],
+      ["memory_mb: 512", "memory_mb: 1.5", "/sidecars/bun-http/limits/memory_mb"],
+      ["data_files: 256", "data_files: -1", "/sidecars/bun-http/limits/data_files"],
+      ["data_mb: 16", "data_mb: 16\n      cpus: 2", "/sidecars/bun-http/limits/cpus"],
+    ] as const) {
+      expect(text).toContain(from);
+      expect([from, bad(text.replace(from, to))]).toEqual([from, expect.arrayContaining([path])]);
+    }
+    // No limits at all: refused, never a sidecar without them.
+    const without = text.replace(/\n    limits:[^\n]*(\n      [^\n]*)+/, "");
+    expect(without).not.toContain("pids:");
+    expect(bad(without)).toContain("/sidecars/bun-http/limits");
   });
 
   test("rejects an unknown enforcement", () => {
@@ -352,6 +372,8 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
     expect(zones.research.tiers).toEqual(["T0", "T1", "T2", "T3"]);
     expect(zones.archon.openWeb).toBeUndefined();
     expect(zones.hermes.openWeb).toBeUndefined();
+    // The review container (design §3.5): the review model's API and CodeRabbit's three hosts, no tier, so no registry.
+    expect(zones.review).toEqual({ tiers: [], hosts: ["api.anthropic.com", "cli.coderabbit.ai", "app.coderabbit.ai", "ide.coderabbit.ai"] });
     expect(tiers.T0.hosts).toEqual([]);
     expect(tiers.T3.hosts).toEqual([]);
     expect(tiers.T2.hosts).toEqual(["context7.com", "deepwiki.com"]);
@@ -444,6 +466,17 @@ describe("loadPolicy rejects bad policy with the file and path", () => {
       );
       expect(policyError(policyWith("trusted_sources.yaml", hermes)).path).toBe("/zones/hermes/tiers/2");
     }
+  });
+
+  test("the review zone lists no tier, and no forge host", () => {
+    const ts = readFileSync("policy/trusted_sources.yaml", "utf8");
+    const at = "  review:";
+    expect(ts.split(at).length).toBe(2);
+    const tiered = policyError(policyWith("trusted_sources.yaml", ts.replace(/(\n  review:[^\n]*\n    tiers: )\[\]/, "$1[T1]")));
+    expect(tiered.path).toBe("/zones/review/tiers");
+    const forge = policyError(policyWith("trusted_sources.yaml", ts.replace("- ide.coderabbit.ai", "- ide.coderabbit.ai\n      - github.com")));
+    expect(forge.path).toBe("/zones/review/hosts/4");
+    expect(forge.message).toContain('"github.com" is a forge host (github.com); the review zone has no forge route (design §3.5)');
   });
 
   test("a host that isn't a plain domain", () => {

@@ -30,12 +30,42 @@
           "port": {
             "description": "The port it listens on.",
             "$ref": "policy-defs.schema.json#/$defs/port"
+          },
+          "limits": {
+            "description": "Fail-closed defaults to tune, always hard and central only: the container's pid and memory limits (docker run --pids-limit, --memory), and the most files and MiB the data exported to it from the run's commit may hold (a run whose data dir holds more is refused).",
+            "type": "object",
+            "properties": {
+              "pids": {
+                "description": "docker run --pids-limit.",
+                "$ref": "policy-defs.schema.json#/$defs/count"
+              },
+              "memory_mb": {
+                "description": "docker run --memory, in MiB.",
+                "$ref": "policy-defs.schema.json#/$defs/count"
+              },
+              "data_files": {
+                "description": "The most files the data dir may hold at the run's commit.",
+                "$ref": "policy-defs.schema.json#/$defs/count"
+              },
+              "data_mb": {
+                "description": "The most MiB the data dir's files may hold together.",
+                "$ref": "policy-defs.schema.json#/$defs/count"
+              }
+            },
+            "required": [
+              "pids",
+              "memory_mb",
+              "data_files",
+              "data_mb"
+            ],
+            "additionalProperties": false
           }
         },
         "required": [
           "image",
           "command",
-          "port"
+          "port",
+          "limits"
         ],
         "additionalProperties": false
       }

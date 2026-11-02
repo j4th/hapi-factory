@@ -14,7 +14,8 @@
  * - the run's name (`runName`) and labels: `org.hapi.run` and
  *   `org.hapi.project` on every object of the run, so `down`, the kill
  *   switches and the reaper find it, plus `org.hapi.int` for a test project;
- *   on the container alone, `org.hapi.kind`, the kind the audit holds it to;
+ *   on the container alone, `org.hapi.kind`, the kind the audit holds it to,
+ *   and `org.hapi.sidecar` when the run starts a smoke sidecar (./sidecar.ts);
  *   the stack's labels are computed as `up` computes them (who started it, the
  *   dev bypass, the build's digest), since the service's are Compose
  *   interpolations; and the image's `com.docker.compose.*` labels, blanked;
@@ -54,6 +55,7 @@
  */
 import { readdirSync, readFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
+import defs from "../../policy/schemas/policy-defs.schema.json";
 import { mountable } from "../audit/checks/tools";
 import { RUN_PATHS } from "../generate/archon";
 import { ROSTERS } from "../generate/index";
@@ -110,7 +112,15 @@ export interface RunInputs {
   /** The run's budget (`RunFile.budget_usd`). */
   budgetUsd: number;
   packDir: string;
+  /**
+   * The policy sidecar the run starts (./sidecar.ts), by name: labelled on the run container as `SIDECAR_LABEL`, so
+   * the audit expects it on the run's network. Absent: the run has none.
+   */
+  sidecar?: string;
 }
+
+/** The label on a run container that has a smoke sidecar, naming its policy sidecar (`RunInputs.sidecar`). */
+export const SIDECAR_LABEL = "org.hapi.sidecar";
 
 /** The roster the deployed build was made for: `<buildDir>/roster`, one bare word that `buildAll` writes. Throws when it is missing or names no roster. */
 export function readRoster(buildDir: string): RosterName {
@@ -204,6 +214,8 @@ export function buildInUse(buildDir: string): string {
 }
 
 const SERVICE = "stack/compose.yaml: archon:";
+/** A sidecar's name in policy/sidecars.yaml (policy-defs.schema.json's `slug`). */
+const SLUG = new RegExp(defs.$defs.slug.pattern, "u");
 const untranslated = (what: string) => new Error(`${SERVICE} ${what} isn't translated into the run container; add it to src/run/spec.ts or remove it`);
 
 /** What the stack's interpolated labels are computed from: who started the run, the dev bypass, the build's digest. */
@@ -325,6 +337,10 @@ export function runArgs(
   profile: KindProfile,
 ): string[] {
   for (const key of Object.keys(service)) if (!TRANSLATED_KEYS.includes(key)) throw untranslated(`key "${key}"`);
+  if (r.sidecar !== undefined) {
+    if (!profile.sidecar) throw new Error(`a ${profile.kind} run has no sidecar: it runs none of the repo's code`);
+    if (!SLUG.test(r.sidecar)) throw new Error(`the sidecar ${JSON.stringify(r.sidecar.slice(0, 80))} is not a sidecar's name`);
+  }
   const name = runName(d.project, r.runId);
   const who = currentUserOverride(d.env, d.user);
   const [uid, gid] = APP_USER.split(":");
@@ -358,6 +374,7 @@ export function runArgs(
     "docker", "run", "-d", "--pull", "never", "--name", name,
     ...runLabels(d.project, r.runId),
     "--label", `${KIND_LABEL}=${profile.kind}`,
+    ...(r.sidecar === undefined ? [] : ["--label", `${SIDECAR_LABEL}=${r.sidecar}`]),
     ...labels(service, { user: who.user, override: who.override, digest: buildInUse(d.buildDir) }),
     ...COMPOSE_LABELS.flatMap((k) => ["--label", `${k}=`]),
     ...hardening(service),

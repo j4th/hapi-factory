@@ -2,7 +2,8 @@
  * The environment hapi sets in each zone container itself: stack/compose.yaml's
  * `environment:` for each zone service (tests/stack/compose.test.ts checks the
  * file against `serviceEnvironment`). These are hardening settings, not
- * secrets: each zone's proxy, loopback going direct, Archon's telemetry
+ * secrets: each zone's proxy, loopback (and, for the archon zone, a run's
+ * sidecar) going direct, Archon's telemetry
  * switches, Pi's offline mode and read-only agent dir, Bun's no-install, the git
  * hardening, and where each tool reads its generated config.
  *
@@ -30,14 +31,24 @@ export type ZoneService = (typeof ZONE_SERVICES)[number];
 export const HERMES_HOME = "/opt/data";
 
 /**
+ * The name a run's smoke sidecar has on the run's own network (src/run/sidecar.ts; design §3.3, H-192). It is in
+ * the archon zone's `NO_PROXY`, so a worker, fix or verify run reaches its sidecar directly: through the proxy, its
+ * private address would be refused (`to_localnet`), and that refusal is never loosened.
+ */
+export const SIDECAR_ALIAS = "hapi-sidecar";
+
+/**
  * A zone's proxy variables: HTTP(S)_PROXY, in both cases, at the zone's own
  * egress proxy, and loopback direct. Every zone container gets exactly these.
- * The review zone has no service of its own: a review run is a run container
- * of the archon service whose proxy variables are these (src/run/spec.ts).
+ * The archon zone's `NO_PROXY` also names `SIDECAR_ALIAS`, the one name a run
+ * reaches without its proxy; every other zone's is loopback only. The review
+ * zone has no service of its own: a review run is a run container of the
+ * archon service whose proxy variables are these (src/run/spec.ts), and it has
+ * no sidecar.
  */
 export function proxyEnv(zone: "hermes" | "archon" | "research" | "review"): Record<string, string> {
   const proxy = `http://egress-${zone}:${PROXY_PORT}`;
-  const direct = "localhost,127.0.0.1,::1";
+  const direct = `localhost,127.0.0.1,::1${zone === "archon" ? `,${SIDECAR_ALIAS}` : ""}`;
   return { HTTP_PROXY: proxy, HTTPS_PROXY: proxy, http_proxy: proxy, https_proxy: proxy, NO_PROXY: direct, no_proxy: direct };
 }
 

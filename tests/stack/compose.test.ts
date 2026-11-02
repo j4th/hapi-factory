@@ -12,13 +12,13 @@ import { PROXY_PORT } from "../../src/generate/egress";
 import { loadPolicy } from "../../src/policy/load";
 import { ENV_DIR } from "../../src/secrets/files";
 import { SECRET_ZONES } from "../../src/secrets/manifest";
-import { RESERVED_ENV_NAMES, serviceEnvironment, ZONE_SERVICES } from "../../src/stack/env";
+import { proxyEnv, RESERVED_ENV_NAMES, serviceEnvironment, SIDECAR_ALIAS, ZONE_SERVICES } from "../../src/stack/env";
 import { composeFile, REPO } from "./helpers";
 
 const c = composeFile();
 const text = readFileSync(join(REPO, "stack", "compose.yaml"), "utf8");
 const svc = (name: string) => c.services[name] as Record<string, any>;
-const ZONES = ["hermes", "archon", "research"] as const;
+const ZONES = ["hermes", "archon", "research", "review"] as const;
 const PROXIES = ZONES.map((z) => `egress-${z}`);
 const DIGEST = /@sha256:[0-9a-f]{64}$/;
 /** A pinned image: name:tag@sha256:digest, never latest. */
@@ -33,14 +33,14 @@ function dockerfileImages(path: string): string[] {
   return [...from, ...copy];
 }
 
-test("five services: hermes, archon and one egress proxy per zone (research's own service comes in Plan 04)", () => {
-  expect(Object.keys(c.services).sort()).toEqual(["archon", "egress-archon", "egress-hermes", "egress-research", "hermes"]);
+test("six services: hermes, archon and one egress proxy per zone (research's own service comes in Plan 04; a review is a run container of archon)", () => {
+  expect(Object.keys(c.services).sort()).toEqual(["archon", "egress-archon", "egress-hermes", "egress-research", "egress-review", "hermes"]);
   expect(c.name).toBe("hapi");
 });
 
 describe("networks", () => {
-  test("hermes-net, archon-net and research-net are internal; outbound is the proxies' only way out", () => {
-    expect(Object.keys(c.networks).sort()).toEqual(["archon-net", "hermes-net", "outbound", "research-net"]);
+  test("hermes-net, archon-net, research-net and review-net are internal; outbound is the proxies' only way out", () => {
+    expect(Object.keys(c.networks).sort()).toEqual(["archon-net", "hermes-net", "outbound", "research-net", "review-net"]);
     for (const z of ZONES) expect([z, c.networks[`${z}-net`]?.internal]).toEqual([z, true]);
     expect(c.networks.outbound?.internal).toBeUndefined();
     // The proxies can't reach each other on outbound.
@@ -163,10 +163,10 @@ describe("the zone services", () => {
   });
 
   for (const z of ZONE_SERVICES) {
-    test(`${z}: HTTP(S)_PROXY points at egress-${z}, loopback goes direct${z === "archon" ? ", and it depends on nothing (a run container starts when the launcher says)" : ", and it starts once its proxy is healthy"}`, () => {
+    test(`${z}: HTTP(S)_PROXY points at egress-${z}, loopback goes direct${z === "archon" ? " and so does the run's sidecar, and it depends on nothing (a run container starts when the launcher says)" : ", and it starts once its proxy is healthy"}`, () => {
       const env = svc(z).environment as Record<string, string>;
       for (const v of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]) expect([v, env[v]]).toEqual([v, `http://egress-${z}:${PROXY_PORT}`]);
-      for (const v of ["NO_PROXY", "no_proxy"]) expect([v, env[v]]).toEqual([v, "localhost,127.0.0.1,::1"]);
+      for (const v of ["NO_PROXY", "no_proxy"]) expect([v, env[v]]).toEqual([v, z === "archon" ? "localhost,127.0.0.1,::1,hapi-sidecar" : "localhost,127.0.0.1,::1"]);
       expect(svc(z).depends_on).toEqual(z === "archon" ? undefined : { [`egress-${z}`]: { condition: "service_healthy" } });
     });
 
@@ -176,6 +176,24 @@ describe("the zone services", () => {
       for (const name of Object.keys(svc(z).environment)) expect([name, RESERVED_ENV_NAMES.includes(name)]).toEqual([name, true]);
     });
   }
+
+  test("the archon zone's NO_PROXY names hapi-sidecar, so a run reaches its sidecar directly; no other zone's does", () => {
+    // Directly, so the proxies' to_localnet is never loosened: the sidecar's address is on the run's private network.
+    expect(SIDECAR_ALIAS).toBe("hapi-sidecar");
+    for (const zone of ["hermes", "archon", "research", "review"] as const) {
+      const direct = zone === "archon" ? "localhost,127.0.0.1,::1,hapi-sidecar" : "localhost,127.0.0.1,::1";
+      expect([zone, proxyEnv(zone).NO_PROXY, proxyEnv(zone).no_proxy]).toEqual([zone, direct, direct]);
+    }
+    for (const v of ["NO_PROXY", "no_proxy"]) {
+      expect([v, svc("archon").environment[v].split(",").includes(SIDECAR_ALIAS)]).toEqual([v, true]);
+      expect([v, svc("hermes").environment[v].split(",").includes(SIDECAR_ALIAS)]).toEqual([v, false]);
+    }
+  });
+
+  test("egress-review is the review zone's proxy alone: no service has review.env as its env_file, since the launcher gives a review run its zone's keys itself", () => {
+    expect(svc("egress-review").networks).toEqual({ "review-net": {}, outbound: {} });
+    for (const [name, s] of Object.entries(c.services)) expect([name, JSON.stringify(s.env_file ?? []).includes("review.env")]).toEqual([name, false]);
+  });
 
   test("archon: every setting of the generated build/archon/archon.env is in its environment:, with the same value, and there are ARCHON_ENV.length of them", () => {
     const generated = emitArchon(loadPolicy(join(REPO, "policy")))["archon.env"]!

@@ -24,6 +24,7 @@ const FILES = [
   "egress/archon.squid.conf",
   "egress/hermes.squid.conf",
   "egress/research.squid.conf",
+  "egress/review.squid.conf",
   "hermes/config.yaml",
   "mcp/hermes.mcp.json",
   "mcp/research.mcp.json",
@@ -61,7 +62,7 @@ describe("buildAll", () => {
   // Task 3 wrote 8 files (1 Hermes, 2 Archon, 2 Pi, 3 egress); Task 3b adds the 2 per-zone mcp.json files;
   // Plan 02 Task 4 adds 3 Archon run files, 2 Pi files, and the guard and hapi-decide bundles; Plan 03 Task 7 adds
   // build/roster, the roster the build was made for, which each run's own guard settings and run config are made for.
-  test("writes the eighteen generated files and returns their paths", async () => {
+  test("writes the nineteen generated files and returns their paths", async () => {
     const out = tempDir();
     const paths = await buildAll(p, out);
     expect(paths.map((f) => relative(out, f)).sort()).toEqual(FILES);

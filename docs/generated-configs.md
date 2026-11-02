@@ -51,6 +51,7 @@ It prints each path it wrote, one per line, and exits 0. A usage error (an unkno
 | `build/egress/hermes.squid.conf` | Squid config for the `hermes` zone's egress proxy | `trusted_sources.yaml` | The `egress-hermes` container, read-only |
 | `build/egress/archon.squid.conf` | Squid config for the `archon` zone's egress proxy | `trusted_sources.yaml` | The `egress-archon` container, read-only |
 | `build/egress/research.squid.conf` | Squid config for the `research` zone's egress proxy | `trusted_sources.yaml` | The `egress-research` container, read-only (the research zone's own service arrives in Plan 04) |
+| `build/egress/review.squid.conf` | Squid config for the `review` zone's egress proxy, the fourth conf | `trusted_sources.yaml` | The `egress-review` container, read-only: the launcher joins it to a review run's own network (design §3.5) |
 | `build/mcp/hermes.mcp.json` | A standard `mcp.json` with the `hermes` zone's whole MCP catalog | `mcp.yaml` | The CI scanners (Plan 05) |
 | `build/mcp/research.mcp.json` | A standard `mcp.json` with the `research` zone's whole MCP catalog | `mcp.yaml` | The CI scanners (Plan 05) |
 | `build/roster` | The roster the build was made for (`budget`, `anthropic` or `portable`), one bare word and a newline | `--roster` | `hapi run start` and the poller (`readRoster`, `src/run/spec.ts`): each run's own `hapi-guard.json` and `run-config.yaml` are made for it ([below](#buildroster)) |
@@ -339,7 +340,7 @@ One Squid config per egress zone (spec §10, §11.4). Each zone's containers sit
 - strips `X-Forwarded-For` and hides its version;
 - ends with `http_access deny all`.
 
-**Allowlisted zones (`hermes`, `archon`)** allow **only HTTPS tunnels** to the zone's allowlist, which is `zoneHosts` (`src/policy/zones.ts`): the zone's own hosts plus its tiers' hosts.
+**Allowlisted zones (`hermes`, `archon`, `review`)** allow **only HTTPS tunnels** to the zone's allowlist, which is `zoneHosts` (`src/policy/zones.ts`): the zone's own hosts plus its tiers' hosts.
 - Each host becomes a Squid `dstdomain` with a leading dot, so `slack.com` also covers `wss-primary.slack.com`.
 - **The allowlist matches by name only** (`dstdomain -n`). Without `-n`, Squid matches a destination given as an IP address by the address's reverse DNS (PTR) name, and the address's owner controls that name. So anyone could point a PTR record at `api.anthropic.com` and get their address through. With neither `-n` nor the next rule, Squid 7.6 tunnels `CONNECT 203.0.113.7:443` once that address's reverse name is `api.anthropic.com`.
 - **IP-address destinations are refused outright** (`ip_literal`, above), before the allow.
@@ -349,7 +350,7 @@ One Squid config per egress zone (spec §10, §11.4). Each zone's containers sit
 **Every host is checked before it is written**, because hosts are pasted into `squid.conf` and the proxy is the boundary. The generator checks again what the schema enforces, so a policy built in code that skipped the schema can't get past it:
 - Each host is lowercased, as Squid matches domains case-insensitively, and must then be a plain domain name (`isHostname`, `src/policy/hosts.ts`). Anything else throws, such as a host holding a space or a newline, which could otherwise add a directive like `http_access allow all`.
 - Each zone's tiers must be source tiers (`T0` to `T3`), because their names go into a comment.
-- A forge host in the `archon` zone throws, in any case (`forgeDomain`, so `GitHub.com` counts): the Archon zone has no forge route (spec §4.3).
+- A forge host in the `archon` or the `review` zone throws, in any case (`forgeDomain`, so `GitHub.com` counts), from its hosts or a tier's: neither zone has a forge route (spec §4.3, design §3.5).
 - `openWeb` on any zone but `research` throws.
 
 **The research zone** (`openWeb: true`) allows any public host, by name: HTTPS tunnels to port 443, and plain HTTP: `http://` requests to port 80 (`http_proto port_80`). A destination written as an IP address is refused, public or private (`ip_literal`). Another scheme on port 80, such as `ftp://host:80/` or `https://host:80/`, is refused. Only hapi-research uses it (spec §10).
@@ -359,6 +360,7 @@ One Squid config per egress zone (spec §10, §11.4). Each zone's containers sit
 | `archon` | `api.anthropic.com`, `files.pythonhosted.org`, `opencode.ai`, `openrouter.ai`, `pypi.org`, `registry.npmjs.org` |
 | `hermes` | `api.anthropic.com`, `files.pythonhosted.org`, `github.com` (covers `api.github.com`), `openrouter.ai`, `pypi.org`, `registry.npmjs.org`, `slack.com`. No T2 hosts (`context7.com`, `deepwiki.com`): spec §10.1 made them research-only. |
 | `research` | Open web, by name, minus the private ranges |
+| `review` | `api.anthropic.com`, `app.coderabbit.ai`, `cli.coderabbit.ai`, `ide.coderabbit.ai`: the review model's API and CodeRabbit's CLI. No tier, so no registry and no forge. The file's header says `Zone review (no tiers)`. |
 
 **Running it.** `stack/compose.yaml` starts Squid **as a non-root user** (`user: "584792:584792"`, the Ubuntu rock's own `_daemon_`) in the foreground (`/usr/sbin/squid-gnutls -N -f /etc/squid/hapi.conf`), with this file mounted read-only at `/etc/squid/hapi.conf`, on a read-only root with no capabilities. The config sets `pid_filename none`, because the container supervises the process, so a reload is a container restart (`mise run up` restarts the proxies when `build/` changes). Started as root, Squid drops privileges and then can't open `/dev/stdout` for its access log, and exits.
 

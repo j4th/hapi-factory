@@ -121,7 +121,8 @@ function toIssue(e: ErrorObject): Issue | undefined {
       if (e.propertyName !== undefined) return undefined; // about a key, reported as "invalid key"
       // The schemas' only `not` is nonForgeHost's `not: {$ref: forgeHost}`; say which forge.
       const forge = typeof e.data === "string" ? forgeDomain(e.data) : undefined;
-      const message = forge !== undefined ? forgeHostMessage(e.data as string, forge) : (e.message ?? "must not match");
+      const zone = e.instancePath.startsWith("/zones/review/") ? "review" : "archon";
+      const message = forge !== undefined ? forgeHostMessage(e.data as string, forge, zone) : (e.message ?? "must not match");
       return { path: e.instancePath, message };
     }
     default:

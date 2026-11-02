@@ -21,7 +21,7 @@ import { loadPolicy } from "../../src/policy/load";
 import { type FsProbe, GIB } from "../../src/run/disk";
 import { RUN_DISK } from "../../src/run/locks";
 import { envFileText } from "../../src/secrets/files";
-import { loadManifest, MANIFEST_FILE } from "../../src/secrets/manifest";
+import { loadManifest, MANIFEST_FILE, manifestEntries } from "../../src/secrets/manifest";
 import { serviceEnvironment } from "../../src/stack/env";
 import { buildDigest } from "../../src/stack/up";
 
@@ -92,10 +92,23 @@ export interface Container {
   State: { Running: boolean };
   Path: string;
   Args: string[];
-  Config: { Labels: Record<string, string>; Env: string[]; Cmd: string[] | null; Entrypoint: string[] | null; User?: string; StopTimeout?: number };
+  Config: { Labels: Record<string, string>; Env: string[]; Cmd: string[] | null; Entrypoint: string[] | null; User?: string; StopTimeout?: number; Image?: string; WorkingDir?: string };
   Mounts: { Type: string; Source: string; Destination: string; RW: boolean }[];
   NetworkSettings?: { Networks: Record<string, unknown> };
-  HostConfig?: { NetworkMode?: string; Init?: boolean | null; AutoRemove?: boolean; CapAdd?: string[] | null; PortBindings: Record<string, unknown>; Tmpfs?: Record<string, string>; CapDrop?: string[]; ReadonlyRootfs?: boolean; SecurityOpt?: string[]; PidsLimit?: number; Memory?: number };
+  HostConfig?: {
+    NetworkMode?: string;
+    Init?: boolean | null;
+    AutoRemove?: boolean;
+    Privileged?: boolean;
+    CapAdd?: string[] | null;
+    PortBindings: Record<string, unknown>;
+    Tmpfs?: Record<string, string>;
+    CapDrop?: string[];
+    ReadonlyRootfs?: boolean;
+    SecurityOpt?: string[];
+    PidsLimit?: number;
+    Memory?: number;
+  };
 }
 
 /** A network as `docker network inspect` prints one (the fields the audit reads). */
@@ -357,16 +370,17 @@ export function hostEnv(env: Record<string, string>): void {
 }
 
 /**
- * The review zone's env names, a fixture: Task 9 adds the zone to stack/secrets.yaml, so nothing here needs it. Its
- * Claude Code keys (`ANTHROPIC_API_KEY`, which Claude Code sends, and `CLAUDE_API_KEY`, Archon's name for it) and
- * CodeRabbit's.
+ * The review zone's env names, as Task 8's tests wrote them before the zone was real: its Claude Code keys
+ * (`ANTHROPIC_API_KEY`, which Claude Code sends, and `CLAUDE_API_KEY`, Archon's name for it) and CodeRabbit's.
+ * tests/audit/runtime.test.ts checks that stack/secrets.yaml's review zone is exactly this, so the two can't drift.
  */
 export const REVIEW_ZONE_KEYS = ["ANTHROPIC_API_KEY", "CLAUDE_API_KEY", "CODERABBIT_API_KEY"];
 
-/** Each zone's env names, as the clean world gives the audit: stack/secrets.yaml's zones, plus the fixture review zone. */
+/** Each zone's env names, as the clean world gives the audit: stack/secrets.yaml's zones, each entry read as the audit reads it. */
 export function zoneKeys(): Record<string, string[]> {
-  const manifest = loadManifest(join(REPO, MANIFEST_FILE));
-  return { ...Object.fromEntries(Object.entries(manifest).map(([zone, names]) => [zone, Object.keys(names ?? {})])), review: REVIEW_ZONE_KEYS };
+  const out: Record<string, string[]> = {};
+  for (const e of manifestEntries(loadManifest(join(REPO, MANIFEST_FILE)))) (out[e.zone] ??= []).push(e.key);
+  return out;
 }
 
 /**
@@ -392,7 +406,7 @@ export async function cleanWorld(o: { repos?: boolean; workflows?: Record<string
   });
   const envList = (e: Record<string, string>) => [...Object.entries(e).map(([k, v]) => `${k}=${v}`), "PATH=/usr/local/bin:/usr/bin:/bin"];
   const containers: Container[] = [
-    ...["egress-hermes", "egress-archon", "egress-research"].map(
+    ...["egress-hermes", "egress-archon", "egress-research", "egress-review"].map(
       (service): Container => ({
         Id: `id-${service}`,
         Name: `/hapi-${service}-1`,
@@ -473,15 +487,24 @@ export type Kind = "worker" | "verify" | "review" | "fix";
  * It is on its own network, named as it is, which this adds to `w.networks`: internal, on a private subnet, and
  * holding the container and its kind's proxy (`hapi-egress-archon-1`, or `hapi-egress-review-1` for a review).
  */
-export function runContainer(w: World, id = "ab12cd34ef56", over: { labels?: Record<string, string>; kind?: Kind } = {}): Container {
+export function runContainer(w: World, id = "ab12cd34ef56", over: { labels?: Record<string, string>; kind?: Kind; sidecar?: string } = {}): Container {
   const name = `hapi-run-${id}`;
   const kind = over.kind ?? "worker";
   const egress = kind === "review" ? "hapi-egress-review-1" : "hapi-egress-archon-1";
-  w.networks.set(name, { Name: name, Internal: true, IPAM: { Config: [{ Subnet: "172.30.0.0/16" }] }, Containers: { [`id-run-${id}`]: { Name: name }, [`id-${egress}`]: { Name: egress } } });
+  w.networks.set(name, {
+    Name: name,
+    Internal: true,
+    IPAM: { Config: [{ Subnet: "172.30.0.0/16" }] },
+    Containers: { [`id-run-${id}`]: { Name: name }, [`id-${egress}`]: { Name: egress }, ...(over.sidecar === undefined ? {} : { [`id-sidecar-${id}`]: { Name: `${name}-sidecar` } }) },
+  });
   const prelude = { worker: "run.sh", fix: "run.sh", verify: "verify.sh", review: "review.sh" }[kind];
   const workflow = { worker: "hapi-check-run", fix: "hapi-check-run", verify: "factory-verify", review: "factory-review" }[kind];
   const env = { ...serviceEnvironment("archon") };
-  if (kind === "review") for (const k of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]) env[k] = "http://egress-review:3128";
+  if (kind === "review") {
+    for (const k of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]) env[k] = "http://egress-review:3128";
+    // A review has no sidecar to reach: loopback only.
+    for (const k of ["NO_PROXY", "no_proxy"]) env[k] = "localhost,127.0.0.1,::1";
+  }
   const bind = (Source: string, Destination: string) => ({ Type: "bind", Source, Destination, RW: false });
   return {
     Id: `id-run-${id}`,
@@ -497,6 +520,7 @@ export function runContainer(w: World, id = "ab12cd34ef56", over: { labels?: Rec
         "org.hapi.run": id,
         "org.hapi.project": "hapi",
         ...(over.kind === undefined ? {} : { "org.hapi.kind": over.kind }),
+        ...(over.sidecar === undefined ? {} : { "org.hapi.sidecar": over.sidecar }),
         "org.hapi.stack": "hapi-factory",
         "org.hapi.started-by": "hapi",
         "org.hapi.dev-override": "0",
@@ -543,6 +567,61 @@ export function runContainer(w: World, id = "ab12cd34ef56", over: { labels?: Rec
       SecurityOpt: ["no-new-privileges:true"],
       PidsLimit: 2048,
       Memory: 4 * 1024 ** 3,
+    },
+  };
+}
+
+/** policy/sidecars.yaml's bun-http image, as a sidecar of it runs it (`Config.Image` is the reference `docker run` was given). */
+export const SIDECAR_IMAGE = "oven/bun:1.4.4-slim@sha256:1846adf22496bd711036aae8be147e57bdebbaea2e5264e3e0b5af1db187d9a4";
+
+/**
+ * A run's smoke sidecar as `docker inspect` printed one on Docker 29.9.2 (probed for Task 9), following its real argv
+ * (src/run/sidecar.ts): named `<run>-sidecar`, the run's labels with `org.hapi.kind=sidecar` and the stack's
+ * started-by and dev-override, the Compose labels blank, on the run's network alone as hapi-sidecar, bun-http's image
+ * and command, read-only as 1001 with every capability dropped, bun-http's limits, its data read-only at /data and
+ * its working dir there, a /tmp tmpfs, HOME and PORT, and no key. Written out here, not read from `sidecarArgs`.
+ * Pair it with `runContainer(w, id, { sidecar: "bun-http" })`, whose network holds it.
+ */
+export function sidecarContainer(id = "ab12cd34ef56"): Container {
+  const run = `hapi-run-${id}`;
+  return {
+    Id: `id-sidecar-${id}`,
+    Name: `/${run}-sidecar`,
+    State: { Running: true },
+    Path: "bun",
+    Args: ["/data/server.ts"],
+    Config: {
+      Labels: {
+        "com.docker.compose.project": "",
+        "com.docker.compose.service": "",
+        "com.docker.compose.version": "",
+        "org.hapi.run": id,
+        "org.hapi.project": "hapi",
+        "org.hapi.kind": "sidecar",
+        "org.hapi.started-by": "hapi",
+        "org.hapi.dev-override": "0",
+      },
+      // The image's own env follows the argv's.
+      Env: ["HOME=/tmp", "PORT=8080", "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "BUN_RUNTIME_TRANSPILER_CACHE_PATH=0"],
+      Cmd: ["/data/server.ts"],
+      Entrypoint: ["bun"],
+      User: "1001:1001",
+      Image: SIDECAR_IMAGE,
+      WorkingDir: "/data",
+    },
+    Mounts: [{ Type: "bind", Source: `/state/runs/${id}/sidecar`, Destination: "/data", RW: false }],
+    NetworkSettings: { Networks: { [run]: { Aliases: ["hapi-sidecar"], DNSNames: [`${run}-sidecar`, "hapi-sidecar", "7777aeb2b08e"] } } },
+    HostConfig: {
+      NetworkMode: run,
+      PortBindings: {},
+      Tmpfs: { "/tmp": "size=64m,uid=1001,gid=1001,mode=0700" },
+      CapDrop: ["ALL"],
+      CapAdd: null,
+      AutoRemove: false,
+      ReadonlyRootfs: true,
+      SecurityOpt: ["no-new-privileges:true"],
+      PidsLimit: 128,
+      Memory: 512 * 1024 ** 2,
     },
   };
 }

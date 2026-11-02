@@ -13,7 +13,7 @@ import { runAudit } from "../../src/audit/index";
 import { buildAll } from "../../src/generate/index";
 import { loadPolicy } from "../../src/policy/load";
 import { buildDigest } from "../../src/stack/up";
-import { cleanup, cleanWorld, files, only, REPO, runContainer, tempDir } from "./helpers";
+import { cleanup, cleanWorld, files, only, REPO, runContainer, sidecarContainer, tempDir } from "./helpers";
 
 afterEach(cleanup);
 
@@ -26,12 +26,26 @@ const edit = (path: string, from: string | RegExp, to: string) => {
 };
 
 describe("generated.drift", () => {
+  test("a run's smoke sidecar mounts nothing of build/ and carries no build label: it isn't counted, and doesn't fail the check (runtime.run-container holds it to policy/sidecars.yaml)", async () => {
+    const w = await cleanWorld();
+    w.containers.push(runContainer(w, "aaaaaaaaaaaa", { sidecar: "bun-http" }), sidecarContainer("aaaaaaaaaaaa"));
+    const r = await drift(w);
+    expect([r.status, r.detail]).toEqual(["pass", expect.stringContaining("6 running containers")]);
+    expect(r.detail).not.toContain("sidecar");
+    // A container that only says it is a sidecar, under another name, is no sidecar: it is counted, and its missing label fails.
+    const v = await cleanWorld();
+    const fake = sidecarContainer("aaaaaaaaaaaa");
+    fake.Name = "/nifty_name";
+    v.containers.push(fake);
+    expect((await drift(v)).detail).toContain("nifty_name has no org.hapi.build-sha256 label");
+  });
+
   test("a deployed build equal to a fresh one, and every container started from it, passes", async () => {
     const w = await cleanWorld();
     const r = await drift(w);
     expect(r.status).toBe("pass");
     expect(r.detail).toContain("roster anthropic");
-    expect(r.detail).toContain("4 running containers");
+    expect(r.detail).toContain("5 running containers");
   });
 
   test("it finds the roster the stack was built with (`up --roster budget`)", async () => {
@@ -150,7 +164,7 @@ describe("generated.drift", () => {
     w.containers.push(runContainer(w, "aaaaaaaaaaaa"));
     let r = await drift(w);
     expect(r.status).toBe("pass");
-    expect(r.detail).toContain("5 running containers");
+    expect(r.detail).toContain("6 running containers");
     w.containers.push(runContainer(w, "bbbbbbbbbbbb", { labels: { "org.hapi.build-sha256": "0".repeat(64) } }));
     r = await drift(w);
     expect(r.status).toBe("fail");

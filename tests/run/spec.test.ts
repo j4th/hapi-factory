@@ -243,16 +243,22 @@ describe("runArgs", () => {
       // A verify run is given no zone's secrets, so a name passed to it is refused, never bound.
       expect(() => runArgs(s, inputs(), f.deps, ["ANTHROPIC_API_KEY"], kindProfile("verify"))).toThrow("a verify run holds no key: it is given no zone's secrets");
 
-      // review: the review zone's proxy (NO_PROXY and no_proxy unchanged) and keys, review.sh, its inputs, factory-review.
+      // review: the review zone's proxy (NO_PROXY and no_proxy loopback only: a review has no sidecar) and keys, review.sh, its inputs, factory-review.
       want = as("review", worker);
       want = splice(want, [prelude("run.sh")], [prelude("review.sh")]);
       for (const k of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]) want = splice(want, [`${k}=http://egress-archon:3128`], [`${k}=http://egress-review:3128`]);
+      for (const k of ["NO_PROXY", "no_proxy"]) want = splice(want, [`${k}=localhost,127.0.0.1,::1,hapi-sidecar`], [`${k}=localhost,127.0.0.1,::1`]);
       want = splice(want, ["-e", "ANTHROPIC_API_KEY", "-e", "HAPI_JEV_OPENROUTER_API_KEY"], ["-e", "ANTHROPIC_API_KEY", "-e", "CLAUDE_API_KEY"]);
       want = splice(want, [SOURCE], [SOURCE, "-v", inputsBind]);
       want = [...want.slice(0, -10), ...tail("review.sh", "factory-review")];
       const review = runArgs(s, inputs(), f.deps, ["CLAUDE_API_KEY", "ANTHROPIC_API_KEY"], kindProfile("review"));
       expect(review).toEqual(want);
-      for (const k of ["NO_PROXY", "no_proxy"]) expect(review).toContain(`${k}=${serviceEnvironment("archon")[k]}`);
+      for (const k of ["NO_PROXY", "no_proxy"]) {
+        expect(review).toContain(`${k}=${proxyEnv("review")[k]}`);
+        expect(review).not.toContain(`${k}=${serviceEnvironment("archon")[k]}`);
+        // Every other kind keeps the archon zone's, which names the sidecar.
+        expect(worker).toContain(`${k}=localhost,127.0.0.1,::1,hapi-sidecar`);
+      }
 
       // fix: the kind label and the inputs bind; the rest is the worker's.
       want = splice(as("fix", worker), [SOURCE], [SOURCE, "-v", inputsBind]);
@@ -282,9 +288,25 @@ describe("runArgs", () => {
       expect(verify.slice(verify.indexOf(SOURCE) + 1, verify.indexOf(SOURCE) + 3)).toEqual(["-v", "/b/y:/etc/y:ro"]);
     });
 
-    test("the review proxy alias is egress-review", () => {
+    test("the review proxy alias is egress-review, and its NO_PROXY is loopback only: only the archon zone's names the sidecar", () => {
       expect(new URL(proxyEnv("review").HTTP_PROXY!).hostname).toBe("egress-review");
-      expect(proxyEnv("review").NO_PROXY).toBe(proxyEnv("archon").NO_PROXY);
+      expect(proxyEnv("review").NO_PROXY).toBe("localhost,127.0.0.1,::1");
+      expect(proxyEnv("archon").NO_PROXY).toBe("localhost,127.0.0.1,::1,hapi-sidecar");
+    });
+
+    test("a run with a sidecar says so on its container, org.hapi.sidecar=<name> right after its kind label; a run without one has no such label", async () => {
+      const f = fakeRun();
+      const s = await archon();
+      const plain = runArgs(s, inputs(), f.deps, [], W);
+      expect(plain.some((a) => a.startsWith("org.hapi.sidecar"))).toBe(false);
+      const smoked = runArgs(s, inputs({ sidecar: "bun-http" }), f.deps, [], kindProfile("verify"));
+      const at = smoked.indexOf("org.hapi.kind=verify");
+      expect(smoked.slice(at + 1, at + 3)).toEqual(["--label", "org.hapi.sidecar=bun-http"]);
+      // Otherwise the argv is the plain one's.
+      expect(smoked.filter((a, i) => a !== "org.hapi.sidecar=bun-http" && smoked[i + 1] !== "org.hapi.sidecar=bun-http")).toEqual(runArgs(s, inputs(), f.deps, [], kindProfile("verify")));
+      // A review has no sidecar: one named for it is refused, never labelled.
+      expect(() => runArgs(s, inputs({ sidecar: "bun-http" }), f.deps, [], kindProfile("review"))).toThrow("a review run has no sidecar");
+      expect(() => runArgs(s, inputs({ sidecar: "Bad Name" }), f.deps, [], W)).toThrow('the sidecar "Bad Name" is not a sidecar\'s name');
     });
   });
 

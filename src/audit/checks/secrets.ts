@@ -13,9 +13,10 @@
  * - secrets.check (H-028): what `hapi secrets resolve` would find, through the
  *   provider contract (`checkSecrets`: names listed without values, then only
  *   those fetched): every manifest entry found, none missing, empty or invalid
- *   (a value resolve would refuse), and every MCP secret reference mapped. A
- *   provider that fails is a fail: the check never passes where resolve
- *   would fail.
+ *   (a value resolve would refuse), and every MCP secret reference mapped. An
+ *   entry the manifest lists optional that is missing or empty is no fail:
+ *   resolve leaves it out (it is named in the detail). A provider that fails
+ *   is a fail: the check never passes where resolve would fail.
  * No config at all is a skip for both.
  */
 import { join } from "node:path";
@@ -23,7 +24,7 @@ import { loadPolicy } from "../../policy/load";
 import { providerFor } from "../../secrets/cli";
 import { recipientReport } from "../../secrets/lifecycle";
 import { loadManifest, MANIFEST_FILE, mcpSecretGaps } from "../../secrets/manifest";
-import { checkSecrets, configPath, describeSecretsConfig, entryLabel, loadSecretsConfig, SecretError, type SecretsConfig } from "../../secrets/provider";
+import { checkSecrets, configPath, counted, describeSecretsConfig, entryLabel, loadSecretsConfig, SecretError, type SecretsConfig } from "../../secrets/provider";
 import { recipientsPath, recoveryPath } from "../../secrets/recipients";
 import { type AuditRun, type CheckResult, result } from "../types";
 
@@ -73,12 +74,18 @@ export async function secretsCheck(run: AuditRun): Promise<CheckResult[]> {
   const provider = providerFor(cfg, { ...ctx.secrets, env: ctx.env });
   const { entries, unknown } = await checkSecrets(manifest, provider);
   const problems = [
-    ...entries.filter((e) => e.status !== "found").map((e) => `${entryLabel(e)} is ${e.status}${e.reason === undefined ? "" : ` (${e.reason})`}`),
+    ...entries.filter(counted).map((e) => `${entryLabel(e)} is ${e.status}${e.reason === undefined ? "" : ` (${e.reason})`}`),
     ...gaps.map((g) => `${g.zone}/${g.env} is not in ${MANIFEST_FILE}, but ${g.server} needs secret:${g.name}`),
   ];
-  const extra = unknown.length > 0 ? `; the store also holds ${unknown.length} name${unknown.length === 1 ? "" : "s"} ${MANIFEST_FILE} doesn't list` : "";
+  const skipped = entries.filter((e) => e.status !== "found" && !counted(e)).map((e) => `${e.zone}/${e.key}`);
+  const extra = [
+    ...(unknown.length > 0 ? [`; the store also holds ${unknown.length} name${unknown.length === 1 ? "" : "s"} ${MANIFEST_FILE} doesn't list`] : []),
+    ...(skipped.length > 0 ? [`; ${skipped.length} optional one${skipped.length === 1 ? "" : "s"} absent or empty (${skipped.join(", ")}), which resolve leaves out`] : []),
+  ].join("");
   if (problems.length > 0) {
     return [result(id, "fail", `${problems.join("; ")}${extra}. \`hapi secrets resolve\` would refuse this, so the stack would not start: fix them in the ${provider.name} store (\`hapi secrets check\` lists them)`)];
   }
-  return [result(id, "pass", `${entries.length} secrets found in the ${provider.name} store, none missing, empty or invalid, and every MCP secret reference mapped (values never read out)${extra}`)];
+  const found = entries.filter((e) => e.status === "found").length;
+  const of = found === entries.length ? `${found}` : `${found} of ${entries.length}`;
+  return [result(id, "pass", `${of} secrets found in the ${provider.name} store, none required missing, empty or invalid, and every MCP secret reference mapped (values never read out)${extra}`)];
 }

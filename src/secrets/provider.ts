@@ -212,14 +212,23 @@ const isAre = (n: number) => (n === 1 ? "is" : "are");
  * once; check every value (an empty one counts as missing; `envValueProblem`);
  * only then write the whole set with `writeSecretFiles`. Any failure throws,
  * naming `zone/ENV (name)`, and writes nothing.
+ *
+ * An optional name (the manifest's `optional` list) is fetched only when the
+ * store lists it (`provider.list()`, asked only when there is one), and an
+ * entry of it that is absent or empty is left out of its zone's file. One that
+ * is there with a value resolve refuses is refused like any other: never
+ * dropped.
  */
 export async function resolveSecrets(manifest: Manifest, provider: SecretProvider, opts: { outDir: string }): Promise<Partial<Record<SecretZone, string>>> {
-  const entries = manifestEntries(manifest);
+  const all = manifestEntries(manifest);
   await secureDir(opts.outDir, dirname(opts.outDir));
-  const names = [...new Set(entries.map((e) => e.name))].sort();
+  const optional = new Set(all.filter((e) => e.optional).map((e) => e.name));
+  const listed = optional.size > 0 ? new Set(await provider.list()) : new Set<string>();
+  const wanted = (name: string) => !optional.has(name) || listed.has(name);
+  const names = [...new Set(all.map((e) => e.name))].filter(wanted).sort();
 
   const missingError = (absent: readonly string[], why?: string) => {
-    const list = entries.filter((e) => absent.includes(e.name)).map(where);
+    const list = all.filter((e) => absent.includes(e.name)).map(where);
     return new SecretError(
       `${list.join(", ")} ${isAre(list.length)} not in the ${provider.name} store${why ? ` (${why})` : ""}: ${storeHint(provider.name, "missing", list.length)}`,
       absent,
@@ -232,8 +241,11 @@ export async function resolveSecrets(manifest: Manifest, provider: SecretProvide
     if (e instanceof SecretError && e.missing.length > 0) throw missingError(e.missing, e.message);
     throw e;
   }
-  const absent = names.filter((n) => !values.has(n));
+  // An optional name the store listed but didn't return is absent too: left out, never an error.
+  const absent = names.filter((n) => !values.has(n) && !optional.has(n));
   if (absent.length > 0) throw missingError(absent);
+  // What goes in the files: every required entry, and each optional one the store holds with a value.
+  const entries = all.filter((e) => !e.optional || (values.get(e.name) ?? "").trim() !== "");
 
   const empty = entries.filter((e) => values.get(e.name)!.trim() === "");
   if (empty.length > 0) {
@@ -268,10 +280,18 @@ export interface SecretCheck extends ManifestEntry {
 }
 
 /**
+ * Whether a check's entry stops resolve: anything but `found`, except an optional entry that is missing or empty,
+ * which resolve leaves out. An optional entry that is `invalid` counts: resolve refuses it.
+ */
+export const counted = (e: SecretCheck): boolean => e.status !== "found" && !(e.optional && (e.status === "missing" || e.status === "empty"));
+
+/**
  * The dry run: what `resolveSecrets` would find, per env var, plus `unknown`,
  * the store's names that the manifest doesn't list, each as `shownName` shows
  * it (a name that isn't a logical name may be a pasted value, so it is masked
- * here, not only when printed). Values are read only to classify them, and
+ * here, not only when printed). Each entry keeps its `optional` mark: an
+ * optional one that is missing or empty is what resolve leaves out, so callers
+ * don't count it (`counted`). Values are read only to classify them, and
  * dropped; nothing is written. A provider failure throws.
  */
 export async function checkSecrets(manifest: Manifest, provider: SecretProvider): Promise<{ entries: SecretCheck[]; unknown: string[] }> {

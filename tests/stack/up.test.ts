@@ -11,7 +11,8 @@ import { lockHeld, RUN_DISK, withStackLock } from "../../src/run/locks";
 import { SecretError } from "../../src/secrets/provider";
 import { secretsResolve } from "../../src/secrets/cli";
 import { resolveAgeDir } from "../../src/secrets/providers/sops";
-import { buildDigest, currentUserOverride, networkProblem, networkProblems, PROJECT_LABEL, reexecScript, RUN_LABEL, removeRuns, type StackDeps, stackDown, stackUp } from "../../src/stack/up";
+import { loadPolicy } from "../../src/policy/load";
+import { buildDigest, currentUserOverride, networkProblem, networkProblems, policySidecarImages, PROJECT_LABEL, reexecScript, RUN_LABEL, removeRuns, type StackDeps, stackDown, stackUp, ZONE_NETWORKS } from "../../src/stack/up";
 import { capture, caught, cleanup, fullStore, sopsConfig, sopsStore, tempDir } from "../secrets/helpers";
 
 afterEach(cleanup);
@@ -20,7 +21,9 @@ type Call = { cmd: string[]; env: Record<string, string>; inherit: boolean };
 
 /** A private, internal zone network, as `docker network inspect` prints it. */
 const net = (name: string, subnet = "172.20.0.0/16", internal = true) => ({ Name: name, Internal: internal, IPAM: { Config: [{ Subnet: subnet }] } });
-const GOOD = [net("hapi_hermes-net"), net("hapi_archon-net", "172.21.0.0/16"), net("hapi_research-net", "192.168.16.0/20"), net("hapi_outbound", "172.23.0.0/16", false)];
+const GOOD = [net("hapi_hermes-net"), net("hapi_archon-net", "172.21.0.0/16"), net("hapi_research-net", "192.168.16.0/20"), net("hapi_review-net", "172.22.0.0/16"), net("hapi_outbound", "172.23.0.0/16", false)];
+/** The sidecar image the fakes pull unless a test names its own: pinned by digest, as policy/sidecars.yaml's are. */
+const SIDECAR_IMAGE = `example/bun:1.4.4-slim@sha256:${"b".repeat(64)}`;
 
 /** Fakes for every step; `steps` records the order. */
 function fakes(
@@ -46,6 +49,9 @@ function fakes(
     failing?: string[];
     resolve?: StackDeps["resolve"];
     build?: StackDeps["build"];
+    sidecarImages?: string[];
+    /** Exit code of `docker pull`. */
+    pullCode?: number;
   } = {},
 ) {
   const steps: string[] = [];
@@ -57,6 +63,7 @@ function fakes(
     env: o.env ?? { HOME: "/home/hapi", XDG_RUNTIME_DIR: "/run/user/1001", PATH: "/usr/bin" },
     build: o.build ?? (async (roster) => (steps.push(`build ${roster}`), [built])),
     resolve: o.resolve ?? (async (args) => (steps.push(`resolve ${args.join(" ")}`.trim()), 0)),
+    sidecarImages: () => o.sidecarImages ?? [SIDECAR_IMAGE],
     run: async (cmd, opts) => {
       calls.push({ cmd, env: opts.env, inherit: opts.inherit });
       steps.push(cmd.slice(0, 3).join(" ") === "docker network inspect" ? "docker network inspect" : cmd.join(" "));
@@ -70,6 +77,7 @@ function fakes(
       if (cmd.includes("--wait")) return { code: o.upCode ?? 0, stdout: "" };
       if (cmd.at(-1) === "down") return { code: o.downCode ?? 0, stdout: "" };
       if (cmd.slice(-2).join(" ") === "build archon") return { code: o.buildCode ?? 0, stdout: "" };
+      if (cmd[1] === "pull") return { code: o.pullCode ?? 0, stdout: "" };
       return { code: 0, stdout: "" };
     },
   };
@@ -125,8 +133,8 @@ describe("currentUserOverride (the dev bypass, for Task 6's audit)", () => {
 });
 
 describe("hapi stack up", () => {
-  test("as hapi: the live-run check, policy build, secrets, then compose build archon, compose create, the network check, and compose up --wait, in that order", async () => {
-    capture();
+  test("as hapi: the live-run check, policy build, secrets, then compose build archon, the sidecar images' pull, compose create, the network check, and compose up --wait, in that order", async () => {
+    const { out } = capture();
     const f = fakes();
     expect(await stackUp(["--roster", "budget"], f.deps)).toBe(0);
     expect(f.steps).toEqual([
@@ -134,12 +142,17 @@ describe("hapi stack up", () => {
       "build budget",
       "resolve",
       [...COMPOSE, "build", "archon"].join(" "),
+      `docker pull ${SIDECAR_IMAGE}`,
       [...COMPOSE, "up", "--no-start", "--build"].join(" "),
       "docker network inspect",
       [...COMPOSE, "up", "-d", "--wait", "--wait-timeout", "300"].join(" "),
     ]);
     const inspect = f.calls.find((c) => c.cmd[1] === "network" && c.cmd[2] === "inspect")!;
-    expect(inspect.cmd.slice(3)).toEqual(["hapi_hermes-net", "hapi_archon-net", "hapi_research-net"]);
+    expect(inspect.cmd.slice(3)).toEqual(["hapi_hermes-net", "hapi_archon-net", "hapi_research-net", "hapi_review-net"]);
+    expect(ZONE_NETWORKS).toEqual(["hermes-net", "archon-net", "research-net", "review-net"]);
+    expect(out.at(-1)).toBe(
+      "the stack is up (Compose project hapi): egress-hermes, egress-archon, egress-research, egress-review, hermes (archon is built, and a container of it starts per run; 1 sidecar image is pulled, and a sidecar starts with a run that smokes)",
+    );
     // Compose gets the caller's env (XDG_RUNTIME_DIR for the env files) and the labels' values.
     const up = f.calls.at(-1)!;
     expect(up.inherit).toBe(true);
@@ -362,7 +375,7 @@ describe("hapi stack up", () => {
     capture();
     const f = fakes({ inspect: { code: 1, stdout: "[]", stderr: "Error response from daemon: Cannot connect to the Docker daemon at unix:///run/user/1001/docker.sock\n" } });
     const e = await caught(stackUp([], f.deps));
-    expect(e.message).toMatch(/^docker network inspect hapi_hermes-net hapi_archon-net hapi_research-net exited 1: Error response from daemon: Cannot connect to the Docker daemon/);
+    expect(e.message).toMatch(/^docker network inspect hapi_hermes-net hapi_archon-net hapi_research-net hapi_review-net exited 1: Error response from daemon: Cannot connect to the Docker daemon/);
     // Not mistaken for a missing network.
     expect(e.message).not.toContain("does not exist");
     expect(e.message).toContain("Nothing was started, and what `compose up --no-start` created was removed");
@@ -410,6 +423,35 @@ describe("hapi stack up", () => {
     expect([build > 0, build < create]).toEqual([true, true]);
     // The same env as the other compose calls, so the build digest label and XDG_RUNTIME_DIR are the same.
     expect(f.calls[build]!.env).toMatchObject({ XDG_RUNTIME_DIR: "/run/user/1001", HAPI_STARTED_BY: "hapi" });
+  });
+
+  test("up pulls every sidecar image by digest after building archon and before creating the stack", async () => {
+    capture();
+    const images = [SIDECAR_IMAGE, `example/postgres:17@sha256:${"c".repeat(64)}`];
+    const f = fakes({ sidecarImages: images });
+    expect(await stackUp([], f.deps)).toBe(0);
+    const at = (step: string) => f.steps.indexOf(step);
+    const pulls = images.map((i) => at(`docker pull ${i}`));
+    expect(pulls.every((i) => i > at([...COMPOSE, "build", "archon"].join(" ")) && i < at([...COMPOSE, "up", "--no-start", "--build"].join(" ")))).toBe(true);
+    // With compose's env (the caller's, and the labels' values), in the terminal, so the operator sees a slow pull.
+    const pull = f.calls.find((c) => c.cmd[1] === "pull")!;
+    expect([pull.cmd, pull.inherit]).toEqual([["docker", "pull", SIDECAR_IMAGE], true]);
+    expect(pull.env).toMatchObject({ XDG_RUNTIME_DIR: "/run/user/1001", HAPI_STARTED_BY: "hapi" });
+    // No sidecar in policy: no pull.
+    const g = fakes({ sidecarImages: [] });
+    expect(await stackUp([], g.deps)).toBe(0);
+    expect(g.steps.some((st) => st.startsWith("docker pull"))).toBe(false);
+  });
+
+  test("a failed sidecar pull stops up before anything is created; the default images are every policy/sidecars.yaml image, each pinned by digest", async () => {
+    capture();
+    const f = fakes({ pullCode: 1 });
+    await expect(stackUp([], f.deps)).rejects.toThrow(`docker pull ${SIDECAR_IMAGE} failed (exit 1); nothing was started`);
+    expect(f.steps.some((st) => st.includes("--no-start"))).toBe(false);
+    const policy = loadPolicy("policy");
+    expect(policySidecarImages("policy")).toEqual(Object.values(policy.sidecars).map((s) => s.image));
+    expect(policySidecarImages("policy").length).toBeGreaterThan(0);
+    for (const image of policySidecarImages("policy")) expect(image).toMatch(/@sha256:[0-9a-f]{64}$/);
   });
 
   test("a failed `compose build archon` stops up before anything is created", async () => {
@@ -466,7 +508,7 @@ describe("hapi stack up", () => {
 describe("networkProblems", () => {
   test("none for internal zone networks inside the proxies' zone_clients ranges", () => {
     expect(networkProblems(GOOD, "hapi")).toEqual([]);
-    expect(networkProblems([net("p_hermes-net", "10.1.0.0/24"), net("p_archon-net", "fd00:1::/64"), net("p_research-net", "192.168.0.0/24")], "p")).toEqual([]);
+    expect(networkProblems([net("p_hermes-net", "10.1.0.0/24"), net("p_archon-net", "fd00:1::/64"), net("p_research-net", "192.168.0.0/24"), net("p_review-net", "10.2.0.0/24")], "p")).toEqual([]);
   });
 
   test("names each missing, non-internal or non-private zone network", () => {
@@ -474,6 +516,7 @@ describe("networkProblems", () => {
       "zone network hapi_hermes-net is not internal: it would have a route out around the proxy",
       "zone network hapi_archon-net has subnet 100.64.0.0/24, outside the proxies' zone_clients ranges, so its requests would all be refused: set Docker's default-address-pools to private ranges",
       "zone network hapi_research-net does not exist",
+      "zone network hapi_review-net does not exist",
     ]);
   });
 });

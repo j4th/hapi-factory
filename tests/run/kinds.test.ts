@@ -14,20 +14,22 @@ const WORKER_OUTPUTS = [
   { name: "run.bundle", limit: "bundle" },
 ];
 
-/** design §3.5's table, as Task 8 writes it: each kind's profile without its extraBinds. */
+/** design §3.5's table, as Task 8 writes it, with Task 9's `sidecar`: each kind's profile without its extraBinds. */
 const TABLE = {
-  worker: { kind: "worker", zone: "archon", egress: "egress-archon", prelude: "run.sh", workflow: undefined, inputs: false, inputFiles: { required: [], allowed: [] }, outputs: WORKER_OUTPUTS },
+  worker: { kind: "worker", zone: "archon", egress: "egress-archon", prelude: "run.sh", workflow: undefined, inputs: false, inputFiles: { required: [], allowed: [] }, sidecar: true, outputs: WORKER_OUTPUTS },
   fix: {
     kind: "fix", zone: "archon", egress: "egress-archon", prelude: "run.sh", workflow: undefined, inputs: true,
-    inputFiles: { required: ["findings.md"], allowed: ["findings.md"] }, outputs: WORKER_OUTPUTS,
+    inputFiles: { required: ["findings.md"], allowed: ["findings.md"] }, sidecar: true, outputs: WORKER_OUTPUTS,
   },
   verify: {
-    kind: "verify", zone: undefined, egress: "egress-archon", prelude: "verify.sh", workflow: "factory-verify", inputs: false, inputFiles: { required: [], allowed: [] },
+    kind: "verify", zone: undefined, egress: "egress-archon", prelude: "verify.sh", workflow: "factory-verify", inputs: false, inputFiles: { required: [], allowed: [] }, sidecar: true,
     outputs: [{ name: "result.json", limit: "result" }, { name: "transcript.jsonl", limit: "transcript" }, { name: "verify.json", limit: "result" }],
   },
   review: {
     kind: "review", zone: "review", egress: "egress-review", prelude: "review.sh", workflow: "factory-review", inputs: true,
     inputFiles: { required: ["diff.patch"], allowed: ["diff.patch", "verify.json"] },
+    // A review runs none of the repo's code, so it has no smoke test to reach a sidecar with.
+    sidecar: false,
     outputs: [
       { name: "result.json", limit: "result" },
       { name: "transcript.jsonl", limit: "transcript" },
@@ -64,8 +66,9 @@ describe("kindProfile", () => {
     }
   });
 
-  test("only verify holds no zone's keys; only review takes the review zone's keys and proxy", () => {
+  test("only verify holds no zone's keys; only review takes the review zone's keys and proxy, and only review gets no sidecar", () => {
     expect(RUN_KINDS.filter((k) => kindProfile(k).zone === undefined)).toEqual(["verify"]);
+    expect(RUN_KINDS.filter((k) => !kindProfile(k).sidecar)).toEqual(["review"]);
     expect(RUN_KINDS.filter((k) => kindProfile(k).egress === "egress-review")).toEqual(["review"]);
     expect(RUN_KINDS.filter((k) => kindProfile(k).inputs)).toEqual(["review", "fix"]);
   });

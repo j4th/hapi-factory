@@ -113,6 +113,47 @@ describe("resolveSecrets", () => {
     expect(calls).toEqual([]);
   });
 
+  test("an optional secret that is absent or empty is left out of its zone's file; a required one still stops resolve", async () => {
+    const optional: Manifest = {
+      archon: { ANTHROPIC_API_KEY: "hapi-archon-key" },
+      review: { ANTHROPIC_API_KEY: "hapi-archon-key", CODERABBIT_API_KEY: "hapi-review-cr" },
+      optional: ["hapi-review-cr"],
+    };
+    // Absent: the store doesn't list it, so it is never fetched (a fetch of a missing name would throw).
+    let outDir = outDirIn(tempDir());
+    const absent = fakeProvider({ "hapi-archon-key": "a" });
+    const paths = await resolveSecrets(optional, absent.provider, { outDir });
+    expect(absent.calls).toEqual([["hapi-archon-key"]]);
+    expect(parseEnvFile(readFileSync(paths.review!, "utf8"))).toEqual({ ANTHROPIC_API_KEY: "a" });
+    expect(parseEnvFile(readFileSync(paths.archon!, "utf8"))).toEqual({ ANTHROPIC_API_KEY: "a" });
+    // Empty, as `hapi secrets init`'s template leaves every name: left out too.
+    for (const empty of ["", "  \n"]) {
+      outDir = outDirIn(tempDir());
+      const p = await resolveSecrets(optional, fakeProvider({ "hapi-archon-key": "a", "hapi-review-cr": empty }).provider, { outDir });
+      expect(parseEnvFile(readFileSync(p.review!, "utf8"))).toEqual({ ANTHROPIC_API_KEY: "a" });
+    }
+    // Present: written like any other.
+    outDir = outDirIn(tempDir());
+    const present = fakeProvider({ "hapi-archon-key": "a", "hapi-review-cr": "c" });
+    const q = await resolveSecrets(optional, present.provider, { outDir });
+    expect(present.calls).toEqual([["hapi-archon-key", "hapi-review-cr"]]);
+    expect(parseEnvFile(readFileSync(q.review!, "utf8"))).toEqual({ ANTHROPIC_API_KEY: "a", CODERABBIT_API_KEY: "c" });
+    // Present but a value resolve refuses: still refused, never dropped.
+    outDir = outDirIn(tempDir());
+    expect((await caught(resolveSecrets(optional, fakeProvider({ "hapi-archon-key": "a", "hapi-review-cr": `${FAKE}'` }).provider, { outDir }))).message).toMatch(
+      /^review\/CODERABBIT_API_KEY \(hapi-review-cr\): .*single quote/,
+    );
+    expect(existsSync(join(outDir, "env"))).toBe(false);
+    // A required name the store lacks still stops resolve, optional names or not, and nothing is written.
+    outDir = outDirIn(tempDir());
+    const e = await caught(resolveSecrets(optional, fakeProvider({ "hapi-review-cr": "c" }).provider, { outDir }));
+    expect(e.message).toContain("archon/ANTHROPIC_API_KEY (hapi-archon-key), review/ANTHROPIC_API_KEY (hapi-archon-key) are not in the sops store");
+    expect(e.message).not.toContain("CODERABBIT_API_KEY");
+    const f = await caught(resolveSecrets(optional, fakeProvider({ "hapi-archon-key": " ", "hapi-review-cr": "c" }).provider, { outDir }));
+    expect(f.message).toBe("archon/ANTHROPIC_API_KEY (hapi-archon-key), review/ANTHROPIC_API_KEY (hapi-archon-key) are empty: fill them in with `mise run secrets:edit`");
+    expect(existsSync(join(outDir, "env"))).toBe(false);
+  });
+
   test("the XDG_RUNTIME_DIR check comes first: a loose runtime root fails before the store is read", async () => {
     const xdg = tempDir();
     chmodSync(xdg, 0o755);
@@ -274,7 +315,12 @@ describe("hapi secrets resolve, check and edit", () => {
     const s = setup();
     expect(await secretsResolve(["--config", s.config], s.deps)).toBe(0);
     const dir = join(s.xdg, "hapi", "env");
-    expect(out).toEqual(["archon", "hermes", "host", "research"].map((z) => join(dir, `${z}.env`)));
+    expect(out).toEqual(["archon", "hermes", "host", "research", "review"].map((z) => join(dir, `${z}.env`)));
+    // The review zone's file: the hapi-factory workspace's key under both names, and no CodeRabbit key, which the store doesn't hold (optional).
+    expect(parseEnvFile(readFileSync(join(dir, "review.env"), "utf8"))).toEqual({
+      ANTHROPIC_API_KEY: "fake-hapi-archon-anthropic-api-key-value",
+      CLAUDE_API_KEY: "fake-hapi-archon-anthropic-api-key-value",
+    });
     expect(parseEnvFile(readFileSync(join(dir, "archon.env"), "utf8"))).toEqual({
       ANTHROPIC_API_KEY: "fake-hapi-archon-anthropic-api-key-value",
       CLAUDE_API_KEY: "fake-hapi-archon-anthropic-api-key-value",
@@ -308,9 +354,34 @@ describe("hapi secrets resolve, check and edit", () => {
     expect(out).toContain("empty    research/EXA_API_KEY (hapi-research-exa-api-key)");
     expect(out).toContain("unknown  hapi-old-key (in the store, not in stack/secrets.yaml)");
     expect(out.slice(-2)).toEqual(["recipient machine  test-machine (post-quantum, added 2026-10-26)", "recipient recovery recovery (post-quantum, added 2026-10-26)"]);
-    expect(out.length).toBe(18);
-    expect(err.join("\n")).toContain("2 of 15 secrets are missing or empty: archon/OPENCODE_API_KEY, research/EXA_API_KEY");
+    expect(out.length).toBe(21);
+    // CodeRabbit's key is optional: absent, it is listed, and not counted.
+    expect(out).toContain("missing  review/CODERABBIT_API_KEY (hapi-review-coderabbit-api-key) (optional)");
+    expect(err.join("\n")).toContain("2 of 18 secrets are missing or empty: archon/OPENCODE_API_KEY, research/EXA_API_KEY.");
     expect([...out, ...err].join("\n")).not.toContain("fake-hapi");
+  });
+
+  test("check reports an absent optional secret as missing (optional) and exits 0", async () => {
+    const { out, err } = capture();
+    const s = setup();
+    expect(await secretsCheck(["--config", s.config], { ...s.deps, env: { HOME: s.home } })).toBe(0);
+    expect(out).toContain("missing  review/CODERABBIT_API_KEY (hapi-review-coderabbit-api-key) (optional)");
+    expect(out).toContain("found    review/ANTHROPIC_API_KEY (hapi-archon-anthropic-api-key)");
+    expect(err).toEqual([]);
+    // Empty is the same; present, it is found, and still marked optional.
+    out.length = 0;
+    const t = setup({ ...fullStore(), "hapi-review-coderabbit-api-key": "" });
+    expect(await secretsCheck(["--config", t.config], { ...t.deps, env: { HOME: t.home } })).toBe(0);
+    expect(out).toContain("empty    review/CODERABBIT_API_KEY (hapi-review-coderabbit-api-key) (optional)");
+    out.length = 0;
+    const u = setup({ ...fullStore(), "hapi-review-coderabbit-api-key": "fake-hapi-review-coderabbit-api-key-value" });
+    expect(await secretsCheck(["--config", u.config], { ...u.deps, env: { HOME: u.home } })).toBe(0);
+    expect(out).toContain("found    review/CODERABBIT_API_KEY (hapi-review-coderabbit-api-key) (optional)");
+    // A value resolve would refuse is counted, optional or not: resolve stops on it.
+    out.length = 0;
+    const v = setup({ ...fullStore(), "hapi-review-coderabbit-api-key": "it's quoted" });
+    expect(await secretsCheck(["--config", v.config], { ...v.deps, env: { HOME: v.home } })).toBe(1);
+    expect(err.join("\n")).toContain("1 of 18 secrets are missing or empty: review/CODERABBIT_API_KEY.");
   });
 
   test("check exits 0 when every env var is found, and needs no XDG_RUNTIME_DIR; --dry-run is the same as check", async () => {
@@ -366,7 +437,7 @@ describe("hapi secrets resolve, check and edit", () => {
     const s = setup();
     const dir = tempDir();
     const manifestFile = join(dir, "secrets.yaml");
-    writeFileSync(manifestFile, "hermes: {}\narchon: {}\nresearch: {}\nhost: {}\n");
+    writeFileSync(manifestFile, "hermes: {}\narchon: {}\nresearch: {}\nreview: {}\nhost: {}\n");
     await expect(secretsResolve(["--config", s.config], { ...s.deps, manifestFile })).rejects.toThrow(
       /research\/HAPI_MCP_CONTEXT7_API_KEY: .*policy\/mcp\.yaml's context7 server needs secret:hapi-mcp-context7-api-key/,
     );

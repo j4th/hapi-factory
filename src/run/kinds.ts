@@ -13,7 +13,8 @@
  *   there, since the model APIs are no use without a key. Its `/work` is a fresh volume of its own, so it never
  *   reuses the worker's `node_modules`;
  * - `review` holds the review zone's keys, behind egress-review, and runs none of the repo's code: review.sh makes
- *   its checkout read-only, and `factory-review` runs only a read-only review session and CodeRabbit's CLI.
+ *   its checkout read-only, and `factory-review` runs only a read-only review session and CodeRabbit's CLI. So it
+ *   gets no smoke sidecar; every other kind does, when its work order smokes and its repo names one (./sidecar.ts).
  *
  * No container fetches a bundle: every kind's source is `StartOptions.repoGitDir`, which must hold the run's commit.
  * A worker's is the repo's mirror; a verify, review or fix run's is the harvester's checked copy of the mirror with
@@ -58,6 +59,12 @@ export interface KindProfile {
    * takes none.
    */
   inputFiles: { required: readonly string[]; allowed: readonly string[] };
+  /**
+   * Whether a run of the kind may start its repo's smoke sidecar (./sidecar.ts; design §3.3, H-192): when its work
+   * order smokes and the repo's overlay names one, it starts on the run's network before the run. True for every
+   * kind but review, which runs none of the repo's code.
+   */
+  sidecar: boolean;
   /** More read-only binds, each through `mountable`: every kind's is empty here (Task 11 gives review's one). */
   extraBinds: (d: Pick<RunDeps, "buildDir">) => [src: string, dst: string][];
   /** The files copy-out reads from `/out`, in order, each capped by its limit in `runs.output_limits_mb`; any other name is reported. */
@@ -83,14 +90,14 @@ const freeze = (p: KindProfile): KindProfile =>
 const NO_INPUTS = { required: [], allowed: [] };
 
 const PROFILES: Readonly<Record<RunKind, KindProfile>> = Object.freeze({
-  worker: freeze({ kind: "worker", zone: "archon", egress: "egress-archon", prelude: "run.sh", workflow: undefined, inputs: false, inputFiles: NO_INPUTS, extraBinds: none, outputs: WORKER_OUTPUTS }),
+  worker: freeze({ kind: "worker", zone: "archon", egress: "egress-archon", prelude: "run.sh", workflow: undefined, inputs: false, inputFiles: NO_INPUTS, sidecar: true, extraBinds: none, outputs: WORKER_OUTPUTS }),
   fix: freeze({
     kind: "fix", zone: "archon", egress: "egress-archon", prelude: "run.sh", workflow: undefined, inputs: true,
-    inputFiles: { required: [RUN_INPUTS.findings], allowed: [RUN_INPUTS.findings] }, extraBinds: none, outputs: WORKER_OUTPUTS,
+    inputFiles: { required: [RUN_INPUTS.findings], allowed: [RUN_INPUTS.findings] }, sidecar: true, extraBinds: none, outputs: WORKER_OUTPUTS,
   }),
   // Its results are verify.json, held to result.json's limit; it commits nothing, so it leaves no bundle, and it runs no model, so no decisions.
   verify: freeze({
-    kind: "verify", zone: undefined, egress: "egress-archon", prelude: "verify.sh", workflow: "factory-verify", inputs: false, inputFiles: NO_INPUTS, extraBinds: none,
+    kind: "verify", zone: undefined, egress: "egress-archon", prelude: "verify.sh", workflow: "factory-verify", inputs: false, inputFiles: NO_INPUTS, sidecar: true, extraBinds: none,
     outputs: [{ name: "result.json", limit: "result" }, { name: "transcript.jsonl", limit: "transcript" }, { name: "verify.json", limit: "result" }],
   }),
   // Its verdict and findings are the review node's structured output in its result.json and transcript (Tasks 11, 12):
@@ -98,7 +105,7 @@ const PROFILES: Readonly<Record<RunKind, KindProfile>> = Object.freeze({
   review: freeze({
     kind: "review", zone: "review", egress: "egress-review", prelude: "review.sh", workflow: "factory-review", inputs: true,
     // verify.json is absent when runs.phases.verify is off (design §3.5: every phase is a knob).
-    inputFiles: { required: [RUN_INPUTS.diff], allowed: [RUN_INPUTS.diff, RUN_INPUTS.verify] }, extraBinds: none,
+    inputFiles: { required: [RUN_INPUTS.diff], allowed: [RUN_INPUTS.diff, RUN_INPUTS.verify] }, sidecar: false, extraBinds: none,
     outputs: [
       { name: "result.json", limit: "result" },
       { name: "transcript.jsonl", limit: "transcript" },

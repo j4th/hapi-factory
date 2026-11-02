@@ -7,12 +7,12 @@ These are outward-facing steps, so the operator does them by hand. First set up 
 2. Add it to your secrets store (`mise run secrets:edit`) as the logical name given here ([docs/secrets.md](../secrets.md#adding-a-secret)).
 3. Never paste a key into a chat, an issue or a file in the repo.
 
-When every key is stored, run `mise run secrets:check` ([docs/secrets.md](../secrets.md#hapi-secrets-check)). Every key should say `found`.
+When every key is stored, run `mise run secrets:check` ([docs/secrets.md](../secrets.md#hapi-secrets-check)). Every key should say `found`, but CodeRabbit's, which is optional ([below](#coderabbit-optional)): until you store one it says `missing ... (optional)`, and the check still passes.
 
 | Key | Cap | Zone / env var | Logical name |
 |---|---|---|---|
 | Anthropic, workspace `hapi-hermes` | $60/month | `hermes` / `ANTHROPIC_API_KEY` | `hapi-hermes-anthropic-api-key` |
-| Anthropic, workspace `hapi-factory` | $100/month | `archon` / `ANTHROPIC_API_KEY` and `CLAUDE_API_KEY` | `hapi-archon-anthropic-api-key` |
+| Anthropic, workspace `hapi-factory` | $100/month | `archon` and `review` / `ANTHROPIC_API_KEY` and `CLAUDE_API_KEY` | `hapi-archon-anthropic-api-key` |
 | Anthropic, workspace `hapi-evals` | $40/month | Not in the manifest yet: the evals plan adds it | |
 | OpenCode Go | The plan's monthly limits, Extra Usage off | `archon` / `OPENCODE_API_KEY` | `hapi-archon-opencode-api-key` |
 | OpenRouter `hapi-jev` | $0.06/day, reset daily (at most $1.86 a month, under the $2 cap); ZDR enforced unless the documented Jev exception applies ([below](#hapi-jev-2month)) | `archon` / `HAPI_JEV_OPENROUTER_API_KEY` | `hapi-archon-jev-openrouter-api-key` |
@@ -20,6 +20,7 @@ When every key is stored, run `mise run secrets:check` ([docs/secrets.md](../sec
 | Brave Search | A spend cap, if your plan has one | `research` / `BRAVE_SEARCH_API_KEY` | `hapi-research-brave-search-api-key` |
 | Exa | A spend cap, if offered | `research` / `EXA_API_KEY` | `hapi-research-exa-api-key` |
 | Context7 | A spend cap, if your plan has one | `research` / `HAPI_MCP_CONTEXT7_API_KEY` | `hapi-mcp-context7-api-key` |
+| CodeRabbit, an Agentic key (**optional**) | The plan's CLI limit (Advanced: 10 reviews an hour per developer) | `review` / `CODERABBIT_API_KEY` | `hapi-review-coderabbit-api-key` |
 
 ## Anthropic Console workspaces
 
@@ -38,7 +39,7 @@ API keys only. **Never subscription OAuth** in Hermes, Pi or Archon (Global Cons
 3. **Leave the default workspace unused.** Its spend can't be capped (spec §11.5), so create no key in it.
 4. Create **one API key in each workspace**, named after it:
    - the `hapi-hermes` key → `hapi-hermes-anthropic-api-key`;
-   - the `hapi-factory` key → `hapi-archon-anthropic-api-key`. The manifest gives this one secret to both `ANTHROPIC_API_KEY` (Pi reads it) and `CLAUDE_API_KEY` (Archon's `claude` nodes read it).
+   - the `hapi-factory` key → `hapi-archon-anthropic-api-key`. The manifest gives this one secret to both `ANTHROPIC_API_KEY` (Pi reads it) and `CLAUDE_API_KEY` (Archon's `claude` nodes read it), in the `archon` zone and again in the `review` zone: the review container's model bills to the same workspace, under the same limit, so the review needs no key of its own.
    - Create the `hapi-evals` key when evals arrive.
 
 When a workspace hits its limit, Anthropic answers 429 `enforced_spend_limit_reached`. hapi treats that as terminal and never retries it (spec §12).
@@ -95,6 +96,19 @@ All three go to the research zone only (spec §10.1): **spend-capped, search-onl
 - **Exa** (Hermes's contents, or extract, backend). In the Exa dashboard, create an API key. Exa is pay-as-you-go with monthly free credits. Set a usage limit if the dashboard offers one; otherwise check the usage page after the first runs. → `hapi-research-exa-api-key`.
 - **Context7** (the `context7` MCP server in `policy/mcp.yaml`). In the Context7 dashboard, create an API key, with a spend cap if your plan has one. The server always runs with a key, because anonymous callers can be sent a setup elicitation. → `hapi-mcp-context7-api-key`. That logical name is fixed by `policy/mcp.yaml` (`secret:hapi-mcp-context7-api-key`), and its env var is `HAPI_MCP_CONTEXT7_API_KEY`.
 
+## CodeRabbit (optional)
+
+CodeRabbit's CLI runs in the review container, after the review session, when `runs.phases.coderabbit` is on (off centrally; a repo's overlay may switch it on). Its key goes in the `review` zone only, never the `archon` zone a worker holds, and only the review container's CodeRabbit node passes it on its argv (the Global Constraints' one written exception).
+
+**The key is optional.** `stack/secrets.yaml` lists `hapi-review-coderabbit-api-key` under `optional`, so `mise run up` starts without it, `review.env` simply has no `CODERABBIT_API_KEY`, and `mise run secrets:check` reports it `missing ... (optional)` and passes ([docs/secrets.md](../secrets.md#the-manifest-stacksecretsyaml)). A review run with `phases.coderabbit` on and no key is refused, never run without its CodeRabbit step.
+
+**Store one only if the account check found an unattended key** (H-167; Task 1's check, [spike 09](../spikes/09-run-engine-offline.md#the-coderabbit-key): the Advanced trial, until 2026-11-10, offers an "Agentic" key type, and unattended use needs one "from an organization where the user has an assigned seat"). Then:
+1. In CodeRabbit's API keys page, create a dedicated **Agentic** key for hapi alone, so it can be revoked on its own.
+2. Store it with `mise run secrets:edit`, under `hapi-review-coderabbit-api-key`.
+3. Run `mise run up`, so `review.env` gets it, and `mise run secrets:check`: it should say `found    review/CODERABBIT_API_KEY (hapi-review-coderabbit-api-key) (optional)`.
+
+Without such a key, store nothing: leave `phases.coderabbit` off, and CodeRabbit's PR review carries its part. When the trial ends without a seat, delete the key from the store and revoke it in CodeRabbit.
+
 ## Kill switch: zero or revoke the keys
 
-Kill switch 1, the fastest (spec §11.8): set a workspace's spend limit as low as it goes (whether it accepts $0 isn't documented **[verify]**), or revoke its key, in the Anthropic Console. Revoke the OpenCode Go, OpenRouter and search keys in their dashboards. Then rotate ([docs/secrets.md](../secrets.md#rotating-a-secret)).
+Kill switch 1, the fastest (spec §11.8): set a workspace's spend limit as low as it goes (whether it accepts $0 isn't documented **[verify]**), or revoke its key, in the Anthropic Console. Revoke the OpenCode Go, OpenRouter, search and CodeRabbit keys in their dashboards. Then rotate ([docs/secrets.md](../secrets.md#rotating-a-secret)).

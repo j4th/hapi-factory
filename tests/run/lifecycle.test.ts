@@ -26,6 +26,7 @@ import {
 } from "../../src/run/lifecycle";
 import { lockHeld, withStackLock } from "../../src/run/locks";
 import { listRecords, PER_RUN_FILES, readRecord, RUN_ID, runKey, withRunLock, withStartLock } from "../../src/run/records";
+import { sidecarArgs } from "../../src/run/sidecar";
 import { STOP_GRACE_S } from "../../src/run/spec";
 import { reexecScript, runCommand } from "../../src/stack/up";
 import { loadWorkOrder } from "../../src/workorder/validate";
@@ -42,8 +43,9 @@ const TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
 
 /**
  * A fake world with both zones' env files in place, a source repo, a valid work order, and a pack that holds the
- * verify and review workflows too (`stubPack`). The review zone is a fixture: its values are its own, none of them the
- * archon zone's, and Task 9 makes the zone real.
+ * verify and review workflows too (`stubPack`). The review zone's values are its own, none of them the archon zone's
+ * (the real zone reuses the archon zone's Anthropic key), so a test sees which file a value came from; it has no
+ * CodeRabbit key, as the real zone needn't until phases.coderabbit is on (`withCodeRabbitKey`).
  */
 function ready(o: Parameters<typeof fakeRun>[0] = {}) {
   const f = fakeRun(o);
@@ -53,6 +55,13 @@ function ready(o: Parameters<typeof fakeRun>[0] = {}) {
   const review = { ANTHROPIC_API_KEY: fakeSecret("REVIEW_ANTHROPIC_API_KEY"), CLAUDE_API_KEY: fakeSecret("REVIEW_CLAUDE_API_KEY") };
   writeZoneEnv(f.xdg, "review", review);
   return { ...f, secret, review, repo: fakeRepo(f.tmp), order: writeOrder(f.tmp) };
+}
+
+/** Adds CodeRabbit's key to `f`'s review zone file, as resolve writes it once the store holds the optional name; returns its value. */
+function withCodeRabbitKey(f: ReturnType<typeof ready>): string {
+  const key = fakeSecret("CODERABBIT_API_KEY");
+  writeZoneEnv(f.xdg, "review", { ...f.review, CODERABBIT_API_KEY: key });
+  return key;
 }
 
 /** An inputs dir in `tmp` holding `files` (name to text): what Task 13 hands a review or fix run. */
@@ -699,6 +708,7 @@ describe("startRun", () => {
     // A review, on a claude tier with another model than implement's: with phases.coderabbit on too, its deadline is still the work order's minutes.
     for (const overlay of [undefined, { runs: { phases: { coderabbit: true } } }]) {
       const r = api();
+      if (overlay !== undefined) withCodeRabbitKey(r.f);
       await seedRun(r.f, { id: P, status: "succeeded", objects: false });
       const reviewed = { ...r.order, roles: { implement: "small" as const, review: "medium" as const } };
       const review = await startRun(r.f.deps, r.base({ workOrder: reviewed, kind: "review", parent: P, inputsDir: inputsIn(r.f.tmp, { "diff.patch": "x\n" }), ...(overlay === undefined ? {} : { overlay }) }));
@@ -770,8 +780,42 @@ describe("startRun", () => {
       // run.json says whether CodeRabbit's step runs: the overlaid phases.coderabbit, off by default, on by the repo's overlay.
       expect(runJson(f, rec.runId)).toMatchObject({ kind: "review", workflow: "factory-review", coderabbit: POLICY.runs.phases.coderabbit });
       const g = await kinded();
+      const key = withCodeRabbitKey(g.f);
       const on = await startRun(g.f.deps, g.review({ overlay: { runs: { phases: { coderabbit: true } } } }));
       expect(runJson(g.f, on.runId).coderabbit).toBe(true);
+      // CodeRabbit's key is the review zone's alone: by name on argv, its value in the review container's docker CLI env only.
+      const cr = runCall(g.f.calls.filter((c) => c.cmd.includes("org.hapi.kind=review")));
+      expect(cr.cmd.filter((a, i) => cr.cmd[i - 1] === "-e" && !a.includes("="))).toEqual(["ANTHROPIC_API_KEY", "CLAUDE_API_KEY", "CODERABBIT_API_KEY"]);
+      expect(cr.env.CODERABBIT_API_KEY).toBe(key);
+      expect(cr.cmd.join("\n")).not.toContain(key);
+      // With phases.coderabbit off, the review container isn't given the key, though review.env holds it.
+      const h = await kinded();
+      const held = withCodeRabbitKey(h.f);
+      await startRun(h.f.deps, h.review());
+      const off = runCall(h.f.calls);
+      expect(off.cmd.filter((a, i) => off.cmd[i - 1] === "-e" && !a.includes("="))).toEqual(["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"]);
+      expect(Object.values(off.env)).not.toContain(held);
+      expect(JSON.stringify(h.f.calls)).not.toContain(held);
+    });
+
+    test("a review run with phases.coderabbit on and no CODERABBIT_API_KEY in the review zone's file is refused before anything is made: no automatic fallback", async () => {
+      capture();
+      const { f, review } = await kinded();
+      const before = ids(f);
+      const on = { overlay: { runs: { phases: { coderabbit: true } } } };
+      expect((await caught(startRun(f.deps, review(on)))).message).toBe(
+        "runs.phases.coderabbit is on for this run, but the review zone's env file has no CODERABBIT_API_KEY: store hapi-review-coderabbit-api-key (`mise run secrets:edit`, docs/runbooks/provider-keys.md) and run `mise run up`, or leave phases.coderabbit off",
+      );
+      expect([changes(f.calls), ids(f)]).toEqual([[], before]);
+      // An empty value is no key either.
+      writeZoneEnv(f.xdg, "review", { ...f.review, CODERABBIT_API_KEY: " " });
+      expect((await caught(startRun(f.deps, review(on)))).message).toContain("the review zone's env file has no CODERABBIT_API_KEY");
+      // With phases.coderabbit off, the review starts without the key.
+      writeZoneEnv(f.xdg, "review", f.review);
+      expect((await startRun(f.deps, review())).kind).toBe("review");
+      // A worker never needs it, whatever the overlay says.
+      const w = api();
+      expect((await startRun(w.f.deps, w.base(on))).kind).toBe("worker");
     });
 
     test("a review run without its zone file is refused", async () => {
@@ -898,6 +942,93 @@ describe("startRun", () => {
       const other = await startRun(f.deps, base({ repoGitDir: scratch, kind: "verify", parent: P, budgetUsd: 0, forgeRepo: "Example-Owner/Other" }));
       expect([other.repo, other.forgeRepo]).toEqual([scratch, "example-owner/other"]);
       expect((await readRecord(f.deps.stateDir, other.runId))!.forgeRepo).toBe("example-owner/other");
+    });
+  });
+
+  describe("the smoke sidecar (design §3.3, H-192)", () => {
+    const SMOKE = { "smoke/server.ts": "Bun.serve({ fetch: () => new Response('ok') });\n", "smoke/fortunes.json": '["a"]\n', "README.md": "not data\n" };
+    const SIDECAR: RepoOverlay = { sidecar: { name: "bun-http", data_dir: "smoke" } };
+    /** A world whose source holds the smoke data, whose work order smokes, and whose worker run P is seeded. */
+    async function smoking(o: Parameters<typeof fakeRun>[0] = {}) {
+      const a = api({ tree: SMOKE, ...o });
+      await seedRun(a.f, { id: P, status: "succeeded", objects: false });
+      const order = { ...a.order, verify: { smoke: true }, roles: { implement: "small" as const, review: "medium" as const } };
+      const opts = (over: Partial<StartOptions> = {}) => a.base({ workOrder: order, overlay: SIDECAR, ...over });
+      return { ...a, order, opts };
+    }
+    const sidecarCalls = (calls: Call[]) => calls.filter((c) => c.cmd[1] === "run" && c.cmd[2] === "-d" && c.cmd.includes("org.hapi.kind=sidecar"));
+
+    test("a run whose work order smokes and whose overlay names a sidecar starts it on the run's network after the volume chown and before the run container; finalize removes it with the run", async () => {
+      capture();
+      for (const [kind, over] of [["worker", {}], ["verify", { kind: "verify", parent: P, budgetUsd: 0 }], ["fix", { kind: "fix", parent: P }]] as const) {
+        const s = await smoking();
+        const rec = await startRun(s.f.deps, s.opts({ ...over, ...(kind === "fix" ? { inputsDir: inputsIn(s.f.tmp, { "findings.md": "x\n" }) } : {}) }));
+        const name = `hapi-run-${rec.runId}`;
+        const dir = join(s.f.deps.stateDir, rec.runId, "sidecar");
+        const made = changes(s.f.calls).map((c) => unbounded(c.cmd));
+        // The network, egress, the two volumes, the chown, then the sidecar, then the run container.
+        expect([kind, made.length]).toEqual([kind, 7]);
+        expect([kind, made[4]!.at(-3)]).toEqual([kind, "1001:1001"]);
+        expect([kind, made[5]]).toEqual([kind, sidecarArgs(s.f.deps, rec, POLICY.sidecars["bun-http"]!, dir)]);
+        expect([kind, made[6]!.slice(0, 7)]).toEqual([kind, ["docker", "run", "-d", "--pull", "never", "--name", name]]);
+        // The run says it has one, so the audit expects it on the run's network.
+        expect([kind, s.f.world.containers.get(name)!.labels["org.hapi.sidecar"]]).toEqual([kind, "bun-http"]);
+        expect([kind, s.f.world.containers.get(`${name}-sidecar`)!.labels]).toEqual([
+          kind,
+          {
+            "org.hapi.run": rec.runId, "org.hapi.project": "hapi", "org.hapi.kind": "sidecar", "org.hapi.started-by": "hapi", "org.hapi.dev-override": "0",
+            "com.docker.compose.project": "", "com.docker.compose.service": "", "com.docker.compose.version": "",
+          },
+        ]);
+        // Its data: the data dir at the run's commit, read from the source by host git, 0755 and 0644, and nothing else of the tree.
+        expect([kind, readdirSync(dir).sort(), (statSync(dir).mode & 0o777).toString(8)]).toEqual([kind, ["fortunes.json", "server.ts"], "755"]);
+        expect([kind, readFileSync(join(dir, "server.ts"), "utf8"), (statSync(join(dir, "server.ts")).mode & 0o777).toString(8)]).toEqual([kind, SMOKE["smoke/server.ts"], "644"]);
+        const listed = s.f.calls.find((c) => c.cmd.includes("ls-tree") && c.cmd.includes("-r"))!.cmd;
+        expect([kind, listed.slice(-8)]).toEqual([kind, ["ls-tree", "-r", "-z", "-l", "--full-tree", SHA, "--", "smoke/"]]);
+        expect([kind, listed.slice(listed.indexOf("--git-dir"), listed.indexOf("--git-dir") + 2)]).toEqual([kind, ["--git-dir", s.gitDir]]);
+        // No secret reaches the sidecar's docker CLI: its env is the host's own.
+        const sc = sidecarCalls(s.f.calls)[0]!;
+        for (const v of [s.f.secret, ...Object.values(s.f.review)]) expect([kind, Object.values(sc.env).includes(v)]).toEqual([kind, false]);
+        // finalize removes it with the run: by the run's labels, with the run container.
+        s.f.world.outputs = {};
+        s.f.world.containers.get(name)!.running = false;
+        await finalizeRun(rec, s.f.deps);
+        expect([kind, s.f.calls.find((c) => c.cmd[1] === "rm")!.cmd.slice(3).sort()]).toEqual([kind, [name, `${name}-sidecar`].sort()]);
+        expect([kind, s.f.world.containers.size, s.f.world.networks.size]).toEqual([kind, 0, 0]);
+      }
+    });
+
+    test("a review run, or a work order with verify.smoke false, gets no sidecar", async () => {
+      capture();
+      const cases: [what: string, opts: (s: Awaited<ReturnType<typeof smoking>>) => StartOptions][] = [
+        ["a review", (s) => s.opts({ kind: "review", parent: P, inputsDir: inputsIn(s.f.tmp, { "diff.patch": "x\n" }) })],
+        ["verify.smoke false", (s) => s.opts({ workOrder: { ...s.order, verify: { smoke: false } } })],
+        ["an overlay that names no sidecar", (s) => s.opts({ overlay: {} })],
+        ["no overlay", (s) => s.base({ workOrder: s.order })],
+      ];
+      for (const [what, opts] of cases) {
+        const s = await smoking();
+        const rec = await startRun(s.f.deps, opts(s));
+        expect([what, sidecarCalls(s.f.calls)]).toEqual([what, []]);
+        expect([what, s.f.calls.some((c) => c.cmd.includes("ls-tree") && c.cmd.includes("-r"))]).toEqual([what, false]);
+        expect([what, existsSync(join(s.f.deps.stateDir, rec.runId, "sidecar"))]).toEqual([what, false]);
+        expect([what, s.f.world.containers.get(`hapi-run-${rec.runId}`)!.labels["org.hapi.sidecar"]]).toEqual([what, undefined]);
+      }
+    });
+
+    test("a data dir the export refuses, or a sidecar that fails to start, stops start, and what it made is removed", async () => {
+      capture();
+      // No file under the data dir at the run's commit: refused after the run's dir is made, before any Docker object.
+      const s = await smoking({ tree: { "README.md": "x\n" } });
+      const e = await caught(startRun(s.f.deps, s.opts()));
+      expect(e.message).toBe(`smoke holds no file at ${SHA}. What start had created was removed.`);
+      expect([changes(s.f.calls), ids(s.f)]).toEqual([[], [P]]);
+      // A sidecar whose docker run fails: the run container never starts, and every object of the run goes.
+      const t = await smoking({ failing: ["docker run -d --pull never --name hapi-run-"] });
+      const f = await caught(startRun(t.f.deps, t.opts()));
+      expect(f.message).toMatch(/^docker run hapi-run-[0-9a-f]{12}-sidecar failed \(exit 1\): boom\. What start had created was removed\.$/);
+      expect(changes(t.f.calls).filter((c) => c.cmd[1] === "run" && c.cmd[2] === "-d").length).toBe(1);
+      expect([t.f.world.containers.size, t.f.world.networks.size, t.f.world.volumes.size, ids(t.f)]).toEqual([0, 0, 0, [P]]);
     });
   });
 

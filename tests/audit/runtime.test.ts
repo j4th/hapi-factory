@@ -11,8 +11,10 @@ import { join } from "node:path";
 import { runAudit } from "../../src/audit/index";
 import { diskProblem, GIB } from "../../src/run/disk";
 import { RUN_DISK } from "../../src/run/locks";
+import * as sidecar from "../../src/run/sidecar";
 import * as spec from "../../src/run/spec";
-import { cleanup, cleanWorld, type Container, DOCKER_ROOT, goodDisks, helperContainer, type Kind, only, REPO, REVIEW_ZONE_KEYS, runContainer, tempDir } from "./helpers";
+import { loadManifest, MANIFEST_FILE, manifestEntries } from "../../src/secrets/manifest";
+import { cleanup, cleanWorld, type Container, DOCKER_ROOT, goodDisks, helperContainer, type Kind, only, REPO, REVIEW_ZONE_KEYS, runContainer, SIDECAR_IMAGE, sidecarContainer, tempDir } from "./helpers";
 
 afterEach(cleanup);
 
@@ -375,17 +377,32 @@ describe("runtime.run-container", () => {
       expect(ok.calls).toContainEqual(["docker", "network", "inspect", N]);
     });
 
-    test("with no zoneKeys in its context, the zones are stack/secrets.yaml's: until the review zone is there, a review container holding a key fails", async () => {
+    test("with no zoneKeys in its context, the zones are stack/secrets.yaml's, its review zone included: a review container holding the review zone's keys passes, and an archon-only key fails", async () => {
       const w = await cleanWorld();
       delete w.ctx.zoneKeys;
       const review = runContainer(w, "aaaaaaaaaaaa", { kind: "review" });
-      setEnv(review, "ANTHROPIC_API_KEY", VALUE);
+      for (const name of ["ANTHROPIC_API_KEY", "CLAUDE_API_KEY", "CODERABBIT_API_KEY"]) setEnv(review, name, VALUE);
       const worker = runContainer(w, "bbbbbbbbbbbb", { kind: "worker" });
       setEnv(worker, "OPENCODE_API_KEY", VALUE);
       w.containers.push(review, worker);
-      const r = await check(w, "runtime.run-container");
-      expect(r.detail).toContain("hapi-run-aaaaaaaaaaaa: ANTHROPIC_API_KEY is set: a review container holds only its zone's keys");
-      expect(r.detail).not.toContain("hapi-run-bbbbbbbbbbbb");
+      expect((await check(w, "runtime.run-container")).status).toBe("pass");
+      // CodeRabbit's key is the review zone's alone: a worker holding it fails, and so does a review holding OpenCode's.
+      const v = await cleanWorld();
+      delete v.ctx.zoneKeys;
+      const bad = runContainer(v, "aaaaaaaaaaaa", { kind: "review" });
+      setEnv(bad, "OPENCODE_API_KEY", VALUE);
+      const leaky = runContainer(v, "bbbbbbbbbbbb", { kind: "worker" });
+      setEnv(leaky, "CODERABBIT_API_KEY", VALUE);
+      v.containers.push(bad, leaky);
+      const r = await check(v, "runtime.run-container");
+      expect(r.detail).toContain("hapi-run-aaaaaaaaaaaa: OPENCODE_API_KEY is set: a review container holds only its zone's keys");
+      expect(r.detail).toContain("hapi-run-bbbbbbbbbbbb: CODERABBIT_API_KEY is set: a worker container holds only its zone's keys");
+      expect(r.detail).not.toContain(VALUE);
+    });
+
+    test("the real manifest's review zone is Task 8's fixture", () => {
+      const review = manifestEntries(loadManifest(join(REPO, MANIFEST_FILE))).filter((e) => e.zone === "review").map((e) => e.key);
+      expect(review).toEqual(REVIEW_ZONE_KEYS);
     });
 
     test("every kind's run definition is checked: an inputs bind, a kind label or a review proxy dropped fails, naming the kind", async () => {
@@ -421,6 +438,170 @@ describe("runtime.run-container", () => {
     });
   });
 
+  describe("the smoke sidecar (design §3.3, H-192)", () => {
+    const VALUE = ["fake", "audit", "sidecar", "key", "0123456789"].join("-");
+    const R = "aaaaaaaaaaaa";
+    const RUN = `hapi-run-${R}`;
+    /** A clean world with a live run of `kind` that has a sidecar, and the sidecar, both changed by `edit`. */
+    async function withSidecar(kind: Kind = "verify", edit: (sc: Container, run: Container, w: World) => void = () => {}) {
+      const w = await cleanWorld();
+      const run = runContainer(w, R, { kind, sidecar: "bun-http" });
+      const sc = sidecarContainer(R);
+      edit(sc, run, w);
+      w.containers.push(run, sc);
+      return check(w, "runtime.run-container");
+    }
+
+    test("a run that has a sidecar, and its sidecar, pass: the run's network holds exactly the run, its proxy and its sidecar", async () => {
+      for (const kind of ["worker", "verify", "fix"] as const) {
+        const r = await withSidecar(kind);
+        expect([kind, r.status, r.detail]).toEqual([kind, "pass", expect.stringContaining("1 live run containers are as their kind's definition says")]);
+        expect([kind, r.detail.includes("and 1 smoke sidecars as policy/sidecars.yaml says (its image, read-only, /data read-only, no key, on its run's network alone)")]).toEqual([kind, true]);
+      }
+      // A stopped sidecar (one that crashed) isn't checked, and has no endpoint on the run's network, so none is expected.
+      const stopped = await withSidecar("verify", (sc, _, w) => {
+        sc.State.Running = false;
+        delete w.networks.get(RUN)!.Containers[`id-sidecar-${R}`];
+      });
+      expect([stopped.status, stopped.detail]).toEqual(["pass", expect.not.stringContaining("smoke sidecars")]);
+    });
+
+    test("a live sidecar is held to its own shape: a policy image, read-only, /data read-only, no secret; an image policy doesn't list fails", async () => {
+      const cases: [what: string, edit: (sc: Container, run: Container, w: World) => void, part: string][] = [
+        ["an image policy doesn't list", (sc) => void (sc.Config.Image = `example/evil:1@sha256:${"e".repeat(64)}`), `runs example/evil:1@sha256:${"e".repeat(64)}, which policy/sidecars.yaml doesn't list`],
+        ["the policy's image by tag alone", (sc) => void (sc.Config.Image = "oven/bun:1.4.4-slim"), "runs oven/bun:1.4.4-slim, which policy/sidecars.yaml doesn't list"],
+        ["a writable root", (sc) => void (sc.HostConfig!.ReadonlyRootfs = false), "its root filesystem is not read-only"],
+        ["/data writable", (sc) => void (sc.Mounts[0]!.RW = true), "/data is not mounted read-only"],
+        ["no /data", (sc) => void (sc.Mounts = []), "nothing is mounted at /data"],
+        ["another mount", (sc) => void sc.Mounts.push({ Type: "bind", Source: "/srv", Destination: "/srv", RW: false }), "/srv is mounted but the run definition has no such mount"],
+        ["a zone's key", (sc) => void sc.Config.Env.push(`ANTHROPIC_API_KEY=${VALUE}`), "ANTHROPIC_API_KEY is set: a sidecar holds no key"],
+        ["CodeRabbit's key", (sc) => void sc.Config.Env.push(`CODERABBIT_API_KEY=${VALUE}`), "CODERABBIT_API_KEY is set: a sidecar holds no key"],
+        ["another port", (sc) => setEnv(sc, "PORT", "9090"), "PORT is not 8080"],
+        ["a published port", (sc) => void (sc.HostConfig!.PortBindings = { "8080/tcp": [{ HostPort: "8080" }] }), "it publishes a port"],
+        ["root", (sc) => void (sc.Config.User = "0:0"), "it runs as 0:0, not 1001:1001"],
+        ["no capability dropped", (sc) => void (sc.HostConfig!.CapDrop = []), "it does not drop ALL capabilities"],
+        ["a capability added", (sc) => void (sc.HostConfig!.CapAdd = ["CAP_NET_RAW"]), "it adds NET_RAW, where a sidecar adds none"],
+        ["privileged", (sc) => void (sc.HostConfig!.Privileged = true), "it is privileged (--privileged), where a sidecar holds no privilege"],
+        ["no no-new-privileges", (sc) => void (sc.HostConfig!.SecurityOpt = []), "no-new-privileges:true is not set"],
+        ["policy's pids limit raised", (sc) => void (sc.HostConfig!.PidsLimit = 4096), "its pids limit is 4096, not 128"],
+        ["policy's memory raised", (sc) => void (sc.HostConfig!.Memory = 4 * 1024 ** 3), `its memory limit is ${4 * 1024 ** 3}, not ${512 * 1024 ** 2}`],
+        ["another command", (sc) => void (sc.Args = ["/data/other.ts"]), "it runs bun /data/other.ts, not bun /data/server.ts"],
+        ["another working dir", (sc) => void (sc.Config.WorkingDir = "/"), "its working dir is /, not /data"],
+        ["a writable /tmp of another size", (sc) => void (sc.HostConfig!.Tmpfs = { "/tmp": "size=1g" }), "the tmpfs at /tmp has options size=1g, not size=64m,uid=1001,gid=1001,mode=0700"],
+        ["another network too", (sc) => void (sc.NetworkSettings!.Networks.bridge = {}), `it is on bridge, ${RUN}, not on its run's network ${RUN} alone`],
+        ["no hapi-sidecar alias", (sc) => void (sc.NetworkSettings!.Networks[RUN] = { Aliases: [] }), `it is not hapi-sidecar on ${RUN}`],
+        ["a Compose label", (sc) => void (sc.Config.Labels["com.docker.compose.project"] = "hapi"), "it carries com.docker.compose.project=hapi: a sidecar is no service of the Compose project"],
+        ["a helper label", (sc) => void (sc.Config.Labels["org.hapi.helper"] = "copyout"), "it carries org.hapi.helper=copyout: a sidecar is no helper"],
+        ["a run that names no sidecar", (_, run) => void delete run.Config.Labels["org.hapi.sidecar"], `its run ${RUN} carries no org.hapi.sidecar label: the run started no sidecar`],
+        ["a run that names another", (_, run) => void (run.Config.Labels["org.hapi.sidecar"] = "postgres"), `${RUN}: carries org.hapi.sidecar=postgres, which policy/sidecars.yaml doesn't list`],
+        ["no run container", (_, run) => void (run.Name = "/somewhere_else"), `its run's container ${RUN} doesn't exist`],
+      ];
+      for (const [what, edit, part] of cases) {
+        const r = await withSidecar("verify", edit);
+        expect([what, r.status]).toEqual([what, "fail"]);
+        expect([what, r.detail.includes(`${RUN}-sidecar: `) || r.detail.includes(`${RUN}: `), r.detail.includes(part)]).toEqual([what, true, true]);
+        expect([what, r.detail.includes(VALUE)]).toEqual([what, false]);
+      }
+    });
+
+    test("the run's network holds its sidecar exactly when the run says it has one: none declared and one there, one declared and none there, or an endpoint that isn't its sidecar each fail", async () => {
+      const N = RUN;
+      const cases: [what: string, make: (w: World) => Container[], part: string][] = [
+        [
+          "a sidecar the run doesn't declare",
+          (w) => {
+            const run = runContainer(w, R, { kind: "verify", sidecar: "bun-http" });
+            delete run.Config.Labels["org.hapi.sidecar"];
+            return [run, sidecarContainer(R)];
+          },
+          `its network ${N} holds hapi-egress-archon-1, ${N}, ${N}-sidecar, not exactly hapi-egress-archon-1 and ${N}`,
+        ],
+        ["a declared sidecar that isn't there", (w) => [runContainer(w, R, { kind: "verify", sidecar: "bun-http" })], `its network ${N}'s endpoint ${N}-sidecar is not its run's sidecar`],
+        [
+          "a declared sidecar's endpoint taken by another container",
+          (w) => {
+            const run = runContainer(w, R, { kind: "verify", sidecar: "bun-http" });
+            const other = helperContainer("copyout", R, "quirky_name");
+            other.Id = `id-sidecar-${R}`;
+            return [run, other];
+          },
+          `its network ${N}'s endpoint ${N}-sidecar is not its run's sidecar`,
+        ],
+        [
+          "a declared sidecar not on the network",
+          (w) => {
+            const run = runContainer(w, R, { kind: "verify", sidecar: "bun-http" });
+            delete w.networks.get(N)!.Containers[`id-sidecar-${R}`];
+            return [run, sidecarContainer(R)];
+          },
+          `its network ${N} holds hapi-egress-archon-1, ${N}, not exactly hapi-egress-archon-1, ${N} and ${N}-sidecar`,
+        ],
+        [
+          "an unexpected third endpoint",
+          (w) => {
+            const run = runContainer(w, R, { kind: "worker" });
+            w.networks.get(N)!.Containers["id-hapi-hermes-1"] = { Name: "hapi-hermes-1" };
+            return [run];
+          },
+          `its network ${N} holds hapi-egress-archon-1, hapi-hermes-1, ${N}, not exactly hapi-egress-archon-1 and ${N}`,
+        ],
+        [
+          "a review that says it has a sidecar",
+          (w) => [runContainer(w, R, { kind: "review", sidecar: "bun-http" }), sidecarContainer(R)],
+          `${N}: carries org.hapi.sidecar=bun-http, but a review run has no sidecar`,
+        ],
+      ];
+      for (const [what, make, part] of cases) {
+        const w = await cleanWorld();
+        w.containers.push(...make(w));
+        const r = await check(w, "runtime.run-container");
+        expect([what, r.status, r.detail.includes(part)]).toEqual([what, "fail", true]);
+      }
+      // Without a sidecar, a run's network holds exactly the run and its proxy, as before.
+      const plain = await cleanWorld();
+      plain.containers.push(runContainer(plain, R, { kind: "verify" }));
+      expect((await check(plain, "runtime.run-container")).status).toBe("pass");
+    });
+
+    test("each policy sidecar's definition (sidecarArgs) is checked with no Docker needed: a dropped hardening flag, a limit other than policy's or a writable /data fails, naming the sidecar", async () => {
+      const ok = await cleanWorld();
+      ok.dockerDown = true;
+      const r = await check(ok, "runtime.run-container");
+      expect([r.status, r.detail.includes("each of policy/sidecars.yaml's 1 sidecars (sidecarArgs, src/run/sidecar.ts) runs read-only as 1001:1001")]).toEqual(["pass", true]);
+      const real = sidecar.sidecarArgs;
+      const cases: [what: string, edit: (argv: string[]) => string[], part: string][] = [
+        ["no --read-only", (argv) => argv.filter((a) => a !== "--read-only"), "bun-http: its root filesystem is not read-only"],
+        ["a raised pids limit", (argv) => argv.map((a, i) => (argv[i - 1] === "--pids-limit" ? "4096" : a)), "bun-http: its pids limit is 4096, not policy's 128"],
+        ["a writable /data", (argv) => argv.map((a) => a.replace(":/data:ro", ":/data")), "bun-http: its data is not its one bind, read-only at /data"],
+        ["a key passed by name", (argv) => [...argv.slice(0, argv.indexOf("--entrypoint")), "-e", "ANTHROPIC_API_KEY", ...argv.slice(argv.indexOf("--entrypoint"))], "bun-http: it passes ANTHROPIC_API_KEY, a key, to a container that holds none"],
+      ];
+      for (const [what, edit, part] of cases) {
+        const spy = spyOn(sidecar, "sidecarArgs").mockImplementation((...a) => edit(real(...a)));
+        try {
+          const w = await cleanWorld();
+          w.dockerDown = true;
+          const bad = await check(w, "runtime.run-container");
+          expect([what, bad.status, bad.detail.includes(`the sidecar definition (sidecarArgs, src/run/sidecar.ts) of policy/sidecars.yaml's ${part}`)]).toEqual([what, "fail", true]);
+        } finally {
+          spy.mockRestore();
+        }
+      }
+    });
+
+    test("only a container named <run>-sidecar labelled org.hapi.kind=sidecar is a sidecar: one under another name, or without the label, is a stray", async () => {
+      const cases: [what: string, edit: (sc: Container) => void, part: string][] = [
+        ["another name", (sc) => void (sc.Name = "/nifty_name"), `nifty_name: carries org.hapi.run=${R} but is neither its run's container (${RUN}), its run's sidecar (${RUN}-sidecar) nor a hapi helper`],
+        ["no kind label", (sc) => void delete sc.Config.Labels["org.hapi.kind"], `${RUN}-sidecar: carries org.hapi.run=${R} but is neither`],
+        ["another run's id", (sc) => void (sc.Config.Labels["org.hapi.run"] = "bbbbbbbbbbbb"), `${RUN}-sidecar: carries org.hapi.run=bbbbbbbbbbbb but is neither`],
+      ];
+      for (const [what, edit, part] of cases) {
+        const r = await withSidecar("verify", edit);
+        expect([what, r.status, r.detail.includes(part)]).toEqual([what, "fail", true]);
+      }
+      expect(SIDECAR_IMAGE).toMatch(/@sha256:[0-9a-f]{64}$/);
+    });
+  });
+
   describe("what a container labelled org.hapi.run is: a run's own, a hapi helper, or a stray, which fails", () => {
     const VALUE = ["fake", "audit", "helper", "key", "0123456789"].join("-");
     /** The run id `helperContainer` labels a chown or cleanup helper with by default. */
@@ -444,12 +625,12 @@ describe("runtime.run-container", () => {
 
     test("a container labelled org.hapi.run that is neither its run's container nor a hapi helper fails: another name, a bare label, an unknown helper", async () => {
       const cases: [what: string, make: (w: World) => Container, part: string][] = [
-        ["its run's id under another name", (w) => edited(runContainer(w, "aaaaaaaaaaaa"), (c) => void (c.Name = "/hapi-run-aaaaaaaaaaaa-copy")), "hapi-run-aaaaaaaaaaaa-copy: carries org.hapi.run=aaaaaaaaaaaa but is neither its run's container (hapi-run-aaaaaaaaaaaa) nor a hapi helper"],
-        ["its run's id under a random name", (w) => edited(runContainer(w, "aaaaaaaaaaaa"), (c) => void (c.Name = "/nifty_name")), "nifty_name: carries org.hapi.run=aaaaaaaaaaaa but is neither its run's container (hapi-run-aaaaaaaaaaaa) nor a hapi helper"],
+        ["its run's id under another name", (w) => edited(runContainer(w, "aaaaaaaaaaaa"), (c) => void (c.Name = "/hapi-run-aaaaaaaaaaaa-copy")), "hapi-run-aaaaaaaaaaaa-copy: carries org.hapi.run=aaaaaaaaaaaa but is neither its run's container (hapi-run-aaaaaaaaaaaa), its run's sidecar (hapi-run-aaaaaaaaaaaa-sidecar) nor a hapi helper"],
+        ["its run's id under a random name", (w) => edited(runContainer(w, "aaaaaaaaaaaa"), (c) => void (c.Name = "/nifty_name")), "nifty_name: carries org.hapi.run=aaaaaaaaaaaa but is neither its run's container (hapi-run-aaaaaaaaaaaa), its run's sidecar (hapi-run-aaaaaaaaaaaa-sidecar) nor a hapi helper"],
         [
           "a bare org.hapi.run with no helper label",
           () => edited(helperContainer("copyout"), (c) => delete c.Config.Labels["org.hapi.helper"]),
-          "quirky_name: carries org.hapi.run=(empty) but is neither its run's container (a run's name) nor a hapi helper",
+          "quirky_name: carries org.hapi.run=(empty) but is neither its run's container (a run's name), its run's sidecar nor a hapi helper",
         ],
         ["a helper label that names no helper", () => edited(helperContainer("clean"), (c) => void (c.Config.Labels["org.hapi.helper"] = "other")), `quirky_name: carries org.hapi.run=${HELPER_RUN} but is neither`],
         [
@@ -465,7 +646,7 @@ describe("runtime.run-container", () => {
             c.HostConfig!.ReadonlyRootfs = false;
             return c;
           },
-          "evil: carries org.hapi.run=aaaaaaaaaaaa but is neither its run's container (hapi-run-aaaaaaaaaaaa) nor a hapi helper",
+          "evil: carries org.hapi.run=aaaaaaaaaaaa but is neither its run's container (hapi-run-aaaaaaaaaaaa), its run's sidecar (hapi-run-aaaaaaaaaaaa-sidecar) nor a hapi helper",
         ],
       ];
       for (const [what, make, part] of cases) {
@@ -658,7 +839,7 @@ describe("runtime.dev-override", () => {
   test("every container started by `hapi stack up` as hapi passes", async () => {
     const r = await check(await cleanWorld(), "runtime.dev-override");
     expect(r.status).toBe("pass");
-    expect(r.detail).toContain("4 containers");
+    expect(r.detail).toContain("5 containers");
   });
 
   test("a stack started with HAPI_ALLOW_CURRENT_USER=1 fails in normal mode, naming who started it", async () => {
@@ -718,7 +899,7 @@ describe("runtime.dev-override", () => {
     const w = await cleanWorld();
     w.containers.push(runContainer(w), helperContainer("copyout"), helperContainer("chown", "dddddddddddd", "nifty_chown"));
     const r = await check(w, "runtime.dev-override");
-    expect([r.status, r.detail]).toEqual(["pass", expect.stringContaining("5 containers")]);
+    expect([r.status, r.detail]).toEqual(["pass", expect.stringContaining("6 containers")]);
     const stray = helperContainer("clean");
     delete stray.Config.Labels["org.hapi.helper"];
     w.containers.push(stray);
@@ -732,7 +913,25 @@ describe("runtime.dev-override", () => {
     w.containers.push(runContainer(w));
     const r = await check(w, "runtime.dev-override");
     expect(r.status).toBe("pass");
-    expect(r.detail).toContain("5 containers");
+    expect(r.detail).toContain("6 containers");
+  });
+
+  test("a run's smoke sidecar carries the launcher's started-by and dev-override labels (m24), so it is held to them like any container", async () => {
+    const w = await cleanWorld();
+    w.containers.push(runContainer(w, "aaaaaaaaaaaa", { sidecar: "bun-http" }), sidecarContainer("aaaaaaaaaaaa"));
+    const r = await check(w, "runtime.dev-override");
+    expect([r.status, r.detail]).toEqual(["pass", expect.stringContaining("7 containers")]);
+    for (const [labels, part] of [
+      [{ "org.hapi.dev-override": "1", "org.hapi.started-by": "operator" }, "hapi-run-aaaaaaaaaaaa-sidecar was started with HAPI_ALLOW_CURRENT_USER=1 by operator"],
+      [{ "org.hapi.dev-override": "" }, "hapi-run-aaaaaaaaaaaa-sidecar was not started through `hapi stack up`"],
+    ] as const) {
+      const v = await cleanWorld();
+      const sc = sidecarContainer("aaaaaaaaaaaa");
+      Object.assign(sc.Config.Labels, labels);
+      v.containers.push(runContainer(v, "aaaaaaaaaaaa", { sidecar: "bun-http" }), sc);
+      const bad = await check(v, "runtime.dev-override");
+      expect([bad.status, bad.detail.includes(part)]).toEqual(["fail", true]);
+    }
   });
 
   test("the stack not running is a skip", async () => {

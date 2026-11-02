@@ -4,8 +4,18 @@
 # one of these and a data dir; it can't bring its own image or command. The run
 # engine starts the sidecar from the pinned image, with the repo's data dir
 # mounted at /data, and the run reaches it by its name on port.
+#
+# limits: fail-closed defaults, a starting point to tune, central only (an
+# overlay can't change them) and always hard. Docker enforces the first two on
+# the sidecar's container; the run engine the last two on the data it exports
+# from the run's commit, refusing the run when the data dir holds more.
 sidecars:
   bun-http:
     image: oven/bun:1.4.4-slim@sha256:1846adf22496bd711036aae8be147e57bdebbaea2e5264e3e0b5af1db187d9a4
     command: ["bun", "/data/server.ts"]   # server.ts must use Bun's default host, so the run reaches it by its alias
     port: 8080
+    limits:
+      pids: 128          # docker run --pids-limit
+      memory_mb: 512     # docker run --memory, in MiB
+      data_files: 256    # the most files the data dir may hold at the run's commit
+      data_mb: 16        # the most MiB its files may hold together

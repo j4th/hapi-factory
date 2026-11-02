@@ -30,15 +30,22 @@
  *    the caller to show; H-217);
  * 6. its kind's zone's env file: the archon zone's for a worker or a fix, the
  *    review zone's for a review (missing: run `mise run up`). A verify run holds
- *    no key of any kind, so it reads none;
+ *    no key of any kind, so it reads none. A review run whose overlaid
+ *    `runs.phases.coderabbit` is on needs CODERABBIT_API_KEY in it (step 10):
+ *    the key is optional in the manifest, but no automatic fallback runs a
+ *    review without the CodeRabbit step it was asked for. With it off, the
+ *    review container isn't given CODERABBIT_API_KEY even when the file has it;
  * 7. the source (`sourceGitDir`);
  * 8. the commit: a commit id, which the source holds (host git with no config);
  * 9. the roster `build/roster` names (`readRoster`, ./spec.ts);
  * 10. the policy, with the repo's overlay applied (H-172): the work order's roles
  *     against the roster, for the run's kind (`rolesProblem`, ruling m16: a
  *     worker's implement on a pi tier; a review's on a claude tier, with
- *     another model than implement's), and the budget against its kind's cap
- *     (`runs.phases.round_usd` for every kind but `worker`);
+ *     another model than implement's), the budget against its kind's cap
+ *     (`runs.phases.round_usd` for every kind but `worker`), and a review's
+ *     CodeRabbit key when `phases.coderabbit` is on (step 6). The sidecar
+ *     the run starts comes from it too: the overlay's `sidecar`, for a kind
+ *     that may have one (./kinds.ts `sidecar`) whose work order smokes;
  * 11. the parent, for every kind but `worker`: the work order's worker run, whose
  *     sha is the run's base commit (`RunFile.base`);
  * 12. the inputs dir (`StartOptions.inputsDir`): a review and a fix need one, a
@@ -55,7 +62,9 @@
  * 1. under the launcher's lock: admission (the key; one live run per repo, by
  *    its git dir and its `forgeRepo`, m23; `runs.max_live`; ./records.ts), then
  *    the run's dir with record.json, run.json, its own files and, for a review
- *    or a fix, its copy of the inputs dir;
+ *    or a fix, its copy of the inputs dir; then, for a run with a sidecar, its
+ *    data, exported from the run's commit into the run's dir (./sidecar.ts
+ *    `exportSidecarData`: a data dir it refuses fails the start here);
  * 2. the run's own network, `--internal`, checked with `networkProblem`;
  * 3. its kind's proxy joined to it (`egressOf`: egress-archon, or egress-review
  *    for a review) under the alias the proxy variables name (spike 07 finding
@@ -66,13 +75,17 @@
  *    17), chowned to 1001 by a one-shot helper with CAP_CHOWN alone: a fresh
  *    volume's root is root's (spike 07 finding 12). Like every helper, it runs
  *    under the host's `timeout` (./copyout.ts `bounded`);
- * 5. the run container, its kind's secrets passed by name, their values in the
+ * 5. the run's smoke sidecar, when it has one (./sidecar.ts `startSidecar`): on
+ *    the run's network as `hapi-sidecar`, its data read-only, no secret;
+ * 6. the run container, its kind's secrets passed by name, their values in the
  *    docker CLI's env only (a verify run's has none);
- * 6. a detached `hapi run supervise <id>`, awaited until its process has
+ * 7. a detached `hapi run supervise <id>`, awaited until its process has
  *    started: one that can't start is a failed step.
- * A failure in 2-6 removes what start made (its kind's egress disconnected before
- * its network goes) and the run's dir, then releases the lock. A supervisor that
- * starts and then dies is left to the reap (below): nothing in start can see it.
+ * A failure after the run's dir is made removes what start made (its kind's
+ * egress disconnected before its network goes, and the sidecar with the run's
+ * other containers, by its labels) and the run's dir, then releases the lock.
+ * A supervisor that starts and then dies is left to the reap (below): nothing
+ * in start can see it.
  *
  * `hapi run start`, by hand, is a thin wrapper: it reads the work order file,
  * the source's HEAD, the task.md beside the work order and the repo's overlay
@@ -143,7 +156,7 @@ import { emitArchon, type RunFile } from "../generate/archon";
 import { emitPi } from "../generate/pi";
 import { loadPolicy, PolicyError } from "../policy/load";
 import { applyOverlay, overlayFromText, PolicyLoosenError } from "../policy/overlay";
-import type { Policy, RepoOverlay, Roster, RosterName } from "../policy/types";
+import type { Policy, RepoOverlay, Roster, RosterName, Sidecar } from "../policy/types";
 import { ENV_DIR, parseEnvFile, runtimeDir } from "../secrets/files";
 import { composeServices } from "../stack/compose";
 import { currentUserOverride, definedEnv, HAPI_USER, listed, networkProblem, reexec, removeRuns, runCommand, runFilters } from "../stack/up";
@@ -179,6 +192,7 @@ import {
   writeRecord,
 } from "./records";
 import { redactSecrets, sanitizeTerminal } from "./sanitize";
+import { exportSidecarData, SIDECAR_DATA, startSidecar } from "./sidecar";
 import { APP_USER, helperLabels, readRoster, runArgs, type RunDeps, type RunInputs, runLabels, runName, STOP_GRACE_S } from "./spec";
 import { spendOfRun, turnsOfRun } from "./spend";
 
@@ -291,11 +305,19 @@ async function headOf(gitDir: string, d: RunDeps): Promise<string> {
 }
 
 /**
- * Steps 2-6 of making a run (see the module comment), each of which throws on failure. Only the run container's
+ * Steps 2-7 of making a run (see the module comment), each of which throws on failure. Only the run container's
  * docker CLI gets the secrets, in its env; an error from it is scrubbed of their values. Its kind's proxy joins the
- * run's network under the alias its proxy variables name (`profile.egress`).
+ * run's network under the alias its proxy variables name (`profile.egress`). With `sidecar`, the policy sidecar
+ * `spec` starts after the volume chown and before the run container, its data the dir `dir` holds.
  */
-async function createRunObjects(d: RunDeps, rec: RunRecord, argv: string[], secrets: Record<string, string>, profile: KindProfile): Promise<void> {
+export async function createRunObjects(
+  d: RunDeps,
+  rec: RunRecord,
+  argv: string[],
+  secrets: Record<string, string>,
+  profile: KindProfile,
+  sidecar?: { spec: Sidecar; dir: string },
+): Promise<void> {
   const labels = runLabels(d.project, rec.runId);
   const must = async (what: string, cmd: string[], env = definedEnv(d.env)) => {
     const r = await d.run(cmd, { env, inherit: false });
@@ -332,6 +354,8 @@ async function createRunObjects(d: RunDeps, rec: RunRecord, argv: string[], secr
     "docker", "run", "--rm", "--pull", "never", "--network", "none", "--read-only", "--user", "0:0", "--cap-drop", "ALL", "--cap-add", "CHOWN", "--security-opt", "no-new-privileges:true",
     ...labels, ...helperLabels("chown"), "-v", `${rec.volumes.work}:/w`, "-v", `${rec.volumes.out}:/o`, "--entrypoint", "chown", d.image, APP_USER, "/w", "/o",
   ]));
+  // Before the run, so it is there when the run's smoke test looks for it; it holds no secret.
+  if (sidecar !== undefined) await startSidecar(d, rec, sidecar.spec, sidecar.dir);
   await must(`docker run ${rec.container}`, argv, { ...definedEnv(d.env), ...secrets });
   await d.spawnDetached(["hapi", "run", "supervise", rec.runId]);
 }
@@ -497,7 +521,7 @@ export async function startRun(d: RunDeps, o: StartOptions): Promise<StartedRun>
   if (o.kind === "worker" && o.parent !== undefined) throw new Error("a worker run takes no parent: it is the work order's first run, and its own base");
   const disk = await checkRunDisk(d);
   // A verify run holds no key of any kind (design §3.5): no zone's env file is read for it.
-  const secrets = profile.zone === undefined ? {} : await zoneSecrets(profile.zone, d.env);
+  const zone = profile.zone === undefined ? {} : await zoneSecrets(profile.zone, d.env);
   const repo = await sourceGitDir(o.repoGitDir);
   await commitIn(d, repo, o.sha);
   const roster = readRoster(d.buildDir);
@@ -506,6 +530,19 @@ export async function startRun(d: RunDeps, o: StartOptions): Promise<StartedRun>
   const roles = rolesProblem(o.kind, order.roles, applied.rosters[roster], roster);
   if (roles !== undefined) throw new Error(roles);
   const phases = applied.runs.phases;
+  // CodeRabbit's key is optional in the manifest (until an unattended one exists, H-167), so a review asked to run
+  // CodeRabbit's step without it is refused here: no automatic fallback, and an unset key is an error.
+  if (o.kind === "review" && phases.coderabbit && (zone.CODERABBIT_API_KEY ?? "").trim() === "") {
+    throw new Error(
+      "runs.phases.coderabbit is on for this run, but the review zone's env file has no CODERABBIT_API_KEY: store hapi-review-coderabbit-api-key (`mise run secrets:edit`, docs/runbooks/provider-keys.md) and run `mise run up`, or leave phases.coderabbit off",
+    );
+  }
+  // And it reaches the review container only when that step runs: with it off, the container never holds the key.
+  const secrets = o.kind === "review" && !phases.coderabbit ? Object.fromEntries(Object.entries(zone).filter(([k]) => k !== "CODERABBIT_API_KEY")) : zone;
+  // The smoke sidecar: the overlay's, for a kind that may have one, when the work order smokes (design §3.3).
+  const sc = profile.sidecar && order.verify.smoke ? applied.repo?.sidecar : undefined;
+  const sidecarSpec = sc === undefined ? undefined : applied.sidecars[sc.name];
+  if (sc !== undefined && sidecarSpec === undefined) throw new Error(`${OVERLAY_LABEL} names the sidecar ${JSON.stringify(sc.name)}, which policy/sidecars.yaml doesn't list`);
   // A worker may spend the work order's budget; every later kind one round's, at most (design §3.9).
   const cap = o.kind === "worker" ? order.budget.usd : Math.min(order.budget.usd, phases.round_usd);
   if (o.budgetUsd !== undefined && o.budgetUsd > cap) {
@@ -531,7 +568,7 @@ export async function startRun(d: RunDeps, o: StartOptions): Promise<StartedRun>
 
   const runId = newRunId();
   const budgetUsd = o.budgetUsd ?? cap;
-  const runInputs: RunInputs = { runId, repo, sha: o.sha, workOrder: order, public: o.public, budgetUsd, packDir: d.packDir };
+  const runInputs: RunInputs = { runId, repo, sha: o.sha, workOrder: order, public: o.public, budgetUsd, packDir: d.packDir, ...(sc === undefined ? {} : { sidecar: sc.name }) };
   const argv = runArgs(service, runInputs, d, Object.keys(secrets), profile);
   const started = d.now();
   const name = runName(d.project, runId);
@@ -564,7 +601,12 @@ export async function startRun(d: RunDeps, o: StartOptions): Promise<StartedRun>
     if (refused !== undefined) throw new Error(refused);
     await createRun(d.stateDir, rec, runFile, files, o.inputsDir);
     try {
-      await createRunObjects(d, rec, argv, secrets, profile);
+      let sidecar: { spec: Sidecar; dir: string } | undefined;
+      if (sc !== undefined && sidecarSpec !== undefined) {
+        sidecar = { spec: sidecarSpec, dir: join(recordDir(d.stateDir, runId), SIDECAR_DATA) };
+        await exportSidecarData(d, repo, o.sha, sc.data_dir, sidecar.dir, sidecarSpec.limits);
+      }
+      await createRunObjects(d, rec, argv, secrets, profile, sidecar);
     } catch (e) {
       let cleanup = "What start had created was removed.";
       try {

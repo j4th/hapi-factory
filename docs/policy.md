@@ -205,12 +205,13 @@ The patterns are a second line of defense: no positional pattern accepts `$`, a 
 | `hermes` | T0–T1 | `api.anthropic.com`, `openrouter.ai`, `api.github.com`, `github.com`, `slack.com` | The Hermes main session. T2 and T3 content reaches it only as schema-validated briefs from hapi-research (spec §10, amended by §10.1). |
 | `archon` | T0–T1 | `api.anthropic.com`, `openrouter.ai`, `opencode.ai`, `registry.npmjs.org`, `pypi.org`, `files.pythonhosted.org` | Archon and its Pi workers. **No forge host**: the Archon zone has no route to GitHub (spec §4.3). |
 | `research` | T0–T3 | None | `openWeb: true`. Only hapi-research touches the open web. Private address ranges stay blocked. |
+| `review` | none | `api.anthropic.com`, `cli.coderabbit.ai`, `app.coderabbit.ai`, `ide.coderabbit.ai` | The review container (design §3.5), behind `egress-review`: the review model's API and CodeRabbit's CLI, and nothing else. No tier, so no package registry (it runs none of the repo's code), and **no forge host**: the harvester posts the review, never the container. |
 
 A zone's allowlist is its own `hosts` **plus** the hosts of every tier it lists (`zoneHosts` in `src/policy/zones.ts` computes it; the egress generator uses it). Hosts are plain, lowercase domains with at least two labels: no scheme, port, path, wildcard or leading dot, and no IP addresses. The egress generator allows each domain and its subdomains, so `slack.com` also covers `wss-primary.slack.com`. It checks every host again before writing it, for a policy built in code ([generated configs](generated-configs.md#buildegresssquidconf)).
 
-The schema enforces spec §10's tier entitlements: the `hermes` and `archon` zones may list only T0–T1, and only the `research` zone may set `openWeb`. Until Task 3b the `hermes` zone also listed T2; spec §10.1 moved the aggregators (Context7, DeepWiki) to the research zone, so `context7.com` and `deepwiki.com` left the hermes allowlist.
+The schema enforces spec §10's tier entitlements: the `hermes` and `archon` zones may list only T0–T1, the `review` zone no tier at all (`maxItems: 0`), and only the `research` zone may set `openWeb`. Until Task 3b the `hermes` zone also listed T2; spec §10.1 moved the aggregators (Context7, DeepWiki) to the research zone, so `context7.com` and `deepwiki.com` left the hermes allowlist.
 
-**Forge hosts.** The `archon` zone has no route to a forge (spec §4.3). So the schema rejects a **forge host** in the `archon` zone's `hosts`, and in tiers `T0` and `T1`, which that zone reaches. A forge host is one of these domains or a subdomain of one: `github.com`, `githubusercontent.com`, `githubassets.com`, `ghcr.io`, `gitlab.com` and `bitbucket.org`. The stack is meant to stay forge-agnostic, so GitLab and Bitbucket count too. The list is defined once, as `forgeHost` in `policy-defs.schema.json`. The same check covers [overlay](#repo-overlays-factoryconfigyaml) and [work-order](#work-orders) `egress_extra` hosts, and `forgeDomain` in `src/policy/hosts.ts` reads the same pattern. The `hermes` zone may reach the forge.
+**Forge hosts.** The `archon` zone has no route to a forge (spec §4.3). So the schema rejects a **forge host** in the `archon` zone's `hosts`, and in tiers `T0` and `T1`, which that zone reaches. A forge host is one of these domains or a subdomain of one: `github.com`, `githubusercontent.com`, `githubassets.com`, `ghcr.io`, `gitlab.com` and `bitbucket.org`. The stack is meant to stay forge-agnostic, so GitLab and Bitbucket count too. The list is defined once, as `forgeHost` in `policy-defs.schema.json`. The same check covers [overlay](#repo-overlays-factoryconfigyaml) and [work-order](#work-orders) `egress_extra` hosts and the `review` zone's `hosts` (`"github.com" is a forge host (github.com); the review zone has no forge route (design §3.5)`), and `forgeDomain` in `src/policy/hosts.ts` reads the same pattern; the egress generator refuses one in either zone again, for a policy built in code. The `hermes` zone may reach the forge.
 
 ### `budgets.yaml`
 
@@ -280,15 +281,16 @@ An overlay can't name `repos`: it is central only.
 
 ### `sidecars.yaml`
 
-The central list of sidecars (Plan 03, design §3.3). A repo's overlay names one with `sidecar: { name, data_dir }`; it can't bring its own image or command. Each entry under `sidecars` is keyed by a slug and has three required keys:
+The central list of sidecars (Plan 03, design §3.3). A repo's overlay names one with `sidecar: { name, data_dir }`; it can't bring its own image or command. Each entry under `sidecars` is keyed by a slug and has four required keys:
 
 | Key | Meaning |
 |---|---|
-| `image` | An OCI image pinned by digest (`name[:tag]@sha256:<64 hex>`); a tag alone is rejected |
+| `image` | An OCI image pinned by digest (`name[:tag]@sha256:<64 hex>`); a tag alone is rejected. `mise run up` pulls it, by that reference |
 | `command` | The argv it runs: a non-empty list of non-empty strings |
-| `port` | The port it listens on, 1 to 65535 |
+| `port` | The port it listens on, 1 to 65535 (set as `PORT`, Bun's default port) |
+| `limits` | Fail-closed defaults, a starting point to tune, central only (an overlay can't change them) and always hard, each a whole number of at least 1: `pids` (`docker run --pids-limit`) and `memory_mb` (`--memory`, in MiB), which Docker enforces on the sidecar's container; `data_files` and `data_mb` (MiB), the most files and bytes its data dir may hold at the run's commit, which the run engine enforces on the export, refusing the run when there is more |
 
-`bun-http` ships: `oven/bun:1.4.4-slim` pinned by digest, running `bun /data/server.ts` on port 8080. The repo's `data_dir` is mounted at `/data`, so `server.ts` is the repo's own code, which is why `applyOverlay` denies `data_dir/**` to workers. Its server must use Bun's default host, so the run can reach it by its alias.
+`bun-http` ships: `oven/bun:1.4.4-slim` pinned by digest, running `bun /data/server.ts` on port 8080, with `limits: { pids: 128, memory_mb: 512, data_files: 256, data_mb: 16 }`. The repo's `data_dir` is exported from the run's commit and mounted read-only at `/data`, so `server.ts` is the repo's own code, which is why `applyOverlay` denies `data_dir/**` to workers. Its server must use Bun's default host, so the run can reach it by its alias, `hapi-sidecar`. How a run starts it, and what the export refuses: [the runs runbook](runbooks/runs.md#the-smoke-sidecar).
 
 ### `gates.yaml`
 

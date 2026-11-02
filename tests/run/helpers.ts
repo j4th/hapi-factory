@@ -10,6 +10,7 @@
  * filesystem facts come from `deps.probeFs`, never from a real mount; the
  * cleanup helper empties the host dirs it is given.
  */
+import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import YAML from "yaml";
@@ -68,6 +69,8 @@ export const SHA2 = "0d1e2f3a4b5c6d7e8f90a1b2c3d4e5f60718293a";
 const COMMITS = [SHA, SHA2];
 /** The blob id the fake's `ls-tree` gives `.factory/config.yaml`. */
 const OVERLAY_BLOB = "e".repeat(40);
+/** The blob id the fake's `ls-tree -r` gives a file of `FakeOptions.tree`: the SHA-1 of its path. */
+const blobOf = (path: string) => createHash("sha1").update(path).digest("hex");
 /** What the fake `docker info --format {{.DockerRootDir}}` prints: Docker's data root, on a filesystem of its own (dev 3). */
 export const DATA_ROOT = "/fake/docker-root";
 export const NOW = new Date("2026-10-29T12:00:00.000Z");
@@ -136,6 +139,12 @@ export interface FakeOptions {
   heads?: string;
   /** The source's `.factory/config.yaml`, at every commit (`ls-tree` lists it, `cat-file blob` prints it); none by default. */
   overlay?: string;
+  /**
+   * The source's files at every commit, path to text, for the sidecar's data export: `ls-tree -r` lists the regular
+   * files under the asked prefix, each as `100644 blob <sha1 of its path> <size>\t<path>\0`, and `cat-file blob <oid>`
+   * prints one's bytes, through `runBytes`. None by default.
+   */
+  tree?: Record<string, string>;
   /** The run network's subnet and whether it is internal, as `docker network inspect` says. */
   subnet?: string;
   internal?: boolean;
@@ -198,6 +207,11 @@ export function fakeRun(o: FakeOptions = {}) {
       if (cmd.includes("rev-parse")) {
         const asked = cmd.at(-1)!.replace(/\^\{commit\}$/, "");
         return ok(`${COMMITS.includes(asked) ? asked : SHA}\n`);
+      }
+      if (cmd.includes("ls-tree") && cmd.includes("-r")) {
+        const prefix = cmd.at(-1)!;
+        const rows = Object.entries(o.tree ?? {}).filter(([p]) => p.startsWith(prefix));
+        return ok(rows.map(([p, text]) => `100644 blob ${blobOf(p)} ${String(Buffer.byteLength(text)).padStart(7)}\t${p}\0`).join(""));
       }
       if (cmd.includes("ls-tree")) return ok(o.overlay === undefined ? "" : `100644 blob ${OVERLAY_BLOB}\t${cmd.at(-1)}\0`);
       if (cmd.includes("cat-file") && cmd.at(-1) === OVERLAY_BLOB && o.overlay !== undefined) return ok(o.overlay);
@@ -308,6 +322,10 @@ export function fakeRun(o: FakeOptions = {}) {
     o.onCall?.(full);
     const cmd = unbounded(full);
     if (o.hangs?.(cmd)) return cmd === full ? new Promise<never>(() => {}) : { code: 137, stdout: new Uint8Array(), stderr: "" };
+    if (cmd[0] === "env" && cmd[1] === "-i" && cmd.includes("cat-file")) {
+      const found = Object.entries(o.tree ?? {}).find(([p]) => blobOf(p) === cmd.at(-1));
+      return found === undefined ? { code: 128, stdout: new Uint8Array(), stderr: `fatal: Not a valid object name ${cmd.at(-1)}` } : { code: 0, stdout: new TextEncoder().encode(found[1]), stderr: "" };
+    }
     if (!cmd.includes(COPY_SCRIPT)) throw new Error(`fake: unexpected byte command ${cmd.join(" ")}`);
     const v = world.volumes.get(volumeAt(cmd, "/out") ?? "");
     if (v === undefined) return { code: 125, stdout: new Uint8Array(), stderr: "no such volume" };
@@ -373,7 +391,8 @@ export const BUILD_FILES: Record<string, string> = {
 
 /**
  * A zone's env file, as `hapi secrets resolve` writes it, at `<xdg>/hapi/env/<zone>.env`. Values are built at run
- * time. The review zone's is a fixture here: Task 9 makes the zone real, so nothing in these tests needs it.
+ * time. The review zone's values here are its own, none of them the archon zone's, though the real zone reuses the
+ * archon zone's Anthropic key (stack/secrets.yaml): so a test sees which zone's file a value came from.
  */
 export function writeZoneEnv(xdg: string, zone: "archon" | "review", values: Record<string, string>): string {
   const dir = join(xdg, "hapi", "env");

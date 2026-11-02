@@ -78,7 +78,8 @@ export interface AuditContext {
   probeFs?: FsProbe;
   /**
    * Each zone's env names, zone to names, which runtime.run-container holds a live run container's keys to: one holds
-   * only its kind's zone's keys, a verify none. Default: each zone of stack/secrets.yaml (tests add a review zone).
+   * only its kind's zone's keys, a verify none, a sidecar none. Default: each zone of stack/secrets.yaml, its review zone
+   * included.
    */
   zoneKeys?: Record<string, string[]>;
 }
