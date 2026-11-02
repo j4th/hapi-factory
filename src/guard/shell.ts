@@ -55,8 +55,9 @@
  *   source directory (past DEPENDENCY_DIRS; with `-L`, through links to
  *   directories, each real one once) and judges every file where it lands
  *   (`T/<name>/...` in a target directory, else `T/...`, and `T/...` for an
- *   `S/.` source or with `-T`). A copy that lands wholly outside the worktree
- *   and the guard's dirs isn't walked; one with more than WALK_LIMIT files, or a
+ *   `S/.` source or with `-T`). Only a copy to a root that doesn't exist,
+ *   outside the worktree and the guard's dirs, isn't walked (an existing tree may
+ *   hold a planted link into the worktree); one with more than WALK_LIMIT files, or a
  *   command whose copies hold more than COPY_BUDGET, blocks, so the walk fails
  *   closed and stays cheap. `ln` with one operand makes `./<name>`, and
  *   `install -d` makes every operand;
@@ -81,10 +82,10 @@
  * where the later words land can't be known; `cd -`, `popd` and a `pushd` that
  * only rotates add no directory. An operand holding `$`, a backtick or a glob
  * character, or a `~` form other than `~` and `~/...`, blocks the same way.
- * When CDPATH or OLDPWD is in play (a word of the command, or of the text read
- * again, may set either: setsCdVars; or the shell's env sets CDPATH), a `cd` to
- * a name not led by "." or "/" (or exactly `~` or `~/...`), and `cd -`, block
- * too. Past MAX_DIRS directories, the command blocks.
+ * When CDPATH or OLDPWD is in play (either name anywhere in the command's
+ * text; a parsed word setting one, the text read again included: setsCdVars;
+ * or CDPATH in the shell's env), a `cd` to a name not led by "." or "/" (or
+ * exactly `~` or `~/...`), and `cd -`, block too. Past MAX_DIRS directories, the command blocks.
  *
  * A target blocks when it resolves (`~`, symlinks and a shell glob's expansion
  * applied; a glob is judged as written too, since bash keeps one that matches
@@ -817,20 +818,25 @@ const COPY_BUDGET = 4 * WALK_LIMIT;
 /** Whether a word has a ".." segment: where a logical and a physical `cd` can part. */
 const hasDotDot = (w: string): boolean => w.split("/").includes("..");
 
-/** Builtins that can set a shell variable, CDPATH or OLDPWD among them, from their words. */
-const ASSIGNERS = new Set(["export", "declare", "typeset", "readonly", "local", "printf", "read", "mapfile", "readarray", "getopts", "let", "eval", "source", ".", "trap"]);
+/** Builtins and keywords that set a variable named by one of their words (`read CDPATH`, `for OLDPWD in ...`). */
+const ASSIGNERS = new Set(["export", "declare", "typeset", "readonly", "local", "read", "mapfile", "readarray", "getopts", "let", "eval", "for", "select"]);
 const CD_VARS = /^(CDPATH|OLDPWD)(\[[^\]]*\])?\+?=/;
+const CD_NAMES = /CDPATH|OLDPWD/;
 
 /**
- * Whether a simple command may set CDPATH or OLDPWD, from its parsed words: an assignment to either before the
- * command word or among an assigning builtin's words, either name as such a builtin's word (`printf -v CDPATH`,
- * `read OLDPWD`), or such a builtin's word holding `$` or a backtick (a name this rule can't read).
+ * Whether a simple command may set CDPATH or OLDPWD, from its parsed words (quotes removed, so `CD''PATH` is read as
+ * CDPATH): an assignment to either before the command word, or an assigning builtin's word assigning or naming one
+ * (`export CDPATH=…`, `read OLDPWD`, `printf -v CDPATH`). checkShell also blocks on either name anywhere in the
+ * command's text (the forms these words don't show: `${CDPATH:=…}`, `declare -n r=CDPATH`); a name built from
+ * pieces (`v=CD; export ${v}PATH=…`) is H-256's.
  */
 function setsCdVars(words: string[]): boolean {
   const at = headOf(words).at;
   if (words.slice(0, at).some((w) => CD_VARS.test(w))) return true;
-  if (!ASSIGNERS.has(baseName(words[at]))) return false;
-  return words.slice(at + 1).some((w) => CD_VARS.test(w) || w === "CDPATH" || w === "OLDPWD" || /[$`]/.test(w));
+  const cmd = baseName(words[at]);
+  const args = words.slice(at + 1);
+  if (cmd === "printf") return args.some((w, k) => w === "-v" && (args[k + 1] === "CDPATH" || args[k + 1] === "OLDPWD"));
+  return ASSIGNERS.has(cmd) && args.some((w) => CD_VARS.test(w) || w === "CDPATH" || w === "OLDPWD");
 }
 
 /** Rule 7 for one bash command: the first write it plainly makes to a protected path, or undefined. */
@@ -865,14 +871,26 @@ export function checkShell(command: string, c: ShellContext): ShellBlock | undef
     }
     return [c.roots.work, c.piDir, c.roots.ledger, c.out].some((root) => within(real, root));
   };
+  /** Whether a path exists, or a `mkdir` earlier in the command makes it: a copy into it may write through what is there. */
+  const present = (p: string): boolean => {
+    try {
+      lstatSync(p);
+      return true;
+    } catch {
+      return made.has(resolve(p));
+    }
+  };
   let walked = 0;
   /**
-   * A recursive copy of the directory `src` to `root`: each file it makes, judged where it lands. A copy that lands
-   * wholly outside the refusable roots isn't walked; one too big to walk blocks, as does a command whose copies
-   * together are (COPY_BUDGET). With `deref` (cp -L), links to directories are followed, each real one once.
+   * A recursive copy of the directory `src` to `root`: each file it makes, judged where it lands. Only a copy to a
+   * root outside the worktree and the guard's dirs that doesn't exist (nor is made earlier in the command) isn't
+   * walked: it makes every file fresh, out of reach. Any other is, since what is there (a planted link into the
+   * worktree) decides where a file lands. One too big to walk blocks,
+   * as does a command whose copies together are (COPY_BUDGET). With `deref` (cp -L), links to directories are
+   * followed, each real one once.
    */
   const copied = (src: string, root: string, word: string, deref: boolean): ShellBlock | undefined => {
-    if (!reachable(root)) return undefined;
+    if (!reachable(root) && !present(root)) return undefined;
     const tooBig = (what: string): ShellBlock => ({ rule: "shell-write", reason: `this command copies ${what} into ${word}, too many to check where they land`, path: root });
     const queue: [dir: string, rel: string][] = [[src, ""]];
     const visited = new Set<string>();
@@ -937,8 +955,11 @@ export function checkShell(command: string, c: ShellContext): ShellBlock | undef
   const cantFollow = (what: string): ShellBlock => ({ rule: "shell-write", reason: `this command's ${what} can't be followed, so where its later words land can't be known` });
   /** Each simple command still to read, and whether the broad rule judges it (it came from an opaque wrapper's words). */
   const queue: { seg: Segment; broad: boolean }[] = parseShell(command).map((seg) => ({ seg, broad: false }));
-  /** CDPATH or OLDPWD may send a `cd` somewhere this rule can't see (H-223): read from the parsed words, and the env. */
-  let cdUnknown = c.cdpath === true || queue.some((q) => setsCdVars(q.seg.words));
+  /**
+   * CDPATH or OLDPWD may send a `cd` somewhere this rule can't see (H-223): either name anywhere in the command's
+   * text, a parsed word setting one (setsCdVars, the text read again included), or CDPATH in the env.
+   */
+  let cdUnknown = c.cdpath === true || CD_NAMES.test(command) || queue.some((q) => setsCdVars(q.seg.words));
   let nested = 0;
   const reread = (text: string, broad: boolean): ShellBlock | undefined => {
     if (++nested > MAX_NESTED) return { rule: "shell-write", reason: `this command nests eval, env -S or sh -c more than ${MAX_NESTED} deep, so what it runs can't be known` };

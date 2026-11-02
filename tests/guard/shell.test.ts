@@ -20,7 +20,8 @@ const NOTE = "; a best-effort check, not a boundary; to only read a file, use th
  * x.md, CLAUDE.md -> notes.md (a protected name over an unprotected file), and loop -> loop (a symlink loop).
  * `/tmp/stage`, `/tmp/lstage` and `/tmp/big` are the harness's /tmp: stage holds .github/workflows/ci.yml, AGENTS.md,
  * pkg/CLAUDE.md, ci.yml and gh/.github/workflows/ci.yml; lstage/sub links to a dir holding AGENTS.md; big holds 2100
- * files and sub/AGENTS.md. `[g]` in the worktree links to .github, and WORK is the worktree.
+ * files and sub/AGENTS.md; payload holds AGENTS.md, and dst/payload/AGENTS.md links to the worktree's (a planted
+ * link). `[g]` in the worktree links to .github, and WORK is the worktree.
  */
 const VECTORS: [string, boolean][] = [
   // Redirection: >, >>, and the fd and &> forms, attached or not.
@@ -230,7 +231,8 @@ const VECTORS: [string, boolean][] = [
   ["cd .gith* && rm workflows/ci.yml", true],
   ["cd .githu[b] && rm workflows/ci.yml", true],
   ["cd ~- && rm workflows/ci.yml", true],
-  ["grep -rn CDPATH . ; cd src && ls", false],
+  // A command naming CDPATH or OLDPWD anywhere makes a later relative cd unknowable: a fail-closed false positive (H-256).
+  ["grep -rn CDPATH . ; cd src && ls", true],
   ["cd ~ && ls", false],
   // Item 5: env -S's escapes and options, and a $ in its string.
   ["env -S 'rm\\_AGENTS.md'", true],
@@ -278,6 +280,26 @@ const VECTORS: [string, boolean][] = [
   ["watch -n 5 git status", false],
   ["flock /tmp/l bun test", false],
   ["bash -c 'cat AGENTS.md'", false],
+  // Fix round 3: CDPATH and OLDPWD are named in the text, or set by a parsed word (the union).
+  ["CDPATH+=:.github; cd workflows; rm ci.yml", true],
+  ["CDPATH[0]=.github; cd workflows; rm ci.yml", true],
+  ["OLDPWD+=.github; cd - && rm workflows/ci.yml", true],
+  [": ${CDPATH:=.github}; cd workflows; rm ci.yml", true],
+  ["echo ${CDPATH:=.github} && cd workflows && rm ci.yml", true],
+  ["true ${OLDPWD=.github}; cd -; rm workflows/ci.yml", true],
+  ["for CDPATH in .github; do cd workflows && rm ci.yml; done", true],
+  ["for OLDPWD in .github; do cd - && rm workflows/ci.yml; done", true],
+  ["select CDPATH in .github; do cd workflows; rm ci.yml; done", true],
+  ["declare -n r=CDPATH; r=.github; cd workflows; rm ci.yml", true],
+  ["for CD''PATH in .github; do cd workflows && rm ci.yml; done", true],
+  ["export PATH=$PATH:/x && cd src && ls", false],
+  ["source \"$HOME/.venv/bin/activate\" && cd src && ls", false],
+  ["trap 'rm -f $t' EXIT; cd src && ls", false],
+  ["local x=$1; cd src && ls", false],
+  ["printf '%s\\n' \"$HOME\"; cd src && ls", false],
+  // A copy into an existing tree outside the worktree is walked: a planted link there lands in it.
+  ["cp -r /tmp/payload /tmp/dst", true],
+  ["cp -r /tmp/payload /tmp/fresh", false],
   // An in-place edit's script is no target; a ".." after a missing dir, and a symlink loop, block (H-223(c)).
   ["sed -i 's/../X/' notes.md", false],
   ["perl -pi -e 's/../X/' notes.md", false],
@@ -354,10 +376,14 @@ test("the vector table: each command blocks or allows as listed", async () => {
   for (let i = 0; i < 2100; i++) writeFileSync(join(h.tmp, "big", `f${i}`), "");
   writeFileSync(join(h.tmp, "big", "sub", "AGENTS.md"), "# deep\n");
   symlinkSync(".github", join(h.work, "[g]"));
+  mkdirSync(join(h.tmp, "payload"));
+  writeFileSync(join(h.tmp, "payload", "AGENTS.md"), "# payload\n");
+  mkdirSync(join(h.tmp, "dst", "payload"), { recursive: true });
+  symlinkSync(join(h.work, "AGENTS.md"), join(h.tmp, "dst", "payload", "AGENTS.md"));
   await h.start();
   const got: [string, boolean][] = [];
   for (const [command] of VECTORS) {
-    const real = command.replace(/\/tmp\/(stage|lstage|big)\b/g, (_m, d: string) => join(h.tmp, d)).replaceAll("WORK", h.work);
+    const real = command.replace(/\/tmp\/(stage|lstage|big|payload|dst|fresh)\b/g, (_m, d: string) => join(h.tmp, d)).replaceAll("WORK", h.work);
     got.push([command, (await h.tool("bash", { command: real }))?.block === true]);
   }
   expect(got).toEqual(VECTORS);
