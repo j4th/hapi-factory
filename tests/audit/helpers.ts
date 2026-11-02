@@ -95,7 +95,7 @@ export interface Container {
   Config: { Labels: Record<string, string>; Env: string[]; Cmd: string[] | null; Entrypoint: string[] | null; User?: string; StopTimeout?: number };
   Mounts: { Type: string; Source: string; Destination: string; RW: boolean }[];
   NetworkSettings?: { Networks: Record<string, unknown> };
-  HostConfig?: { NetworkMode?: string; Init?: boolean; PortBindings: Record<string, unknown>; Tmpfs?: Record<string, string>; CapDrop?: string[]; ReadonlyRootfs?: boolean; SecurityOpt?: string[]; PidsLimit?: number; Memory?: number };
+  HostConfig?: { NetworkMode?: string; Init?: boolean | null; AutoRemove?: boolean; CapAdd?: string[] | null; PortBindings: Record<string, unknown>; Tmpfs?: Record<string, string>; CapDrop?: string[]; ReadonlyRootfs?: boolean; SecurityOpt?: string[]; PidsLimit?: number; Memory?: number };
 }
 
 /** A network as `docker network inspect` prints one (the fields the audit reads). */
@@ -543,6 +543,48 @@ export function runContainer(w: World, id = "ab12cd34ef56", over: { labels?: Rec
       SecurityOpt: ["no-new-privileges:true"],
       PidsLimit: 2048,
       Memory: 4 * 1024 ** 3,
+    },
+  };
+}
+
+/**
+ * A one-shot helper container as `docker inspect` prints one mid-flight, following its real argv: the copy-out
+ * (src/run/copyout.ts: a bare org.hapi.run, 1001, /out read-only), the volume chown (src/run/lifecycle.ts:
+ * org.hapi.run=<id>, 0:0, CHOWN added, which Docker keeps as CAP_CHOWN) or the run disk's cleanup (src/run/disk.ts:
+ * org.hapi.run=<id>, 1001). Each carries `org.hapi.helper=<kind>`, a name of Docker's choosing, `--rm`,
+ * `--network none`, a read-only root, every capability dropped, and no key.
+ */
+export function helperContainer(kind: "copyout" | "chown" | "clean", runId = "ab12cd34ef56", name = "quirky_name"): Container {
+  const vol = (v: string, dest: string, rw: boolean) => ({ Type: "volume", Source: `/var/lib/docker/volumes/hapi-run-${runId}-${v}/_data`, Destination: dest, RW: rw });
+  return {
+    Id: `id-helper-${kind}-${runId}`,
+    Name: `/${name}`,
+    State: { Running: true },
+    Path: kind === "chown" ? "chown" : "sh",
+    Args: kind === "chown" ? ["1001:1001", "/w", "/o"] : ["-c", "(the helper's fixed script)"],
+    Config: {
+      Labels: { "org.hapi.run": kind === "copyout" ? "" : runId, "org.hapi.project": "hapi", "org.hapi.helper": kind },
+      Env: ["PATH=/usr/local/bin:/usr/bin:/bin"],
+      Cmd: null,
+      Entrypoint: [kind === "chown" ? "chown" : "sh"],
+      User: kind === "chown" ? "0:0" : "1001:1001",
+    },
+    Mounts:
+      kind === "copyout"
+        ? [vol("out", "/out", false)]
+        : kind === "chown"
+          ? [vol("work", "/w", true), vol("out", "/o", true)]
+          : [{ Type: "bind", Source: `/var/lib/hapi/rundisk/hapi-run-${runId}-work`, Destination: "/w", RW: true }],
+    NetworkSettings: { Networks: { none: {} } },
+    HostConfig: {
+      NetworkMode: "none",
+      Init: null,
+      AutoRemove: true,
+      PortBindings: {},
+      CapDrop: ["ALL"],
+      CapAdd: kind === "chown" ? ["CAP_CHOWN"] : null,
+      ReadonlyRootfs: true,
+      SecurityOpt: ["no-new-privileges:true"],
     },
   };
 }

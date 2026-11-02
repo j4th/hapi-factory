@@ -179,7 +179,7 @@ import {
   writeRecord,
 } from "./records";
 import { redactSecrets, sanitizeTerminal } from "./sanitize";
-import { APP_USER, readRoster, runArgs, type RunDeps, type RunInputs, runLabels, runName, STOP_GRACE_S } from "./spec";
+import { APP_USER, helperLabels, readRoster, runArgs, type RunDeps, type RunInputs, runLabels, runName, STOP_GRACE_S } from "./spec";
 import { spendOfRun, turnsOfRun } from "./spend";
 
 /**
@@ -330,7 +330,7 @@ async function createRunObjects(d: RunDeps, rec: RunRecord, argv: string[], secr
   }
   await must("the volume chown helper", bounded([
     "docker", "run", "--rm", "--pull", "never", "--network", "none", "--read-only", "--user", "0:0", "--cap-drop", "ALL", "--cap-add", "CHOWN", "--security-opt", "no-new-privileges:true",
-    ...labels, "-v", `${rec.volumes.work}:/w`, "-v", `${rec.volumes.out}:/o`, "--entrypoint", "chown", d.image, APP_USER, "/w", "/o",
+    ...labels, ...helperLabels("chown"), "-v", `${rec.volumes.work}:/w`, "-v", `${rec.volumes.out}:/o`, "--entrypoint", "chown", d.image, APP_USER, "/w", "/o",
   ]));
   await must(`docker run ${rec.container}`, argv, { ...definedEnv(d.env), ...secrets });
   await d.spawnDetached(["hapi", "run", "supervise", rec.runId]);

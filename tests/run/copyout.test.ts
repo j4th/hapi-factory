@@ -183,7 +183,8 @@ describe("copyOut", () => {
         // The host's bound on the whole helper: TERM, which the docker CLI passes on, then KILL.
         "timeout", "-k", String(HELPER_KILL_AFTER_S), String(HELPER_HOST_TIMEOUT_S),
         "docker", "run", "--rm", "--pull", "never", "--network", "none", "--read-only", "--user", "1001:1001", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
-        "--label", RUN_LABEL, "--label", `${PROJECT_LABEL}=hapi`, "-v", `${VOL}:/out:ro`, "--entrypoint", "sh", "hapi-factory/archon:0.12.1", "-c", script,
+        // The run labels, so `down` finds it, and org.hapi.helper=copyout, so the audit holds it to the helpers' invariants.
+        "--label", RUN_LABEL, "--label", `${PROJECT_LABEL}=hapi`, "--label", "org.hapi.helper=copyout", "-v", `${VOL}:/out:ro`, "--entrypoint", "sh", "hapi-factory/archon:0.12.1", "-c", script,
       ]);
     }
     // The listing and every read are bounded in time inside the helper too, below the host's bound.

@@ -32,7 +32,7 @@ import { join } from "node:path";
 import type { Runs } from "../policy/types";
 import { definedEnv, PROJECT, PROJECT_LABEL, RUN_LABEL } from "../stack/up";
 import type { KindProfile } from "./kinds";
-import { APP_USER, type RunDeps } from "./spec";
+import { APP_USER, helperLabels, type RunDeps } from "./spec";
 
 /** Seconds a helper may spend on its work inside its container: the listing, or reading one file. */
 export const HELPER_TIMEOUT_S = 120;
@@ -81,8 +81,9 @@ const plain = (name: string) => /^[A-Za-z0-9._-]{1,64}$/.test(name);
 function helper(volume: string, d: Pick<RunDeps, "project" | "image">): string[] {
   return [
     "docker", "run", "--rm", "--pull", "never", "--network", "none", "--read-only", "--user", APP_USER, "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
-    // The run labels, so `down` and the kill switches find a helper that outlives its CLI; no run's name, so it is never a live run.
-    "--label", RUN_LABEL, "--label", `${PROJECT_LABEL}=${d.project}`, ...(d.project === PROJECT ? [] : ["--label", `org.hapi.int=${d.project}`]),
+    // The run labels, so `down` and the kill switches find a helper that outlives its CLI; no run's name, so it is
+    // never a live run; and the helper label, so the audit holds it to the helpers' invariants.
+    "--label", RUN_LABEL, "--label", `${PROJECT_LABEL}=${d.project}`, ...(d.project === PROJECT ? [] : ["--label", `org.hapi.int=${d.project}`]), ...helperLabels("copyout"),
     "-v", `${volume}:/out:ro`, "--entrypoint", "sh", d.image, "-c",
   ];
 }

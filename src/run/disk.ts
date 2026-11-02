@@ -28,7 +28,7 @@ import { mountable } from "../audit/checks/tools";
 import type { Runs } from "../policy/types";
 import { definedEnv } from "../stack/up";
 import { bounded, HELPER_HOST_TIMEOUT_S, timedOut } from "./copyout";
-import { APP_USER, type RunDeps, runLabels, runName } from "./spec";
+import { APP_USER, helperLabels, type RunDeps, runLabels, runName } from "./spec";
 
 /** Bytes in a GiB: runs.disk.gb counts GiB, and the messages show GiB to one decimal, labelled "GB". */
 export const GIB = 2 ** 30;
@@ -158,7 +158,7 @@ export async function removeVolumeDirs(d: Pick<RunDeps, "run" | "env" | "project
   const r = await d.run(
     bounded([
       "docker", "run", "--rm", "--pull", "never", "--network", "none", "--read-only", "--user", APP_USER, "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
-      ...runLabels(d.project, runId), ...full.flatMap(({ path, at }) => ["-v", `${path}:${at}`]), "--entrypoint", "sh", d.image, "-c", CLEAN_SCRIPT,
+      ...runLabels(d.project, runId), ...helperLabels("clean"), ...full.flatMap(({ path, at }) => ["-v", `${path}:${at}`]), "--entrypoint", "sh", d.image, "-c", CLEAN_SCRIPT,
     ]),
     { env: definedEnv(d.env), inherit: false },
   );

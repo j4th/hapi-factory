@@ -166,6 +166,17 @@ export function runName(project: string, runId: string): string {
   return `${project}-run-${runId}`;
 }
 
+/**
+ * The label every one-shot helper container carries, naming which it is: the copy-out (./copyout.ts), the volume
+ * chown (./lifecycle.ts) or the run disk's cleanup (./disk.ts). The audit holds a helper to the helpers' invariants
+ * (no network, no key, `--rm`, a read-only root, no capability but chown's CHOWN), never to a run kind's definition.
+ */
+export const HELPER_LABEL = "org.hapi.helper";
+export const HELPER_KINDS = ["copyout", "chown", "clean"] as const;
+export type HelperKind = (typeof HELPER_KINDS)[number];
+/** `--label org.hapi.helper=<kind>`. */
+export const helperLabels = (kind: HelperKind): string[] => ["--label", `${HELPER_LABEL}=${kind}`];
+
 /** The labels on every object of a run: its id and project, and `org.hapi.int` for a test project (tests/stack/helpers.ts cleans those up). */
 export function runLabels(project: string, runId: string): string[] {
   return ["--label", `${RUN_LABEL}=${runId}`, "--label", `${PROJECT_LABEL}=${project}`, ...(project === PROJECT ? [] : ["--label", `org.hapi.int=${project}`])];

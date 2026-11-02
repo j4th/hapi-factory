@@ -294,7 +294,8 @@ describe("hapi run start: the order of steps", () => {
       [
         "timeout", "-k", String(HELPER_KILL_AFTER_S), String(HELPER_HOST_TIMEOUT_S),
         "docker", "run", "--rm", "--pull", "never", "--network", "none", "--read-only", "--user", "0:0", "--cap-drop", "ALL", "--cap-add", "CHOWN", "--security-opt", "no-new-privileges:true",
-        ...labels, "-v", `${N}-work:/w`, "-v", `${N}-out:/o`, "--entrypoint", "chown", "hapi-factory/archon:0.12.1", "1001:1001", "/w", "/o",
+        // Its run's labels, so `down` finds it, and org.hapi.helper=chown, so the audit holds it to the helpers' invariants.
+        ...labels, "--label", "org.hapi.helper=chown", "-v", `${N}-work:/w`, "-v", `${N}-out:/o`, "--entrypoint", "chown", "hapi-factory/archon:0.12.1", "1001:1001", "/w", "/o",
       ],
     ]);
     expect(made[5]!.slice(0, 7)).toEqual(["docker", "run", "-d", "--pull", "never", "--name", N]);

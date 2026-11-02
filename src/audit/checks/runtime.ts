@@ -50,7 +50,7 @@ import { loadPolicy } from "../../policy/load";
 import { dataRootOf, diskProblem, GIB, probeFs } from "../../run/disk";
 import { egressOf, KIND_LABEL, type KindProfile, kindProfile, proxyZoneOf, RUN_KINDS, type RunKind } from "../../run/kinds";
 import { RUN_DISK } from "../../run/locks";
-import { APP_HOME, APP_USER, NO_NEW_PRIVILEGES, runArgs, type RunInputs, runName, STOP_GRACE_S } from "../../run/spec";
+import { APP_HOME, APP_USER, HELPER_KINDS, HELPER_LABEL, type HelperKind, NO_NEW_PRIVILEGES, runArgs, type RunInputs, runName, STOP_GRACE_S } from "../../run/spec";
 import { loadManifest, MANIFEST_FILE, manifestEntries } from "../../secrets/manifest";
 import { composeServices } from "../../stack/compose";
 import { HERMES_HOME, proxyEnv, serviceEnvironment } from "../../stack/env";
@@ -79,6 +79,10 @@ export interface Container {
     PortBindings?: Record<string, unknown> | null;
     Tmpfs?: Record<string, string> | null;
     CapDrop?: string[] | null;
+    /** `--cap-add`, as Docker keeps it: `CAP_`-prefixed (`CAP_CHOWN`). */
+    CapAdd?: string[] | null;
+    /** `--rm`. */
+    AutoRemove?: boolean;
     ReadonlyRootfs?: boolean;
     SecurityOpt?: string[] | null;
     PidsLimit?: number | null;
@@ -251,8 +255,8 @@ export function kindProblems(c: Container, profile: KindProfile, zoneKeys: Recor
  * the container is: src/run/spec.ts `runName`, which `createRunObjects` makes), and that network, read with
  * `docker network inspect`, must be internal with a private subnet (src/stack/up.ts `networkProblem`, start's own
  * check) and hold exactly two endpoints: the container (by its id and its name) and its kind's proxy (`egressOf`:
- * egress-archon, or egress-review for a review). Another network, Docker's default bridge, an extra endpoint, or the other zone's
- * proxy each fail.
+ * egress-archon, or egress-review for a review). Another network, Docker's default bridge, an extra endpoint, or the
+ * other zone's proxy each fail.
  */
 export async function runNetworkProblems(run: AuditRun, c: Container, profile: KindProfile): Promise<string[]> {
   const name = containerName(c);
@@ -280,7 +284,8 @@ export async function runNetworkProblems(run: AuditRun, c: Container, profile: K
     problems.push(`its network ${name} holds ${have.length === 0 ? "no endpoint" : have.map(shown).join(", ")}, not exactly ${want.join(" and ")}`);
   }
   // The endpoint named for the container is the container itself: the network's Containers are keyed by id.
-  if (c.Id !== undefined && net.Containers?.[c.Id]?.Name !== name) problems.push(`its network ${name} has no endpoint of this container's id under its name`);
+  if (c.Id === undefined) problems.push(`it has no container id, so its endpoint on ${name} can't be matched by id`);
+  else if (net.Containers?.[c.Id]?.Name !== name) problems.push(`its network ${name} has no endpoint of this container's id under its name`);
   return problems;
 }
 
@@ -325,6 +330,20 @@ export interface RunShape {
 
 const BYTES: Record<string, number> = { "": 1, b: 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3 };
 
+/**
+ * What the argv's `--init` says, as Docker reads it: the last `--init` or `--init=<bool>` wins, and a value Go's
+ * ParseBool doesn't know (Docker would refuse it) says nothing. Undefined: no flag, so the daemon's default.
+ */
+function initOf(argv: string[]): boolean | undefined {
+  const last = argv.filter((a) => a === "--init" || a.startsWith("--init=")).at(-1);
+  if (last === undefined) return undefined;
+  if (last === "--init") return true;
+  const value = last.slice("--init=".length);
+  if (["1", "t", "T", "TRUE", "true", "True"].includes(value)) return true;
+  if (["0", "f", "F", "FALSE", "false", "False"].includes(value)) return false;
+  return undefined;
+}
+
 export function shapeOf(argv: string[]): RunShape {
   const after = (flag: string) => argv.flatMap((a, i) => (argv[i - 1] === flag ? [a] : []));
   const mem = /^(\d+)([bkmg]?)$/i.exec(after("--memory")[0] ?? "");
@@ -346,7 +365,7 @@ export function shapeOf(argv: string[]): RunShape {
     pids: pids === undefined ? undefined : Number(pids),
     memory: mem === null ? undefined : Number(mem[1]) * BYTES[mem[2]!.toLowerCase()]!,
     stopTimeout: stop === undefined ? undefined : Number(stop),
-    init: argv.includes("--init=false") ? false : argv.includes("--init") || argv.includes("--init=true") ? true : undefined,
+    init: initOf(argv),
     ports: argv.some((a) => ["-p", "--publish", "-P", "--publish-all"].includes(a) || a.startsWith("--publish=")),
   };
   for (const v of after("-v")) {
@@ -426,7 +445,53 @@ export function liveProblems(c: Container, want: RunShape, packDir: string): str
   const stop = c.Config?.StopTimeout ?? undefined;
   if (want.stopTimeout !== undefined && stop !== want.stopTimeout) problems.push(`its stop timeout is ${stop ?? "Docker's default"}, not ${want.stopTimeout}`);
   // docker-init at PID 1 would make a verify's or review's guarded kill of what its workflow left a silent no-op.
-  if (h.Init === true) problems.push("it runs an init process at PID 1 (HostConfig.Init), so its prelude isn't PID 1");
+  // A null Init takes the daemon's default, which may be `"init": true`, so it must be what the definition says.
+  if (want.init !== undefined && h.Init !== want.init) {
+    problems.push(`its HostConfig.Init is ${h.Init ?? "unset (the daemon's default)"}, not ${want.init}: an init process may be its PID 1, not its prelude`);
+  }
+  return problems;
+}
+
+/**
+ * What a running container labelled `org.hapi.run` is, by the one rule `runtime.run-container` and
+ * `runtime.dev-override` share, with v its `org.hapi.run` (empty for a copy-out helper):
+ * - **a run container**: v isn't empty and its name is its run's (`runName(PROJECT, v)`): held to its kind's whole
+ *   definition. A helper label never exempts a container with a run's name;
+ * - **a helper**: it carries `org.hapi.helper` with one of `HELPER_KINDS` (src/run/spec.ts): held to the helpers'
+ *   invariants (`helperProblems`), not to a kind's definition;
+ * - **a stray**: anything else, which fails.
+ */
+export function classify(c: Container): { run: true } | { helper: HelperKind } | { stray: string } {
+  const v = c.Config?.Labels?.["org.hapi.run"] ?? "";
+  if (v !== "" && containerName(c) === runName(PROJECT, v)) return { run: true };
+  const helper = c.Config?.Labels?.[HELPER_LABEL];
+  if (helper !== undefined && (HELPER_KINDS as readonly string[]).includes(helper)) return { helper: helper as HelperKind };
+  return { stray: `carries org.hapi.run=${v === "" ? "(empty)" : shown(v)} but is neither its run's container (${v === "" ? "a run's name" : runName(PROJECT, v)}) nor a hapi helper` };
+}
+
+/** A capability's name as Docker keeps it in HostConfig (`CAP_CHOWN`) or as the CLI takes it (`CHOWN`): the bare name. */
+const cap = (c: string) => c.toUpperCase().replace(/^CAP_/, "");
+
+/**
+ * How a helper container (`classify`) falls short of the helpers' invariants (src/run/copyout.ts, ./lifecycle.ts'
+ * chown, src/run/disk.ts's cleanup): no network at all (`--network none`), no env name any zone holds, `--rm`, a
+ * read-only root, every capability dropped, and none added but CHOWN, which only the chown helper has.
+ */
+export function helperProblems(c: Container, kind: HelperKind, zoneKeys: Record<string, string[]>): string[] {
+  const problems: string[] = [];
+  const h = c.HostConfig ?? {};
+  const nets = Object.keys(c.NetworkSettings?.Networks ?? {});
+  if (h.NetworkMode !== "none" || nets.length !== 1 || nets[0] !== "none") {
+    problems.push(`a helper is on no network, but its network is ${shown(h.NetworkMode ?? "(none)")} and it is on ${nets.length === 0 ? "no network" : nets.map(shown).join(", ")}`);
+  }
+  const any = new Set(Object.values(zoneKeys).flat());
+  for (const name of [...envOf(c).keys()].filter((n) => any.has(n)).sort()) problems.push(`${name} is set: a helper holds no key`);
+  if (h.AutoRemove !== true) problems.push("it isn't --rm (HostConfig.AutoRemove)");
+  if (h.ReadonlyRootfs !== true) problems.push("its root filesystem is not read-only");
+  if (!(h.CapDrop ?? []).map(cap).includes("ALL")) problems.push("it does not drop ALL capabilities");
+  const added = (h.CapAdd ?? []).map(cap).sort();
+  const allowed = kind === "chown" ? ["CHOWN"] : [];
+  if (added.some((a) => !allowed.includes(a))) problems.push(`it adds ${added.join(", ")}, where a ${kind} helper may add ${allowed.length === 0 ? "none" : allowed.join(", ")}`);
   return problems;
 }
 
@@ -468,16 +533,22 @@ export async function runContainer(run: AuditRun): Promise<CheckResult[]> {
   if (static_.length > 0) return [result(id, "fail", `the run definition (runArgs, src/run/spec.ts): ${static_.join("; ")}. ${fix}`)];
 
   const runs = await runContainers(run);
-  // A run container is named for its run (`<project>-run-<org.hapi.run>`), as src/stack/up.ts's liveRuns tells one: a
-  // copy-out or chown helper caught mid-flight carries the run labels (a bare org.hapi.run) but no run's name, runs
-  // with --network none and is gone in seconds, so it is no run container to hold to a kind's definition.
-  const isRun = (c: Container) => {
-    const runId = c.Config?.Labels?.["org.hapi.run"];
-    return runId !== undefined && runId !== "" && containerName(c) === runName(PROJECT, runId);
-  };
-  const live = "containers" in runs ? runs.containers.filter((c) => isRunning(c) && isRun(c)) : [];
+  // Every running container the run labels select is a run container, a helper or a stray (`classify`).
+  const running = "containers" in runs ? runs.containers.filter(isRunning) : [];
+  const live = running.filter((c) => "run" in classify(c));
   const checkedLive: (readonly [Container, string[]])[] = [];
-  for (const c of live) {
+  let helpers = 0;
+  for (const c of running) {
+    const what = classify(c);
+    if ("stray" in what) {
+      checkedLive.push([c, [what.stray]]);
+      continue;
+    }
+    if ("helper" in what) {
+      helpers++;
+      checkedLive.push([c, helperProblems(c, what.helper, zoneKeys)]);
+      continue;
+    }
     // A container's kind is its label; a Plan 02 run container has none, and is a worker's.
     const label = c.Config?.Labels?.[KIND_LABEL];
     if (label !== undefined && !(RUN_KINDS as readonly string[]).includes(label)) {
@@ -494,16 +565,16 @@ export async function runContainer(run: AuditRun): Promise<CheckResult[]> {
       result(
         id,
         "fail",
-        `${bad.map(([c, p]) => `${containerName(c)}: ${p.join("; ")}`).join("; ")}. A live run container must be as its kind's run definition says, and hold only its kind's zone's keys: stop it with \`hapi run stop <id>\`, then ${fix}`,
+        `${bad.map(([c, p]) => `${containerName(c)}: ${p.join("; ")}`).join("; ")}. A live run container must be as its kind's run definition says, and hold only its kind's zone's keys, and a helper must be as the helpers are made (src/run/copyout.ts, lifecycle.ts, disk.ts); anything else labelled org.hapi.run isn't hapi's: stop a run with \`hapi run stop <id>\`, remove anything else, then ${fix}`,
       ),
     ];
   }
   const checked =
     "unavailable" in runs
       ? `no live run container was checked (${runs.unavailable})`
-      : live.length === 0
+      : live.length === 0 && helpers === 0
         ? "no live run container was checked (none is running)"
-        : `${live.length} live run containers are as their kind's definition says, each holding only its kind's zone's keys, on its own internal network with only its kind's proxy`;
+        : `${live.length} live run containers are as their kind's definition says, each holding only its kind's zone's keys, on its own internal network with only its kind's proxy${helpers === 0 ? "" : `, and ${helpers} helpers as the helpers are made (no network, no key, --rm, read-only, no capability but chown's CHOWN)`}`;
   const nonProxy = Object.entries(serviceEnvironment("archon")).filter(([k]) => !/proxy/i.test(k)).length;
   const binds = RUN_KINDS.map((k) => `${k} ${readOnlyDestinations(kindProfile(k), buildDir).length}`).join(", ");
   return [
@@ -609,7 +680,8 @@ export async function devOverride(run: AuditRun): Promise<CheckResult[]> {
     problems.push(`this shell sets HAPI_ALLOW_CURRENT_USER=1 as ${shell.user}, not ${HAPI_USER}, so \`mise run up\` from it runs the stack as ${shell.user}`);
   }
   const stack = await liveContainers(run);
-  const containers = "containers" in stack ? stack.containers.filter(isRunning) : [];
+  // A helper caught mid-flight carries no stack labels: runtime.run-container holds it to the helpers' invariants.
+  const containers = "containers" in stack ? stack.containers.filter((c) => isRunning(c) && !(c.Config?.Labels?.["org.hapi.run"] !== undefined && "helper" in classify(c))) : [];
   for (const c of containers) {
     const v = label(c, "org.hapi.dev-override") ?? "";
     const by = label(c, "org.hapi.started-by") ?? "";

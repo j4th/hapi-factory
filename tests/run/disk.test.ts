@@ -115,10 +115,11 @@ describe("the cleanup helper", () => {
     }
     return { work, out };
   }
+  // It carries its run's labels, so `down` finds it, and org.hapi.helper=clean, so the audit holds it to the helpers' invariants.
   const helperArgv = (mounts: string[]) =>
     bounded([
       "docker", "run", "--rm", "--pull", "never", "--network", "none", "--read-only", "--user", "1001:1001", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
-      ...runLabels("hapi", ID), ...mounts, "--entrypoint", "sh", "hapi-factory/archon:0.12.1", "-c", CLEAN_SCRIPT,
+      ...runLabels("hapi", ID), "--label", "org.hapi.helper=clean", ...mounts, "--entrypoint", "sh", "hapi-factory/archon:0.12.1", "-c", CLEAN_SCRIPT,
     ]);
 
   test("the cleanup helper empties only the run's existing dirs as 1001:1001, then they are removed", async () => {
