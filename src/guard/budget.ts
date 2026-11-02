@@ -38,6 +38,12 @@
  * - a file that was already unreadable when this process started is covered by
  *   the decision log's highest total so far (log.ts `highest`, index.ts).
  *
+ * Each process's totals never fall, but two Pi nodes running at once would each
+ * write their own into the one log, interleaved, and a lower one after a higher
+ * one makes spendOfRun read the run's spend as unknown: a false unknown, which
+ * fails closed (the run counts at its whole budget). Today's workflows run their
+ * Pi nodes one after another.
+ *
  * The residual: the ledger is in the worker's own tmpfs, so its shell can edit or
  * delete it (the write tool can't: rule 1). An unreadable file counts as 0, and
  * so does a started attempt that left no file (known from its session_start in

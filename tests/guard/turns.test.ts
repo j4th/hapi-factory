@@ -27,10 +27,39 @@ test("the turn budget is run.json's turns, counted across the run's attempts in 
   // The spend record of that turn comes first, and counts it.
   expect([log.at(-2).rule, log.at(-2).turns]).toEqual(["spend", 2]);
 
-  // A later attempt of the run counts the earlier one's turns: it is stopped at its first turn that isn't the last.
+  // A later attempt of the run counts the earlier one's turns, and is held to them before it sends or runs a tool,
+  // as the spend is (the Task 10 review's ruling): no paid request goes out, and no turn is added.
   const b = setup({ share: a, settings: gatesOff, run: (r) => (r.turns = 2), attempt: "attempt-B" });
   await b.start();
-  await expect(turn(b, 0)).rejects.toThrow(HARD(2, "3 turns"));
+  expect(await b.tool("bash", { command: "ls" })).toEqual({
+    block: true,
+    reason: "hapi-guard: the run's turn budget of 2 is spent (2 turns); no more tool calls (rule run-turns)",
+  });
+  await expect(b.fire("before_provider_headers", { headers: {} })).rejects.toThrow(HARD(2, "2 turns"));
+  expect(rec(b.log().at(-1))).toEqual(["budget", "fail", "run-turns"]);
+  await expect(b.fire("before_provider_headers", { headers: {} })).rejects.toThrow(HARD(2, "2 turns"));
+  await expect(turn(b, 0, "stop")).rejects.toThrow(HARD(2, "2 turns"));
+  expect(b.log().filter((r) => r.rule === "spend").map((r) => r.turns)).toEqual([1, 2]);
+  // Without a send first, a final turn past the budget still fails: only the turn that reaches it is let end.
+  const c = setup({ share: a, settings: gatesOff, run: (r) => (r.turns = 2), attempt: "attempt-C" });
+  await c.start();
+  await expect(turn(c, 0, "stop")).rejects.toThrow(HARD(2, "3 turns"));
+});
+
+test("soft mode flags a spent turn budget once, at a send or a turn end, and goes on", async () => {
+  const soft = (s: any) => (gatesOff(s), (s.budgets.mode = "soft"));
+  const a = setup({ settings: soft, run: (r) => (r.turns = 1), attempt: "attempt-A" });
+  await a.start();
+  expect(await turn(a, 0, "stop")).toBeUndefined();
+  const b = setup({ share: a, settings: soft, run: (r) => (r.turns = 1), attempt: "attempt-B" });
+  await b.start();
+  expect(await b.fire("before_provider_headers", { headers: {} })).toBeUndefined();
+  expect(await b.fire("before_provider_headers", { headers: {} })).toBeUndefined();
+  expect(await b.tool("ls", { path: "." })).toBeUndefined();
+  expect(await turn(b, 0)).toBeUndefined();
+  expect(b.log().filter((r) => r.attempt === "attempt-B" && r.rule === "run-turns").map((r) => [r.decision, r.turns, r.reason])).toEqual([
+    ["flag", 1, "the run's turn budget of 1 is spent (1 turn); the run goes on and is flagged (budgets.enforcement.hapi_guard: soft)"],
+  ]);
 });
 
 test("the turn that ends the session never fails on turns", async () => {
@@ -72,6 +101,8 @@ test("after a turn stop, a tool call is blocked as run-turns, without touching t
   await expect(h.fire("before_provider_headers", { headers: {} })).rejects.toThrow(HARD(2, "2 turns"));
   await expect(h.fire("message_end", { message: { role: "assistant" } })).rejects.toThrow(HARD(2, "2 turns"));
   await expect(turn(h, 2)).rejects.toThrow(HARD(2, "2 turns"));
+  // A session_start in the same process (a session replaced) throws the stop too, before it reads anything.
+  await expect(h.start()).rejects.toThrow(HARD(2, "2 turns"));
   expect(h.log().filter((r) => r.rule === "error")).toEqual([]);
 });
 

@@ -14,16 +14,35 @@
  * rest) and any wrapper (`sudo`, `env`, `xargs`, `nohup`, `timeout` and the
  * like, WRAPPERS) with its `-` options, their values (`xargs -n 1 rm`, `sudo
  * -u root rm`) and a leading count (`timeout 5 rm`), and past `function <name>`.
- * Only the command word's basename is tested (`/bin/rm` is `rm`), so `grep -n
- * install AGENTS.md` writes nothing. The write indicators, and the words each
- * one writes (its **targets**):
+ * `env`'s and `sudo`'s options are read exactly: `env -C d` and `sudo -D d`
+ * (`--chdir`) run the command in `d`, so its targets are judged there too, and
+ * one without its value, or `sudo -R` (a new root), takes the broad rule.
+ * `eval`'s arguments and `env -S`'s string are read again as commands of their
+ * own. Only the command word's basename is tested (`/bin/rm` is `rm`), so
+ * `grep -n install AGENTS.md` writes nothing.
+ *
+ * A segment led by an **opaque wrapper** (OPAQUE: `eval`, `watch`, `flock`,
+ * `chroot`, `strace`, `fakeroot`, `parallel`, `su`, `runuser` and the like),
+ * which runs its command in a way this rule can't follow, takes **the broad
+ * rule**, Plan 02's in full: a file command's name anywhere, sed or perl with an
+ * in-place switch after it, or a git write makes every word and every `=` value
+ * a target. Any other command word is read as itself, never broadly: rule 7
+ * doesn't read `rsync`, `tar -x` or an archive tool. Options are read as GNU
+ * getopt reads them, a long one by any prefix (`--targ`, `--ex=`, `--in-pl`),
+ * an ambiguous prefix counting as each option it could be. The write
+ * indicators, and the words each one writes (its **targets**):
  *
  * - an output redirection (`>`, `>>`, `>|`, `&>`, `N>`), of any simple command:
  *   its target;
  * - `cp`, `install` and `ln`: the `-t`/`--target-directory` value, else the last
- *   operand, and in a target directory (`-t`, a trailing "/", or one that
- *   exists) the file each source makes there; `ln` with one operand makes
- *   `./<name>`, and `install -d` makes every operand;
+ *   operand, and in a target directory (`-t`, a trailing "/", one that exists,
+ *   or one a `mkdir` earlier in the command makes) the file each source makes
+ *   there, by its name past any trailing "/"; a recursive `cp` (`-r`, `-R`, `-a`,
+ *   `--recursive`, `--archive`) walks each source directory (up to WALK_LIMIT
+ *   entries, past DEPENDENCY_DIRS) and judges every file where it lands
+ *   (`T/<name>/...` in a target directory, else `T/...`, and `T/...` for an
+ *   `S/.` source); `ln` with one operand makes `./<name>`, and `install -d`
+ *   makes every operand;
  * - `dd`: its `of=` values;
  * - `mv` and the other file commands (`tee`, `rm`, `chmod`, `chown`,
  *   `truncate`, `touch`, `mkdir`, `rmdir`, `unlink`, `patch`): every operand,
@@ -33,8 +52,8 @@
  *   `-e`/`-E`, gives it), so `sed -i 's/../X/' notes.md` targets notes.md alone;
  * - git's `config` (not `--get`/`--list`; it writes `.git/config`), `apply`,
  *   `checkout`, `restore`, `rm` and `mv`: every word, and the value after `=`;
- * - `find` with `-exec`, `-execdir`, `-ok` or `-okdir` running a file command:
- *   every word, as git's.
+ * - `find` with `-exec`, `-execdir`, `-ok` or `-okdir` whose command, read as
+ *   any simple command is, writes (or is opaque): every word, as git's.
  *
  * The **directories** a target is resolved against: the cwd, and every
  * directory a `cd` or `pushd` earlier in the command may have moved to, all at
@@ -43,7 +62,10 @@
  * the new ones, and blocks if any lands on a protected path (H-223(b)). `cd`'s
  * `--`, `-L`, `-P`, `-e` and `-@` are parsed; any other option blocks, since
  * where the later words land can't be known; `cd -`, `popd` and a `pushd` that
- * only rotates add no directory. Past MAX_DIRS directories, the command blocks.
+ * only rotates add no directory. When CDPATH or OLDPWD is in play (the command
+ * names either, or the shell's env sets CDPATH), a `cd` to a relative name that
+ * doesn't start with "." or "/", and `cd -`, block the same way. Past MAX_DIRS
+ * directories, the command blocks.
  *
  * A target blocks when it resolves (`~`, symlinks and a shell glob's expansion
  * applied) to a protected path of the worktree, or into Pi's agent dir, the
@@ -66,7 +88,7 @@
  * as this repo's, so `rm -rf node_modules` stays allowed.
  */
 import { lstatSync, readdirSync, statSync } from "node:fs";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { isProtected, namedRel, realPath, relTo, type Roots, Unresolvable, within } from "./paths";
 
 /** One simple command: its words, and the targets of its output redirections. */
@@ -199,54 +221,29 @@ const GIT_VALUE_OPTIONS = new Set(["-C", "-c", "--git-dir", "--work-tree", "--na
 const KNOWN = new Set([...FILE_COMMANDS, "sed", "perl", "git", "find"]);
 /** The shell's reserved words that can come before a command in a simple command, as parseShell splits them. */
 const RESERVED = new Set(["if", "then", "else", "elif", "do", "while", "until", "!", "{", "}"]);
-/** Commands that run the command after them (and their options). */
+/** Commands that run the command after them, past their options. */
 const WRAPPERS = new Set(["sudo", "doas", "env", "xargs", "command", "builtin", "exec", "nohup", "nice", "ionice", "time", "timeout", "stdbuf", "setsid", "busybox"]);
+/**
+ * Commands that run another command in a way this rule can't follow (their own syntax for it, a new root, a script,
+ * a trace): a segment led by one is judged by the broad rule (broadIndicator).
+ */
+const OPAQUE = new Set([
+  "eval", "coproc", "watch", "chroot", "flock", "unshare", "nsenter", "strace", "ltrace", "fakeroot", "parallel", "su", "runuser", "script",
+  "setpriv", "prlimit", "taskset", "chrt", "numactl", "systemd-run", "firejail", "bwrap", "proot", "valgrind", "unbuffer", "rlwrap", "sg",
+  "faketime", "torsocks", "proxychains", "proxychains4", "catchsegv",
+]);
 /** find's actions that run a command. */
 const FIND_EXEC = new Set(["-exec", "-execdir", "-ok", "-okdir"]);
 
 const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
-/** A word's last path component: `/bin/rm` is `rm`. */
-const baseName = (w: string | undefined): string => (w === undefined ? "" : w.slice(w.lastIndexOf("/") + 1));
+/** A word's last path component, past any trailing "/": `/bin/rm` is `rm`, `a/b/` is `b`. */
+const baseName = (w: string | undefined): string => {
+  if (w === undefined) return "";
+  const t = w.length > 1 ? w.replace(/\/+$/, "") : w;
+  return t.slice(t.lastIndexOf("/") + 1);
+};
 
-/** The index of a simple command's command word (see the module comment); `words.length` when it has none. */
-export function commandAt(words: string[]): number {
-  /** A word that is a wrapper option's value or a count, not a command: after an option (`-n 1`, `-u root`), or a number or duration (`timeout 5s`). */
-  const valueLike = (k: number): boolean => {
-    const w = words[k]!;
-    if (KNOWN.has(baseName(w)) || WRAPPERS.has(baseName(w))) return false;
-    const prev = words[k - 1]!;
-    return (prev.startsWith("-") && prev !== "--" && !prev.includes("=")) || /^\d[\d.]*[smhd]?$/.test(w);
-  };
-  let i = 0;
-  for (;;) {
-    while (i < words.length && (ENV_ASSIGNMENT.test(words[i]!) || RESERVED.has(words[i]!))) i++;
-    // `function f { ...`: the name is no command.
-    if (words[i] === "function") {
-      i += 2;
-      continue;
-    }
-    if (!WRAPPERS.has(baseName(words[i]))) return i;
-    i++;
-    while (i < words.length) {
-      const w = words[i]!;
-      if ((w.startsWith("-") && w !== "-") || ENV_ASSIGNMENT.test(w) || valueLike(i)) i++;
-      else break;
-    }
-  }
-}
-
-/** Whether a sed or perl switch cluster turns on in-place editing; `takesRest` are the switches whose argument is the rest of the word. */
-function inPlace(word: string, takesRest: string): boolean {
-  if (word.startsWith("--")) return /^--in-place(=|$)/.test(word);
-  if (!word.startsWith("-")) return false;
-  for (const ch of word.slice(1)) {
-    if (ch === "i") return true;
-    if (takesRest.includes(ch)) return false;
-  }
-  return false;
-}
-
-/** How a command's options take values, for parseArgs. */
+/** How a command's options take values (parseArgs), and which of a wrapper's change its cwd or its root. */
 interface OptionSpec {
   /** Short options whose value is the rest of the word, or else the next word. */
   next?: string;
@@ -254,7 +251,25 @@ interface OptionSpec {
   rest?: string;
   /** Long options whose value is after "=", or else the next word. */
   long?: string[];
+  /** A wrapper's options that run the command in another directory, short and long. */
+  chdir?: string[];
+  /** A wrapper's options that run the command under another root. */
+  chroot?: string[];
 }
+
+/** The wrappers whose options are read exactly, for the directory they run the command in (env -C, sudo -D). */
+const WRAPPER_SPECS: Record<string, OptionSpec> = {
+  env: { next: "uCS", long: ["unset", "chdir", "split-string"], chdir: ["C", "chdir"] },
+  sudo: {
+    next: "CDghprtTUuR",
+    long: ["close-from", "chdir", "group", "host", "prompt", "role", "type", "command-timeout", "other-user", "user", "chroot"],
+    chdir: ["D", "chdir"],
+    chroot: ["R", "chroot"],
+  },
+};
+
+/** The long options of `spec` a `--name` stands for: GNU getopt takes any unambiguous prefix, and an ambiguous one counts as each. */
+const longMatches = (name: string, spec: OptionSpec): string[] => (name === "" ? [] : (spec.long ?? []).filter((o) => o.startsWith(name)));
 
 /** A command's arguments as GNU getopt reads them: its operands (all of them after `--`), and its option values by name. */
 function parseArgs(args: string[], spec: OptionSpec): { operands: string[]; values: Map<string, string[]> } {
@@ -270,9 +285,10 @@ function parseArgs(args: string[], spec: OptionSpec): { operands: string[]; valu
     if (w.startsWith("--")) {
       const eq = w.indexOf("=");
       const name = eq < 0 ? w.slice(2) : w.slice(2, eq);
-      if (eq >= 0) put(name, w.slice(eq + 1));
-      else if (spec.long?.includes(name) && i + 1 < args.length) put(name, args[++i]!);
-      else put(name, "");
+      const matches = longMatches(name, spec);
+      const keys = matches.length > 0 ? matches : [name];
+      const value = eq >= 0 ? w.slice(eq + 1) : matches.length > 0 && i + 1 < args.length ? args[++i]! : "";
+      for (const k of keys) put(k, value);
       continue;
     }
     if (w.length > 1 && w.startsWith("-")) {
@@ -294,11 +310,120 @@ function parseArgs(args: string[], spec: OptionSpec): { operands: string[]; valu
   return { operands, values };
 }
 
-/** A word a command writes. `into`: the names it makes inside that word when the word is a directory; `always`: it is one. */
+/** A simple command's command word, and what its wrappers say about how it runs (see the module comment). */
+interface Head {
+  /** The command word's index; `words.length` when there is none. */
+  at: number;
+  /** Directories a wrapper runs it in (`env -C`, `sudo -D`), as given. */
+  chdirs: string[];
+  /** A wrapper this rule can't follow: an opaque one, a new root, or a directory option without its value. */
+  broad: boolean;
+  /** Text the shell runs as commands of its own: `eval`'s arguments, `env -S`'s string. */
+  more?: string;
+}
+
+/** The command word of a simple command, past assignments, reserved words, `function <name>` and wrappers. */
+export function headOf(words: string[]): Head {
+  const out: Head = { at: words.length, chdirs: [], broad: false };
+  /** A word that is a wrapper option's value or a count, not a command: after an option (`-n 1`), or a number or duration (`timeout 5s`). */
+  const valueLike = (k: number): boolean => {
+    const w = words[k]!;
+    const name = baseName(w);
+    if (KNOWN.has(name) || WRAPPERS.has(name) || OPAQUE.has(name)) return false;
+    const prev = words[k - 1]!;
+    return (prev.startsWith("-") && prev !== "--" && !prev.includes("=")) || /^\d[\d.]*[smhd]?$/.test(w);
+  };
+  let i = 0;
+  for (;;) {
+    while (i < words.length && (ENV_ASSIGNMENT.test(words[i]!) || RESERVED.has(words[i]!))) i++;
+    if (words[i] === "function") {
+      i += 2;
+      continue;
+    }
+    const name = baseName(words[i]);
+    if (name === "eval") out.more = words.slice(i + 1).join(" ");
+    if (!WRAPPERS.has(name)) {
+      out.at = i;
+      out.broad ||= OPAQUE.has(name);
+      return out;
+    }
+    i++;
+    const spec = WRAPPER_SPECS[name];
+    if (spec === undefined) {
+      while (i < words.length && ((words[i]!.startsWith("-") && words[i] !== "-") || ENV_ASSIGNMENT.test(words[i]!) || valueLike(i))) i++;
+      continue;
+    }
+    // env and sudo: their options read exactly, for the directory or the root they give the command.
+    const take = (key: string, value: string | undefined) => {
+      if (spec.chroot?.includes(key)) out.broad = true;
+      if (spec.chdir?.includes(key)) {
+        if (value === undefined || value === "") out.broad = true;
+        else out.chdirs.push(value);
+      }
+      if (name === "env" && (key === "S" || key === "split-string") && value !== undefined) out.more = [value, ...words.slice(i + 1)].join(" ");
+    };
+    while (i < words.length) {
+      const w = words[i]!;
+      if (w === "--") {
+        i++;
+        break;
+      }
+      if (ENV_ASSIGNMENT.test(w)) {
+        i++;
+        continue;
+      }
+      if (w.startsWith("--")) {
+        const eq = w.indexOf("=");
+        const matches = longMatches(eq < 0 ? w.slice(2) : w.slice(2, eq), spec);
+        if (matches.length > 0) {
+          const value = eq >= 0 ? w.slice(eq + 1) : words[++i];
+          for (const m of matches) take(m, value);
+        }
+        i++;
+        continue;
+      }
+      if (w.length > 1 && w.startsWith("-")) {
+        for (let k = 1; k < w.length; k++) {
+          const ch = w[k]!;
+          if (!spec.next?.includes(ch)) continue;
+          const tail = w.slice(k + 1);
+          take(ch, tail !== "" ? tail : words[++i]);
+          break;
+        }
+        i++;
+        continue;
+      }
+      break;
+    }
+  }
+}
+
+/** The index of a simple command's command word (headOf). */
+export const commandAt = (words: string[]): number => headOf(words).at;
+
+/** Whether a sed or perl switch cluster turns on in-place editing (`--in-place` or any prefix of it); `takesRest` are the switches whose argument is the rest of the word. */
+function inPlace(word: string, takesRest: string): boolean {
+  if (word.startsWith("--")) {
+    const name = word.slice(2).split("=")[0]!;
+    return name !== "" && "in-place".startsWith(name);
+  }
+  if (!word.startsWith("-")) return false;
+  for (const ch of word.slice(1)) {
+    if (ch === "i") return true;
+    if (takesRest.includes(ch)) return false;
+  }
+  return false;
+}
+
+/**
+ * A word a command writes. `into`: the names it makes inside that word when the word is a directory (`always`: it
+ * is one). `sources`: a recursive copy's sources, whose trees land under it.
+ */
 interface Target {
   word: string;
   into?: string[];
   always?: boolean;
+  sources?: string[];
 }
 
 /** The value after "=" in each word that has one (`of=x`, `--directory=x`). */
@@ -307,20 +432,32 @@ const eqValues = (words: string[]): string[] =>
     const eq = w.indexOf("=");
     return eq > 0 && eq < w.length - 1 ? [w.slice(eq + 1)] : [];
   });
-/** Every word but options, and the value after "=": what git and find name. */
+/** Every word but options, and the value after "=": what git, find and the broad rule name. */
 const everyWord = (words: string[]): Target[] => [...words.filter((w) => !w.startsWith("-")), ...eqValues(words)].map((word) => ({ word }));
+
+const COPY_SPECS: Record<string, OptionSpec> = {
+  cp: { next: "tS", long: ["target-directory", "suffix", "sparse", "no-preserve"] },
+  install: { next: "tSmog", long: ["target-directory", "suffix", "mode", "owner", "group", "strip-program"] },
+  ln: { next: "tS", long: ["target-directory", "suffix"] },
+};
+
+/** Whether parseArgs' values hold a recursive copy's switch: -r, -R, -a, or --recursive, --archive or a prefix of either. */
+const recursive = (values: Map<string, string[]>): boolean =>
+  [...values.keys()].some((k) => (k.length === 1 ? "rRa".includes(k) : "recursive".startsWith(k) || "archive".startsWith(k)));
 
 /** cp's, install's and ln's targets (see the module comment). */
 function copyTargets(cmd: string, args: string[]): Target[] {
-  const spec: OptionSpec = cmd === "install" ? { next: "tSmog", long: ["target-directory", "suffix", "mode", "owner", "group"] } : { next: "tS", long: ["target-directory", "suffix"] };
-  const { operands, values } = parseArgs(args, spec);
-  if (cmd === "install" && (values.has("d") || values.has("directory"))) return operands.map((word) => ({ word }));
-  const dirs = [...(values.get("t") ?? []), ...(values.get("target-directory") ?? [])].filter((d) => d !== "");
+  const { operands, values } = parseArgs(args, COPY_SPECS[cmd]!);
+  if (cmd === "install" && (values.has("d") || [...values.keys()].some((k) => k.length > 1 && "directory".startsWith(k)))) return operands.map((word) => ({ word }));
+  const dirs = (values.get("target-directory") ?? []).concat(values.get("t") ?? []).filter((d) => d !== "");
   const names = (sources: string[]) => sources.map(baseName).filter((n) => n !== "" && n !== "." && n !== "..");
-  if (dirs.length > 0) return dirs.map((word) => ({ word, into: names(operands), always: true }));
+  const tree = cmd === "cp" && recursive(values);
+  const withSources = (t: Target, sources: string[]): Target => (tree ? { ...t, sources } : t);
+  if (dirs.length > 0) return dirs.map((word) => withSources({ word, into: names(operands), always: true }, operands));
   if (operands.length === 0) return [];
   if (operands.length === 1) return cmd === "ln" ? [{ word: baseName(operands[0]) || operands[0]! }] : [];
-  return [{ word: operands.at(-1)!, into: names(operands.slice(0, -1)) }];
+  const sources = operands.slice(0, -1);
+  return [withSources({ word: operands.at(-1)!, into: names(sources) }, sources)];
 }
 
 /** An in-place edit's targets: every operand but the script. `scripts` are the options that give the script instead. */
@@ -341,8 +478,52 @@ interface Indicator {
   base?: string;
 }
 
-/** What one simple command, with its command word at `at`, writes (see the module comment). */
-function indicator(words: string[], at: number): Indicator {
+/** git's write subcommands, from the word `git` at `g`: whether it writes, deletes, and the paths it writes unnamed. */
+function gitWrites(words: string[], g: number, out: Indicator): void {
+  let j = g + 1;
+  for (; j < words.length; j++) {
+    const w = words[j]!;
+    const value = words[j + 1];
+    if (w === "-C" && value !== undefined) out.base = value;
+    if (GIT_VALUE_OPTIONS.has(w)) j++;
+    else if (!w.startsWith("-")) break;
+  }
+  const sub = words[j];
+  const rest = words.slice(j + 1);
+  if (sub === "config") {
+    const read = rest[0] === "get" || rest[0] === "list" || rest.some((w) => w.startsWith("--get") || w === "--list" || w === "-l");
+    if (!read) {
+      out.write = true;
+      out.implicit.push(".git/config");
+    }
+  } else if (sub !== undefined && GIT_WRITES.has(sub)) {
+    out.write = true;
+    if (sub === "rm" || sub === "mv") out.tree = true;
+  }
+}
+
+/**
+ * The broad rule, for a segment this rule can't follow (an opaque wrapper, a new root, a directory it can't read):
+ * Plan 02's rule in full. A file command's name anywhere, sed or perl with an in-place switch after it, or a git
+ * write makes every word, and every `=` value, a target; any of `rm`, `rmdir` and `mv` makes them trees.
+ */
+function broadIndicator(words: string[]): Indicator {
+  const names = words.map(baseName);
+  const out: Indicator = { write: names.some((n) => FILE_COMMANDS.has(n)), tree: names.some((n) => TREE_COMMANDS.has(n)), targets: [], implicit: [] };
+  const sed = names.indexOf("sed");
+  if (sed >= 0 && words.slice(sed + 1).some((w) => inPlace(w, "efl"))) out.write = true;
+  const perl = names.indexOf("perl");
+  if (perl >= 0 && words.slice(perl + 1).some((w) => inPlace(w, "eEMmIxFlCdDV0"))) out.write = true;
+  const git = names.indexOf("git");
+  if (git >= 0) gitWrites(words, git, out);
+  if (out.write) out.targets = everyWord(words);
+  return out;
+}
+
+/** What one simple command writes (see the module comment). */
+function indicator(words: string[], head: Head): Indicator {
+  if (head.broad) return broadIndicator(words);
+  const at = head.at;
   const cmd = baseName(words[at]);
   const args = words.slice(at + 1);
   const out: Indicator = { write: false, tree: false, targets: [], implicit: [] };
@@ -359,34 +540,24 @@ function indicator(words: string[], at: number): Indicator {
     out.write = true;
     out.targets = editTargets(args, { next: "eE", rest: "iMmIxFlCdDV0" }, ["e", "E"]);
   } else if (cmd === "git") {
-    let j = at + 1;
-    for (; j < words.length; j++) {
-      const w = words[j]!;
-      const value = words[j + 1];
-      if (w === "-C" && value !== undefined) out.base = value;
-      if (GIT_VALUE_OPTIONS.has(w)) j++;
-      else if (!w.startsWith("-")) break;
-    }
-    const sub = words[j];
-    const rest = words.slice(j + 1);
-    if (sub === "config") {
-      const read = rest[0] === "get" || rest[0] === "list" || rest.some((w) => w.startsWith("--get") || w === "--list" || w === "-l");
-      if (!read) {
-        out.write = true;
-        out.implicit.push(".git/config");
-      }
-    } else if (sub !== undefined && GIT_WRITES.has(sub)) {
-      out.write = true;
-      if (sub === "rm" || sub === "mv") out.tree = true;
-    }
+    gitWrites(words, at, out);
     if (out.write) out.targets = everyWord(words);
   } else if (cmd === "find") {
-    const run = args.findIndex((w, k) => FIND_EXEC.has(w) && FILE_COMMANDS.has(baseName(args[k + 1])));
-    if (run >= 0) {
-      out.write = true;
-      out.tree = TREE_COMMANDS.has(baseName(args[run + 1]));
-      out.targets = everyWord(words);
+    // Each -exec's command, read as any simple command is: a write there makes every word of the find a target.
+    for (let k = 0; k < args.length; k++) {
+      if (!FIND_EXEC.has(args[k]!)) continue;
+      let end = k + 1;
+      while (end < args.length && args[end] !== ";" && args[end] !== "+") end++;
+      const run = args.slice(k + 1, end);
+      const inner = headOf(run);
+      const ran = indicator(run, inner);
+      if (ran.write || inner.broad) {
+        out.write = true;
+        out.tree ||= ran.tree;
+      }
+      k = end;
     }
+    if (out.write) out.targets = everyWord(words);
   }
   return out;
 }
@@ -484,6 +655,8 @@ export interface ShellContext {
   piDir: string;
   /** The decision log's dir (`paths.out`), real. */
   out: string;
+  /** Whether the shell's env sets CDPATH, so a relative `cd` may go anywhere (index.ts reads it from the guard's env). */
+  cdpath?: boolean;
 }
 
 export interface ShellBlock {
@@ -537,6 +710,8 @@ function refused(abs: string, word: string, tree: boolean, c: ShellContext): She
 
 /** The most directories a command's `cd`s may have left it in before it blocks (see the module comment). */
 const MAX_DIRS = 64;
+/** The most times one command's `eval` or `env -S` text is read again as commands. */
+const MAX_NESTED = 32;
 
 /** Whether a word has a ".." segment: where a logical and a physical `cd` can part. */
 const hasDotDot = (w: string): boolean => w.split("/").includes("..");
@@ -545,6 +720,10 @@ const hasDotDot = (w: string): boolean => w.split("/").includes("..");
 export function checkShell(command: string, c: ShellContext): ShellBlock | undefined {
   /** Every directory the command may be in by now: the cwd, and where each earlier cd or pushd may have gone. */
   let dirs = [c.cwd];
+  /** Directories an earlier `mkdir` in the command makes, as resolved lexically. */
+  const made = new Set<string>();
+  /** CDPATH or OLDPWD may send a `cd` somewhere this rule can't see (H-223). */
+  const cdUnknown = c.cdpath === true || /CDPATH|OLDPWD/.test(command);
   const tilde = (w: string) => (w === "~" ? c.home : w.startsWith("~/") ? step(c.home, w.slice(2)) : w);
   /** A word as the kernel gets it: `~` expanded, relative to `base`, unnormalized. */
   const under = (base: string, w: string) => {
@@ -555,33 +734,87 @@ export function checkShell(command: string, c: ShellContext): ShellBlock | undef
     try {
       return statSync(p).isDirectory();
     } catch {
-      return false;
+      return made.has(resolve(p));
     }
   };
-  /** Where a target word, resolved against `base`, lands, as refused judges it; and the files it makes inside a target dir. */
-  const judge = (t: Target, tree: boolean, base: string): ShellBlock | undefined => {
-    const abs = under(base, t.word);
-    for (const path of /[*?[]/.test(t.word) ? expand(abs) : [abs]) {
-      const hit = refused(path, t.word, tree, c);
-      if (hit) return hit;
-      if (t.into === undefined || !(t.always || t.word.endsWith("/") || isDir(path))) continue;
-      for (const name of t.into) {
-        const inner = refused(step(path, name), step(t.word, name), false, c);
-        if (inner) return inner;
+  const paths = (word: string, abs: string) => (/[*?[]/.test(word) ? expand(abs) : [abs]);
+  /** A recursive copy of the directory `src` to `root`: each file it makes, judged where it lands. */
+  const copied = (src: string, root: string, word: string): ShellBlock | undefined => {
+    const queue: [dir: string, rel: string][] = [[src, ""]];
+    let seen = 0;
+    while (queue.length > 0) {
+      const [dir, rel] = queue.shift()!;
+      let entries: string[] = [];
+      try {
+        entries = readdirSync(dir);
+      } catch {
+        continue;
+      }
+      for (const name of entries) {
+        if (++seen > WALK_LIMIT) return undefined;
+        const r = rel === "" ? name : `${rel}/${name}`;
+        const hit = refused(step(root, r), step(word, r), false, c);
+        if (hit) return hit;
+        try {
+          if (!DEPENDENCY_DIRS.has(name) && lstatSync(step(dir, name)).isDirectory()) queue.push([step(dir, name), r]);
+        } catch {
+          // gone
+        }
       }
     }
     return undefined;
   };
-  for (const { words, redirects } of parseShell(command)) {
-    const at = commandAt(words);
-    const head = words[at];
-    const cd = head === "cd" || head === "pushd" || head === "popd";
-    const ind = cd ? undefined : indicator(words, at);
-    const targets: [t: Target, tree: boolean][] = redirects.map((word) => [{ word }, false]);
-    if (ind?.write) for (const t of ind.targets) targets.push([t, ind.tree]);
+  /** Where a target word, resolved against `base`, lands, as refused judges it; the files it makes inside a target dir; a recursive copy's tree. */
+  const judge = (t: Target, tree: boolean, base: string): ShellBlock | undefined => {
+    for (const path of paths(t.word, under(base, t.word))) {
+      const hit = refused(path, t.word, tree, c);
+      if (hit) return hit;
+      const asDir = t.always === true || t.word.endsWith("/") || isDir(path);
+      if (t.into !== undefined && asDir) {
+        for (const name of t.into) {
+          const inner = refused(step(path, name), step(t.word, name), false, c);
+          if (inner) return inner;
+        }
+      }
+      for (const s of t.sources ?? []) {
+        for (const src of paths(s, under(base, s))) {
+          if (!isDir(src)) continue;
+          // `cp -r S T` makes T/<S's name>/... in an existing directory T, else T/...; `cp -r S/. T` makes T/... either way.
+          const contents = s === "." || s.endsWith("/.") || s.endsWith("/./");
+          const root = asDir && !contents ? step(path, baseName(s)) : path;
+          const hit2 = copied(src, root, asDir && !contents ? step(t.word, baseName(s)) : t.word);
+          if (hit2) return hit2;
+        }
+      }
+    }
+    return undefined;
+  };
+  const cantFollow = (what: string): ShellBlock => ({ rule: "shell-write", reason: `this command's ${what} can't be followed, so where its later words land can't be known` });
+  const queue = parseShell(command);
+  let nested = 0;
+  while (queue.length > 0) {
+    const { words, redirects } = queue.shift()!;
+    const h = headOf(words);
+    if (h.more !== undefined) {
+      if (++nested > MAX_NESTED) return { rule: "shell-write", reason: `this command nests eval or env -S more than ${MAX_NESTED} deep, so what it runs can't be known` };
+      queue.unshift(...parseShell(h.more));
+    }
+    const head = words[h.at];
+    const cd = !h.broad && (head === "cd" || head === "pushd" || head === "popd");
+    const ind = cd ? undefined : indicator(words, h);
+    // The shell opens a redirect where it is; a wrapper's directory (`env -C d`, `sudo -D d`) runs this command, and
+    // only this one, there too.
     for (const dir of dirs) {
-      for (const [t, tree] of targets) {
-        const hit = judge(t, tree, dir);
+      for (const word of redirects) {
+        const hit = judge({ word }, false, dir);
+        if (hit) return hit;
+      }
+    }
+    const here = new Set(dirs);
+    for (const d of dirs) for (const v of h.chdirs) here.add(resolve(d, tilde(v)));
+    for (const dir of here) {
+      for (const t of ind?.write ? ind.targets : []) {
+        const hit = judge(t, ind!.tree, dir);
         if (hit) return hit;
       }
       if (ind?.write) {
@@ -592,9 +825,17 @@ export function checkShell(command: string, c: ShellContext): ShellBlock | undef
         }
       }
     }
+    if (!h.broad && baseName(head) === "mkdir") {
+      // Each directory it makes, and with -p the ones above it, count as directories for the rest of the command.
+      for (const d of here) {
+        for (const op of parseArgs(words.slice(h.at + 1), { next: "m", long: ["mode"] }).operands) {
+          for (let p = resolve(under(d, op)); p !== dirname(p) && !made.has(p); p = dirname(p)) made.add(p);
+        }
+      }
+    }
     if (!cd || head === "popd") continue;
     // cd's and pushd's options (bash's `cd [-L|[-P [-e]] [-@]] [dir]`, `pushd [-n] [+N | -N | dir]`).
-    const args = words.slice(at + 1);
+    const args = words.slice(h.at + 1);
     let i = 0;
     let rotate = false;
     for (; i < args.length; i++) {
@@ -610,11 +851,14 @@ export function checkShell(command: string, c: ShellContext): ShellBlock | undef
         rotate = true;
         break;
       }
-      return { rule: "shell-write", reason: `this command's ${head} ${w} can't be followed, so where its later words land can't be known` };
+      return cantFollow(`${head} ${w}`);
     }
     const to = args[i];
+    const rotation = rotate || (head === "pushd" && to !== undefined && /^\+\d+$/.test(to));
+    // `cd -` goes to OLDPWD, and a relative name may go through CDPATH: unknowable when either is in play.
+    if (!rotation && cdUnknown && (to === "-" || (to !== undefined && !/^[./~]/.test(to)))) return cantFollow(`${head} ${to}`);
     // `cd -` and `popd` go back to a directory already in `dirs`; so does a pushd with no operand, or a rotation.
-    if (rotate || to === "-" || (head === "pushd" && (to === undefined || /^\+\d+$/.test(to)))) continue;
+    if (rotation || to === "-" || (head === "pushd" && to === undefined)) continue;
     const target = to ?? c.home;
     const next = new Set(dirs);
     for (const d of dirs) {
