@@ -82,7 +82,9 @@ nodes:
       [ -n "${CODERABBIT_API_KEY:-}" ] || skip "the review zone gave this run no CODERABBIT_API_KEY"
       # The review session has ended: no process left running Claude Code's binary (ARCHON_ENV's CLAUDE_BIN_PATH).
       [ -n "${CLAUDE_BIN_PATH:-}" ] || skip "CLAUDE_BIN_PATH is not set, so whether the review session has ended can't be told"
-      alive() { for p in /proc/[0-9]*; do if [ "$(readlink "$p/exe" 2> /dev/null)" = "$CLAUDE_BIN_PATH" ]; then return 0; fi; done; return 1; }
+      # /proc/<pid>/exe is the resolved path, so it is compared with the binary's resolved path.
+      want=$(readlink -f "$CLAUDE_BIN_PATH") || skip "CLAUDE_BIN_PATH doesn't resolve, so whether the review session has ended can't be told"
+      alive() { for p in /proc/[0-9]*; do if [ "$(readlink "$p/exe" 2> /dev/null)" = "$want" ]; then return 0; fi; done; return 1; }
       i=0
       while alive && [ "$i" -lt 20 ]; do sleep 0.5; i=$((i + 1)); done
       if alive; then skip "the review session's Claude Code process is still running, so the key stays off argv"; fi

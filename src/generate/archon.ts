@@ -96,6 +96,12 @@ export interface RunFile {
   sidecar_port?: number;
   /** A review run's alone: whether its CodeRabbit step runs, the overlaid policy's `runs.phases.coderabbit`. */
   coderabbit?: boolean;
+  /**
+   * The model the run's session runs on, as its own run config's alias names it: `@implement`'s for a worker or a fix,
+   * `@review`'s for a review (the record's `model`); absent for a verify, which runs none. factory-task's commit
+   * node writes it as the `Model:` trailer with jq, so it runs no bun that the worker's `$HOME` could steer.
+   */
+  model?: string;
 }
 
 /**

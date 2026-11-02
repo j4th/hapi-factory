@@ -320,7 +320,7 @@ describe("hapi run start: the order of steps", () => {
     const dir = join(f.deps.stateDir, id);
     expect(JSON.parse(readFileSync(join(dir, "run.json"), "utf8"))).toEqual({
       run_id: id, work_order: "0003-check-run", traceparent: TRACEPARENT, budget_usd: 1.5, public: true, workflow: "hapi-check-run", started_at: NOW.toISOString(),
-      kind: "worker", round: 0, turns: 10, base: SHA, sha: SHA,
+      kind: "worker", round: 0, turns: 10, base: SHA, sha: SHA, model: IMPLEMENT_MODEL,
     });
     const gitDir = realpathSync(join(f.repo, ".git"));
     expect(await readRecord(f.deps.stateDir, id)).toEqual({
@@ -882,6 +882,23 @@ describe("startRun", () => {
       const a = await kinded();
       const rec = await startRun(a.f.deps, a.review({ sha: SHA2 }));
       expect([runJson(a.f, rec.runId).sha, runJson(a.f, rec.runId).base]).toEqual([SHA2, SHA]);
+    });
+
+    test("run.json's model is the record's, the one its alias names: implement's for a worker or a fix, review's for a review, none for a verify", async () => {
+      capture();
+      // Each start in a world of its own: one live run per repo.
+      const a = await kinded();
+      const worker = await startRun(a.f.deps, a.base());
+      expect([runJson(a.f, worker.runId).model, worker.model]).toEqual([IMPLEMENT_MODEL, IMPLEMENT_MODEL]);
+      const b = await kinded();
+      const fix = await startRun(b.f.deps, b.base({ kind: "fix", parent: P, inputsDir: inputsIn(b.f.tmp, { "findings.md": "x\n" }, "inputs-fix") }));
+      expect(runJson(b.f, fix.runId).model).toBe(IMPLEMENT_MODEL);
+      const c = await kinded();
+      const review = await startRun(c.f.deps, c.review());
+      expect(runJson(c.f, review.runId).model).toBe(POLICY.rosters.anthropic.medium.model);
+      const d = await kinded();
+      const verify = await startRun(d.f.deps, d.base({ kind: "verify", parent: P, budgetUsd: 0 }));
+      expect("model" in runJson(d.f, verify.runId)).toBe(false);
     });
 
     test("a fix or review run needs an inputs dir holding its kind's inputs alone (a fix's findings.md; a review's diff.patch, and verify.json), copied into its run dir 0755 with 0644 files; a worker or verify run takes none", async () => {

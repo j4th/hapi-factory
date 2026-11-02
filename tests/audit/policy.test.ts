@@ -34,10 +34,14 @@ describe("policy.budget-enforcement", () => {
     expect(r.detail).toContain("budgets.enforcement: hapi_guard and archon are both soft: no enforcer stops a run at run_usd (design §3.5)");
   });
 
-  test("either one hard passes", async () => {
-    for (const modes of [{ hapi_guard: "hard", archon: "soft" }, { hapi_guard: "soft", archon: "hard" }]) {
+  test("either one hard passes, and the detail says which stops a Pi run: Archon bounds nodes, never dollars (H-257)", async () => {
+    for (const [modes, says] of [
+      [{ hapi_guard: "hard", archon: "soft" }, "hapi-guard stops a Pi run at run_usd"],
+      [{ hapi_guard: "soft", archon: "hard" }, "Archon bounds the run's nodes (max_work_units), not its dollars, so nothing stops a Pi run at run_usd (H-257)"],
+    ] as const) {
       const r = await enforcement(modes);
-      expect([modes, r.status]).toEqual([modes, "pass"]);
+      expect([modes, r.status, r.detail]).toEqual([modes, "pass", expect.stringContaining(says)]);
+      expect(r.detail).not.toContain("Archon stops");
     }
   });
 });

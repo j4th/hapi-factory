@@ -155,6 +155,15 @@ describe("pins.versions", () => {
       ["RUN mise use -g aqua:zizmorcore/zizmor@1.31.1", "pass"],
       ["RUN mise use -g node", "fail", "mise use node has no version"],
       ["RUN mise install --locked", "pass"],
+      ["RUN mise install --locked bun@1.4.2", "pass"],
+      ["RUN mise --version", "pass"],
+      // mise exec and mise x: the tools before `--` are pinned, and the command after it is read as its own.
+      ["RUN mise exec bun@1.4.2 -- bun --version", "pass"],
+      ["RUN mise x node -- node -v", "fail", "mise x node has no version"],
+      ["RUN mise exec zizmor@latest -- zizmor --version", "fail", "mise exec zizmor@latest has no version"],
+      ["RUN mise exec bun@1.4.2 -- npm install left-pad", "fail", "npm install left-pad has no version"],
+      ["RUN mise exec -- bun ci --frozen-lockfile", "pass"],
+      ["RUN mise -C /tmp/x install zizmor", "fail", "mise install zizmor has no version"],
     ];
     for (const [line, status, says] of cases) {
       const r = await pins((root) => append(root, "stack/archon/Dockerfile", `${line}\n`));

@@ -165,6 +165,9 @@ nodes:
       mise run check || fail "mise run check failed"
       if [ "$smoke" = true ]; then mise run smoke || fail "mise run smoke failed"; fi
   # One commit per piece, in the work order's order, with spec §13.2's trailers. Never a push: the host takes the bundle.
+  # The gates' scope check ran before their checks, and the checks run the worker's code, so this node checks the scope
+  # again: HEAD still the run's commit and nothing staged before it stages anything, and each commit on the one before
+  # it, holding its own piece's files alone. It runs no bun: nothing the worker wrote under $HOME loads here.
   - id: commit
     depends_on: [gates]
     bash: |
@@ -177,16 +180,26 @@ nodes:
       [ "$wo" = "${INPUTS_WORK_ORDER_ID:-}" ] || fail "the work order at $order is $wo, not the run's input"
       # hapi's run id: the Archon run's id ends with its container (ruling b2(6)).
       hapi_run=$(jq -r .run_id "$run")
+      start=$(jq -r '.sha // empty' "$run")
       trace=$(printf '%s' "${INPUTS_TRACEPARENT:-}" | cut -d- -f2)
       printf '%s' "$trace" | grep -Eq '^[0-9a-f]{32}$' || fail "the run's traceparent has no trace id"
       pi=$(jq -r .version /app/node_modules/@earendil-works/pi-coding-agent/package.json)
-      # The model @implement names in this run's own config, read from / so that no bunfig.toml of the repo's loads.
-      model=$(cd / && bun --no-env-file -e 'console.log(Bun.YAML.parse(await Bun.file("/opt/hapi/run-config.yaml").text()).aliases["@implement"].model)')
-      [ -n "$model" ] || fail "/opt/hapi/run-config.yaml names no model for @implement"
+      # The model @implement names in this run's own config, as the host wrote it in run.json.
+      model=$(jq -r '.model // empty' "$run")
+      [ -n "$model" ] || fail "$run names no model for @implement"
+      # Nothing the checks ran has committed or staged anything since the gates' scope check.
+      [ -n "$start" ] || fail "$run names no commit the run started from"
+      [ "$(git rev-parse HEAD)" = "$start" ] || fail "HEAD has moved from the run's commit since the session ended: something the checks ran committed"
+      if ! git diff --cached --quiet; then
+        git diff --cached --name-only >&2
+        fail "the index holds staged changes (above) before this node staged any: something the checks ran staged them"
+      fi
+      prev=$start
       n=$(jq '.pieces | length' "$order")
       for i in $(seq 0 $((n - 1))); do
         piece=$(jq -r ".pieces[$i].id" "$order")
         mapfile -t globs < <(jq -r "$def"' .pieces['"$i"'].files[] | norm | ":(glob)" + .' "$order")
+        mapfile -t others < <(jq -r "$def"' .pieces['"$i"'].files[] | norm | ":(exclude,glob)" + .' "$order")
         # Stage the piece's changed files: only the pathspecs that match a change (git add refuses one that doesn't).
         for g in "${globs[@]}"; do
           if [ -n "$(git status --porcelain --untracked-files=all -- "$g")" ]; then git add --all -- "$g"; fi
@@ -195,5 +208,11 @@ nodes:
         git commit -q -m "$wo: $piece" \
           --trailer "Work-Order: $wo" --trailer "Hapi-Run: $hapi_run" --trailer "Hapi-Lane: factory" \
           --trailer "Trace-Id: $trace" --trailer "Agent: pi@$pi" --trailer "Model: $model"
+        # The commit sits on the one before it and holds this piece's declared files alone.
+        [ "$(git rev-parse HEAD^)" = "$prev" ] || fail "the commit of $piece doesn't sit on the run's last commit: something else committed"
+        stray=$(git diff --name-only "$prev" HEAD -- . "${others[@]}")
+        if [ -n "$stray" ]; then printf '%s\n' "$stray" >&2; fail "the commit of $piece holds files (above) outside its declared files"; fi
+        prev=$(git rev-parse HEAD)
         git log --oneline -1
       done
+      [ "$(git rev-parse HEAD)" = "$prev" ] || fail "HEAD moved after the last commit: something else committed"

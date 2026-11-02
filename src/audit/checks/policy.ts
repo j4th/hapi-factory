@@ -14,5 +14,7 @@ export async function budgetEnforcement(run: AuditRun): Promise<CheckResult[]> {
   if (guard === "soft" && archon === "soft") {
     return [result(id, "fail", "budgets.enforcement: hapi_guard and archon are both soft: no enforcer stops a run at run_usd (design §3.5). Set one to hard in policy/budgets.yaml, in a PR")];
   }
-  return [result(id, "pass", `budgets.enforcement: hapi_guard ${guard}, archon ${archon}: ${guard === "hard" ? "hapi-guard" : "Archon"} stops a run at run_usd`)];
+  // Archon bounds a run's nodes (max_work_units), never its dollars, so only hapi-guard stops a run at run_usd (H-257).
+  const how = guard === "hard" ? "hapi-guard stops a Pi run at run_usd" : "Archon bounds the run's nodes (max_work_units), not its dollars, so nothing stops a Pi run at run_usd (H-257)";
+  return [result(id, "pass", `budgets.enforcement: hapi_guard ${guard}, archon ${archon}: ${how}`)];
 }

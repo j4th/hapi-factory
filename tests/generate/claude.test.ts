@@ -28,7 +28,8 @@ test("emitClaude writes Claude Code's managed settings: no hooks, no plugins, no
       allow: ["Read(//run/hapi/inputs/**)", "Read(//run/hapi/order.json)", "Read(//run/hapi/task.md)"],
       // Every tool that writes, runs or reaches out, and every read of /proc: the environment there holds the review
       // zone's keys, and a deny holds for a symlink's target too (the operator's argv exception, condition 2).
-      deny: ["Bash", "Edit", "MultiEdit", "NotebookEdit", "Task", "WebFetch", "WebSearch", "Write", "Read(//proc/**)"],
+      // Agent is Claude Code 2.1.302's subagent tool (T19 r2 listed it); Task its older name.
+      deny: ["Agent", "Bash", "Edit", "MultiEdit", "NotebookEdit", "Task", "WebFetch", "WebSearch", "Write", "Read(//proc/**)"],
       disableBypassPermissionsMode: "disable",
     },
     env: { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", DISABLE_AUTOUPDATER: "1", DISABLE_TELEMETRY: "1" },

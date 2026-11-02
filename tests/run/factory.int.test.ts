@@ -161,6 +161,56 @@ describe.skipIf(!INT || !ONLINE)("the factory pack in the run image (a throwaway
     expect(lines.at(-2)).toBe("0.9.1");
   }, 120_000);
 
+  test("the CodeRabbit node's alive() sees the review's Claude Code binary while it runs, by its resolved path, a link to it included, and not once it has ended (fix round 1)", async () => {
+    const cr: string = YAML.parse(readFileSync(join(REPO, "archon", "workflows", "hapi", "factory-review.yaml"), "utf8")).nodes.find((x: { id: string }) => x.id === "coderabbit").bash;
+    const lines = cr.split("\n").map((l) => l.trim());
+    const want = lines.find((l) => l.startsWith("want=$(readlink -f"))!;
+    const alive = lines.find((l) => l.startsWith("alive() {"))!;
+    expect([want, alive].every((l) => l !== undefined)).toBe(true);
+    const script = [
+      'skip() { echo "skip: $1"; exit 0; }',
+      want,
+      alive,
+      '(sleep 8 | "$CLAUDE_BIN_PATH" -p > /dev/null 2>&1) &',
+      "sleep 3",
+      'if alive; then echo "real: alive"; else echo "real: not alive"; fi',
+      'ln -s "$CLAUDE_BIN_PATH" /tmp/claude-link',
+      "CLAUDE_BIN_PATH=/tmp/claude-link",
+      want,
+      'if alive; then echo "link: alive"; else echo "link: not alive"; fi',
+      "wait",
+      'if alive; then echo "after: alive"; else echo "after: not alive"; fi',
+    ].join("\n");
+    const r = await run(["docker", "run", "--rm", "--name", `${p.name}-alive`, "--label", `org.hapi.int=${p.name}`, "--pull", "never", "--network", "none", "--read-only",
+      "--user", "1001:1001", "--tmpfs", "/tmp", "--tmpfs", `${APP_HOME}:uid=1001,gid=1001`, "-e", `HOME=${APP_HOME}`, "-e", `ANTHROPIC_API_KEY=${FAKE_KEY}`,
+      "-e", `CLAUDE_BIN_PATH=${serviceEnvironment("archon").CLAUDE_BIN_PATH}`, "--entrypoint", "bash", image, "-c", script], { timeoutMs: 120_000 });
+    expect(r.stdout.trim().split("\n")).toEqual(["real: alive", "link: alive", "after: not alive"]);
+  }, 120_000);
+
+  test("mise reads no global config from the run's $HOME, which the worker can write; and the scan fails on any config mise loaded but the root mise.toml (fix round 1)", async () => {
+    const repo = dir("mise-global");
+    put(join(repo, "mise.toml"), '[tasks.check]\nrun = "true"\n');
+    const scan = `sh ${RUN_PATHS.pack}/mise-config-scan.sh`;
+    const script = [
+      'mkdir -p "$HOME/.config/mise/conf.d"',
+      'printf "[tasks.check]\\nrun = \\"echo forged\\"\\n" > "$HOME/.config/mise/config.toml"',
+      'printf "[env]\\nFORGED = \\"1\\"\\n" > "$HOME/.config/mise/conf.d/x.toml"',
+      'mise config ls --json | jq -r ".[].path"',
+      `${scan} > /dev/null 2>&1; echo "scan=$?"`,
+      // As if mise loaded a global config from a path the worker wrote: the scan names it.
+      `MISE_GLOBAL_CONFIG_FILE="$HOME/.config/mise/config.toml" ${scan} 2>&1; echo "scan=$?"`,
+    ].join("\n");
+    const r = await run(["docker", "run", "--rm", "--name", `${p.name}-mise-global`, "--label", `org.hapi.int=${p.name}`, "--pull", "never", "--network", "none", "--read-only",
+      "--user", "1001:1001", "--tmpfs", "/tmp", "--tmpfs", `${APP_HOME}:uid=1001,gid=1001`, "-e", `HOME=${APP_HOME}`,
+      "-v", `${repo}:/work/repo:ro`, "-v", `${join(REPO, "archon", "workflows", "hapi")}:${RUN_PATHS.pack}:ro`, "-w", "/work/repo", "--entrypoint", "sh", image, "-c", script], { timeoutMs: 120_000 });
+    const out = r.stdout.trim().split("\n");
+    // Only the checkout's own config loads, and the scan passes it.
+    expect(out.slice(0, 2)).toEqual(["/work/repo/mise.toml", "scan=0"]);
+    expect(out).toContain(`${APP_HOME}/.config/mise/config.toml`);
+    expect(out.at(-1)).toBe("scan=1");
+    expect(r.stdout).toContain("mise config or tasks besides the root mise.toml");
+  }, 120_000);
+
   describe("factory-verify, under verify.sh", () => {
     let repo: string;
     const shas: Record<string, string> = {};
@@ -232,7 +282,9 @@ describe.skipIf(!INT || !ONLINE)("the factory pack in the run image (a throwaway
     let sha: string;
     let pack: string;
     /** The work order: one small piece declared as `./check.txt` (preflight and the gates drop the `.`), one source. */
-    const task = { ...order, id: "0011-factory-task", workflow: "factory-task", pieces: [{ id: "check", files: ["./check.txt"], size: "small" }], sources: ["docs/notes.md"] };
+    // tests/plant.test.ts is in the piece too, so a stand-in can plant a test the gates' check runs: code that runs
+    // after the gates' scope check.
+    const task = { ...order, id: "0011-factory-task", workflow: "factory-task", pieces: [{ id: "check", files: ["./check.txt", "tests/plant.test.ts"], size: "small" }], sources: ["docs/notes.md"] };
     beforeAll(async () => {
       repo = dir("task-repo");
       await git(repo, ["init", "-q", "-b", "main"]);
@@ -257,6 +309,10 @@ describe.skipIf(!INT || !ONLINE)("the factory pack in the run image (a throwaway
         "  outside) echo after > check.txt; echo stray > stray.txt; rec done ;;",
         "  missing) echo after > check.txt ;;",
         "  declined) rec no-change ;;",
+        // The session commits for itself (the gates' HEAD check).
+        "  selfcommit) echo after > check.txt; git commit -qam self; rec done ;;",
+        // A test the gates' check runs stages a stray file, or commits (the commit node's own checks).
+        "  plantstage|plantcommit) echo after > check.txt; mkdir -p tests; cp \"/opt/t11/$STANDIN.test.ts\" tests/plant.test.ts; rec done ;;",
         "esac",
       ].join("\n");
       for (const n of wf.nodes) if (n.id === "implement" || n.id === "fix") {
@@ -264,10 +320,19 @@ describe.skipIf(!INT || !ONLINE)("the factory pack in the run image (a throwaway
         n.bash = standIn;
       }
       writeFileSync(join(pack, "factory-task.yaml"), YAML.stringify(wf), { mode: 0o644 });
+      plants = dir("task-plants");
+      const plant = (git: string) => `import { test } from "bun:test";\nimport { execSync } from "node:child_process";\nimport { writeFileSync } from "node:fs";\ntest("plant", () => {\n  writeFileSync("stray.txt", "stray\\n");\n  execSync(${JSON.stringify(git)});\n});\n`;
+      put(join(plants, "plantstage.test.ts"), plant("git add stray.txt"));
+      put(join(plants, "plantcommit.test.ts"), plant("git add -A && git commit -qm planted"));
     }, 60_000);
 
+    /** The planted tests: each runs during the gates' `mise run check`, after their scope check. */
+    let plants: string;
     const runTask = (standIn: string, kind = "worker") =>
-      runOnce({ entry: ["sh", "/opt/hapi/run.sh", "factory-task", sha, task.id, TRACEPARENT], source: repo, runFile: runFile(kind, sha, { workflow: "factory-task" }), order: task, pack, env: { STANDIN: standIn } });
+      runOnce({
+        entry: ["sh", "/opt/hapi/run.sh", "factory-task", sha, task.id, TRACEPARENT], source: repo, runFile: runFile(kind, sha, { workflow: "factory-task", model: policy.rosters.anthropic[policy.roles.implement].model }), order: task, pack,
+        env: { STANDIN: standIn }, binds: [[plants, "/opt/t11"]],
+      });
     /** What the run says of itself: the transcript and result.json, where a failed node's stderr lands. */
     const said = (out: Record<string, string>) => `${out["transcript.jsonl"] ?? ""}\n${out["result.json"] ?? ""}`;
     const states = (out: Record<string, string>) => Object.fromEntries((JSON.parse(out["result.json"]!).run.nodes as { nodeId: string; state: string }[]).map((x) => [x.nodeId, x.state]));
@@ -306,6 +371,25 @@ describe.skipIf(!INT || !ONLINE)("the factory pack in the run image (a throwaway
       const r = await runTask("missing");
       expect(states(r.out)).toMatchObject({ gates: "failed", commit: "skipped" });
       expect(said(r.out)).toContain("the session's last result is missing");
+    }, 600_000);
+
+    test("a session that commits for itself fails the gates: HEAD is no longer the run's commit", async () => {
+      const r = await runTask("selfcommit");
+      expect(states(r.out)).toMatchObject({ implement: "completed", gates: "failed", commit: "skipped" });
+      expect(said(r.out)).toContain("HEAD has moved from the run's commit: the session committed");
+    }, 600_000);
+
+    test("code the gates' check runs that stages a stray file fails the commit node before it commits anything (fix round 1)", async () => {
+      const r = await runTask("plantstage");
+      expect(states(r.out)).toMatchObject({ gates: "completed", commit: "failed" });
+      expect(said(r.out)).toContain("the index holds staged changes (above) before this node staged any");
+      expect(r.out["run.bundle"]).toBeUndefined();
+    }, 600_000);
+
+    test("code the gates' check runs that commits fails the commit node: HEAD moved since the session ended (fix round 1)", async () => {
+      const r = await runTask("plantcommit");
+      expect(states(r.out)).toMatchObject({ gates: "completed", commit: "failed" });
+      expect(said(r.out)).toContain("HEAD has moved from the run's commit since the session ended");
     }, 600_000);
 
     test("a fix round that declines every finding passes the gates with no change, and commits nothing (ruling b2(2)); a worker that does so fails", async () => {

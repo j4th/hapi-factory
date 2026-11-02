@@ -638,6 +638,8 @@ export async function startRun(d: RunDeps, o: StartOptions): Promise<StartedRun>
     kind: o.kind, round, turns: o.kind === "fix" ? Math.min(order.budget.turns, phases.round_turns) : order.budget.turns, base, sha: o.sha,
     // factory-task's preflight probes the sidecar on this port when the work order smokes (Task 11).
     ...(sidecarPort === undefined ? {} : { sidecar_port: sidecarPort }),
+    // The model its session runs on (its alias's, as the record says): factory-task's commit trailer reads it.
+    ...(rec.model === undefined ? {} : { model: rec.model }),
     // A review's CodeRabbit node runs only when the overlaid policy says so (Task 11 reads it).
     ...(o.kind === "review" ? { coderabbit: phases.coderabbit } : {}),
   };

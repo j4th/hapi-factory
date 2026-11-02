@@ -42,6 +42,8 @@ test("RUN_PATHS holds the run container's fixed paths", () => {
   // Task 11: the commit the run starts from (factory-task's gates hold HEAD to it), and the smoke sidecar's port when the repo names one.
   const smoked: RunFile = { ...engine, sha: "b".repeat(40), sidecar_port: 8080 };
   expect(Object.keys(smoked)).toHaveLength(13);
+  // Fix round 1: the model its session runs on, which factory-task's commit trailer reads with jq.
+  expect(Object.keys({ ...smoked, model: "anthropic/claude-opus-5-5" } satisfies RunFile)).toHaveLength(14);
 });
 
 test("config.yaml holds assistants.pi.enableExtensions: true for every roster (H-181(b))", () => {

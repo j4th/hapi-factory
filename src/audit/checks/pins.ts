@@ -13,7 +13,7 @@
  *   pulls a registry image of that name) and whose Dockerfile is checked.
  * - each Dockerfile: every `FROM` and `COPY --from=` image by digest (an
  *   earlier stage's name is fine), every package a `RUN` installs by
- *   name (apt-get, apt, apk, pip, uv, npm, bun, pnpm, yarn, go, mise) at an
+ *   name (apt-get, apt, apk, pip, uv, npm, bun, pnpm, yarn, go, and mise's install, use and exec) at an
  *   exact version, behind any BuildKit flag, wrapper or shell keyword, and
  *   every `ADD` of a URL (or a git remote) with its SHA-256
  *   (`--checksum=sha256:<64 hex>`), so a download is the one reviewed.
@@ -90,7 +90,7 @@ const NPM_EXACT = /^(?:@[A-Za-z0-9._-]+\/)?[A-Za-z0-9._-]+@v?\d+\.\d+\.\d+(?:[-+
  * its own word (`apt-get -o Acquire::Retries=3 install`, `pip --index-url URL install`) doesn't hide it. That fails
  * closed: `go build -o install ./x` reads as an install.
  */
-function installAt(w: string[]): { installer: string; pkgs: string[]; ok: (p: string) => boolean } | undefined {
+function installAt(w: string[]): { installer: string; pkgs: string[]; ok: (p: string) => boolean; next?: number } | undefined {
   const cmd = (w[0] ?? "").split("/").at(-1)!;
   const args = w.slice(1).filter((a) => !a.startsWith("-"));
   /** The first of `subs` (each one or more words) to stand in args, and the words after it. */
@@ -116,8 +116,19 @@ function installAt(w: string[]): { installer: string; pkgs: string[]; ok: (p: st
   }
   if (cmd === "bun" || cmd === "pnpm" || cmd === "yarn") return found(`${cmd} add`, at(["add"]), (p) => NPM_EXACT.test(p));
   if (cmd === "go") return found("go install", at(["install"]), (p) => /@v\d+\.\d+\.\d+/.test(p));
-  // mise: `mise install bun@1.4.2`; a bare tool, @latest, a prefix (`@2`) or a range resolves to whatever is newest.
+  // mise, by its subcommand: `mise install bun@1.4.2`, `mise use -g x@1.2.3`, and `mise exec` (or `mise x`) with
+  // its tools before `--`, the command after it read as a command of its own (`next`). A bare tool, @latest, a prefix
+  // (`@2`) or a range resolves to whatever is newest.
   if (cmd === "mise") {
+    const at0 = w.findIndex((x, j) => j > 0 && !x.startsWith("-"));
+    const sub = at0 === -1 ? undefined : w[at0];
+    if (sub === "install" || sub === "use") return { installer: `mise ${sub}`, pkgs: w.slice(at0 + 1).filter((a) => !a.startsWith("-")), ok: (p) => MISE_EXACT.test(p) };
+    if (sub === "exec" || sub === "x") {
+      const end = w.indexOf("--", at0);
+      const tools = w.slice(at0 + 1, end === -1 ? undefined : end).filter((a) => !a.startsWith("-"));
+      return { installer: `mise ${sub}`, pkgs: tools, ok: (p) => MISE_EXACT.test(p), ...(end === -1 ? {} : { next: end + 1 }) };
+    }
+    // An option's value before the subcommand (`mise -C dir install x`) hides it: fail closed, as for any installer.
     const f = at(["install"], ["use"]);
     return f === undefined ? undefined : found(`mise ${f.sub}`, f, (p) => MISE_EXACT.test(p));
   }
@@ -140,7 +151,9 @@ export function installs(run: string): { installer: string; pkg: string; pinned:
       const found = installAt(w.slice(i));
       if (found === undefined) continue;
       for (const pkg of found.pkgs) out.push({ installer: found.installer, pkg, pinned: found.ok(pkg) });
-      break;
+      // A wrapper's own command (`mise exec <tools> -- <command>`) is read on from where it starts.
+      if (found.next === undefined) break;
+      i += found.next - 1;
     }
     for (const quoted of w) if (/\s/.test(quoted)) out.push(...installs(quoted));
   }

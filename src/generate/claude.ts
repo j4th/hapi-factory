@@ -39,7 +39,8 @@ export function emitClaude(p: Policy): Record<string, string> {
     strictKnownMarketplaces: [],
     permissions: {
       allow: [read(`${RUN_PATHS.inputs}/**`), read(RUN_PATHS.order), read(RUN_PATHS.task)],
-      deny: ["Bash", "Edit", "MultiEdit", "NotebookEdit", "Task", "WebFetch", "WebSearch", "Write", read("/proc/**")],
+      // Agent is Claude Code 2.1.302's subagent tool (Task its older name; spike 09, T19 r2 listed Agent).
+      deny: ["Agent", "Bash", "Edit", "MultiEdit", "NotebookEdit", "Task", "WebFetch", "WebSearch", "Write", read("/proc/**")],
       disableBypassPermissionsMode: "disable",
     },
     env: {

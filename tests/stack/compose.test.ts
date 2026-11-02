@@ -139,15 +139,32 @@ describe("pins", () => {
     expect(mise).toBeLessThan(froms.length - 1);
     expect(froms.at(-1)).toMatch(/^FROM ghcr\.io\/coleam00\/archon:0\.12\.1@/);
     expect(docker).toContain("COPY --from=mise /usr/local/bin/mise /usr/local/bin/mise");
-    // Every tool the template's mise.toml pins is installed at that version (Bun.TOML.parse, as mise reads it).
+    // The tools install from the contract's own lock, so each download is checked against its checksum (fix round 1):
+    // the image's [tools] are the template mise.toml's (Bun.TOML.parse, as mise reads it) and its mise.lock is the
+    // template's, byte for byte, both as COPY heredocs; `mise install --locked` installs each tool at its pin.
+    const heredoc = (dst: string) => {
+      const start = docker.indexOf(`COPY <<'EOF' ${dst}\n`);
+      expect([dst, start]).not.toEqual([dst, -1]);
+      const body = docker.slice(start + `COPY <<'EOF' ${dst}\n`.length);
+      return body.slice(0, body.indexOf("\nEOF\n") + 1);
+    };
     const template = Bun.TOML.parse(readFileSync(join(REPO, "templates", "repo-contract", "mise.toml.tmpl"), "utf8")) as { tools: Record<string, string> };
-    const install = lines.find((l) => l.startsWith("RUN mise install "))!;
     expect(Object.keys(template.tools).length).toBeGreaterThan(0);
+    expect((Bun.TOML.parse(heredoc("/tmp/hapi-tools/mise.toml")) as { tools: Record<string, string> }).tools).toEqual(template.tools);
+    expect(heredoc("/tmp/hapi-tools/mise.lock")).toBe(readFileSync(join(REPO, "templates", "repo-contract", "mise.lock.tmpl"), "utf8"));
+    const joined = docker.replace(/\\\n\s*/g, " ");
+    const install = joined.split("\n").find((l) => l.includes("mise install --locked "))!;
+    expect(install).toContain("cd /tmp/hapi-tools");
     for (const [name, version] of Object.entries(template.tools)) expect([name, install.split(/\s+/).includes(`${name}@${version}`)]).toEqual([name, true]);
     expect(docker).toContain("RUN mise --version | grep -q '^2026\\.10\\.9 '");
     // mise's settings are the image's ENV lines, never the run's environment (ARCHON_ENV is unchanged).
     const env = (name: string) => new RegExp(`^ENV (?:.*\\s)?${name}=`, "m");
-    const settings = { MISE_DATA_DIR: "/opt/hapi/mise", MISE_CACHE_DIR: "/opt/hapi/mise-cache", MISE_TRUSTED_CONFIG_PATHS: "/work/repo", MISE_OFFLINE: "1", MISE_LOCKED: "1", MISE_SHIMS_DIR: "/tmp/mise-shims" };
+    // And its global config from an empty dir in the read-only image, never the run's $HOME the worker can write.
+    const settings = {
+      MISE_DATA_DIR: "/opt/hapi/mise", MISE_CACHE_DIR: "/opt/hapi/mise-cache", MISE_TRUSTED_CONFIG_PATHS: "/work/repo", MISE_OFFLINE: "1", MISE_LOCKED: "1", MISE_SHIMS_DIR: "/tmp/mise-shims",
+      MISE_CONFIG_DIR: "/opt/hapi/mise-config", MISE_GLOBAL_CONFIG_FILE: "/opt/hapi/mise-config/config.toml",
+    };
+    expect(docker).toContain("mkdir -p /opt/hapi/mise-config");
     for (const [name, value] of Object.entries(settings)) {
       expect([name, env(name).test(docker.replace(/\\\n\s*/g, " "))]).toEqual([name, true]);
       expect([name, docker.replace(/\\\n\s*/g, " ").includes(`${name}=${value}`)]).toEqual([name, true]);
@@ -156,7 +173,7 @@ describe("pins", () => {
     // Never the auto-installs at 0: mise run would fall back to the image's own Bun without a word (T18 finding 5).
     for (const name of ["MISE_EXEC_AUTO_INSTALL", "MISE_TASK_RUN_AUTO_INSTALL", "MISE_NOT_FOUND_AUTO_INSTALL"]) expect([name, docker.includes(name)]).toEqual([name, false]);
     // The install runs before the settings that make mise read-only and offline.
-    expect(docker.indexOf("RUN mise install ")).toBeLessThan(docker.indexOf("MISE_OFFLINE=1"));
+    expect(docker.indexOf("mise install --locked ")).toBeLessThan(docker.indexOf("MISE_OFFLINE=1"));
     // CodeRabbit's CLI 0.9.1 (the review's CodeRabbit node), checked against its signed release's SHA-256.
     expect(docker).toMatch(/^ADD --checksum=sha256:[0-9a-f]{64} https:\/\/cli\.coderabbit\.ai\/releases\/0\.9\.1\/coderabbit-linux-x64\.zip /m);
     expect(docker).toContain('test "$(HOME=/tmp/coderabbit-home CODERABBIT_CLI_DISABLE_AUTO_UPDATE=1 CR_CLI_TELEMETRY_DISABLED=1 cr --version)" = 0.9.1');

@@ -212,6 +212,9 @@ describe("the factory workflows (Plan 03 Task 11, design §3.5)", () => {
     expect(c.indexOf("find .")).toBeLessThan(c.indexOf("mise "));
     expect(c.indexOf("mise config ls --json")).toBeGreaterThan(c.indexOf("find ."));
     expect(s).toContain("mise tasks ls --json --hidden");
+    // Stricter than CI's: any config or task file mise loaded but the root mise.toml, wherever it is (a worker's $HOME too).
+    expect(s).toContain('select(type != "string" or . != $root + "mise.toml")');
+    expect(c).not.toContain("startswith($root)");
     // Every hit is a failure, its paths on stderr.
     expect(s).toContain("exit 1");
   });
@@ -318,10 +321,31 @@ describe("the factory workflows (Plan 03 Task 11, design §3.5)", () => {
       for (const x of [
         RUN_PATHS.order, RUN_PATHS.runFile, "--trailer", "Work-Order: ", "Hapi-Run: ", "Hapi-Lane: factory", "Trace-Id: ", "Agent: pi@", "Model: ",
         "jq -r .run_id", "INPUTS_TRACEPARENT", "cut -d- -f2", "/app/node_modules/@earendil-works/pi-coding-agent/package.json",
-        "/opt/hapi/run-config.yaml", "cd / && bun --no-env-file -e", "Bun.YAML.parse", '.aliases["@implement"].model', "git add --all --", "git diff --cached --quiet",
+        "jq -r '.model // empty' \"$run\"", "git add --all --", "git diff --cached --quiet",
       ]) expect([x, b.includes(x)]).toEqual([x, true]);
       expect(b).not.toContain("git push");
       expect(b).not.toContain("--no-verify");
+      // No bun in it: a preload in the worker-writable $HOME/.bunfig.toml would run here (fix round 1).
+      expect(code(b)).not.toMatch(/\bbun\b/);
+    });
+
+    test("commit checks the scope again, since the gates' checks ran the worker's code: HEAD still the run's commit and nothing staged before it stages, then each commit on the last one with its own piece's files alone", () => {
+      const b = code(bash("factory-task", "commit"));
+      const at = (x: string) => b.indexOf(x);
+      const loop = at("for i in $(seq 0");
+      // Before the loop: HEAD and the index.
+      expect(at('[ "$(git rev-parse HEAD)" = "$start" ]')).toBeGreaterThan(-1);
+      expect(at('[ "$(git rev-parse HEAD)" = "$start" ]')).toBeLessThan(loop);
+      expect(at("if ! git diff --cached --quiet; then")).toBeGreaterThan(-1);
+      expect(at("if ! git diff --cached --quiet; then")).toBeLessThan(loop);
+      // After each commit: on the one before it, and nothing outside that piece's own pathspecs.
+      const commit = at("git commit -q");
+      for (const x of ['[ "$(git rev-parse HEAD^)" = "$prev" ]', 'git diff --name-only "$prev" HEAD -- . "${others[@]}"', 'prev=$(git rev-parse HEAD)']) {
+        expect([x, at(x) > commit]).toEqual([x, true]);
+      }
+      expect(b).toContain('":(exclude,glob)" + .');
+      // And at the end, HEAD is the last commit the node made.
+      expect(b.trimEnd().split("\n").at(-1)).toContain('[ "$(git rev-parse HEAD)" = "$prev" ]');
     });
   });
 
@@ -424,6 +448,9 @@ describe("the factory workflows (Plan 03 Task 11, design §3.5)", () => {
         // And the session's process itself is gone, read from /proc (CLAUDE_BIN_PATH is ARCHON_ENV's), before the key goes on argv.
         expect(b).toContain('readlink "$p/exe"');
         expect(b).toContain('"$CLAUDE_BIN_PATH"');
+        // /proc/<pid>/exe is a resolved path, so it is compared with the binary's resolved path (fix round 1).
+        expect(b).toContain('want=$(readlink -f "$CLAUDE_BIN_PATH")');
+        expect(b).toContain('= "$want" ]');
         expect(b.indexOf('readlink "$p/exe"')).toBeLessThan(b.indexOf("--api-key"));
         expect(b).toContain("the review session's Claude Code process is still running");
       });
