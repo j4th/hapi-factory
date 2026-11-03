@@ -124,9 +124,11 @@ describe("authedGit", () => {
     const r = await runCommand(cmd, { env: { PATH: process.env.PATH ?? "", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", ...entries }, inherit: false });
     expect(r.code).toBe(0);
     expect(r.stdout.trim()).toBe(entries.GIT_CONFIG_VALUE_0!);
-    // git saw the header in its environment only: the spawned argv is the four words above, and the token is in no entry's key.
-    expect(cmd).toEqual(["git", "config", "--get", "http.https://github.com/.extraheader"]);
-    expect(Object.keys(entries).some((k) => k.includes(T))).toBe(false);
+    // git read the header from its environment (D22): the base64 it printed decodes to the token's credential, and
+    // the token itself is in neither the argv nor the printed value.
+    const b64 = r.stdout.trim().replace(/^AUTHORIZATION: basic /, "");
+    expect(Buffer.from(b64, "base64").toString()).toBe(`x-access-token:${T}`);
+    expect(cmd.some((w) => w.includes(T))).toBe(false);
     expect(r.stdout).not.toContain(T);
   });
 });

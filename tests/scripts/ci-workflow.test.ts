@@ -200,6 +200,16 @@ describe.skipIf(!runs("mise") || !runs("jq"))("the mise-config check, run on a t
 test("ci.yml has three jobs, build, secrets and the aggregator ci (the required check), each least-privileged", () => {
   expect(Object.keys(doc.jobs)).toEqual(["build", "secrets", "ci"]);
   for (const [id, job] of Object.entries(doc.jobs)) expect([id, job.name, job["runs-on"], typeof job["timeout-minutes"]]).toEqual([id, id, "ubuntu-latest", "number"]);
+  // D33: each job's keys, pinned, and a step's limited to name, uses, with, env, if and run.
+  const jobKeys = Object.fromEntries(Object.entries(doc.jobs).map(([id, job]) => [id, Object.keys(job).sort()]));
+  expect(jobKeys).toEqual({
+    build: ["name", "permissions", "runs-on", "steps", "timeout-minutes"],
+    secrets: ["defaults", "env", "name", "permissions", "runs-on", "steps", "timeout-minutes"],
+    ci: ["if", "name", "needs", "permissions", "runs-on", "steps", "timeout-minutes"],
+  });
+  for (const [id, job] of Object.entries(doc.jobs)) {
+    for (const st of job.steps) expect([id, st.name, Object.keys(st).filter((k) => !["name", "uses", "with", "env", "if", "run"].includes(k))]).toEqual([id, st.name, []]);
+  }
   expect(doc.permissions).toEqual({});
   expect(build.permissions).toEqual({ contents: "read" });
   expect(secrets.permissions).toEqual({ contents: "read" });

@@ -157,7 +157,8 @@ export function fakeForge(o: { repo?: string; private?: boolean; pageSize?: numb
       const head = url.searchParams.get("head") ?? "";
       const state = url.searchParams.get("state") ?? "open";
       const list = [...prs.values()].filter(
-        (x) => (head === "" || `${repo.split("/")[0]}:${x.headRef}` === head) && (state === "all" || x.state === state),
+        // A merged PR is closed, as GitHub lists it, whatever its record's state says (D24).
+        (x) => (head === "" || `${repo.split("/")[0]}:${x.headRef}` === head) && (state === "all" || (x.merged ? "closed" : x.state) === state),
       );
       return page(url, list, (xs) => xs.map((x) => prJson(x, false)));
     }

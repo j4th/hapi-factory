@@ -76,13 +76,11 @@ describe("rest", () => {
   });
 
   test("a success reply whose body can't be read is a status-0 ForgeError, with no token in it", async () => {
-    const f = fakeFetch({});
     const garbled = (async () => new Response("<html>not json " + TOKEN, { status: 200 })) as unknown as typeof fetch;
     const e = (await caught(restOk(garbled, "GET", "/x?y=1", TOKEN, 200))) as ForgeError;
     expect(e).toBeInstanceOf(ForgeError);
     expect(e.status).toBe(0);
     expect(e.message).toBe("GitHub: GET /x: HTTP 200: the reply body could not be read as JSON");
-    void f;
   });
 
   test("a 429, or a 403 with x-ratelimit-remaining 0, is a rate-limited ForgeError", async () => {

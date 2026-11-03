@@ -142,6 +142,17 @@ test("gates.yml is a workflow_call with no permissions, and three jobs: scan, ch
     expect([id, job.name, job["runs-on"]]).toEqual([id, id, "ubuntu-latest"]);
     expect([id, typeof job["timeout-minutes"]]).toEqual([id, "number"]);
   }
+  // D33: each job's keys, pinned: no strategy, container, services, outputs, continue-on-error or environment slips in.
+  const jobKeys = Object.fromEntries(Object.entries(doc.jobs).map(([id, job]) => [id, Object.keys(job).sort()]));
+  expect(jobKeys).toEqual({
+    scan: ["env", "name", "permissions", "runs-on", "steps", "timeout-minutes"],
+    check: ["name", "permissions", "runs-on", "steps", "timeout-minutes"],
+    gates: ["if", "name", "needs", "permissions", "runs-on", "steps", "timeout-minutes"],
+  });
+  // And a step has only these: no shell, working-directory, continue-on-error or timeout of its own.
+  for (const [id, job] of Object.entries(doc.jobs)) {
+    for (const st of job.steps) expect([id, st.name, Object.keys(st).filter((k) => !["name", "uses", "with", "env", "if", "run"].includes(k))]).toEqual([id, st.name, []]);
+  }
   expect(scan.permissions).toEqual({ contents: "read" });
   expect(check.permissions).toEqual({ contents: "read" });
   expect(scan.steps.map((s) => s.uses?.replace(/@.*$/, "") ?? s.name)).toEqual(["actions/checkout", MISE_SCAN, CONFIGS, ATTRS, REFUSE, INSTALL_GITLEAKS, GITVER, DRYRUN, SECRETS, INSTALL_OTHERS, OSV, ZIZMOR, TRAILERS]);

@@ -18,7 +18,7 @@ describe.skipIf(!process.env.HAPI_INT)("mise run policy:build", () => {
   });
   afterAll(() => rmSync(out, { recursive: true, force: true }));
 
-  test("-- --roster budget --out <dir>: writes the twenty generated files there, with the budget roster", () => {
+  test("-- --roster budget --out <dir>: writes the twenty-two generated files there, with the budget roster", () => {
     const r = Bun.spawnSync(["mise", "run", "policy:build", "--", "--roster", "budget", "--out", out], { cwd: REPO, stdout: "pipe", stderr: "pipe" });
     expect([r.exitCode, r.stderr.toString().includes("ERROR")]).toEqual([0, false]);
     const written = r.stdout.toString().trim().split("\n");
@@ -43,6 +43,8 @@ describe.skipIf(!process.env.HAPI_INT)("mise run policy:build", () => {
       "pi/models.json",
       "pi/settings.json",
       "roster",
+      "systemd/hapi-poll.service",
+      "systemd/hapi-poll.timer",
     ]);
     expect(readFileSync(join(out, "roster"), "utf8")).toBe("budget\n");
     // The budget roster: Haiku 5.5 on every Archon tier but review's, Sonnet 5.5 (Plan 03 Task 11), and never Opus.
