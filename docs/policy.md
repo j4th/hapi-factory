@@ -751,6 +751,38 @@ The harvester (Plan 03 Task 12, `src/engine/decisions.ts`) asks `decide()` befor
 
 Runs one decision (`bash-gate`, `result-screen` or the run engine's `diff-screen`) on a state and prints the result as one JSON line. The state comes from `--state-file` or stdin, never from argv. An engine decision's state is the JSON object the harvester built (`{ goal, path, part, diff }`), so its text must parse as one, and is passed on as that object. `--public` marks the run public; `--mock` answers offline with the vendored mock and needs no policy directory. Without `--mock` it reads the gates and flags from `$HAPI_POLICY_DIR` (default `policy`). To replay an engine decision offline, rebuild its state from the mirror by the ledger line's `run`, `head`, `subject` and `part`, check it against the line's `key`, and run `hapi decide diff-screen --state-file <file>`, passing `--public` only when the line's `public` is true. Exit 0: a result was printed (a fallback verdict counts); 1: the decision could not run; 2: a usage error, an unknown name, or an engine decision's state that isn't a JSON object.
 
+## Running without decision models
+
+hapi-factory runs with no classifier at all when the operator chooses it (the operator's "failthrough option", 2026-11-02): no `decide()` question in the run engine, and none in the guard. It is one recipe, for both halves, made as a protected change and undone by reverting it. Nothing automatic ever sets it.
+
+**The recipe.** One PR that changes two files, both protected (`policy/**`), which the operator reviews and merges:
+
+```yaml
+# policy/gates.yaml
+bash_gate:
+  enabled: false
+  # ...
+result_screen:
+  enabled: false
+  # ...
+decisions:
+  mode: off
+  # ...
+```
+
+```yaml
+# policy/flags.yaml
+jev:          { enabled: false, fallback: none, via: openrouter }
+```
+
+Then, as hapi in hapi's checkout, `git pull --ff-only` and `mise run up` ([runs.md's form](runbooks/runs.md#rollout-on-hapis-checkout)): the poller reads `policy/` there at every tick, and `hapi run start` writes each run's own `hapi-guard.json` from it, so the next tick and every later run follow the recipe; a run already live keeps the gates it started with.
+
+- **The engine.** `decisions.mode: off`: the harvester builds no subject and asks no `decide()` question, appends nothing to the decision ledger, and no decision holds or notes a PR. Everything else that stands between a worker and `main` is unchanged: the host gates on the bundle (protected paths, scope, sizes, the secret scan), verify and the planner's acceptance tests, the independent review, CodeRabbit, the required `ci / gates` check, and the operator's merge. `decisions.mode: notes` is the half-way setting: each decision is asked and recorded as in `enforce`, but nothing holds a PR: a hold, an unscreened file's included, becomes a note under "Check this yourself".
+- **The guard's gates (level 6).** `bash_gate.enabled: false` and `result_screen.enabled: false` turn off the classifier on a worker's bash calls and on what its tools return. With `jev: { enabled: false, fallback: none, … }` there is no classifier at all, so `loadPolicy` refuses any gate or engine decision switched back on alone ([`gates.yaml`](#gatesyaml)): turning one back on means reverting the whole recipe. hapi-guard's deterministic rules still apply: the command rules, the protected paths, the write gate's key patterns and the budget.
+- **What shows it.** Each factory PR's Evidence row (`off: decision models are off (gates.decisions.mode)`) and its "Check this yourself" line; the planning PR's status comment and `hapi status` (`Decision models are off (gates.decisions.mode: off): …`); `decisions: "off"` on each run record the harvest first read; and the audit's [`policy.decision-models`](audit.md#policydecision-models) note, a pass, never a fail.
+- **What never sets it.** Nothing automatic. In `enforce`, a missing key, a failing provider or a spent Jev share gives each subject its decision's `on_unscreened` (`hold`, so the PR waits at Needs your decision), and the guard's gates take their fallbacks (`block` for a bash call, `wrap` for a tool result). A missing key never turns decision models off.
+- **How, and how back.** A protected change to `policy/gates.yaml` and `policy/flags.yaml`, in a PR the operator merges; undo it by reverting that PR. A PR whose head was harvested while decision models were off reads as held at its next re-render after they're back on, since a re-render asks nothing: merge it anyway (the verdict is advice), or send it back with `hapi:rework` ([the engine runbook](runbooks/engine.md#troubleshooting)).
+
 ## TypeScript API
 
 Later plans build on these functions:

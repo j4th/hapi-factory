@@ -1,10 +1,186 @@
 # Runbook: the run engine
 
-This runbook covers the run engine that Plan 03 builds (design: [the run engine's design](../superpowers/specs/2026-10-31-hapi-factory-03-run-engine-design.md), §3.4 to §3.8): the poller that reads each registered repo, the pipeline each merged work order goes through, and the factory PR it ends in. Plan 03 writes it in parts; these are Tasks 12's and 13's:
+This runbook covers the run engine Plan 03 builds (design: [the run engine's design](../superpowers/specs/2026-10-31-hapi-factory-03-run-engine-design.md), §3.0 to §3.9): what it does with a merged work order, from the poller's tick to the factory PR you merge, rework or close, and what to do when it stops. Its parts:
 
-- [the harvester](#the-harvester): the host gates on a run's bundle, the four verdicts, the acceptance tests, the decision models, the never-forced push and `harvestedAt`;
+- [what the engine does](#what-the-engine-does), in nine lines;
+- [the poller](#the-poller): its timer, a tick, its lock, its journal, and a tick by hand;
+- [the pipeline](#the-pipeline): the work order's phases, the caps' texts, the CodeRabbit round on the PR, rework by label, the operator's actions, a failed work order and `hapi retry`, and a work order that stops its repo's tick;
+- [acceptance tests and the verify container](#acceptance-tests-and-the-verify-container);
+- [the harvester](#the-harvester): the host gates on a run's bundle, the four verdicts, the decision models, the never-forced push and `harvestedAt`;
 - [the factory PR](#the-factory-pr): its nine parts, its markers, and what the harvester reads to write it;
-- [the pipeline](#the-pipeline): the work order's phases, the caps, the CodeRabbit round on the PR, rework by label, the operator's actions, stops, timeouts and `hapi retry`'s next pass.
+- [the verdicts](#the-verdicts), and your three moves;
+- [decisions](#decisions): what the harvester asks a classifier, what an answer can do, the knobs, the ledger and the spend;
+- [the status comment, `hapi status` and `events.jsonl`](#the-status-comment-hapi-status-and-eventsjsonl);
+- [the caps](#the-caps), in one table;
+- [stopping everything](#stopping-everything);
+- [troubleshooting](#troubleshooting).
+
+Every command below that runs as hapi is run on the host, from your own terminal, in [runs.md's form](runs.md#how-to-run-the-commands): one fixed script handed to hapi's `sh`, with your words as its arguments. hapi's engine state is under `~hapi/.local/state/hapi/engine/` (the engine dir).
+
+## What the engine does
+
+1. You merge a planning PR (`lane:planning`) whose `.factory/work/<id>/` holds one or more work orders.
+2. The poller, a systemd user timer as hapi, fetches the repo's bare mirror and takes up each newly merged work order: `queued`, or `held` when two of one merge overlap.
+3. One work order at a time per repo, a worker run (Pi, in a container of its own with the archon zone's keys and no forge route) implements it from the merge commit, one commit per piece.
+4. The harvester, deterministic host code, checks the run's bundle on the host: protected paths, scope, sizes, trailers and a secret scan.
+5. A verify container with no key installs from the lockfile and runs `check`, `smoke` and the planner's acceptance tests on the bundle's head.
+6. A review container (its own keys, no repo code) runs the independent review, and CodeRabbit's CLI when it is on; findings at major or above get one fix run, then verify and review once more.
+7. The harvester asks its advisory decisions about the diff, pushes `factory/<id>` (never forced) and opens one PR (`lane:factory`) with a verdict and the evidence.
+8. CodeRabbit reviews the PR, at most one automatic fix round follows, and then it waits for you: merge, `hapi:rework` or close. Nothing merges on its own.
+9. The planning PR's status comment, `hapi status` and `events.jsonl` show every step; caps bound every run, and a failed work order waits for your `hapi retry`.
+
+## The poller
+
+`hapi poll --once` is one tick (`src/engine/poll.ts`). Two systemd user units, generated into `build/systemd/` ([the units](../generated-configs.md#buildsystemd)), run it as hapi: `mise run up` links and starts `hapi-poll.timer` ([the stack runbook](stack.md#4-mise-run-up-and-mise-run-down), its step 7), and `mise run down` and [kill switch 3](kill-switches.md#3-stop-the-stack) stop it first. The first tick runs `runs.poll_interval_s` (120 s; 30 to 3600, central only) after the timer starts, then one that long after each tick starts. Under the dev bypass no timer is installed: run each tick by hand ([below](#a-tick-by-hand)).
+
+**A tick:**
+
+1. takes **the poll lock**, keyed by the engine dir: one tick at a time, and `hapi retry` takes it too, so only its holder writes a work order's state or `events.jsonl`. A tick that finds it held skips (`poll: another tick holds the poll lock`, exit 0);
+2. reaps every run whose container has exited, so a run is finalized before the tick reads it;
+3. for each repo `policy/repos.yaml` registers, in sorted order and each on its own (one repo's failure never touches another's):
+   - fetches the repo's [mirror](runs.md#the-mirror) with a read-only token minted for this tick alone;
+   - finds each work order newly merged on `main` ([discovery](runs.md#discovery): a `.factory/work/<id>/` with no state yet, keyed by its id and the merge commit that first added it, so a later commit never starts it again), and gives it a state: `queued`, or `held` when its pieces overlap another of the same merge;
+   - moves one pipeline per repo ([the pipeline](#the-pipeline)): every work order with a PR, each tick; then the one active work order with no PR; if there is none, the head of the queue (the oldest `cap-stopped`, else the oldest `queued`). Each step is taken under that work order's own lock, and a held lock leaves it for the next tick (`<id> waiting: <the lock's holder>`);
+   - writes each planning PR's [status comment](#the-status-comment-hapi-status-and-eventsjsonl), asking GitHub only when it must change;
+   - revokes every token it minted.
+
+**The work orders it can't read** (a work-order file that fails its check or is over `runs.work_order_kb`, or an overlay the central policy now refuses) are kept to themselves: each is a journal line, `<repo>: can't run <the file and why>`, and a row of the status comment's "Can't run" table, and the work order waits. Fix it in a new planning PR. **A repo's tick that fails** (a forge or git error, a rate limit, an expired token, a state file hapi didn't write, a harvest that throws) fails closed: it writes nothing for the work order it was on, the journal says `<repo>: failed closed: <error>; the next tick retries`, the service exits 1, and the other repos go on. One work order that fails the same way every tick stops its repo's later ones: [when one work order stops its repo's tick](#when-one-work-order-stops-its-repos-tick).
+
+**The timer and the journal**, as hapi:
+
+```bash
+sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
+  export XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"; \
+  systemctl --user list-timers hapi-poll.timer --no-pager; \
+  journalctl --user -u hapi-poll.service -n 50 --no-pager'
+```
+
+Each tick writes a line per repo: what it created, moved or left waiting, and which comments it wrote, or `nothing to do`. The audit's [`runtime.poller-timer`](../audit.md#runtimepoller-timer) fails while the stack is up and the timer isn't active.
+
+### A tick by hand
+
+As hapi; the poll lock keeps it apart from the timer's:
+
+```bash
+sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
+  export XDG_RUNTIME_DIR PATH="$HOME/.local/bin:$PATH"; \
+  cd "$HOME/hapi-factory" && exec mise run hapi -- poll --once'
+```
+
+It prints the tick's lines and exits 1 when a repo's tick failed closed, else 0 (a skipped tick included). `hapi poll` without `--once` ticks every `runs.poll_interval_s` until stopped; the timer is the normal way.
+
+## The pipeline
+
+The state machine (`src/engine/pipeline.ts`, `advance`) moves each work order one step at a time, from its merge to a settled phase. Its state is one file per work order, `<engineDir>/orders/<owner>/<name>/<id>.json` (0600, written whole by temp and rename), and the poller writes it only once a step has succeeded, so a crash leaves the last good state. Each step makes at most one transition and starts at most one run, and its one status event goes to `events.jsonl` after the state is written. A crash between a run's start and the state's write is resumed without a second run: the next step adopts a run of the work order's current pass that its state doesn't list (an engine run of this repo, this pass, keyed at the merge or naming the pass's worker as its parent), and every step looks for its run by key before it starts one. A replayed harvest finds the PR it opened and edits it; on a PR, a branch already at the head that harvest pushes is the factory's own push (the write after it failed, or a crash), never read as the operator's move, and isn't pushed again. Each source run's head is kept once its host gates pass (`<engineDir>/heads/<owner>/<name>/<id>.json`), so a verify or review a cap blocked starts on it later without running the gates again; one the gates now refuse holds with their details. Every time is compared as an instant, since GitHub writes whole seconds and the host milliseconds.
+
+**Decisions never route a phase or start a run.** A decision's hold reaches only the verdict and the reasons, through the harvester's outcome; it never turns the CodeRabbit round off or starts a fix, and every re-render of the PR keeps it ([Decisions](#decisions)).
+
+### The phases
+
+| Phase | Waits for | What moves it | The status comment shows |
+|---|---|---|---|
+| `held` | the operator | nothing: two work orders of one planning PR whose pieces overlap (H-243(a)) | **Needs your decision**, with the overlap |
+| `queued` | its repo's turn: no other work order of the repo running before its PR, none queued ahead of it | its worker starts at the merge, from the mirror; a cap that refuses it moves it to `cap-stopped` | queued |
+| `cap-stopped` | the month or the day to turn, or the cap to rise | the worker starts once the caps allow (each tick tries) | the cap's text |
+| `worker` | the worker run | succeeded and its gates pass: `verify` (or `review`, or `harvest`, when those phases are off); failed or timed out: `failed`; stopped: `failed`; its gates refuse it: `failed` | the run |
+| `verify` | the verify run on the head (no model key; budget 0) | nothing failed: `review` (or `harvest` with review off); check, smoke or the acceptance tests failed, or no readable `verify.json`: `harvest` (a draft); stopped: `failed`, or `waiting` with a PR | the run |
+| `review` | the review run of the head | before the PR, `needs-work` or a CLI finding at major or above, with fewer than `phases.fix_rounds_before_pr` fixes in this pass: `fix`; otherwise, and always once a PR exists: `harvest`; stopped: `failed`, or `waiting` with a PR | the run |
+| `fix` | a fix run: before the PR, the automatic fix (its round the pass's next); with a PR, a maintainer's rework | succeeded and its gates pass: `verify`, round k; failed, timed out or refused by its gates: `harvest` with no PR (the worker's head, or the last that passed; the fix's reason goes on the PR), `waiting` with one; stopped: `failed`, or `waiting` with a PR | the run |
+| `harvest` | nothing | the harvester's PR: `pr`; no PR (nothing it could push): `failed` | the verdict |
+| `pr` | nothing | a draft (**Do not merge**): `waiting` (CodeRabbit doesn't review drafts); `pr-review` when `flags.coderabbit.enabled`, fewer than `phases.fix_rounds_on_pr` rounds have run on the PR, no human has acted on it and no rework has run; otherwise `waiting` | the PR and its verdict |
+| `pr-review` | CodeRabbit's review of the head the factory pushed | findings at major or above: `pr-fix`; nothing found: `waiting`; paused, skipped, rate-limited, or no review within six polls (`6 × runs.poll_interval_s`): `waiting` with **Needs your decision** and the reason, on the PR too | the PR |
+| `pr-fix` | the automatic fix run on the PR's head, from CodeRabbit's findings | as `fix`, with the PR: `verify`, or `waiting` with `round <k>'s fix run ended <status>: <reason>; the PR is unchanged` or `round <k>'s fix run was refused by the host gates: <details>; the PR is unchanged` | the run |
+| `waiting` | the operator: a merge, a close or a `hapi:rework` label | merged: `merged`; closed: `closed`; a maintainer's `hapi:rework`: `fix` (a rework), up to `runs.max_rework_rounds` | the PR, and why it waits |
+| `failed` | the operator's `hapi retry` | nothing on its own (below) | the reason |
+| `merged`, `closed` | nothing | settled; the work order's pin in the mirror is dropped | the PR |
+
+**A `cap-stopped` work order heads its repo's queue.** The tick tries the oldest `cap-stopped` one before any `queued` one, so every queued work order of that repo waits behind it until its cap clears, at the month's or the day's turn, or when the cap is raised (H-243(d)).
+
+**`failed`**, before any PR exists: a worker that failed, timed out or was stopped; host gates that refused its bundle; a harvest with nothing it could push; or any later run of it that was stopped. A `hapi run stop` that reaches a live run ends the work order's automatic work, even past the run's deadline (the stop outranks it): `failed` with no PR, `waiting` with one (`round <k>'s <kind> run ended stopped: …; the PR is unchanged`). Nothing more is pushed or started for it, but a maintainer's `hapi:rework` label on its PR still starts a rework. A stop that comes after the run has ended changes nothing ([runs.md](runs.md#hapi-run-stop)), and a run that ended `timed-out` is routed as one that failed. The poller never retries on its own: `hapi retry <owner>/<name> <id>` queues a failed work order with no PR again, at most `runs.max_retries` times (2), for a fresh pass from the worker at the same merge commit, whose run keys name the retry (`worker:0:retry1`, `review:0:retry1`, …), so it never reuses the failed pass's runs, and a worker that succeeded doesn't block it. Each pass's runs still count toward the repo's month. [A failed work order](#a-failed-work-order) says when and how to retry it, and [Troubleshooting](#troubleshooting) what to do with each reason.
+
+**Rounds and stages.** The worker is round 0 and the pass's k-th fix is round k; a verify or review takes the round of the head it checks. Every run's parent is the pass's worker. A fix that started before the pass's first harvest is `before the PR`; after it, the newest ones up to the rework count are `rework` and the rest `on the PR`. The PR's "Review rounds" lists the current pass's only.
+
+**What each run is given.** The worker starts on the merge commit from the mirror. Verify, review and fixes start from the harvester's scratch copy on the head: with no PR, the head of the pass's newest worker or fix whose gates passed; with a PR, the newest fix's own. A rework starts from the mirror on the PR's head. A verify gets no inputs (its source holds the bundle's commits). A review gets `diff.patch` (the diff from the merge, read with hardened git) and `verify.json` (the verify run's, copied); its base is `run.json`'s `base`. A fix gets `findings.md` alone: one IS-7 block per item (the review's findings and its criteria not met, the CLI's major and critical findings, CodeRabbit's PR comments, or for a rework the maintainers' comments since the last round), quoted as data, never instructions. An inputs copy over `runs.inputs_mb` (16 MiB) is refused, never truncated: the work order fails, or waits with a PR. Before a PR that failure is deterministic: the same work order gives the same inputs, so `hapi retry` can't get past it; plan the work again, smaller. A worker's budget is the order's, at most `budgets.run_usd`; a review's or fix's the order's, at most `phases.round_usd`; a verify's 0.
+
+### The caps' texts
+
+[The caps](#the-caps) has every cap in one table. Before every run it starts (a worker, a verify, a review, a fix, a rework, a retry's), the poller checks, in order:
+
+1. **The repo's month**, `budgets.repo_monthly_usd` (an overlay may lower it): `this month's spend on <repo> ($<spent>) plus the run's budget ($<budget>) would pass budgets.repo_monthly_usd ($<cap>): no new run for it until <the 1st of next month>`.
+2. **The day**, `budgets.daily_usd` (central only): `today's spend ($<spent>) plus the run's budget ($<budget>) would pass budgets.daily_usd ($<cap>): nothing new starts until <tomorrow> (UTC)`.
+3. **The automatic rounds**, `runs.max_auto_rounds` (3), for a worker or an automatic fix: `<n> automatic runs since the last human action (runs.max_auto_rounds: <n>): waiting for the operator`.
+4. **The rework rounds**, `runs.max_rework_rounds` (3, central only), before a rework: `<n> rework rounds on #<pr> (runs.max_rework_rounds: <n>): close the PR, or plan the work again under a new work order id`. The PR waits, **Needs your decision**, and its body says so (anti-goal 1).
+
+The month and the day are UTC calendar ones, by each run's `startedAt`. The month sums every run the repo's work orders list, every pass's, its name compared in any case; the day sums every run record, hand runs too. Each run counts its reported spend, or its whole budget when that isn't known (a live run, or a ledger the run wrote that doesn't add up), and decision spend counts with the runs' (each work order's decision ledger, an unanswered call at `unknown_call_usd`). A run's record is kept until its month is over, because the monthly cap reads it ([runs.md, Retention](runs.md#retention)). With `budgets.enforcement.poller: hard` (the default) a cap refuses the run: a queued work order goes to `cap-stopped`, and a verify or review stays in its phase with the reason, starting once the cap clears; a refused fix leaves the work order where it was, to try again. With `soft` the run starts, its event carries the text, and its PR is flagged `hapi:flagged` (once there is one; the reason is kept until then). The round caps are always hard, whatever `budgets.enforcement.poller` says (ruling m38): an automatic fix the round cap refuses goes to the harvest before the PR (its reason on the PR), and to `waiting` on it. The count restarts at any human action (a comment, a label, a push, a review, a rework, a retry).
+
+### The CodeRabbit round
+
+The one automatic round on a PR (design §3.6) starts only from CodeRabbit's own review of the head commit the factory pushed:
+
+- the head counts as reviewed only when CodeRabbit's check run (`CodeRabbit`, App 347564) on it is completed, `success` and titled `Finished…`; any other title (`Review paused`, `Review skipped`, `Rate limited`) is named (`CodeRabbit did not review <h7>: <title>`) and fails closed;
+- a finding is a root review comment (never a reply) by CodeRabbit's bot user (id 136622811, never matched by login), on the head commit, in a review CodeRabbit submitted on that commit, starting with its generated-comment marker, whose first `**<Severity>**` is Critical or Major, in a thread no one else has replied in; its "Supported by static analysis" sections are stripped;
+- check runs are read with the `checks` token, reviews and comments with the `pr` token.
+
+**What turns it off:** a draft PR; `flags.coderabbit.enabled: false`; `phases.fix_rounds_on_pr` used up; any human action on the PR or a rework so far; and a comment or review from anyone but the operator, hapi's Apps (`hapi-factory[bot]`, `hapi-planner[bot]`) and CodeRabbit (`<login> commented on #<n>, so the automatic CodeRabbit round is off: the PR is the operator's`, or `user <id> reviewed #<n>, …` for a review, which carries no login). The PR's round doesn't yet drop a finding the fix before the PR declined (H-277).
+
+### Rework by label
+
+A `hapi:rework` label on a factory PR in `waiting` starts a rework when a human added it: `type: User`, not through an App, no `[bot]` login, with at least triage permission on the repo, after the work order's newest worker or fix run started, and not taken off since. The rework is a fix run on the PR's head, from the mirror, with the unchanged work order and, as data, each issue comment since that run by a maintainer (triage or above) and each review comment by the operator; with `flags.coderabbit.include_in_rework`, CodeRabbit's findings on the head too. It is the operator's: it counts no automatic round, restarts the count, and its harvest pushes on top of the PR (never over a branch that moved since). To ask for another rework after it, take the label off and add it again. **Post your comments first, then add the label:** the rework is given the comments there are when it starts, at the next tick, so a comment posted after that isn't in it (it is in the next rework's). At most `runs.max_rework_rounds` (3) reworks run on one PR; past it the label starts nothing, and the PR waits with the cap's text. A third rework crosses `flags.thresholds.review_rounds` (2), so its PR is flagged `hapi:flagged`. A label on a PR still in its automatic round stops the round first (`waiting`), and the rework starts on the next tick.
+
+### The operator always wins
+
+At the top of every step with a PR:
+
+1. A merged PR settles the work order `merged`, a closed one `closed`.
+2. The operator's actions since the last one the state recorded (comments and labels by the repo owner's login, as a User and not through an App; reviews by the user id those show; a head the factory didn't push) set `lastHumanAt` and restart the automatic-round count.
+3. In an automatic chain (a PR and no rework yet), an action, a pending rework request or anyone else on the PR moves it to `waiting`, **Needs your decision**, with the reason: `the operator acted on #<n> (<what>): the automatic CodeRabbit round is off`, or, during the automatic fix round, `the operator acted during the automatic fix round (<what>): its result is not pushed`. A live fix run is left to end under its own caps, and its result is never harvested (H-278).
+4. Only `waiting` takes the PR's head as the factory's, so a moved head is reported once.
+
+**What counts as an operator action:** a comment or a label by the repo owner's login, as a User and not through an App; a review by that user (by its user id); and a push to `factory/<id>` the factory didn't make. A `hapi:rework` label and a `hapi retry` are human actions too: each restarts the automatic-round count. A comment or review by anyone else (a maintainer included) isn't an operator action, but it turns the automatic CodeRabbit round off, since the PR is then the operator's.
+
+**The PR's body is re-rendered**, from the scratch and the ledger as the harvester builds it (the screens re-read from the ledger, so it asks, spends and pushes nothing), in two cases:
+
+- the PR moves to `waiting` with a reason: the reason goes under Unresolved, and the verdict is **Needs your decision** at best;
+- in `pr-review` or `waiting`, `ci / gates` completes on the head (**Ready to merge** shows only once it is green), or a reason of the state's isn't on the PR yet. This one touches only a body that still has the host's markers.
+
+A re-render waits while a run of the work order is live (the host gates it re-runs write the scratch) and happens on a later tick in `pr-review` or `waiting`. It needs a verify or review run of the PR's head to find the run that made it (with both phases off, the newest worker or fix whose gates give that head); a head the factory didn't push (the operator's) isn't re-rendered.
+
+### A failed work order
+
+A work order becomes `failed` only before it has a PR ([the phases](#the-phases)): its worker failed, timed out or was stopped; the host gates refused its bundle; its harvest had nothing it could push; a review's or fix's inputs were over `runs.inputs_mb`; or a later run of it was stopped. The reason is in `hapi status` and on the status comment. The poller never retries one on its own. If the cause was outside the work order ([Troubleshooting](#troubleshooting) has the list), fix it, then queue a fresh pass from your own terminal, with the repo's name and the work order's id:
+
+```bash
+OWNER="$(gh api user --jq .login)"
+sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
+  export XDG_RUNTIME_DIR PATH="$HOME/.local/bin:$PATH"; \
+  cd "$HOME/hapi-factory" && mise run hapi -- retry "$1" "$2" && \
+  mise run hapi -- status "$1"' \
+  hapi-retry "$OWNER/<name>" <work-order-id>
+```
+
+`hapi retry` reads hapi's local state and the central policy alone: no git, no token, no GitHub or Docker call. It refuses, naming why:
+
+- a repo `policy/repos.yaml` doesn't register, or a work order with no state there: ``<repo> has no work order <id>: `hapi status <repo>` lists them``;
+- a work order that isn't failed: `work order <id> is <phase>, not failed: only a failed work order is retried (docs/runbooks/engine.md, Troubleshooting)`;
+- one with a PR: `work order <id> has PR #<n>: a PR is reworked with the hapi:rework label, not retried`;
+- one already retried `runs.max_retries` times (2; central only, always hard, and 0 turns `hapi retry` off): `work order <id> has been retried <n> times, and runs.max_retries is <n>: plan the work again under a new work order id`;
+- while a tick holds the poll lock: `…: run hapi retry again when the tick ends`.
+
+**When it starts.** The retry puts the work order at the back of its repo's queue and says how many are ahead of it (`hapi retry: <repo> <id> is queued again (retry <n>), with <k> of the repo's work orders ahead of it: …`). A tick starts its worker at the same merge commit, from the mirror, once no work order of that repo is running before its PR, none is queued ahead of it, and the caps allow. A cap that trips makes it `cap-stopped`, which starts on its own when the cap clears, perhaps at the month's turn. A queued retry can't be withdrawn (H-243(e)). The new pass's runs have keys of their own (`worker:0:retry1`, `review:0:retry1`, …), so it reuses none of the failed pass's. `hapi status` shows `retry <n>` in the Rounds cell, and every later event of the work order carries `retry`. Every pass spends under the same caps, and its runs count toward the repo's month and the day: at most `runs.max_retries` passes after the first. The retry is a human action, so the automatic-round count restarts.
+
+### When one work order stops its repo's tick
+
+[The poller](#the-poller) says what a tick does, and [Troubleshooting](#troubleshooting) links here. The poller fails a repo's tick closed at the first error it can't keep to one work order: a forge or git error, a state or record file hapi didn't write, a harvest that throws. It writes nothing for that work order, and the next tick tries again. So a work order whose step throws the same way every tick (a poison pill) stops that repo's later work orders and its status comments, tick after tick, while the other repos go on. The tick's line in the journal names it: `<repo>: failed closed: <error>; the next tick retries` (`journalctl --user -u hapi-poll.service`, as hapi). A work order that can't be read, an overlay the central policy now refuses, and a held lock are kept to their work order: the first two are a "Can't run" problem, the last is `<id> waiting: <the lock's holder>`. Fix the cause the line names, and the next tick goes on from where the work order was.
+
+## Acceptance tests and the verify container
+
+- **The planner's acceptance tests.** The planner writes behaviour-level tests for each work order at `.factory/work/<id>/acceptance/`, in the planning PR, beside its `order.yaml` and `task.md`, and your merge of the planning PR approves them. `.factory/**` is protected from workers (`workers: deny`), so the host's protected-path gate refuses any change a run makes to them ([the host gates](#the-host-gates)): the worker can't weaken the tests it is judged by.
+- **The verify container** (`factory-verify`; the verify profile in `src/run/kinds.ts`) holds no key of any kind and gets no inputs dir. Its source is the harvester's scratch copy of the mirror, which holds the bundle's commits, and its `/work` is a fresh volume, so it never reuses the worker's `node_modules`, which could fake a result. It joins `egress-archon` only so it can install from the bundle's `bun.lock` with `bun ci --frozen-lockfile --ignore-scripts` (the template's `setup`: no install script runs). Only the package registries on that allowlist matter: the zone's model APIs are no use without a key.
+- **What it runs**, in order, each step's exit code kept: CI's mise-config scan, the install, `mise run check`, `mise run smoke` (when the work order's `verify.smoke` is true), and `bun test ./.factory/work/<id>/acceptance` with a junit report (when that directory exists).
+- **`verify.json`**, written last, is `{ check: { exit, tail }, smoke: { exit, tail } | null, acceptance: { exit, tail } | null }`: `null` means not run, or no acceptance tests. A tail is the step's last 40 lines, untrusted text the harvester doesn't use. [What the harvester reads](#what-the-harvester-reads) has the exact rules, and [the four verdicts](#the-four-verdicts) the four signals that must agree before verify passes.
+- **`runs.phases.require_acceptance`** is on by default, and an overlay may only switch it on: **Ready to merge** then needs the acceptance tests to exist and pass ([the verdicts](#the-verdicts)).
+
+Two limits stand ([the threat model](../security/threat-model.md#plan-03-the-run-engine)): the change's own code runs in the verify container and could write its own results (H-251), so in-run verify is a pre-filter, and CI's `ci / gates` on the pushed head is the run the worker can't touch; and the acceptance tests are only as strong as the planner wrote them, with your merge of the planning PR their only review.
 
 ## The harvester
 
@@ -57,7 +233,7 @@ With the gates passed, the harvester reads the evidence and settles a verdict, i
 
 ### The decision models
 
-Before it settles the verdict of a head it will push, the harvester asks `decide()`'s advisory diff screen about each changed file (`policy/decisions/diff-screen.ts`), after the host gates and the secret scan, and only once the PR lookup has settled the push: never for a refused bundle, a closed PR, a moved branch, or a ready PR whose new head failed check. Each call is written to the work order's decision ledger before it is made, and each answer before it is used. An answer can only hold back **Ready to merge** (a reason under Unresolved) or add a note under "Check this yourself"; it never changes the push or the draft, and a file no classifier answered holds too. `gates.decisions.mode: off` turns the decision models off, and the PR, the status comment and the run records say so. [docs/policy.md, "In the run engine"](../policy.md#in-the-run-engine) has the knobs, the ledger and the spend; Task 15 adds this runbook's "Decisions" section and the recipe for running without decision models.
+Before it settles the verdict of a head it will push, the harvester asks `decide()`'s advisory diff screen about each changed file (`policy/decisions/diff-screen.ts`), after the host gates and the secret scan, and only once the PR lookup has settled the push: never for a refused bundle, a closed PR, a moved branch, or a ready PR whose new head failed check. Each call is written to the work order's decision ledger before it is made, and each answer before it is used. An answer can only hold back **Ready to merge** (a reason under Unresolved) or add a note under "Check this yourself"; it never changes the push or the draft, and a file no classifier answered holds too. `gates.decisions.mode: off` turns the decision models off, and the PR, the status comment and the run records say so. [Decisions](#decisions) has what it asks, the knobs, the ledger and the spend, and [docs/policy.md, "Running without decision models"](../policy.md#running-without-decision-models) the recipe for running with none.
 
 ### The push and `harvestedAt`
 
@@ -94,78 +270,140 @@ The harvester writes the PR's description (`src/engine/pr.ts`) between two marke
 | worker or fix | `transcript.jsonl`, `decisions.jsonl` | The final message (the last attempt's text after its last tool call, in `implement`, `implement-retry` or `fix`), the guard's last `result` record, whether the message ends on a question (its last line, or the line before `RESULT:`), and its `## Account` section. |
 | every run | `decisions.jsonl` | The guard's spend records: the cost line's spend (the higher of the guard's total and Archon's, unknown counted at the run's budget) and turns (the last spend record's `turns`). |
 
-## The pipeline
+## The verdicts
 
-The state machine (`src/engine/pipeline.ts`, `advance`) moves each work order one step at a time, from its merge to a settled phase. Its state is one file per work order, `<engineDir>/orders/<owner>/<name>/<id>.json` (0600, written whole by temp and rename), and the poller writes it only once a step has succeeded, so a crash leaves the last good state. Each step makes at most one transition and starts at most one run, and its one status event goes to `events.jsonl` after the state is written. A crash between a run's start and the state's write is resumed without a second run: the next step adopts a run of the work order's current pass that its state doesn't list (an engine run of this repo, this pass, keyed at the merge or naming the pass's worker as its parent), and every step looks for its run by key before it starts one. A replayed harvest finds the PR it opened and edits it; on a PR, a branch already at the head that harvest pushes is the factory's own push (the write after it failed, or a crash), never read as the operator's move, and isn't pushed again. Each source run's head is kept once its host gates pass (`<engineDir>/heads/<owner>/<name>/<id>.json`), so a verify or review a cap blocked starts on it later without running the gates again; one the gates now refuse holds with their details. Every time is compared as an instant, since GitHub writes whole seconds and the host milliseconds.
+Each factory PR opens with one verdict, and each maps to one of your three moves. [The four verdicts](#the-four-verdicts) has the full rules, in the harvester's order.
 
-**Decisions never route a phase or start a run.** A decision's hold reaches only the verdict and the reasons, through the harvester's outcome; it never turns the CodeRabbit round off or starts a fix, and every re-render of the PR keeps it (Task 15 adds the "Decisions" section).
+| Verdict | It means | Your move |
+|---|---|---|
+| **Ready to merge** (green) | everything passed: the host gates, verify (check, smoke, the acceptance tests), the review with every criterion met, no open major CodeRabbit finding, no decision holding a file, and `ci / gates` green on the head (until then **Waiting for `ci / gates`**) | merge it |
+| **Needs your decision** (yellow) | something fell short of that, or wasn't checked: the reasons are at the top, under Unresolved | read the reasons, then merge (the verdict is advice), send it back with `hapi:rework`, or close it |
+| **Do not merge** (red), a draft | check, smoke or the acceptance tests failed in the verify container, or verify left no readable result | send it back with `hapi:rework`, or close it. A draft can't be merged: GitHub refuses it |
 
-### The phases
+With `runs.phases.require_acceptance` on (the default), **Ready to merge** needs the planner's acceptance tests to be present and passing. A work order with none is at best **Needs your decision** (`the work order has no acceptance tests (runs.phases.require_acceptance)`), and a failing one makes the PR a draft **Do not merge**. No verdict merges anything: only you merge, and with `main-review`'s Restrict updates every merge into `main` is your bypass, which GitHub logs as one (H-092).
 
-| Phase | Waits for | What moves it | The status comment shows |
+## Decisions
+
+The harvester asks one decision, `diff-screen` (`policy/decisions/diff-screen.ts`), before it settles a PR's verdict. [The decision models](#the-decision-models) is where it sits in the harvest; [docs/policy.md, "In the run engine"](../policy.md#in-the-run-engine) has the full rules.
+
+- **What it asks**, of each changed file: does it hold text addressed to whoever reviews or checks the change (`reviewer_steer`)? Does it loosen a check (`loosened_check`)? Does code stand in for the real behaviour (`stand_in`)? Does it go beyond the work order's goal (`beyond_goal`)?
+- **When:** only about a head it will push, after the host gates, the secret scan and the PR lookup: never for a refused bundle, a closed PR, or a branch that moved.
+- **On what:** each file's diff from the merge commit (`diff -U3`; a fix round's harvest screens the whole change), redacted first (both zones' values, raw and base64, and every key format), cut into windows of whole lines when it is long, with the work order's goal (`task.md`'s first paragraph). Jev is asked only for a public repo; Haiku otherwise.
+- **What an answer can do:** a `hold` keeps the PR from **Ready to merge**, its reason under Unresolved after every other; a `note` adds a line under "Check this yourself". Only `reviewer_steer` at 0.7 or more holds, since the review reads the diff with no result screen, and so does a file no classifier screened (no key, a provider error, content the diff doesn't show, past the call cap, a re-render), through `on_unscreened: hold`. **What it never does:** change the push or the draft, move a phase, start or skip a run, add `hapi:flagged`, or close, dismiss or resolve anything. A pass never makes a verdict better, and no re-render drops a hold.
+- **The knobs** are `policy/gates.yaml`'s `decisions` block, central and protected, so each change is a PR you merge: `decisions.mode` (`enforce`; `notes`: asked and recorded, but no answer holds a PR; `off`: nothing is asked); one decision moved to `shadow` (asked and recorded, with no effect but its Evidence row) or `off`; its `on_unscreened`, and `max_calls_per_head`; and adding a decision (a decision file, a registry line, a `by_name` entry and its schema line). Running with none at all: [docs/policy.md, "Running without decision models"](../policy.md#running-without-decision-models).
+- **The ledger**, `~hapi/.local/state/hapi/engine/decisions/<owner>/<name>/<id>.jsonl` (0600, append-only, one per work order, kept with its state): an `asking` line before each call, and an `answer` line after it (or for a subject that wasn't asked). A line holds names and numbers: the decision and its version, the run, head, subject and part, the typed answers, the classifier, the verdict, its effect and the cost. It never holds the state's text or a key.
+
+**Reading a repo's ledger**, as hapi. It needs `jq` on the host; since each line is names and numbers only, `cat` does too:
+
+```bash
+OWNER="$(gh api user --jq .login)"
+sudo -u hapi -H -- sh -c 'cd "$HOME/.local/state/hapi/engine/decisions/$1" && \
+  jq -c "select(.kind == \"answer\") | {workOrder, retry, run: .run[0:12], head: .head[0:7], decision, version, subject, part, public, models, via, verdict, effect, cost_usd}" *.jsonl' \
+  hapi-decisions "$OWNER/<name>"
+```
+
+**Replaying one decision** offline (calibration, H-262): rebuild the line's state from the mirror by its `run`, `head`, `subject` and `part`, check it against the line's `key` ([`hapi decide`](../policy.md#hapi-decide-name---state-file-file---public---mock)), and save it as `~hapi/replay.json`. Then, as hapi, add `--public` only when the line's `public` is `true`, never for a private repo's line:
+
+```bash
+sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
+  export XDG_RUNTIME_DIR PATH="$HOME/.local/bin:$PATH"; \
+  cd "$HOME/hapi-factory" && exec mise run hapi -- decide diff-screen --state-file "$HOME/$1"' \
+  hapi-decide replay.json
+```
+
+It reads the classifier keys from its own environment alone (`HAPI_JEV_OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`); with neither set, it prints the file's fallback with `via: default`.
+
+- **Spend.** Each call is written to the ledger before it is made, and counts at its reported cost, or at `classifiers.jev.unknown_call_usd` ($0.001) when nothing answered, never $0. At most `decisions.max_calls_per_head` (24) calls are made for one pushed head, over every harvest of it. Decision spend counts toward the repo's month and the day ([the caps](#the-caps)), the status comment's row and the PR's "Cost and turns" line.
+- **Time.** When the providers fail, a harvest's calls (made together) take up to about 2 minutes: Jev's 30 s, then Haiku's 30 s with its two retries. A re-render makes no call.
+
+## The status comment, `hapi status` and `events.jsonl`
+
+The host is the source of truth: the run records, the work orders' states and GitHub's PRs. The poller shows them three ways (`src/engine/status.ts`).
+
+**The status comment** on each planning PR is written only by the poller, with the `hapi-factory` App's token (its Pull requests write covers issue comments). It is posted once, edited in place whenever its content changes, and starts with a hidden marker, `<!-- hapi:status v1 -->`. It holds:
+
+- one row per work order of the plan: its id; its state (the phase, the verdict, and the first reason, with how many more); its last run; its PR; its rounds (`<n> automatic, <n> rework`, then `, retry <n>` once it has been retried); and its cost (every pass's runs and its decision ledger, with `(budget: spend unknown)` when a run's spend isn't known and counts at its budget);
+- a **"Can't run"** table: each work-order file the poller can't run with, and why (fix each in a new planning PR);
+- the plan's total, against the repo's monthly cap and the day's cap for all repos;
+- the decision-models line, when `gates.decisions.mode` isn't `enforce`.
+
+Once every work order of the plan has settled (`merged`, `closed` or `failed`) and no problem is open, the poller posts **one final comment** (`This plan has settled: <n> merged, <n> closed, <n> failed. Total: $<x>.`), and from then on leaves the plan's comments as they are. A `hapi retry` reopens the plan: its comment is edited again, and when the plan settles again, another final comment is posted. Every cell is one line, and text a run, a planner or GitHub controls is in a code span, so nothing in it renders as a mention, a link or HTML. The poller remembers each comment by a mark, `~hapi/.local/state/hapi/engine/status/<owner>/<name>/<planning-pr>.json`; a mark lost in a crash is recovered from the PR (the newest comment by the factory's App that starts with the marker), never by posting a second comment.
+
+**`hapi status [<owner>/<name>]`** prints the same table for each planning PR, every registered repo's with no argument, from hapi's local state alone: no GitHub, no Docker, no fetch, so no "Can't run" table (that comes from a tick's discovery). As hapi:
+
+```bash
+OWNER="$(gh api user --jq .login)"
+sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
+  export XDG_RUNTIME_DIR PATH="$HOME/.local/bin:$PATH"; \
+  cd "$HOME/hapi-factory" && exec mise run hapi -- status "$@"' \
+  hapi-status "$OWNER/<name>"
+```
+
+**`events.jsonl`**, `~hapi/.local/state/hapi/engine/events.jsonl` (0600): one JSON line per transition, `{ at, repo, workOrder, phase, run?, pr?, verdict?, reason?, usd?, retry? }`, appended only by the holder of the poll lock (a tick, after it writes the state; or `hapi retry`), so a line names a state already on disk. A retry is a `failed` line followed by a `queued` one, whose reason is `the operator retried it (retry <n>) after: <the failure's reason>`, and every later line of that work order carries `retry: <n>`. Plan 04's Hermes and any later board read it, and take `failed` as final only until a retry (H-245).
+
+## The caps
+
+Every cap is a fail-closed default in policy (anti-goal 1: no unbounded spend, no thrashing without a human), and each default is a starting point to tune by a reviewed change; the policy files are protected. The poller checks the spend caps before every run it starts; [the caps' texts](#the-caps-texts) has each refusal word for word.
+
+| Cap | Policy key | Default | What tripping it does |
 |---|---|---|---|
-| `held` | the operator | nothing: two work orders of one planning PR whose pieces overlap (H-243(a)) | **Needs your decision**, with the overlap |
-| `queued` | its repo's turn: no other work order of the repo running before its PR, none queued ahead of it | its worker starts at the merge, from the mirror; a cap that refuses it moves it to `cap-stopped` | queued |
-| `cap-stopped` | the month or the day to turn, or the cap to rise | the worker starts once the caps allow (each tick tries) | the cap's text |
-| `worker` | the worker run | succeeded and its gates pass: `verify` (or `review`, or `harvest`, when those phases are off); failed or timed out: `failed`; stopped: `failed`; its gates refuse it: `failed` | the run |
-| `verify` | the verify run on the head (no model key; budget 0) | nothing failed: `review` (or `harvest` with review off); check, smoke or the acceptance tests failed, or no readable `verify.json`: `harvest` (a draft); stopped: `failed`, or `waiting` with a PR | the run |
-| `review` | the review run of the head | before the PR, `needs-work` or a CLI finding at major or above, with fewer than `phases.fix_rounds_before_pr` fixes in this pass: `fix`; otherwise, and always once a PR exists: `harvest`; stopped: `failed`, or `waiting` with a PR | the run |
-| `fix` | a fix run: before the PR, the automatic fix (its round the pass's next); with a PR, a maintainer's rework | succeeded and its gates pass: `verify`, round k; failed, timed out or refused by its gates: `harvest` with no PR (the worker's head, or the last that passed; the fix's reason goes on the PR), `waiting` with one; stopped: `failed`, or `waiting` with a PR | the run |
-| `harvest` | nothing | the harvester's PR: `pr`; no PR (nothing it could push): `failed` | the verdict |
-| `pr` | nothing | a draft (**Do not merge**): `waiting` (CodeRabbit doesn't review drafts); `pr-review` when `flags.coderabbit.enabled`, fewer than `phases.fix_rounds_on_pr` rounds have run on the PR, no human has acted on it and no rework has run; otherwise `waiting` | the PR and its verdict |
-| `pr-review` | CodeRabbit's review of the head the factory pushed | findings at major or above: `pr-fix`; nothing found: `waiting`; paused, skipped, rate-limited, or no review within six polls (`6 × runs.poll_interval_s`): `waiting` with **Needs your decision** and the reason, on the PR too | the PR |
-| `pr-fix` | the automatic fix run on the PR's head, from CodeRabbit's findings | as `fix`, with the PR: `verify`, or `waiting` with `round <k>'s fix run ended <status>: <reason>; the PR is unchanged` or `round <k>'s fix run was refused by the host gates: <details>; the PR is unchanged` | the run |
-| `waiting` | the operator: a merge, a close or a `hapi:rework` label | merged: `merged`; closed: `closed`; a maintainer's `hapi:rework`: `fix` (a rework), up to `runs.max_rework_rounds` | the PR, and why it waits |
-| `failed` | the operator's `hapi retry` | nothing on its own (below) | the reason |
-| `merged`, `closed` | nothing | settled; the work order's pin in the mirror is dropped | the PR |
+| A run's dollars | `budgets.run_usd`, and the work order's `budget.usd` under it; a review's or fix's `runs.phases.round_usd` | $3.00; $1.00 a round | hapi-guard fails the node (`budgets.enforcement.hapi_guard: hard`); a review stops at its node's own `maxBudgetUsd` (H-259) |
+| A run's turns and time | the work order's `budget.turns` and `budget.minutes`; a fix's `runs.phases.round_turns` | the work order's; 40 | hapi-guard fails the node at the turn cap; the launcher ends the run at its deadline (`timed-out`) |
+| A run's nodes | `factory-task`'s `max_work_units` | its node count | Archon refuses further nodes |
+| The runs' disk | `runs.disk.gb` | 20 GiB, every run's volumes together | `hapi run start` refuses every run on a run disk that isn't at most the cap (`runs.disk.enforcement: hard`) |
+| A repo's month | `budgets.repo_monthly_usd` (an overlay may lower it) | $25 ($15 on the sandbox) | no new run for the repo until the 1st (UTC): a queued work order goes `cap-stopped`, a verify or review waits in its phase; the status comment says so |
+| The day, all repos | `budgets.daily_usd` (central only) | $10 | nothing new starts until the next UTC day |
+| Live runs | `runs.max_live` | 1 | the launcher refuses the next; the poller waits for a free slot |
+| Fix rounds before the PR | `runs.phases.fix_rounds_before_pr` | 1 | no further fix: the harvest, with what is left open on the PR |
+| Fix rounds on the PR | `runs.phases.fix_rounds_on_pr` | 1 | no further automatic round: the PR waits for you |
+| Automatic rounds | `runs.max_auto_rounds` (always hard) | 3 runs with no human action between them | the factory waits for you; the PR and the status comment say so |
+| Rework rounds | `runs.max_rework_rounds` (central only, always hard); `flags.thresholds.review_rounds` | 3; flagged past 2 | a `hapi:rework` label starts nothing more, and the PR waits; past 2, `hapi:flagged` |
+| Retries | `runs.max_retries` (central only, always hard) | 2 a work order | `hapi retry` refuses: plan the work again under a new work order id |
+| Decision calls per pushed head | `gates.decisions.max_calls_per_head` | 24 | the rest are not asked, and their decision's `on_unscreened` applies (`hold`) |
+| Inputs and work-order files | `runs.inputs_mb`; `runs.work_order_kb` (both central only) | 16 MiB; 1024 KiB | a review's or fix's inputs over it are refused, never truncated (the work order fails, or waits with a PR); a work-order file over it can't run |
+| The provider's own limit | the `hapi-factory` Console workspace's monthly limit | $100 (about $25 while the sandbox runs) | Anthropic refuses every request: the stop no worker can get around |
 
-**`failed`**, before any PR exists: a worker that failed, timed out or was stopped; host gates that refused its bundle; a harvest with nothing it could push; or any later run of it that was stopped. A `hapi run stop` that reaches a live run ends the work order's automatic work, even past the run's deadline (the stop outranks it): `failed` with no PR, `waiting` with one (`round <k>'s <kind> run ended stopped: …; the PR is unchanged`). Nothing more is pushed or started for it, but a maintainer's `hapi:rework` label on its PR still starts a rework. A stop that comes after the run has ended changes nothing ([runs.md](runs.md#hapi-run-stop)), and a run that ended `timed-out` is routed as one that failed. The poller never retries on its own: `hapi retry <owner>/<name> <id>` queues a failed work order with no PR again, at most `runs.max_retries` times (2), for a fresh pass from the worker at the same merge commit, whose run keys name the retry (`worker:0:retry1`, `review:0:retry1`, …), so it never reuses the failed pass's runs, and a worker that succeeded doesn't block it. Each pass's runs still count toward the repo's month. What to do with each reason is in this runbook's Troubleshooting (Task 15).
+`budgets.enforcement.poller` (`hard` by default) applies to the month and the day: `soft` starts the run anyway, puts the cap's text on its event, and flags its PR `hapi:flagged`. The round, rework and retry counts are always hard. Each run counts its reported spend, or its whole budget when that isn't known. **Decision spend counts with the runs'**: each work order's decision ledger, an unanswered call at `classifiers.jev.unknown_call_usd`. Reported spend is written inside the run's containers, so it catches an honest runaway, not a compromised worker (H-250): the provider's limit is the bound. CodeRabbit's CLI reviews per hour have no cap of hapi's (H-167): a review CodeRabbit refuses for its own rate limit is "not reviewed" on the PR.
 
-**Rounds and stages.** The worker is round 0 and the pass's k-th fix is round k; a verify or review takes the round of the head it checks. Every run's parent is the pass's worker. A fix that started before the pass's first harvest is `before the PR`; after it, the newest ones up to the rework count are `rework` and the rest `on the PR`. The PR's "Review rounds" lists the current pass's only.
+## Stopping everything
 
-**What each run is given.** The worker starts on the merge commit from the mirror. Verify, review and fixes start from the harvester's scratch copy on the head: with no PR, the head of the pass's newest worker or fix whose gates passed; with a PR, the newest fix's own. A rework starts from the mirror on the PR's head. A verify gets no inputs (its source holds the bundle's commits). A review gets `diff.patch` (the diff from the merge, read with hardened git) and `verify.json` (the verify run's, copied); its base is `run.json`'s `base`. A fix gets `findings.md` alone: one IS-7 block per item (the review's findings and its criteria not met, the CLI's major and critical findings, CodeRabbit's PR comments, or for a rework the maintainers' comments since the last round), quoted as data, never instructions. An inputs copy over `runs.inputs_mb` (16 MiB) is refused, never truncated: the work order fails, or waits with a PR. Before a PR that failure is deterministic: the same work order gives the same inputs, so `hapi retry` can't get past it; plan the work again, smaller. A worker's budget is the order's, at most `budgets.run_usd`; a review's or fix's the order's, at most `phases.round_usd`; a verify's 0.
+- **[Kill switch 3](kill-switches.md#3-stop-the-stack)**, `mise run down`, stops the poller's timer and its service first, so no new tick starts a run, then removes every live run and stops the stack. `mise run up` brings it all back, the timer included.
+- **The timer alone**, so no tick runs while the stack stays up, as hapi:
 
-### The caps
+  ```bash
+  sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
+    export XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"; \
+    systemctl --user stop hapi-poll.timer'
+  ```
 
-Before every run it starts (a worker, a verify, a review, a fix, a rework, a retry's), the poller checks, in order:
+  A tick already running finishes; none starts after it. A live run goes on to its end under its own caps, and its work order stays where it is until the timer runs again (`mise run up`, or `systemctl --user start hapi-poll.timer` in the same form). [`runtime.poller-timer`](../audit.md#runtimepoller-timer) fails while it is stopped.
+- **The provider's limit:** the `hapi-factory` workspace's monthly limit in the Anthropic Console ([provider keys](provider-keys.md#anthropic-console-workspaces)), lowered, is the one stop no worker can get around: every model call of every run is refused from then on, whatever a run's reported spend says. [Kill switch 1](kill-switches.md#1-zero-or-revoke-the-provider-keys) does that for every provider.
+- **One run:** `hapi run stop <id>` of a live run ([runs.md](runs.md#hapi-run-stop)) ends its work order's automatic work: `failed` with no PR (`hapi retry` can queue it again), `waiting` with one; and the repo's queue moves on at the next tick. A stop after the run has ended changes nothing.
+- **There is no per-repo halt:** stopping the timer pauses every repo.
+- **Kill switch 3 also removes live runs**, which end `failed`, not `stopped`. So after `mise run up`, a pre-PR fix, verify or review removed that way goes on to the harvest and its PR: `hapi run stop` it first if its work order must not reach a PR.
 
-1. **The repo's month**, `budgets.repo_monthly_usd` (an overlay may lower it): `this month's spend on <repo> ($<spent>) plus the run's budget ($<budget>) would pass budgets.repo_monthly_usd ($<cap>): no new run for it until <the 1st of next month>`.
-2. **The day**, `budgets.daily_usd` (central only): `today's spend ($<spent>) plus the run's budget ($<budget>) would pass budgets.daily_usd ($<cap>): nothing new starts until <tomorrow> (UTC)`.
-3. **The automatic rounds**, `runs.max_auto_rounds` (3), for a worker or an automatic fix: `<n> automatic runs since the last human action (runs.max_auto_rounds: <n>): waiting for the operator`.
-4. **The rework rounds**, `runs.max_rework_rounds` (3, central only), before a rework: `<n> rework rounds on #<pr> (runs.max_rework_rounds: <n>): close the PR, or plan the work again under a new work order id`. The PR waits, **Needs your decision**, and its body says so (anti-goal 1).
+## Troubleshooting
 
-The month and the day are UTC calendar ones, by each run's `startedAt`. The month sums every run the repo's work orders list, every pass's, its name compared in any case; the day sums every run record, hand runs too. Each run counts its reported spend, or its whole budget when that isn't known (a live run, or a ledger the run wrote that doesn't add up), and decision spend counts with the runs' (each work order's decision ledger, an unanswered call at `unknown_call_usd`). A run's record is kept until its month is over, because the monthly cap reads it ([runs.md, Retention](runs.md#retention)). With `budgets.enforcement.poller: hard` (the default) a cap refuses the run: a queued work order goes to `cap-stopped`, and a verify or review stays in its phase with the reason, starting once the cap clears; a refused fix leaves the work order where it was, to try again. With `soft` the run starts, its event carries the text, and its PR is flagged `hapi:flagged` (once there is one; the reason is kept until then). The round caps are always hard, whatever `budgets.enforcement.poller` says (ruling m38): an automatic fix the round cap refuses goes to the harvest before the PR (its reason on the PR), and to `waiting` on it. The count restarts at any human action (a comment, a label, a push, a review, a rework, a retry).
-
-### The CodeRabbit round
-
-The one automatic round on a PR (design §3.6) starts only from CodeRabbit's own review of the head commit the factory pushed:
-
-- the head counts as reviewed only when CodeRabbit's check run (`CodeRabbit`, App 347564) on it is completed, `success` and titled `Finished…`; any other title (`Review paused`, `Review skipped`, `Rate limited`) is named (`CodeRabbit did not review <h7>: <title>`) and fails closed;
-- a finding is a root review comment (never a reply) by CodeRabbit's bot user (id 136622811, never matched by login), on the head commit, in a review CodeRabbit submitted on that commit, starting with its generated-comment marker, whose first `**<Severity>**` is Critical or Major, in a thread no one else has replied in; its "Supported by static analysis" sections are stripped;
-- check runs are read with the `checks` token, reviews and comments with the `pr` token.
-
-**What turns it off:** a draft PR; `flags.coderabbit.enabled: false`; `phases.fix_rounds_on_pr` used up; any human action on the PR or a rework so far; and a comment or review from anyone but the operator, hapi's Apps (`hapi-factory[bot]`, `hapi-planner[bot]`) and CodeRabbit (`<login> commented on #<n>, so the automatic CodeRabbit round is off: the PR is the operator's`, or `user <id> reviewed #<n>, …` for a review, which carries no login). The PR's round doesn't yet drop a finding the fix before the PR declined (H-277).
-
-### Rework by label
-
-A `hapi:rework` label on a factory PR in `waiting` starts a rework when a human added it: `type: User`, not through an App, no `[bot]` login, with at least triage permission on the repo, after the work order's newest worker or fix run started, and not taken off since. The rework is a fix run on the PR's head, from the mirror, with the unchanged work order and, as data, each issue comment since that run by a maintainer (triage or above) and each review comment by the operator; with `flags.coderabbit.include_in_rework`, CodeRabbit's findings on the head too. It is the operator's: it counts no automatic round, restarts the count, and its harvest pushes on top of the PR (never over a branch that moved since). To ask for another rework after it, take the label off and add it again. At most `runs.max_rework_rounds` (3) reworks run on one PR; past it the label starts nothing, and the PR waits with the cap's text. A third rework crosses `flags.thresholds.review_rounds` (2), so its PR is flagged `hapi:flagged`. A label on a PR still in its automatic round stops the round first (`waiting`), and the rework starts on the next tick.
-
-### The operator always wins
-
-At the top of every step with a PR:
-
-1. A merged PR settles the work order `merged`, a closed one `closed`.
-2. The operator's actions since the last one the state recorded (comments and labels by the repo owner's login, as a User and not through an App; reviews by the user id those show; a head the factory didn't push) set `lastHumanAt` and restart the automatic-round count.
-3. In an automatic chain (a PR and no rework yet), an action, a pending rework request or anyone else on the PR moves it to `waiting`, **Needs your decision**, with the reason: `the operator acted on #<n> (<what>): the automatic CodeRabbit round is off`, or, during the automatic fix round, `the operator acted during the automatic fix round (<what>): its result is not pushed`. A live fix run is left to end under its own caps, and its result is never harvested (H-278).
-4. Only `waiting` takes the PR's head as the factory's, so a moved head is reported once.
-
-**The PR's body is re-rendered**, from the scratch and the ledger as the harvester builds it (the screens re-read from the ledger, so it asks, spends and pushes nothing), in two cases:
-
-- the PR moves to `waiting` with a reason: the reason goes under Unresolved, and the verdict is **Needs your decision** at best;
-- in `pr-review` or `waiting`, `ci / gates` completes on the head (**Ready to merge** shows only once it is green), or a reason of the state's isn't on the PR yet. This one touches only a body that still has the host's markers.
-
-A re-render waits while a run of the work order is live (the host gates it re-runs write the scratch) and happens on a later tick in `pr-review` or `waiting`. It needs a verify or review run of the PR's head to find the run that made it (with both phases off, the newest worker or fix whose gates give that head); a head the factory didn't push (the operator's) isn't re-rendered.
-
-### When one work order stops its repo's tick
-
-Task 15 writes this runbook's poller sections and its troubleshooting; until then, one row of it. The poller fails a repo's tick closed at the first error it can't keep to one work order: a forge or git error, a state or record file hapi didn't write, a harvest that throws. It writes nothing for that work order, and the next tick tries again. So a work order whose step throws the same way every tick (a poison pill) stops that repo's later work orders and its status comments, tick after tick, while the other repos go on. The tick's line in the journal names it: `<repo>: failed closed: <error>; the next tick retries` (`journalctl --user -u hapi-poll.service`, as hapi). A work order that can't be read, an overlay the central policy now refuses, and a held lock are kept to their work order: the first two are a "Can't run" problem, the last is `<id> waiting: <the lock's holder>`. Fix the cause the line names, and the next tick goes on from where the work order was.
+| Symptom | Cause and fix |
+|---|---|
+| The journal says `<repo>: failed closed: <error>; the next tick retries` | A 5xx, a rate limit (GitHub's secondary one is a 403 with retry-after), an expired token: the next tick retries, and nothing is written half-way. If one work order fails the same way every tick, it is [a poison pill](#when-one-work-order-stops-its-repos-tick): fix the cause the line names. |
+| `<repo>: can't run <file and why>` in the journal, and a row in the status comment's "Can't run" table | The poller can't read that work order (a file that fails its check, or is over `runs.work_order_kb`, or an overlay the central policy now refuses). It waits; fix it in a new planning PR. |
+| A work order is `held` | Two work orders of one merge whose pieces declare overlapping files. It stays held for good (H-243(a)): fix it with a new planning PR that makes them independent. |
+| A work order is `cap-stopped` | The repo's month or the day, with the cap's text. It starts on its own when the cap clears (the 1st, or the next UTC day), or when the cap is raised by a reviewed change; until then it heads its repo's queue. |
+| Stuck in `queued` | Another work order of the repo is active before its PR, a `cap-stopped` one is ahead of it, or `runs.max_live` is reached (another live run, a hand run included). `hapi status` and `hapi run list` show which. |
+| `Needs your decision` with `the work order has no acceptance tests (runs.phases.require_acceptance)` | Its planning PR carried none under `.factory/work/<id>/acceptance/`. Check it yourself and merge, or plan it again with tests. |
+| A verify run can't install (check's tail shows `bun ci` failing), and the PR is a draft | The bundle's `bun.lock` is out of date with its `package.json`, or a registry isn't on `egress-archon`'s allowlist (`policy/trusted_sources.yaml`). Send it back with `hapi:rework`, or add the host by a reviewed change. |
+| A status comment someone deleted | It comes back the next time its content changes. To get it back now, remove its mark, as hapi: `sudo -u hapi -H -- sh -c 'rm -- "$HOME/.local/state/hapi/engine/status/$1/$2.json"' hapi-mark "$OWNER/<name>" <planning-pr>`; on a settled plan, that posts the final comment again too. |
+| No timer after a reboot (`runtime.poller-timer` fails, `list-timers` shows none) | The timer's links are runtime ones, which a reboot clears: run `mise run up`. |
+| A work order is `failed` | Read the reason in `hapi status`. If the cause was outside the work order (a rate limit, a timeout, a container `mise run down` removed, a flaky preflight, your own `hapi run stop`), fix it, then [`hapi retry`](#a-failed-work-order). A failure from the work order's own content, or `has been retried <n> times, and runs.max_retries is <n>`, needs a new id in a new planning PR; so does a closed `factory/<id>` PR, which shows as `closed`. A `hapi run start` by hand is never picked up by the poller. |
+| `failed` with `a <kind> run's inputs (…) are <n> MiB, over runs.inputs_mb (16 MiB): refused, never truncated` | Before a PR the inputs are the same every pass, so `hapi retry` fails the same way: plan the work again, smaller. |
+| Every PR says `not screened (no classifier answered: …)` | Check the archon zone's keys (`hapi secrets check`), the providers' caps (OpenRouter's daily limit answers 402; the Console limit), and hapi's own network from the host to `openrouter.ai` and `api.anthropic.com` (the harvester calls them on the host, not through a zone's proxy). That head stays held, since a re-render asks nothing: merge anyway (the verdict is advice), or send it back with `hapi:rework`. A missing key never turns decision models off. |
+| A hold under Unresolved: is it the file, or the cover? | The reason says. A coverage hold reads `<path>: not screened (<why>) (gates.decisions.by_name.diff-screen.on_unscreened: hold)`, `<why>` being `not asked: over gates.decisions.max_calls_per_head (24)`, `no classifier answered: …`, `not asked: a re-render asks nothing` or `content not shown in the diff`: it says nothing about the file, so check the file yourself. A finding reads `<path>: it holds text addressed to whoever reviews or checks the change (decide diff-screen: …, via jev)` (or `via haiku`): read that file's diff first. |
+| A hold you disagree with | Merge anyway, since the verdict is advice, and record it for calibration (H-262): a hold on a PR you then merged unchanged is a false alarm. |
+| `not asked: over gates.decisions.max_calls_per_head (24)` | A large change, or a head asked about many times. Raise the knob by a protected change, or split the work order. |
+| `content not shown in the diff` | A binary file, a gitlink, or a `-diff` attribute on `main`. Check the file yourself, or set `on_unscreened: note` by a protected change. |
+| `<file> line <n> is not a decision entry` | A damaged decision ledger. It fails that repo's ticks, and, since the day's cap reads every ledger, stops new runs everywhere. With [the timer stopped](#stopping-everything), move that one line into a dated `.bad` file beside the ledger, as hapi, with the file and line the message names: `sudo -u hapi -H -- sh -c 'umask 077; sed -n "$2p" "$1" >> "$1.$(date -u +%Y%m%d).bad" && sed -i "$2d" "$1"' hapi-ledger <file> <n>`, then start the timer again. A lost `answer` line only means its subject is asked again; a lost `asking` line under-counts at most one call ($0.001). |
+| Every PR and the status comment say `Decision models are off` | `gates.decisions.mode` is `off`, the operator's setting ([Running without decision models](../policy.md#running-without-decision-models)); set it back to `enforce` by a protected change. A PR whose head was harvested while it was off then reads as held at its next re-render, since a re-render asks nothing: merge it anyway, or send it back with `hapi:rework`. |
+| You added `hapi:rework`, and nothing started and no cap's text shows | The label counts only when it was added after the work order's newest worker or fix run started, and GitHub gives the label's time in whole seconds: one added in the same second as the run's start reads as before it. Take the label off and add it again. |
+| A verify or review holds with `the host gates refuse <kind> run <id>'s bundle now: <details>` | The run's bundle passed the host gates once but fails them now, most likely after a policy change (a newly protected path, a tighter overlay). The work order holds in its phase, runs the gates again each tick, and holds its repo's queue. Undo or narrow the change the details name, and the next tick goes on. There is no command to fail it instead (H-243(h)). |
+| `hapi:rework` starts nothing, and the PR's body doesn't say why | Past `runs.max_rework_rounds` (3), the cap's text is in the status comment and `hapi status`. The PR's body shows it too, unless you pushed to `factory/<id>` after the factory's last push: a head the factory didn't push isn't re-rendered. Close the PR, or plan the work again under a new work order id. |

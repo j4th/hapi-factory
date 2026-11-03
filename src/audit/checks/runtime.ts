@@ -44,6 +44,16 @@
  *   bypass". Both fail, and so does this shell's own bypass
  *   (`currentUserOverride`), unless `--dev` makes them a skip.
  *
+ * - runtime.poller-timer (Plan 03 design §3.4): the poller's timer,
+ *   `hapi-poll.timer`, is active in hapi's user manager, asked with
+ *   `systemctl --user show hapi-poll.timer --property=ActiveState` through
+ *   `env` with `systemctlEnv`'s XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS
+ *   (spike 09, T20; the same env `hapi stack up` uses). It checks, in order:
+ *   the dev bypass (no timer is installed under it: a skip), that the audit runs
+ *   as hapi (the timer is in hapi's user manager: a skip otherwise), that the
+ *   stack is up (a skip, as below), then the timer's state: any but `active`
+ *   fails, and a systemctl that can't answer is a skip.
+ *
  * With no Docker, each but runtime.run-container (whose definition needs
  * none) is a skip. With Docker but no container of the Compose project,
  * runtime.hermes-no-yolo and runtime.dev-override skip; runtime.run-disk reads
@@ -63,7 +73,7 @@ import { APP_HOME, APP_USER, HELPER_KINDS, HELPER_LABEL, type HelperKind, NO_NEW
 import { loadManifest, MANIFEST_FILE, manifestEntries } from "../../secrets/manifest";
 import { composeServices } from "../../stack/compose";
 import { HERMES_HOME, proxyEnv, serviceEnvironment, SIDECAR_ALIAS } from "../../stack/env";
-import { currentUserOverride, HAPI_USER, networkProblem, PROJECT, runFilters } from "../../stack/up";
+import { currentUserOverride, HAPI_USER, networkProblem, POLL_UNITS, PROJECT, runFilters, systemctlEnv } from "../../stack/up";
 import type { WorkOrder } from "../../workorder/validate";
 import { type AuditContext, type AuditRun, type CheckResult, result } from "../types";
 import { freshBuilds } from "./generated";
@@ -873,4 +883,35 @@ export async function devOverride(run: AuditRun): Promise<CheckResult[]> {
   if ("unavailable" in stack) return [result(id, "skip", stack.unavailable)];
   if (containers.length === 0) return [result(id, "skip", NOT_RUNNING)];
   return [result(id, "pass", `all ${containers.length} containers were started by \`hapi stack up\` as ${HAPI_USER}, with no dev bypass (org.hapi.dev-override=0)`)];
+}
+
+/** runtime.poller-timer */
+export async function pollerTimer(run: AuditRun): Promise<CheckResult[]> {
+  const id = "runtime.poller-timer";
+  const { ctx } = run;
+  const timer = POLL_UNITS[0];
+  const who = currentUserOverride(ctx.env, ctx.user);
+  if (who.override) return [result(id, "skip", "HAPI_ALLOW_CURRENT_USER=1: `mise run up` installs no poller timer under the dev bypass")];
+  if (!who.isHapi) return [result(id, "skip", `run the audit as ${HAPI_USER}: ${timer} is in ${HAPI_USER}'s user manager (systemctl --user)`)];
+  const stack = await stackContainers(run);
+  if ("unavailable" in stack) return [result(id, "skip", stack.unavailable)];
+  if (stack.containers.length === 0) return [result(id, "skip", NOT_RUNNING)];
+  const env = systemctlEnv(ctx.env);
+  const show = ["systemctl", "--user", "show", timer, "--property=ActiveState"];
+  const cannot = `cannot ask ${HAPI_USER}'s user manager`;
+  let r;
+  try {
+    r = await ctx.exec(["env", `XDG_RUNTIME_DIR=${env.XDG_RUNTIME_DIR}`, `DBUS_SESSION_BUS_ADDRESS=${env.DBUS_SESSION_BUS_ADDRESS}`, ...show]);
+  } catch (e) {
+    return [result(id, "skip", `${cannot}: ${(e as Error).message}`)];
+  }
+  if (r.code !== 0) return [result(id, "skip", `${cannot}: ${show.slice(0, 4).join(" ")} exited ${r.code}: ${firstLine(r.stderr) || "no error output"}`)];
+  const state = r.stdout
+    .split("\n")
+    .map((l) => l.trim())
+    .find((l) => l.startsWith("ActiveState="))
+    ?.slice("ActiveState=".length);
+  if (state === undefined) return [result(id, "fail", `${show.slice(0, 4).join(" ")} printed no ActiveState, so whether the poller runs can't be told: \`mise run up\` installs and starts it (docs/runbooks/stack.md)`)];
+  if (state !== "active") return [result(id, "fail", `the stack is up, but ${timer} is ${state || "(empty)"}: no merged work order starts until it runs. \`mise run up\` starts it (docs/runbooks/stack.md)`)];
+  return [result(id, "pass", `${timer} is active in ${HAPI_USER}'s user manager`)];
 }

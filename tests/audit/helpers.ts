@@ -145,8 +145,13 @@ export interface World {
   enableExtensions: { code: number; out: string };
   /** What the Hermes validation run prints (Hermes's defaults, effective config, issues). */
   hermes: { defaults: unknown; issues: { severity: string; message: string }[]; config_version: number; latest_config_version: number; effective?: unknown };
-  /** Images `docker image inspect` finds. */
+  /** Images `docker image inspect` finds: the zone images and every policy sidecar's, by default. */
   images: Set<string>;
+  /**
+   * What `systemctl --user show hapi-poll.timer --property=ActiveState` answers in hapi's user manager (run through
+   * `env` with `systemctlEnv`'s two names): its exit code, and `out` on stdout when it is 0, else on stderr.
+   */
+  timer: { code: number; out: string };
   /** Every command run, and every request made. */
   calls: string[][];
   requests: FetchCall[];
@@ -442,7 +447,8 @@ export async function cleanWorld(o: { repos?: boolean; workflows?: Record<string
     archonValidate: { code: 1, out: readJson("archon-validate-v0.12.1.json") },
     enableExtensions: { code: 0, out: "true" },
     hermes: { defaults, issues: [], config_version: 0, latest_config_version: 51, effective: hermesMerge(defaults, ours) },
-    images: new Set([ARCHON_IMAGE, HERMES_IMAGE]),
+    images: new Set([ARCHON_IMAGE, HERMES_IMAGE, ...Object.values(loadPolicy(join(REPO, "policy")).sidecars).map((s) => s.image)]),
+    timer: { code: 0, out: "ActiveState=active\n" },
     calls: [],
     requests: [],
     routes: githubRoutes({ workflows: o.workflows ?? {} }),
@@ -684,6 +690,7 @@ function archonBindings(configFile: string): { aliases: unknown; tiers: unknown 
 function fakeExec(w: World, cmd: string[]): ExecResult {
   w.calls.push(cmd);
   if (cmd[0] === "getent") return ok("hapi:x:1001:1001::/home/hapi:/bin/bash\n");
+  if (cmd[0] === "env" && cmd.includes("systemctl")) return w.timer.code === 0 ? ok(w.timer.out) : { code: w.timer.code, stdout: "", stderr: w.timer.out };
   if (cmd[0] === "env" && cmd.includes("git")) return fakeGit(w, cmd.slice(cmd.indexOf("git") + 1));
   if (cmd[0] !== "docker") return { code: 127, stdout: "", stderr: `${cmd[0]}: not found` };
   if (w.dockerDown) return { code: 1, stdout: "", stderr: "Cannot connect to the Docker daemon at unix:///run/user/1001/docker.sock. Is the docker daemon running?" };

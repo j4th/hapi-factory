@@ -1,8 +1,9 @@
 /**
  * `hapi audit` (`mise run audit`, spec §11.8): the deployed config, the pins,
- * the budget policy, the run container's definition, the running stack's
- * settings, the secrets setup and each `--repo`'s GitHub settings, checked
- * against policy. docs/audit.md describes every check: what
+ * the budget policy, the repo registry's installations, the sidecar images,
+ * which decision models are off, the run container's definition, the running
+ * stack's settings and the poller's timer, the secrets setup and each
+ * `--repo`'s GitHub settings, checked against policy. docs/audit.md describes every check: what
  * it verifies, why, the credential it uses, how to fix a failure and what its
  * skip means.
  *
@@ -27,9 +28,9 @@ import { generatedDrift } from "./checks/generated";
 import { githubAppPerms, githubLabels, githubRepoSettings, githubRulesets, repoAiWorkflows } from "./checks/github";
 import { mcpToolHashes } from "./checks/mcp";
 import { pinsVersions } from "./checks/pins";
-import { budgetEnforcement } from "./checks/policy";
+import { budgetEnforcement, policyDecisionModels, policyRepos, policySidecars } from "./checks/policy";
 import { repoPrivateUntracked } from "./checks/repo";
-import { devOverride, hermesNoYolo, runContainer, runDisk } from "./checks/runtime";
+import { devOverride, hermesNoYolo, pollerTimer, runContainer, runDisk } from "./checks/runtime";
 import { secretsCheck, secretsProvider } from "./checks/secrets";
 import { archonValidate, hermesValidate } from "./checks/tools";
 import { type AuditContext, type Check, type CheckResult, type Exec, newRun, type RepoRef, result } from "./types";
@@ -41,7 +42,11 @@ const CHECKS: readonly (readonly [id: string, check: Check])[] = [
   ["runtime.run-disk", runDisk],
   ["runtime.hermes-no-yolo", hermesNoYolo],
   ["runtime.dev-override", devOverride],
+  ["runtime.poller-timer", pollerTimer],
   ["policy.budget-enforcement", budgetEnforcement],
+  ["policy.repos", policyRepos],
+  ["policy.sidecars", policySidecars],
+  ["policy.decision-models", policyDecisionModels],
   ["pins.versions", pinsVersions],
   ["tools.archon-validate", archonValidate],
   ["tools.hermes-validate", hermesValidate],

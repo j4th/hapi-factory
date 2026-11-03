@@ -62,7 +62,11 @@ Without the stack and without `--repo`, as on a development machine, most checks
 | [`runtime.run-disk`](#runtimerun-disk) | The run disk, where the runs' volumes live: there, a filesystem of its own, apart from Docker's data root, writable, and at most `runs.disk.gb` | design §3.1 (H-217) | Docker; the run disk |
 | [`runtime.hermes-no-yolo`](#runtimehermes-no-yolo) | No yolo, approvals not off, and the Kanban dispatcher off, in Hermes's effective config | §9.1 | Docker, the stack up |
 | [`runtime.dev-override`](#runtimedev-override) | The stack, and each live run, was started as hapi, without the dev bypass | §4.3, §11.3 | Docker, the stack up |
+| [`runtime.poller-timer`](#runtimepoller-timer) | The poller's timer, `hapi-poll.timer`, is active in hapi's user manager | design §3.4 | hapi, the stack up |
 | [`policy.budget-enforcement`](#policybudget-enforcement) | At least one enforcer of `run_usd` is hard | design §3.5 | policy/ |
+| [`policy.repos`](#policyrepos) | Each repo `policy/repos.yaml` registers is covered by the hapi-planner and hapi-factory installations it records | design §3.2 step 9 | policy/; the App keys |
+| [`policy.sidecars`](#policysidecars) | Every sidecar image `policy/sidecars.yaml` pins is in this Docker | design §3.3 | policy/; Docker |
+| [`policy.decision-models`](#policydecision-models) | Never fails: a note says which decision models are off, or that the engine's decisions give notes only | design §3.6 | policy/ |
 | [`pins.versions`](#pinsversions) | Every tool, image and installed package pinned exactly | §11.6 | The checkout |
 | [`tools.archon-validate`](#toolsarchon-validate) | Archon's own validation of the deployed config and the workflow pack: no errors, no parse warnings, every alias and tier read as generated, `assistants.pi.enableExtensions` true | §9.2 | Docker, the Archon image |
 | [`tools.hermes-validate`](#toolshermes-validate) | Hermes's own reading of the deployed config: every key known, every value read as written | §9.1 | Docker, the Hermes image |
@@ -170,6 +174,18 @@ The pass detail gives its size against the cap, and the data root. A fail's deta
 
 **Skip.** The stack isn't running or Docker isn't available, and this shell sets no bypass. With `--dev`, a bypass is a skip saying what was found.
 
+### runtime.poller-timer
+
+**Verifies.** `systemctl --user show hapi-poll.timer --property=ActiveState`, in hapi's user manager, says `active`. It asks through `env` with `XDG_RUNTIME_DIR` (hapi's `/run/user/<uid>` when unset) and `DBUS_SESSION_BUS_ADDRESS` (its `bus` socket when unset), as `hapi stack up` does (`systemctlEnv`, `src/stack/up.ts`; spike 09, T20). Any other state (`inactive`, `failed`, …) fails, and so does an answer with no `ActiveState`. It checks, in order: the dev bypass, that the audit runs as hapi, that the stack is up, then the timer.
+
+**Why.** Design §3.4: the poller is what starts a merged work order's runs, on its timer. With the stack up and the timer stopped, nothing fails and nothing runs: a merged work order waits with no word.
+
+**Credential.** None: hapi's own user manager.
+
+**Fix.** `mise run up`, as hapi: it links and starts the timer ([the stack runbook](runbooks/stack.md)). If it stops again, `journalctl --user -u hapi-poll.service -n 50` as hapi says why ([the engine runbook](runbooks/engine.md#the-poller)).
+
+**Skip.** The audit runs under the dev bypass (`HAPI_ALLOW_CURRENT_USER=1`: `mise run up` installs no timer then), or as a user other than hapi (the timer is in hapi's user manager); the stack isn't running or Docker isn't available; or systemctl can't answer (the detail starts `cannot ask hapi's user manager:`, with its exit code and first line of error).
+
 ### policy.budget-enforcement
 
 **Verifies.** In `policy/budgets.yaml`, `enforcement.hapi_guard` and `enforcement.archon` are not both `soft`: at least one enforcer of `run_usd` is `hard`, so something stops a run at its target instead of flagging it and letting it finish.
@@ -179,6 +195,42 @@ The pass detail gives its size against the cap, and the data root. A fail's deta
 **Credential.** None: policy/.
 
 **Fix.** Set one of the two to `hard` in `policy/budgets.yaml`, in a PR; then `mise run up`.
+
+**Skip.** Never.
+
+### policy.repos
+
+**Verifies**, for each repo `policy/repos.yaml` registers, with each App's own JWT: `GET /repos/{owner}/{repo}/installation` gives hapi-planner the installation id `installations.planner` records, and hapi-factory the one `installations.factory` records. A different id fails, naming the repo, the App and both ids; so does an App that isn't installed there (GitHub's 404), a suspended installation, or any other error GitHub gives. A registry with no repo passes, saying the poller acts on none. CodeRabbit's installation (`installations.coderabbit`) isn't checked: hapi holds no key for CodeRabbit's App.
+
+**Why.** Design §3.2 step 9: the poller acts only on a registered repo, and the run engine's tokens (`forgeToken`, `src/forge/github/token.ts`) refuse to mint when hapi-factory's installation on the repo isn't the one the registry records. A wrong id means every tick of that repo fails closed; this finds it before a merge waits on it. It runs without `--repo`: the registry, not the command line, names the repos.
+
+**Credential.** The App ids and keys from `$XDG_RUNTIME_DIR/hapi/env/host.env`, read as `hapi token mint` reads them; a JWT needs no permission, and nothing is minted.
+
+**Fix.** Find each App's installation id (Settings → Applications → Installed GitHub Apps → Configure; the page's URL ends in `/settings/installations/<id>`) and correct `installations` in `policy/repos.yaml`, in a PR ([the GitHub Apps runbook](runbooks/github-apps.md)); or install the App on the repo, for selected repositories only.
+
+**Skip.** A registered repo but no App key (`hapi secrets resolve` writes `host.env`). With one App's key missing and the other's installation matching, it skips, naming the App it couldn't ask.
+
+### policy.sidecars
+
+**Verifies.** For each sidecar `policy/sidecars.yaml` lists, `docker image inspect` finds its pinned image (`image`, a tag and a digest) in the Docker of the user running the audit. A missing image fails, naming the sidecar and the image; only Docker's own "No such image" counts as missing.
+
+**Why.** Design §3.3: a run starts its smoke sidecar from the pinned image with `--pull never`, so a missing image refuses the run instead of fetching anything at run time. `mise run up` pulls each one (by digest), so a missing image means `up` hasn't run since the image was pinned.
+
+**Credential.** None: `docker image inspect`.
+
+**Fix.** `mise run up`, as hapi; it pulls every sidecar image, and fails if one can't be pulled.
+
+**Skip.** Docker isn't available, or `docker image inspect` fails for another reason (the detail starts `cannot ask Docker:`).
+
+### policy.decision-models
+
+**Verifies.** Nothing that can fail. It reads `policy/gates.yaml` and `policy/flags.yaml` and passes with a detail that says which decision models are on or off: `decision models are on: …` when the engine's decisions (`gates.decisions.mode: enforce`), the bash gate and the result screen are all on, or a `note:` naming, in order, what is off (`gates.decisions.mode: off`, else each decision whose `by_name.<name>.mode` is `off`; then `bash_gate.enabled: false` and `result_screen.enabled: false`) and whether the engine's decisions give notes only (`gates.decisions.mode: notes`).
+
+**Why.** Design §3.6 ("Decisions"): running without decision models is the operator's explicit choice ([Running without decision models](policy.md#running-without-decision-models)), never a fallthrough, and `loadPolicy` already refuses a gate or an engine decision that is on with no classifier. So there is nothing to fail; the note is there so a policy without decision models is never silent, in the audit beside the PR, the status comment and the run records.
+
+**Credential.** None: policy/.
+
+**Fix.** It never fails. To turn decision models back on, revert the change that turned them off ([the recipe](policy.md#running-without-decision-models)).
 
 **Skip.** Never.
 
@@ -417,3 +469,4 @@ On 2026-10-27, against the pinned images (`ghcr.io/coleam00/archon:0.12.1@sha256
 - **Hermes's `.env`:** `runtime.hermes-no-yolo` doesn't read `$HERMES_HOME/.env`, which Hermes loads at startup, so a yolo variable planted there passes; Plan 04 mounts an empty read-only file over it and has the check require that mount (H-190).
 - **A dev-bypass stack on another user's Docker:** `runtime.dev-override` reads only the auditing user's Docker, so the audit as hapi never sees a bypass stack on the operator's own Docker (H-193).
 - **Active skill forks:** Plan 04 (H-109).
+- **Template drift:** `hapi new-repo` writes `.factory/template.lock` (the hapi-factory commit and a sha256 per contract file), but no check reads it yet, so a repo whose contract files drifted from the lock isn't reported (H-238).

@@ -1051,3 +1051,87 @@ describe("runtime.run-disk", () => {
     }
   });
 });
+
+describe("runtime.poller-timer", () => {
+  const SHOW = ["systemctl", "--user", "show", "hapi-poll.timer", "--property=ActiveState"];
+  /** The systemctl calls the audit made, each with the env assignments `env` was given before it. */
+  const showCalls = (w: World) => w.calls.filter((c) => c[0] === "env" && c.includes("systemctl"));
+
+  test("passes when hapi-poll.timer is active in hapi's user manager, asked with systemctlEnv's XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS (T20)", async () => {
+    const w = await cleanWorld();
+    const r = await check(w, "runtime.poller-timer");
+    expect([r.status, r.detail]).toEqual(["pass", "hapi-poll.timer is active in hapi's user manager"]);
+    const xdg = w.ctx.env.XDG_RUNTIME_DIR!;
+    expect(showCalls(w)).toEqual([["env", `XDG_RUNTIME_DIR=${xdg}`, `DBUS_SESSION_BUS_ADDRESS=unix:path=${xdg}/bus`, ...SHOW]]);
+  });
+
+  test("a DBUS_SESSION_BUS_ADDRESS already set is passed as it is", async () => {
+    const w = await cleanWorld();
+    w.ctx.env.DBUS_SESSION_BUS_ADDRESS = "unix:path=/run/user/1001/bus";
+    await check(w, "runtime.poller-timer");
+    expect(showCalls(w)[0]).toContain("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus");
+  });
+
+  test("an inactive timer fails: no merged work order starts until it runs", async () => {
+    const w = await cleanWorld();
+    w.timer = { code: 0, out: "ActiveState=inactive\n" };
+    const r = await check(w, "runtime.poller-timer");
+    expect([r.status, r.detail]).toEqual(["fail", "the stack is up, but hapi-poll.timer is inactive: no merged work order starts until it runs. `mise run up` starts it (docs/runbooks/stack.md)"]);
+  });
+
+  test("any other state fails the same way, naming it; an answer with no ActiveState fails too", async () => {
+    for (const [out, says] of [
+      ["ActiveState=failed\n", "hapi-poll.timer is failed"],
+      ["Id=hapi-poll.timer\n", "systemctl --user show hapi-poll.timer printed no ActiveState"],
+    ] as const) {
+      const w = await cleanWorld();
+      w.timer = { code: 0, out };
+      const r = await check(w, "runtime.poller-timer");
+      expect([out, r.status, r.detail]).toEqual([out, "fail", expect.stringContaining(says)]);
+    }
+  });
+
+  test("run as another user it skips: the timer is in hapi's user manager", async () => {
+    const w = await cleanWorld();
+    w.ctx.user = "dev";
+    const r = await check(w, "runtime.poller-timer");
+    expect([r.status, r.detail]).toEqual(["skip", "run the audit as hapi: hapi-poll.timer is in hapi's user manager (systemctl --user)"]);
+    expect(showCalls(w)).toEqual([]);
+  });
+
+  test("under the dev bypass it skips: `mise run up` installs no timer then", async () => {
+    const w = await cleanWorld();
+    w.ctx.user = "dev";
+    w.ctx.env.HAPI_ALLOW_CURRENT_USER = "1";
+    const r = await check(w, "runtime.poller-timer");
+    expect([r.status, r.detail]).toEqual(["skip", "HAPI_ALLOW_CURRENT_USER=1: `mise run up` installs no poller timer under the dev bypass"]);
+    expect(showCalls(w)).toEqual([]);
+  });
+
+  test("with no stack container it skips, as the other runtime checks do; with no Docker, saying so", async () => {
+    const w = await cleanWorld();
+    w.containers = [];
+    const r = await check(w, "runtime.poller-timer");
+    expect([r.status, r.detail]).toEqual(["skip", "the stack is not running (no container of the Compose project hapi): `mise run up` starts it"]);
+    const down = await cleanWorld();
+    down.dockerDown = true;
+    const d = await check(down, "runtime.poller-timer");
+    expect([d.status, d.detail.toLowerCase()]).toEqual(["skip", expect.stringContaining("docker")]);
+    expect(showCalls(w)).toEqual([]);
+  });
+
+  test("when systemctl exits non-zero, or can't be run, it skips, naming the first line of its error", async () => {
+    const w = await cleanWorld();
+    w.timer = { code: 1, out: "Failed to connect to bus: No medium found\nmore\n" };
+    const r = await check(w, "runtime.poller-timer");
+    expect([r.status, r.detail]).toEqual(["skip", "cannot ask hapi's user manager: systemctl --user show hapi-poll.timer exited 1: Failed to connect to bus: No medium found"]);
+    const t = await cleanWorld();
+    const real = t.ctx.exec;
+    t.ctx.exec = async (cmd, o) => {
+      if (cmd.includes("systemctl")) throw new Error("cannot run env: is it installed and on PATH?");
+      return real(cmd, o);
+    };
+    const e = await check(t, "runtime.poller-timer");
+    expect([e.status, e.detail]).toEqual(["skip", "cannot ask hapi's user manager: cannot run env: is it installed and on PATH?"]);
+  });
+});
