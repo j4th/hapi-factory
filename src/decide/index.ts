@@ -30,6 +30,9 @@ export type Answers = Record<string, Answer>;
 
 export type Verdict = "allow" | "block" | "wrap" | "flag";
 
+/** The run engine's decision files (src/engine/decisions.ts): pass, a note for the operator, or hold back Ready to merge. */
+export type EngineVerdict = "pass" | "note" | "hold";
+
 export interface DecisionFile<V extends string = Verdict> {
   /** A slug, equal to the file name. */
   readonly name: string;
@@ -38,6 +41,11 @@ export interface DecisionFile<V extends string = Verdict> {
   readonly fallback: V;
   /** Thresholds live here, in code. */
   readonly verdict: (answers: Answers) => V;
+}
+
+/** An engine decision file: its `says` is the reason wording, in the file beside its thresholds. */
+export interface EngineDecisionFile extends DecisionFile<EngineVerdict> {
+  readonly says: { hold: string; note: string };
 }
 
 export interface DecideOptions {
@@ -68,8 +76,8 @@ export interface DecideResult<V extends string = Verdict> {
   error?: string;
 }
 
-/** How many characters of state a classifier would be shown. */
-function stateLength(state: State): number {
+/** How many characters of state a classifier would be shown: how decide() measures a state against `gates.max_state_chars`. */
+export function stateLength(state: State): number {
   return (typeof state === "string" ? state : JSON.stringify(state)).length;
 }
 

@@ -166,6 +166,33 @@ export interface Gates {
   };
 }
 
+/** One run-engine decision's mode (gates.yaml's `decisions.by_name.<name>.mode`): off, asked and recorded only, or acted on. */
+export type DecisionMode = "off" | "shadow" | "enforce";
+
+/** The whole `decisions` block's mode (gates.yaml's `decisions.mode`): the operator's switch for running without decision models. */
+export type DecisionModels = "enforce" | "notes" | "off";
+
+/** One run-engine decision's knobs. `skip_paths` only for a decision whose subjects are changed files. */
+export interface EngineDecision {
+  mode: DecisionMode;
+  /** What a subject no classifier answered does: hold back Ready to merge, or add a note. */
+  on_unscreened: "hold" | "note";
+  /** Globs (`globMatches`) of changed files never screened. */
+  skip_paths?: string[];
+}
+
+/**
+ * The run engine's `decide()` questions, from gates.yaml's `decisions` block (Plan 03 Task 12): central only, and
+ * loaded apart from the guard's gates, so `Policy.gates` keeps Plan 02's shape. `by_name`'s keys are
+ * src/engine/decisions.ts's `ENGINE_DECISIONS`, held equal by the schema and a test.
+ */
+export interface EngineDecisions {
+  mode: DecisionModels;
+  /** Classifier calls for one pushed head, over every harvest of it and every re-ask. */
+  max_calls_per_head: number;
+  by_name: Record<string, EngineDecision>;
+}
+
 /** The fixed short list of actions that always need the operator (spec §8.1). */
 export type Approval =
   | "merge"
@@ -286,6 +313,8 @@ export interface Policy {
   budgets: Budgets;
   runs: Runs;
   gates: Gates;
+  /** gates.yaml's `decisions` block: the run engine's decisions, loaded apart from the guard's gates. */
+  decisions: EngineDecisions;
   approvals: Approval[];
   roles: Roles;
   rosters: Record<RosterName, Roster>;

@@ -3,6 +3,10 @@
  * character or bidi control reaches a terminal), then `redactSecrets` with its zones' values (keys off the screen; no
  * boundary). `hapi run watch` prints every line through both, and finalize keeps a run container's log through both
  * (./lifecycle.ts). Its own module so lifecycle.ts can use it: view.ts imports lifecycle.ts.
+ *
+ * The run engine also finds and redacts a value's base64 forms (`base64Forms`, `secretHits`, `redactSecretForms`):
+ * the harvester's secret scan of a bundle, and what it shows of a run (the worker's account) or sends to a
+ * classifier (a decision's state), cover each zone value raw and base64, and every key format.
  */
 import { MIN_SECRET_CHARS, redactKeyFormats } from "../guard/secrets";
 
@@ -31,4 +35,52 @@ export function redactSecrets(text: string, values: Record<string, string>): str
   const exact = Object.entries(values).filter(([, v]) => v.length >= MIN_SECRET_CHARS).sort((a, b) => b[1].length - a[1].length);
   for (const [name, value] of exact) out = out.split(value).join(`[hapi: ${name} redacted]`);
   return redactKeyFormats(out).text;
+}
+
+/**
+ * The base64 forms of `value` that any base64 text holding it must contain, one per alignment of its first byte in
+ * the encoded stream: the characters fixed by the value's bytes alone, padding and the partial characters at either
+ * end dropped. So a value encoded on its own or inside a longer string is found either way. Forms under
+ * MIN_SECRET_CHARS characters are dropped (too short to tell from ordinary text).
+ */
+export function base64Forms(value: string): string[] {
+  const bytes = Buffer.from(value, "utf8");
+  const forms = new Set<string>();
+  for (const k of [0, 1, 2]) {
+    const enc = Buffer.concat([Buffer.alloc(k), bytes]).toString("base64").replace(/=+$/, "");
+    const end = (k + bytes.length) % 3 === 0 ? enc.length : enc.length - 1;
+    const core = enc.slice([0, 2, 3][k], end);
+    if (core.length >= MIN_SECRET_CHARS) forms.add(core);
+  }
+  return [...forms];
+}
+
+/**
+ * Where `text` holds one of `values` (each of MIN_SECRET_CHARS or more), raw or in a base64 form (`base64Forms`):
+ * the value's name and how, never the value. The host's secret scan of a run's bundle reads the bundle with it.
+ */
+export function secretHits(text: string, values: Record<string, string>): { name: string; form: "raw" | "base64" }[] {
+  const hits: { name: string; form: "raw" | "base64" }[] = [];
+  for (const [name, value] of Object.entries(values)) {
+    if (value.length < MIN_SECRET_CHARS) continue;
+    if (text.includes(value)) hits.push({ name, form: "raw" });
+    else if (base64Forms(value).some((f) => text.includes(f))) hits.push({ name, form: "base64" });
+  }
+  return hits;
+}
+
+/**
+ * `redactSecrets` (each exact value, then each key format), then each value's base64 forms, as `[hapi: <NAME>
+ * redacted (base64)]`: what the harvester does to every string of a run's it shows (a worker's account) or sends to
+ * a classifier (a decision's state). The same coverage as the host's secret scan of the bundle (`secretHits`), plus
+ * the key formats.
+ */
+export function redactSecretForms(text: string, values: Record<string, string>): string {
+  let out = redactSecrets(text, values);
+  const encoded = Object.entries(values)
+    .filter(([, v]) => v.length >= MIN_SECRET_CHARS)
+    .flatMap(([name, v]) => base64Forms(v).map((form) => [name, form] as const))
+    .sort((a, b) => b[1].length - a[1].length);
+  for (const [name, form] of encoded) out = out.split(form).join(`[hapi: ${name} redacted (base64)]`);
+  return out;
 }

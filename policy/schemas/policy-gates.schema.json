@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "policy-gates.schema.json",
   "title": "policy/gates.yaml",
-  "description": "The level-6 gate settings (Plan 02): the bash gate, the result screen and the classifiers behind them. Every key is required: the loader fills no defaults. A gate may be on only while flags.jev has a classifier (checked by loadPolicy).",
+  "description": "The level-6 gate settings (Plan 02): the bash gate, the result screen and the classifiers behind them; and the run engine's decide() questions (Plan 03 Task 12), the decisions block, which the harvester asks and which loadPolicy loads apart from the gates. Every key is required: the loader fills no defaults. A gate, or an engine decision that isn't off, may be on only while flags.jev has a classifier (checked by loadPolicy).",
   "type": "object",
   "properties": {
     "bash_gate": {
@@ -113,13 +113,90 @@
         "haiku"
       ],
       "additionalProperties": false
+    },
+    "decisions": {
+      "description": "The run engine's decide() questions, asked on the host by the harvester about a head it will push. Advisory: an answer can only hold back Ready to merge or add a note.",
+      "type": "object",
+      "properties": {
+        "mode": {
+          "description": "The operator's switch for the whole block. enforce: each decision acts as by_name sets it; notes: asked and recorded, but no answer holds a PR (a hold becomes a note); off: decision models are off, nothing is asked, held or noted, and the PR, the status comment and the run records say so.",
+          "enum": [
+            "enforce",
+            "notes",
+            "off"
+          ]
+        },
+        "max_calls_per_head": {
+          "description": "Classifier calls for one pushed head, over every harvest of it and every re-ask. A subject past it is not asked, and its decision's on_unscreened applies.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "by_name": {
+          "description": "One entry per decision file the engine asks (policy/decisions/<name>.ts), held to the engine's registry (src/engine/decisions.ts ENGINE_DECISIONS).",
+          "type": "object",
+          "properties": {
+            "diff-screen": {
+              "description": "The diff screen: each changed file of a head the harvester will push, in windows of whole lines when long.",
+              "$ref": "#/$defs/engineDecision"
+            }
+          },
+          "required": [
+            "diff-screen"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "mode",
+        "max_calls_per_head",
+        "by_name"
+      ],
+      "additionalProperties": false
     }
   },
   "required": [
     "bash_gate",
     "result_screen",
     "max_state_chars",
-    "classifiers"
+    "classifiers",
+    "decisions"
   ],
-  "additionalProperties": false
+  "additionalProperties": false,
+  "$defs": {
+    "engineDecision": {
+      "description": "One engine decision's knobs.",
+      "type": "object",
+      "properties": {
+        "mode": {
+          "description": "off: never asked; shadow: asked and recorded, no effect on the PR but its Evidence row; enforce: a hold keeps the PR at Needs your decision, a note goes under Check this yourself.",
+          "enum": [
+            "off",
+            "shadow",
+            "enforce"
+          ]
+        },
+        "on_unscreened": {
+          "description": "What a subject no classifier answered does (no key, a provider error, over max_state_chars, content the diff doesn't show, past max_calls_per_head): hold, or note.",
+          "enum": [
+            "hold",
+            "note"
+          ]
+        },
+        "skip_paths": {
+          "description": "Globs of changed files never screened (globMatches syntax). Only for a decision whose subjects are changed files.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "mode",
+        "on_unscreened"
+      ],
+      "additionalProperties": false
+    }
+  }
 }

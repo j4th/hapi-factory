@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { commandRuleIssues } from "./commands";
 import { mcpIssues } from "./mcp";
 import { check, formatIssue, type Issue, readYaml, type SchemaName } from "./schema";
-import type { Budgets, Commands, Flags, Gates, McpCatalog, Policy, Roster, RosterName, Runs } from "./types";
+import type { Budgets, Commands, EngineDecisions, Flags, Gates, McpCatalog, Policy, Roster, RosterName, Runs } from "./types";
 
 /** A policy or overlay file failed to load. `path` is a JSON Pointer into the file ("" = the whole file). */
 export class PolicyError extends Error {
@@ -48,17 +48,22 @@ export function loadChecked(file: string, schema: SchemaName): unknown {
  * such a run would take the gate's fallback on every call, blocking every bash
  * command and wrapping every result while it spends its budget, so refuse it here
  * rather than at the first run (final review A-6).
+ *
+ * The run engine's decisions (gates.yaml's `decisions` block) are held the same way: one whose `mode` isn't `off`
+ * would give every subject its file's fallback (a hold), so it is refused at `/decisions/by_name/<name>/mode`, unless
+ * `decisions.mode` is `off`, which asks nothing. `notes` still asks, so it is refused too.
  */
-function gateIssues(flags: Flags, gates: Gates): Issue[] {
+function gateIssues(flags: Flags, gates: Gates, decisions: EngineDecisions): Issue[] {
   if (flags.jev.fallback !== "none") return [];
   const issues: Issue[] = [];
+  const message =
+    "on, but flags.jev.fallback is none, so a run that isn't public has no classifier whatever flags.jev.enabled says: set fallback to haiku, or turn the gate off here";
   for (const gate of ["bash_gate", "result_screen"] as const) {
     if (!gates[gate].enabled) continue;
-    issues.push({
-      path: `/${gate}/enabled`,
-      message:
-        "on, but flags.jev.fallback is none, so a run that isn't public has no classifier whatever flags.jev.enabled says: set fallback to haiku, or turn the gate off here",
-    });
+    issues.push({ path: `/${gate}/enabled`, message });
+  }
+  if (decisions.mode !== "off") {
+    for (const [name, d] of Object.entries(decisions.by_name)) if (d.mode !== "off") issues.push({ path: `/decisions/by_name/${name}/mode`, message });
   }
   return issues;
 }
@@ -83,7 +88,7 @@ const ROSTERS: RosterName[] = ["budget", "anthropic", "portable"];
  * Load the policy directory `dir` (normally `policy`). Throws PolicyError on the
  * first bad file. Beyond the schemas, it checks that every commands.yaml pattern
  * compiles, the MCP catalog's floors, blocklist, tool denylists and env
- * (`mcpIssues`, ./mcp.ts), and that no gate is on without a classifier (`gateIssues`).
+ * (`mcpIssues`, ./mcp.ts), and that no gate or engine decision is on without a classifier (`gateIssues`).
  */
 export function loadPolicy(dir: string): Policy {
   const load = <T>(file: string, schema: SchemaName) => loadChecked(join(dir, file), schema) as T;
@@ -95,8 +100,9 @@ export function loadPolicy(dir: string): Policy {
   const catalogIssues = mcpIssues(mcp);
   if (catalogIssues.length > 0) throw new PolicyError(join(dir, "mcp.yaml"), catalogIssues);
   const flags = load<Flags>("flags.yaml", "policy-flags");
-  const gates = load<Gates>("gates.yaml", "policy-gates");
-  const gate = gateIssues(flags, gates);
+  // gates.yaml holds the guard's gates and the run engine's decisions; Policy.gates keeps Plan 02's shape.
+  const { decisions, ...gates } = load<Gates & { decisions: EngineDecisions }>("gates.yaml", "policy-gates");
+  const gate = gateIssues(flags, gates, decisions);
   if (gate.length > 0) throw new PolicyError(join(dir, "gates.yaml"), gate);
   const budgets = load<Budgets>("budgets.yaml", "policy-budgets");
   const runs = load<Runs>("runs.yaml", "policy-runs");
@@ -109,6 +115,7 @@ export function loadPolicy(dir: string): Policy {
     budgets,
     runs,
     gates,
+    decisions,
     approvals: load("approvals.yaml", "policy-approvals"),
     roles: load("roles.yaml", "policy-roles"),
     rosters: Object.fromEntries(

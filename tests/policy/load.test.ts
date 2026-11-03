@@ -273,7 +273,8 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
   describe("a gate that is on needs Haiku as the fallback (Plan 02 has no other classifier for a repo that isn't public)", () => {
     const jev = (enabled: boolean, fallback: string) =>
       readFileSync("policy/flags.yaml", "utf8").replace(/^jev:.*$/m, `jev:          { enabled: ${enabled}, fallback: ${fallback}, via: openrouter }`);
-    const gates = readFileSync("policy/gates.yaml", "utf8");
+    // The engine's diff-screen off, so each refusal names only its gate (the engine's decisions are held the same way below).
+    const gates = readFileSync("policy/gates.yaml", "utf8").replace(/(diff-screen:[^\n]*\n\s*mode:) enforce/, "$1 off");
     const off = (text: string, gate: string) => text.replace(new RegExp(`(${gate}:\\s*enabled:) true`), "$1 false");
     const message =
       "on, but flags.jev.fallback is none, so a run that isn't public has no classifier whatever flags.jev.enabled says: set fallback to haiku, or turn the gate off here";
@@ -301,6 +302,58 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
         writeFileSync(join(dir, "gates.yaml"), off(off(gates, "result_screen"), "bash_gate"));
         const p = loadPolicy(dir);
         expect([p.flags.jev.enabled, p.gates.bash_gate.enabled, p.gates.result_screen.enabled]).toEqual([enabled, false, false]);
+      }
+    });
+  });
+
+  test("loads the engine's decisions, and keeps them out of the guard's gates", () => {
+    expect(p.decisions).toEqual({ mode: "enforce", max_calls_per_head: 24, by_name: { "diff-screen": { mode: "enforce", on_unscreened: "hold", skip_paths: ["bun.lock"] } } });
+    expect("decisions" in p.gates).toBe(false);
+  });
+
+  describe("an engine decision that is on while flags.jev.fallback is none is refused", () => {
+    const flags = readFileSync("policy/flags.yaml", "utf8").replace(/^jev:.*$/m, "jev:          { enabled: true, fallback: none, via: openrouter }");
+    const gatesOff = readFileSync("policy/gates.yaml", "utf8")
+      .replace(/(bash_gate:\s*enabled:) true/, "$1 false")
+      .replace(/(result_screen:\s*enabled:) true/, "$1 false");
+    const decision = (mode: string, text = gatesOff) => text.replace(/(diff-screen:[^\n]*\n\s*mode:) enforce/, `$1 ${mode}`);
+    const models = (mode: string, text = gatesOff) => text.replace(/^(  mode:) enforce/m, `$1 ${mode}`);
+    const dirWith = (gates: string) => {
+      const dir = policyWith("flags.yaml", flags);
+      writeFileSync(join(dir, "gates.yaml"), gates);
+      return dir;
+    };
+    const message =
+      "on, but flags.jev.fallback is none, so a run that isn't public has no classifier whatever flags.jev.enabled says: set fallback to haiku, or turn the gate off here";
+
+    test("shadow, enforce and notes are refused", () => {
+      for (const text of [decision("shadow"), gatesOff, models("notes")]) {
+        const e = policyError(dirWith(text));
+        expect(e.file).toEndWith("gates.yaml");
+        expect(e.issues).toEqual([{ path: "/decisions/by_name/diff-screen/mode", message }]);
+      }
+    });
+
+    test("the decision off, or decision models off, loads", () => {
+      expect(loadPolicy(dirWith(decision("off"))).decisions.by_name["diff-screen"]!.mode).toBe("off");
+      const p = loadPolicy(dirWith(models("off")));
+      expect([p.decisions.mode, p.decisions.by_name["diff-screen"]!.mode]).toEqual(["off", "enforce"]);
+    });
+
+    test("a malformed decisions block is a schema error", () => {
+      const shipped = readFileSync("policy/gates.yaml", "utf8");
+      const bad = [
+        decision("on", shipped),
+        shipped.replace("      on_unscreened: hold", "      on_unscreened: hold\n      extra: 1"),
+        shipped.replace("  by_name:", "  by_name:\n    nope:\n      mode: off\n      on_unscreened: hold"),
+        shipped.replace(/    diff-screen:[\s\S]*$/, "    {}\n").replace("  by_name:\n    {}", "  by_name: {}"),
+        models("shadow", shipped),
+        shipped.replace(/^  mode: enforce[^\n]*\n/m, ""),
+      ];
+      for (const text of bad) {
+        const e = policyError(policyWith("gates.yaml", text));
+        expect(e.file).toEndWith("gates.yaml");
+        expect(e.path.startsWith("/decisions")).toBe(true);
       }
     });
   });

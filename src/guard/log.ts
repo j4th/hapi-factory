@@ -25,6 +25,7 @@
  */
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import type { ClassifierRecord } from "../decide/record";
 import type { RunFile } from "../generate/archon";
 import type { Identity } from "./config";
 
@@ -32,22 +33,8 @@ export type GuardEvent = "session_start" | "agent_start" | "tool_call" | "tool_r
 /** `done`, `blocked`, `no-change` and `missing` are a `result` record's alone (result.ts). */
 export type GuardDecision = "allow" | "block" | "wrap" | "flag" | "fail" | "done" | "blocked" | "no-change" | "missing";
 
-/** One answer as recorded: its type and numbers only. */
-export type RecordedAnswer =
-  | { type: "noul"; noul: number }
-  | { type: "choice"; choice: string; probabilities: Record<string, number>; confidence: number }
-  | { type: "score"; score: number; probabilities: Record<string, number>; confidence: number };
-
-export interface ClassifierRecord {
-  /** The decision file's name. */
-  decision: string;
-  via: string;
-  fallback: boolean;
-  latency_ms: number;
-  cost_usd: number;
-  answers?: Record<string, RecordedAnswer>;
-  error?: string;
-}
+/** A classifier's answer as recorded (its type and numbers only): src/decide/record.ts's, shared with the run engine. */
+export type { ClassifierRecord, RecordedAnswer } from "../decide/record";
 
 export interface DecisionRecord {
   ts: string;
