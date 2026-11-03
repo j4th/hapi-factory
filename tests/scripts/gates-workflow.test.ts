@@ -123,7 +123,7 @@ const workflowCommands = (out: string) => {
 const withoutStopToken = (script: string) =>
   script
     .split("\n")
-    .filter((l) => !/::stop-commands::|echo "::\$t::"/.test(l))
+    .filter((l) => !/::stop-commands::|printf '\\n::%s::\\n' "\$t"/.test(l))
     .join("\n");
 
 test("gates.yml is a workflow_call with no permissions, and three jobs: scan, check and the aggregator gates", () => {
@@ -441,9 +441,14 @@ describe("the gitleaks step fails closed on what gitleaks 8.30.1 would let pass"
       const lines = r.out.split("\n");
       expect(lines[0]).toMatch(/^::stop-commands::[0-9a-f]{32}$/);
       const t = lines[0]!.slice("::stop-commands::".length);
-      expect(lines.indexOf(`::${t}::`)).toBe(lines.indexOf("10:07AM WRN leaks found: 1") + 1);
+      // D34: the end token is printed after a newline of its own, so it starts a line even after output that ends
+      // without one (an empty line between, when the output does end in one).
+      expect(lines.indexOf(`::${t}::`)).toBe(lines.indexOf("10:07AM WRN leaks found: 1") + 2);
       expect(workflowCommands(r.out)).toEqual([]);
     }
+    const unended = withStub(forged.replace(/\n$/, ""), 1);
+    const ut = unended.out.split("\n")[0]!.slice("::stop-commands::".length);
+    expect(unended.out.split("\n")).toContain(`::${ut}::`);
     expect(a.out.split("\n")[0]).not.toBe(b.out.split("\n")[0]);
     // The guards' own ::error:: comes after the token's end, so Actions still reads it.
     const warned = withStub(`10:07AM WRN you may want to set your diff.renameLimit\n${CLEAN_RUN}`, 0);

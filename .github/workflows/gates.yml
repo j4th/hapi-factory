@@ -184,7 +184,7 @@ jobs:
             t="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
             echo "::stop-commands::$t"
             head -n 20 "$err" | sed 's/^/git: /'
-            echo "::$t::"
+            printf '\n::%s::\n' "$t"
             echo "::error::git log, run as gitleaks runs it, exited $code or wrote to stderr, and gitleaks 8.30.1 would scan on regardless: the history scan fails closed"
             exit 1
           fi
@@ -206,7 +206,7 @@ jobs:
             "$RUNNER_TEMP/bin/gitleaks" git --config "$RUNNER_TEMP/gitleaks.toml" \
             --log-opts="--full-history --all -m --no-mailmap --no-renames --ignore-submodules=none --no-ext-diff --no-textconv" \
             --ignore-gitleaks-allow --redact --no-banner --no-color -v . 2>&1 | tee "$log" || code=$?
-          echo "::$t::"
+          printf '\n::%s::\n' "$t"
           # The guards read the saved log, as text even with a NUL byte in it (-a): GNU grep would otherwise call it
           # a binary file and print no matching line.
           if grep -aEq '(^|[[:space:]])ERR([[:space:]]|$)' "$log"; then
