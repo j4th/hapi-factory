@@ -9,6 +9,7 @@ import { advance } from "../../src/engine/pipeline";
 import { scratchPath } from "../../src/engine/harvest";
 import { mirrorPath } from "../../src/engine/mirror";
 import { retryState, type WorkOrderState, writeState } from "../../src/engine/state";
+import { statusTable } from "../../src/engine/status";
 import type { Policy } from "../../src/policy/types";
 import { lockHeld, readRecord, runKey } from "../../src/run/records";
 import { SecretError } from "../../src/secrets/provider";
@@ -408,6 +409,17 @@ describe("Review Focus", () => {
     const replay = await step(w, saved);
     expect([replay.s.phase, replay.s.prHead, replay.s.lastHumanAt, replay.s.autoRounds, w.fw.pushes.length]).toEqual(["pr", headAt(1), undefined, 3, 1]);
     expect(replay.s.reasons.some((r) => r.includes("moved"))).toBe(false);
+    // D77: the operator acted after that push and before the replay: the result was pushed, and nothing more is.
+    const o = await atHarvest();
+    await step(o.w, o.saved);
+    o.w.ff.comment(1, OPERATOR, "taking this");
+    const acted = await step(o.w, o.saved);
+    expect([acted.s.phase, acted.s.prHead, acted.s.reasons.at(-1), o.w.fw.pushes.length]).toEqual([
+      "waiting",
+      headAt(1),
+      "the operator acted during the automatic fix round (commented on #1): its result was pushed before the operator acted: nothing more is pushed",
+      1,
+    ]);
     // A write after the push that fails (GitHub's 502 on the labels): the tick throws, nothing is saved, and the replay finishes it.
     const f = await atHarvest();
     f.w.ff.failNext("POST", `/repos/${ORDER.repo}/issues/1/labels`, 502);
@@ -932,4 +944,72 @@ describe("Review Focus", () => {
     const r = await step(w, w.state({ phase: "verify", runs: [W0, V0], autoRounds: 1 }));
     expect([r.s.phase, r.starts, r.s.reasons[0]]).toEqual(["failed", [], "a review run's inputs (diff.patch, verify.json) are 1.0 MiB, over runs.inputs_mb (1 MiB): refused, never truncated"]);
   });
+});
+
+describe("final review I4: an operator action while a round's verify or review waits to start wins", () => {
+  /** A PR whose automatic fix F1 succeeded: the state at `phase` with no run of it, its start refused before. */
+  async function waitingToStart(phase: "verify" | "review") {
+    const w = pipelineDeps();
+    await reviewed(w, { harvestedAt: "2026-10-29T11:00:00.000Z" });
+    prAt(w);
+    await w.seed("fix", { id: F1, round: 1, parent: W0 });
+    const runs = [W0, V0, R0, F1];
+    if (phase === "review") {
+      await w.seed("verify", { id: V1, round: 1, parent: W0 });
+      runs.push(V1);
+    }
+    return { w, s: w.state({ phase, pr: 1, prHead: headAt(0), verdict: "ready", runs, autoRounds: 2, reasons: ["refused: runs.max_live (1) runs are live"] }) };
+  }
+
+  for (const phase of ["verify", "review"] as const) {
+    test(`at ${phase} with no ${phase} run, an OPERATOR comment ends waiting with why, no start and no push`, async () => {
+      const { w, s } = await waitingToStart(phase);
+      w.ff.comment(1, OPERATOR, "taking this");
+      const r = await step(w, s);
+      const halt = "the operator acted during the automatic fix round (commented on #1): its result is not pushed";
+      // The start's stale refusal goes: the halt is the reason, first, as on any other in-round wait.
+      expect([r.s.phase, r.s.verdict, r.s.reasons, r.starts]).toEqual(["waiting", "decision", [halt], []]);
+      // The status row (the planning PR's comment and `hapi status`) shows it.
+      expect(statusTable([{ state: r.s, usd: 0, known: true }])).toContain(`waiting: Needs your decision (\`${halt}\`)`);
+      let s2 = r.s;
+      for (let i = 0; i < 3; i++) s2 = (await step(w, s2)).s;
+      expect([s2.phase, w.starts, w.fw.pushes]).toEqual(["waiting", [], []]);
+    });
+  }
+});
+
+describe("final review I3: a rework after retention removed the pass's runs", () => {
+  for (const lastHumanAt of [undefined, "2026-10-30T00:00:00.000Z"]) {
+    test(`a MAINT hapi:rework with no run records${lastHumanAt === undefined ? "" : " and lastHumanAt set"} holds with why, never throws`, async () => {
+      const w = pipelineDeps();
+      prAt(w);
+      w.ff.label(1, "hapi:rework", MAINT);
+      // The runs W0, V0 and R0 were reaped (runs.retention_days): the state still names them.
+      const s = w.state({ phase: "waiting", pr: 1, prHead: headAt(0), verdict: "ready", runs: [W0, V0, R0], ...(lastHumanAt === undefined ? {} : { lastHumanAt }) });
+      const r = await step(w, s);
+      const why = `work order ${ORDER.id}'s worker run of pass 0 has no record (runs.retention_days removed it once its month ended): no rework can start on #1; close the PR, or plan the work again under a new work order id`;
+      expect([r.s.phase, r.s.reasons[0], r.starts]).toEqual(["waiting", why, []]);
+      expect(statusTable([{ state: r.s, usd: 0, known: true }])).toContain(`(\`${why}\`)`);
+      // The next tick holds the same, with no new event.
+      const again = await step(w, r.s);
+      expect([again.s.reasons[0], again.events, again.starts]).toEqual([why, [], []]);
+    });
+  }
+});
+
+test("D76: a heads-cache hit whose commit the scratch no longer holds drops the entry and runs the gates again", async () => {
+  const c = pipelineDeps({ central: policy((p) => (p.budgets.daily_usd = 0.4)) });
+  let gated = 0;
+  const gates = c.d.gates;
+  c.d.gates = async (o, rec) => (gated++, gates(o, rec));
+  await c.seed("worker", { id: W0, usd: 0.5 });
+  const blocked = await step(c, c.state({ phase: "worker", runs: [W0], autoRounds: 1 }));
+  expect([blocked.s.phase, gated]).toEqual(["verify", 1]);
+  await step(c, blocked.s);
+  expect(gated).toBe(1);
+  // The scratch lost the head (a purge, a re-clone): the cache isn't trusted, and the gates run again.
+  c.missing.add(headAt(0));
+  await step(c, blocked.s);
+  expect(gated).toBe(2);
+  expect(c.gitCalls.some((a) => a[0] === "cat-file" && a[1] === "-e" && a[2] === `${headAt(0)}^{commit}`)).toBe(true);
 });

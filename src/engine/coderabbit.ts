@@ -162,16 +162,21 @@ export async function othersOnPr(forge: Forge, n: number, operator: string): Pro
  */
 export async function operatorActions(forge: Forge, pr: PrInfo, o: { operator: string; since: string | undefined; prHead: string | undefined; now?: string }): Promise<{ at: string; what: string }[]> {
   const n = pr.number;
-  const after = (at: string) => (o.since === undefined ? Number.isFinite(Date.parse(at)) : later(at, o.since));
+  const now = o.now ?? new Date().toISOString();
+  // An action whose time doesn't parse still counts, timed now (D78): the operator wins, never a lost action.
+  const add = (at: string, what: string) => {
+    if (!Number.isFinite(Date.parse(at))) acts.push({ at: now, what });
+    else if (o.since === undefined || later(at, o.since)) acts.push({ at, what });
+  };
   const comments = await forge.issueComments(n);
   const events = await forge.labelEvents(n);
   const acts: { at: string; what: string }[] = [];
-  for (const c of comments) if (byOperator(commenter(c), o.operator) && after(c.createdAt)) acts.push({ at: c.createdAt, what: `commented on #${n}` });
-  for (const e of events) if (byOperator(actor(e), o.operator) && after(e.at)) acts.push({ at: e.at, what: `${e.action} #${n} ${shown(e.label)}` });
+  for (const c of comments) if (byOperator(commenter(c), o.operator)) add(c.createdAt, `commented on #${n}`);
+  for (const e of events) if (byOperator(actor(e), o.operator)) add(e.at, `${e.action} #${n} ${shown(e.label)}`);
   const mine = await operatorIds(forge, n, o.operator, comments, events);
-  if (mine.size > 0) for (const r of await forge.reviews(n)) if (mine.has(r.userId) && r.submittedAt !== "" && after(r.submittedAt)) acts.push({ at: r.submittedAt, what: `reviewed #${n}` });
+  if (mine.size > 0) for (const r of await forge.reviews(n)) if (mine.has(r.userId) && r.submittedAt !== "") add(r.submittedAt, `reviewed #${n}`);
   acts.sort((a, b) => byTime(a.at, b.at));
-  if (o.prHead !== undefined && pr.headSha !== o.prHead) acts.push({ at: o.now ?? new Date().toISOString(), what: `${shown(pr.headRef)} moved to ${h7(pr.headSha)}` });
+  if (o.prHead !== undefined && pr.headSha !== o.prHead) acts.push({ at: now, what: `${shown(pr.headRef)} moved to ${h7(pr.headSha)}` });
   return acts;
 }
 

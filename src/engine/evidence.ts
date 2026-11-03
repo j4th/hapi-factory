@@ -103,7 +103,8 @@ export interface CrFinding {
   /** The finding's line, when the CLI gave one. */
   line?: number;
 }
-export type CodeRabbitResult = { state: "off" } | { state: "not-reviewed"; why: string } | { state: "reviewed"; findings: CrFinding[] };
+/** reviewed's gateFailed: the CLI exited 2 (`--gate major` found a finding at major or above); the harvest cross-checks it against the findings it read (final review M1). */
+export type CodeRabbitResult = { state: "off" } | { state: "not-reviewed"; why: string } | { state: "reviewed"; findings: CrFinding[]; gateFailed?: true };
 export interface WorkerResult {
   result: "done" | "blocked" | "no-change" | "missing";
   endsOnQuestion: boolean;
@@ -296,14 +297,15 @@ export function codeRabbitResult(outDir: string | undefined, phases: Phases): Co
     if (typeof r.severity !== "string" || typeof r.fileName !== "string") return bad;
     const line = [r.line, r.startLine].find((n) => typeof n === "number" && Number.isInteger(n) && n > 0) as number | undefined;
     findings.push({
-      severity: r.severity,
+      // Lower-cased (final review M1): `Major` is major, as the CLI's own gate reads it.
+      severity: r.severity.toLowerCase(),
       file: r.fileName,
       title: typeof r.title === "string" ? r.title : "",
       text: typeof r.comment === "string" ? r.comment : "",
       ...(line === undefined ? {} : { line }),
     });
   }
-  return { state: "reviewed", findings };
+  return { state: "reviewed", findings, ...(last.exit === 2 ? { gateFailed: true as const } : {}) };
 }
 
 /**

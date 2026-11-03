@@ -254,8 +254,15 @@ async function cacheHead(c: Ctx, runId: string, head: string): Promise<void> {
  * when they refuse it; `live` when a run of the pass is live, since the gates write the scratch a run clones from.
  */
 async function gatedHead(c: Ctx, src: RunRecord): Promise<{ head: string } | { problems: string[] } | { live: true }> {
-  const cached = (await readHeads(c))[src.runId];
-  if (cached !== undefined) return { head: cached };
+  const heads = await readHeads(c);
+  const cached = heads[src.runId];
+  if (cached !== undefined) {
+    // A cache hit only while the scratch holds that commit (D76): a purge or a fresh scratch drops it, and the gates
+    // run again on the bundle.
+    if ((await scratchGit(c.d.run, scratch(c), ["cat-file", "-e", `${cached}^{commit}`])).code === 0) return { head: cached };
+    const { [src.runId]: _, ...rest } = heads;
+    await writeWhole(headsPath(c), `${JSON.stringify(rest)}\n`);
+  }
   if (c.pass.some((r) => r.status === "live")) return { live: true };
   const g = await c.d.gates(c.order, src);
   if (g.problems.length > 0 || g.head === undefined) return { problems: g.problems.length > 0 ? g.problems.map((p) => p.detail) : [`${kindOf(src)} run ${src.runId}'s bundle has no head`] };
@@ -299,6 +306,12 @@ async function wait(c: Ctx, reason: string | undefined, o: { run?: string; usd?:
   const s = await move(c, "waiting", { reason, ...o });
   if (reason !== undefined) await renderPr(c, undefined);
   return s;
+}
+
+/** The automatic round halted before its verify or review started (final review I4): `waiting` with the halt, the start's refusal dropped. */
+function halted(c: Ctx): Promise<WorkOrderState> {
+  c.s = { ...c.s, reasons: sticky(c.s.reasons) };
+  return wait(c, c.halt);
 }
 
 /** A run's own stop (`hapi run stop`): the automatic work ends. */
@@ -349,7 +362,15 @@ async function begin(c: Ctx, step: Step): Promise<Begun> {
     if (a !== undefined) return { refused: a, why: "auto" };
   }
   const parent = passWorker(c);
-  if (step.kind !== "worker" && parent === undefined) throw new Error(`work order ${c.s.id} has no worker run in pass ${c.s.retry}, so a ${step.kind} run has no parent`);
+  if (step.kind !== "worker" && parent === undefined) {
+    // Final review I3: the reaper (runs.retention_days) removes a waiting PR's runs once their month ended; a step
+    // that needs the pass's worker as its parent can't start, and says so instead of failing the repo's tick.
+    const what = step.kind === "fix" && !step.auto ? "rework" : `${step.kind} run`;
+    return {
+      refused: `work order ${c.s.id}'s worker run of pass ${c.s.retry} has no record (runs.retention_days removed it once its month ended): no ${what} can start${c.s.pr === undefined ? "" : ` on #${c.s.pr}`}; close the PR, or plan the work again under a new work order id`,
+      why: "start",
+    };
+  }
   let inputsDir: string | undefined;
   if (step.inputs !== undefined) {
     const dir = await writeInputs(c, step, await step.inputs());
@@ -543,6 +564,9 @@ async function verify(c: Ctx): Promise<WorkOrderState> {
   if (src === undefined) return queued(c);
   const v = after(c, src).filter((r) => kindOf(r) === "verify").at(-1);
   if (v === undefined) {
+    // An operator action while the start waits wins (final review I4): the round's result is never pushed, and the
+    // start's refusal, now moot, gives way to the halt.
+    if (c.halt !== undefined) return halted(c);
     // Its start was refused (a cap, an error): try again, on the head the gates gave (cached), or say why not.
     const g = await gatedHead(c, src);
     if ("live" in g) return c.s;
@@ -567,6 +591,8 @@ async function review(c: Ctx): Promise<WorkOrderState> {
   if (src === undefined) return queued(c);
   const rv = after(c, src).filter((r) => kindOf(r) === "review").at(-1);
   if (rv === undefined) {
+    // An operator action while the start waits wins (final review I4), as in verify().
+    if (c.halt !== undefined) return halted(c);
     const v = after(c, src).filter((r) => kindOf(r) === "verify").at(-1);
     if (v !== undefined) return enter(c, "review", reviewStep(c, v.sha, src.round ?? 0, v));
     const g = await gatedHead(c, src);
@@ -696,15 +722,20 @@ async function prTop(c: Ctx): Promise<WorkOrderState | undefined> {
   }
   // A harvest replayed after its push (a write after it failed, or a crash, lost the state): the branch at the head
   // that harvest pushes is the factory's own, never the operator's move.
+  let adopted = false;
   if (c.s.phase === "harvest" && pr.headSha !== c.s.prHead) {
     const run = await harvestable(c);
     const g = run === undefined ? undefined : await gatedHead(c, run);
-    if (g !== undefined && "head" in g && g.head === pr.headSha) c.s = { ...c.s, prHead: pr.headSha };
+    if (g !== undefined && "head" in g && g.head === pr.headSha) {
+      c.s = { ...c.s, prHead: pr.headSha };
+      adopted = true;
+    }
   }
   const before = c.s.lastHumanAt;
   const acts = await operatorActions(forge, pr, { operator: c.d.operator, since: before, prHead: c.s.prHead, now: c.at });
   const newest = c.pass.filter((r) => isSource(r) && !c.lost.has(r.runId)).at(-1);
-  const since = latest([newest?.startedAt, before]) ?? "";
+  // With no run records (the reaper removed them) and no human action yet, every rework request counts (I3).
+  const since = latest([newest?.startedAt, before]) ?? new Date(0).toISOString();
   const rework = await reworkRequest(forge, pr.number, since);
   if (rework !== undefined) c.rework = rework;
   if (acts.length > 0) {
@@ -714,7 +745,8 @@ async function prTop(c: Ctx): Promise<WorkOrderState | undefined> {
   }
   if (c.s.reworkRounds === 0 && CHAIN.includes(c.s.phase)) {
     const round = IN_ROUND.includes(c.s.phase);
-    const tail = round ? "its result is not pushed" : "the automatic CodeRabbit round is off";
+    // A replayed harvest whose push is adopted above was pushed already (D77): nothing more is.
+    const tail = !round ? "the automatic CodeRabbit round is off" : adopted ? "its result was pushed before the operator acted: nothing more is pushed" : "its result is not pushed";
     if (acts.length > 0) {
       const what = acts.at(-1)!.what;
       c.halt = round ? `the operator acted during the automatic fix round (${what}): ${tail}` : `the operator acted on #${pr.number} (${what}): ${tail}`;

@@ -196,6 +196,19 @@ describe("the CodeRabbit round", () => {
     expect(moved).toEqual([{ at: "2026-11-02T00:00:00.000Z", what: "factory/0001-skeleton moved to 9999999" }]);
   });
 
+  test("D78: an operator action whose time doesn't parse counts, timed now", async () => {
+    const { w, pr } = await prWorld();
+    w.ff.comment(1, OPERATOR, "taking this", false, "not a time");
+    w.ff.label(1, "do-not-touch", OPERATOR, { at: "also not a time" });
+    const now = "2026-11-02T00:00:00.000Z";
+    for (const since of [undefined, "2026-11-01T00:00:00.000Z"]) {
+      expect(await operatorActions(w.forges.pr, await pr(), { operator: OPERATOR.login, since, prHead: HH, now })).toEqual([
+        { at: now, what: "commented on #1" },
+        { at: now, what: "labeled #1 do-not-touch" },
+      ]);
+    }
+  });
+
   test("maintainerComments quotes a maintainer's comments and the operator's review comments since a time, as data", async () => {
     const { w } = await prWorld();
     w.ff.comment(1, OPERATOR, "before");

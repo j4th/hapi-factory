@@ -18,7 +18,7 @@ import { type Phase, readState, retryState, statePath, withOrderLock, writeState
 import { lockHeld } from "../../src/run/records";
 import { SHA } from "../run/helpers";
 import { cleanup } from "../secrets/helpers";
-import { MERGE, ORDER, SANDBOX, SECOND, tickWorld } from "./helpers";
+import { MAINT, MERGE, ORDER, SANDBOX, SECOND, tickWorld } from "./helpers";
 
 afterEach(cleanup);
 
@@ -403,5 +403,28 @@ describe("pollTick", () => {
     await pollTick(w.d);
     expect(err).toContain(`hapi poll: ${SANDBOX}: revoking the mirror token failed: DELETE /installation/token: HTTP 500`);
     expect(w.mints.find((m) => m.repo === SECOND)!.revoked).toBe(true);
+  });
+});
+
+describe("final review I3", () => {
+  test("a rework on a PR whose runs retention removed holds that work order with why, and the repo's next state still advances", async () => {
+    const w = tickWorld();
+    const world = w.worlds[SANDBOX]!;
+    world.collaborators.set("maint", "triage");
+    const pr = world.addPr({ head: `factory/${W1}` });
+    world.label(pr, "hapi:rework", MAINT);
+    await writeState(w.engineDir, w.state({ id: W1, phase: "waiting", pr, prHead: SHA, verdict: "ready", runs: ["ab12cd34ef56"] }));
+    await writeState(w.engineDir, w.state({ id: W2, phase: "queued" }));
+    const real = engineAdvance(w.d.run, w.d.policy, w.engineDir);
+    const recorded = w.d.advance;
+    w.d.advance = (s, order, t) => (s.id === W1 ? real(s, order, t) : recorded(s, order, t));
+    const r = await pollTick(w.d);
+    expect(r.repos.find((x) => x.repo === SANDBOX)!.error).toBeUndefined();
+    const held = (await readState(w.engineDir, SANDBOX, W1))!;
+    expect([held.phase, held.reasons[0]]).toEqual([
+      "waiting",
+      `work order ${W1}'s worker run of pass 0 has no record (runs.retention_days removed it once its month ended): no rework can start on #${pr}; close the PR, or plan the work again under a new work order id`,
+    ]);
+    expect(seen(w)).toEqual([W2]);
   });
 });

@@ -797,7 +797,8 @@ export async function bundleProblem(file: string, d: Pick<RunDeps, "run" | "env"
     const head = refs.indexOf("HEAD");
     const extra = head === -1 ? refs : refs.filter((_, i) => i !== head);
     if (head !== -1 && extra.length === 0) return undefined;
-    return `unexpected refs in run.bundle: ${extra.length === 0 ? "(none)" : extra.slice(0, 10).map(safe).join(", ")}`;
+    // Each ref name a code span (final review M2): a run chose it, so it is never live Markdown in a PR or comment.
+    return `unexpected refs in run.bundle: ${extra.length === 0 ? "(none)" : extra.slice(0, 10).map((r) => `\`${safe(r).replace(/[`@<>]/g, "?")}\``).join(", ")}`;
   } finally {
     await rm(empty, { recursive: true, force: true });
   }

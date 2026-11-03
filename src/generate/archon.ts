@@ -230,6 +230,13 @@ function archonEnv(): string {
   return `${head}\n\n${body}\n`;
 }
 
+/**
+ * The identity the run container's git commits as (its `~/.gitconfig`'s `[user]`): the only author and committer the
+ * host gates accept on a run's commits (src/engine/harvest.ts), so a worker-written git config can't credit them to
+ * anyone else.
+ */
+export const WORKER_IDENTITY = { name: "hapi-factory worker", email: "worker@hapi.invalid" } as const;
+
 /** The directories Git is told to trust: the source clone, and Archon's workspaces and worktrees. */
 const SAFE_DIRECTORIES = [RUN_PATHS.source, "/.archon/workspaces", "/.archon/workspaces/*", "/.archon/worktrees", "/.archon/worktrees/*"];
 
@@ -242,7 +249,7 @@ const SAFE_DIRECTORIES = [RUN_PATHS.source, "/.archon/workspaces", "/.archon/wor
 function gitconfig(): string {
   const head = hashComment(notice("Git config for the run container (~/.gitconfig)", ["the run container's paths (RUN_PATHS), no policy file"]));
   const safe = SAFE_DIRECTORIES.map((d) => `\tdirectory = ${d}`).join("\n");
-  return `${head}\n[safe]\n${safe}\n[user]\n\tname = hapi-factory worker\n\temail = worker@hapi.invalid\n`;
+  return `${head}\n[safe]\n${safe}\n[user]\n\tname = ${WORKER_IDENTITY.name}\n\temail = ${WORKER_IDENTITY.email}\n`;
 }
 
 /** Bound over `/.archon/.env`: only comments, so Archon loads no env file. */

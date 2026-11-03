@@ -231,6 +231,16 @@ describe("upsertStatusComment", () => {
     expect(writes(v.ff)).toEqual(["POST /issues/3/comments", "PATCH /issues/comments/1000"]);
   });
 
+  test("D84: a lost mark with two marked App comments adopts the newer and edits only it", async () => {
+    const w = world();
+    await upsertStatusComment(w.lazy, 3, B("one"), undefined, w.file, false);
+    const newer = w.ff.comment(3, FACTORY_BOT, B("one, posted again"), true);
+    rmSync(w.file);
+    expect(await upsertStatusComment(w.lazy, 3, B("two"), undefined, w.file, false)).toEqual(["adopted", "edited"]);
+    expect(writes(w.ff)).toEqual(["POST /issues/3/comments", `PATCH /issues/comments/${newer}`]);
+    expect(mark(w.file)).toEqual({ commentId: newer, sha256: sha256(B("two")), final: false });
+  });
+
   test("a lost mark on a plan whose final comment is posted is found again as final: no second final comment", async () => {
     const w = world();
     await upsertStatusComment(w.lazy, 3, B("settled"), "<!-- hapi:status-final v1 -->\nFINAL", w.file, true);

@@ -63,6 +63,20 @@ describe("hapi poll", () => {
     expect(out).toEqual(["poll: another tick holds the poll lock"]);
   });
 
+  test("M6: hapi poll --once exits 1 when the tick's reap failed", async () => {
+    const { out } = capture();
+    const w = tickWorld();
+    const { chmodSync, mkdirSync } = await import("node:fs");
+    mkdirSync(w.f.deps.stateDir, { recursive: true });
+    chmodSync(w.f.deps.stateDir, 0o000);
+    try {
+      expect(await pollCommand(["--once"], { run: w.f.deps, poll: w.d })).toBe(1);
+    } finally {
+      chmodSync(w.f.deps.stateDir, 0o700);
+    }
+    expect(out.some((l) => l.startsWith("poll: "))).toBe(true);
+  });
+
   test("hapi poll ticks again every runs.poll_interval_s", async () => {
     const { out, err } = capture();
     const w = tickWorld();

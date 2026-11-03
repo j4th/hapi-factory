@@ -49,8 +49,9 @@ import type { WorkOrderState } from "./state";
 export type SubjectSource = "diff";
 
 /** The engine's decisions, by name: each file and its subjects' source. gates.yaml's `decisions.by_name` matches it. */
-export const ENGINE_DECISIONS: Readonly<Record<string, { file: EngineDecisionFile; subjects: SubjectSource }>> = Object.freeze({
-  "diff-screen": { file: diffScreen, subjects: "diff" },
+/** heldFor: what a finding hold found, for the PR's verdict line (D73: `held: <heldFor> in <paths>`). */
+export const ENGINE_DECISIONS: Readonly<Record<string, { file: EngineDecisionFile; subjects: SubjectSource; heldFor: string }>> = Object.freeze({
+  "diff-screen": { file: diffScreen, subjects: "diff", heldFor: "text aimed at the reviewer" },
 });
 
 const NAME = /^[a-z0-9][a-z0-9-]*$/;
@@ -470,8 +471,10 @@ function lockJsonUnsafe(text: string): unknown {
 
 // The grammar every string of a skipped bun.lock must fit (the controller's rulings, Task 12 fix rounds 1 and 2):
 // names, resolutions, specs, registries, integrities, paths and platforms, each printable ASCII and at most 256
-// characters, with at most 16 dist-tag specs in all. Free text fits none of them; what still fits (a hyphenated word
-// as a name, one word per dist-tag, words joined without spaces in a path or a URL) is H-275's residual.
+// characters, with at most 16 dist-tag specs in all. Free text with spaces fits none of them; what still fits is
+// H-275's residual: hyphenated words as package names, up to 16 dist-tag specs of lower-case words joined by hyphens
+// (each up to 32 characters), and words joined without spaces in a workspace, file, link or github path, a catalog
+// name, an https or git+https URL, a registry URL, a prerelease tag or a bin path.
 const NPM_NAME = /^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/;
 const NESTED_NAME = /^(?:@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*(?:\/(?:@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*)*$/;
 const PART = "(?:0|[1-9][0-9]*|x|X|\\*)";
@@ -673,6 +676,13 @@ export interface Screened {
   holds: string[];
   /** Lines for Check this yourself. */
   notes: string[];
+  /**
+   * D73 (the hold-fatigue ruling): the files `holds` holds for want of an answer, by cause (`call cap 24`, `no
+   * classifier answered`, …), and the files it holds for what an answer found (`shownPath`s); in enforce only, as
+   * `holds` holds only then. The PR's verdict line names both apart (./pr.ts).
+   */
+  coverage?: { cause: string; files: number }[];
+  held?: string[];
   /** What the calls for this head cost. */
   usd: number;
   /** false: the head was not pushed, so nothing was screened. */
@@ -758,6 +768,13 @@ export async function screenHarvest(
   const cap = p.decisions.max_calls_per_head;
   const answered = new Map<string, DecisionEntry>();
   for (const l of ledger) if (l.kind === "answer" && (l.via === "jev" || l.via === "haiku")) answered.set(l.key, l);
+  // Final review M3: a re-render (ask: false) gives a subject no classifier answered the why its newest via-default
+  // line recorded, as the harvest worded it, so one file never shows two contradictory coverage holds.
+  const unanswered = new Map<string, string>();
+  for (const l of ledger) {
+    if (l.kind !== "answer" || l.via !== "default") continue;
+    unanswered.set(l.key, l.call !== undefined ? `no classifier answered: ${clip(l.error ?? "no classifier gave a reason", 200)}` : (l.error ?? NOT_SHOWN));
+  }
   let left = cap - ledger.filter((l) => l.kind === "asking" && l.head === o.head).length;
   const at = () => d.run.now().toISOString();
   const base = (name: string, version: string, x: Settled) => ({
@@ -792,7 +809,7 @@ export async function screenHarvest(
         return { subject, key, chars, answer: { via: reuse.via, verdict: reuse.verdict, ...(reuse.answers ? { answers: reuse.answers } : {}), head: reuse.head, cost: reuse.cost_usd } };
       }
       if (chars > max) return { subject, key, chars, why: `over gates.max_state_chars (${max})`, truncated: true };
-      if (!o.ask) return { subject, key, chars, why: "not asked: a re-render asks nothing" };
+      if (!o.ask) return { subject, key, chars, why: unanswered.get(key) ?? "not asked: a re-render asks nothing" };
       if (left <= 0) return { subject, key, chars, why: `not asked: over gates.decisions.max_calls_per_head (${cap})` };
       left--;
       return { subject, key, chars, call: randomBytes(6).toString("hex") };
@@ -887,8 +904,10 @@ function screened(name: string, knob: EngineDecision, models: DecisionModels, he
   let reused = 0;
   let unscreened = 0;
   let usd = 0;
-  // One line per file: its first hold (or would-be hold), else its first note.
-  const best = new Map<string, { rank: number; text: string; notesText: string }>();
+  // One line per file: its first hold (or would-be hold), else its first note; a hold is for want of an answer
+  // (coverage, with its cause) or for what an answer found (finding).
+  type Line = { rank: number; text: string; notesText: string; path: string; cause?: string };
+  const best = new Map<string, Line>();
   for (const x of xs) {
     const v = x.answer?.via ?? "default";
     via[v] = (via[v] ?? 0) + 1;
@@ -897,22 +916,25 @@ function screened(name: string, knob: EngineDecision, models: DecisionModels, he
       asked++;
       usd += x.answer.cost;
     } else reused++;
-    const p = `${shownPath(x.subject.subject)}${partText(x.subject.part)}`;
-    let line: { rank: number; text: string; notesText: string } | undefined;
+    const path = shownPath(x.subject.subject);
+    const p = `${path}${partText(x.subject.part)}`;
+    let line: Line | undefined;
     if (x.answer === undefined) {
       const why = x.why ?? NOT_SHOWN;
       line = {
         rank: knob.on_unscreened === "hold" ? 2 : 1,
         text: `${p}: not screened (${why}) (gates.decisions.by_name.${name}.on_unscreened: ${knob.on_unscreened})`,
         notesText: `${p}: not screened (${why}) (gates.decisions.mode: notes)`,
+        path,
+        cause: causeOf(why),
       };
     } else {
       const nums = `(decide ${name}: ${answersText(f, x.answer.answers)}, via ${x.answer.via})`;
       if (x.answer.verdict === "hold") {
-        line = { rank: 2, text: `${p}: ${f.says.hold} ${nums}`, notesText: `${p}: ${f.says.hold} ${nums}: check it yourself (gates.decisions.mode: notes)` };
+        line = { rank: 2, text: `${p}: ${f.says.hold} ${nums}`, notesText: `${p}: ${f.says.hold} ${nums}: check it yourself (gates.decisions.mode: notes)`, path };
       } else if (x.answer.verdict === "note") {
         const text = `${p}: ${f.says.note} ${nums}: check it yourself`;
-        line = { rank: 1, text, notesText: text };
+        line = { rank: 1, text, notesText: text, path };
       }
     }
     if (line === undefined) continue;
@@ -922,11 +944,20 @@ function screened(name: string, knob: EngineDecision, models: DecisionModels, he
   const lines = [...best.values()];
   let holds: string[] = [];
   let notes: string[] = [];
+  const coverage: { cause: string; files: number }[] = [];
+  let held: string[] = [];
   if (knob.mode === "shadow") holds = lines.filter((l) => l.rank === 2).map((l) => l.text);
   else if (models === "notes") notes = lines.map((l) => l.notesText);
   else {
     holds = lines.filter((l) => l.rank === 2).map((l) => l.text);
     notes = lines.filter((l) => l.rank === 1).map((l) => l.text);
+    for (const l of lines.filter((x) => x.rank === 2)) {
+      if (l.cause === undefined) continue;
+      const c = coverage.find((x) => x.cause === l.cause);
+      if (c === undefined) coverage.push({ cause: l.cause, files: 1 });
+      else c.files++;
+    }
+    held = lines.filter((l) => l.rank === 2 && l.cause === undefined).map((l) => l.path);
   }
   return {
     decision: name,
@@ -940,9 +971,18 @@ function screened(name: string, knob: EngineDecision, models: DecisionModels, he
     via,
     holds: capped(holds, name),
     notes: capped(notes, name),
+    coverage,
+    held,
     usd,
     pushed: true,
   };
+}
+
+/** A coverage hold's cause, short, for the verdict line: `call cap <n>`, `no classifier answered`, or the why itself. */
+function causeOf(why: string): string {
+  if (why.startsWith("no classifier answered")) return "no classifier answered";
+  const cap = /^not asked: over gates\.decisions\.max_calls_per_head \((\d+)\)$/.exec(why);
+  return cap ? `call cap ${cap[1]}` : why;
 }
 
 /** What screenHarvest needs: the harvester's deps (./harvest.ts `HarvestDeps`) narrowed. */

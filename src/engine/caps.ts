@@ -45,6 +45,16 @@ async function entries(dir: string): Promise<string[]> {
   }
 }
 
+/** The directories in `dir`, sorted: a stray file where an owner or a repo dir would be is skipped (D79); any error but ENOENT throws. */
+async function dirs(dir: string): Promise<string[]> {
+  try {
+    return (await readdir(dir, { withFileTypes: true })).filter((e) => e.isDirectory()).map((e) => e.name).sort();
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw e;
+  }
+}
+
 /**
  * The states of `repo`, its name in any case: only the dirs whose `<owner>/<name>` matches are read, so another
  * repo's state file never stops this repo's check; one of its own that isn't a state throws (fail closed).
@@ -53,8 +63,8 @@ async function repoStates(engineDir: string, repo: string): Promise<WorkOrderSta
   const root = join(engineDir, "orders");
   const want = repo.toLowerCase();
   const out: WorkOrderState[] = [];
-  for (const owner of await entries(root)) {
-    for (const name of await entries(join(root, owner))) if (`${owner}/${name}`.toLowerCase() === want) out.push(...(await listStates(engineDir, `${owner}/${name}`)));
+  for (const owner of await dirs(root)) {
+    for (const name of await dirs(join(root, owner))) if (`${owner}/${name}`.toLowerCase() === want) out.push(...(await listStates(engineDir, `${owner}/${name}`)));
   }
   return out;
 }

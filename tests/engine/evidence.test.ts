@@ -151,7 +151,7 @@ describe("CodeRabbit's CLI", () => {
 
   test(`a skipped, failed, reused, partial, unverified or rate-limited CLI review is "not reviewed"`, () => {
     const f = fakeRun();
-    expect(cr(f, "f00000000001", [...STREAM, '{"type":"hapi","exit":2}'])).toEqual({ state: "reviewed", findings: [{ severity: "major", file: "src/a.ts", title: "t", text: "c" }] });
+    expect(cr(f, "f00000000001", [...STREAM, '{"type":"hapi","exit":2}'])).toEqual({ state: "reviewed", findings: [{ severity: "major", file: "src/a.ts", title: "t", text: "c" }], gateFailed: true });
     const complete = STREAM[2]!;
     const cases: [string[], string][] = [
       [[...STREAM, '{"type":"status","status":"review_skipped"}'], "CodeRabbit skipped the review"],
@@ -192,6 +192,25 @@ describe("CodeRabbit's CLI", () => {
     const md = cr(f, "f40000000002", [JSON.stringify({ type: "hapi", skipped: "see [x](https://example.invalid) ![](https://example.invalid/i.png) #1 `code`" })]);
     expect(md).toEqual({ state: "not-reviewed", why: "the CodeRabbit CLI step was skipped: `see [x](https://example.invalid) ![](https://example.invalid/i.png) #1 code`" });
     expect(codeRabbitResult(outDir(f, "f50000000001"), ON)).toEqual({ state: "not-reviewed", why: "the review run left no coderabbit.ndjson" });
+  });
+});
+
+describe("final review M1: CodeRabbit's severity and its exit code", () => {
+  const lines = (severity: string, exit: number) => [
+    `{"type":"finding","severity":"${severity}","fileName":"src/a.ts","title":"t","comment":"c"}`,
+    '{"type":"complete","outcome":"completed","unreviewedFileCount":0}',
+    `{"type":"hapi","exit":${exit}}`,
+  ];
+  const cr = (f: ReturnType<typeof fakeRun>, id: string, l: string[]) => {
+    writeOut(f, id, "coderabbit.ndjson", `${l.join("\n")}\n`);
+    return codeRabbitResult(outDir(f, id), ON);
+  };
+
+  test("a severity is read without regard to case", () => {
+    const f = fakeRun();
+    expect(cr(f, "f90000000001", lines("Major", 2))).toEqual({ state: "reviewed", findings: [{ severity: "major", file: "src/a.ts", title: "t", text: "c" }], gateFailed: true });
+    expect(cr(f, "f90000000002", lines("CRITICAL", 2))).toMatchObject({ findings: [{ severity: "critical" }] });
+    expect(cr(f, "f90000000003", lines("Minor", 0))).toEqual({ state: "reviewed", findings: [{ severity: "minor", file: "src/a.ts", title: "t", text: "c" }] });
   });
 });
 

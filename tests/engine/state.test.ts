@@ -112,6 +112,10 @@ describe("state files", () => {
     writeFileSync(join(dirname(statePath(dir, ORDER.repo, "0001-a")), ".0001-a.json.tmp"), "{");
     expect(await listStates(dir, ORDER.repo)).toEqual([b, a]);
     expect(await listStates(dir)).toEqual([c, b, a]);
+    // D79: a stray file where an owner or a repo dir would be is skipped, never a throw.
+    writeFileSync(join(dir, "orders", "README"), "x");
+    writeFileSync(join(dir, "orders", "another-owner", "notes.txt"), "x");
+    expect(await listStates(dir)).toEqual([c, b, a]);
   });
 
   test("transition appends one StatusEvent with the phase, run, PR, verdict and reason", () => {

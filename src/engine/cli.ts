@@ -4,8 +4,8 @@
  *
  * - **`hapi poll [--once]`**: one tick (./poll.ts `pollTick`), or a tick every `runs.poll_interval_s`. The systemd
  *   user timer (`build/systemd/hapi-poll.timer`, src/generate/systemd.ts) runs `poll --once`. With `--once` it exits 1
- *   when a repo's tick failed closed, so the service's status says so; a skipped tick (another holds the poll lock)
- *   exits 0.
+ *   when a repo's tick failed closed or the tick's reap failed, so the service's status says so; a skipped tick
+ *   (another holds the poll lock) exits 0.
  * - **`hapi status [<owner>/<name>]`**: each planning PR's work orders, as its status comment shows them, from local
  *   state alone: hapi's state files, and the repo's overlay at the plan's merge read from its mirror with hardened
  *   host git (read-only; skipped when there is no mirror), so a run's unknown spend counts at the same `run_usd` as
@@ -141,7 +141,8 @@ export async function pollCommand(args: string[], deps: { run?: Partial<RunDeps>
     for (;;) {
       const report = await pollTick(pd);
       for (const line of formatTick(report)) console.log(line);
-      if (once) return report.repos.some((r) => r.error !== undefined) ? 1 : 0;
+      // A repo that failed closed, or a reap that failed (M6), is a failed tick.
+      if (once) return report.reap !== undefined || report.repos.some((r) => r.error !== undefined) ? 1 : 0;
       await sleep(pd.policy.runs.poll_interval_s * 1000);
     }
   });

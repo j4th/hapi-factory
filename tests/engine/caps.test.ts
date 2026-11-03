@@ -137,6 +137,10 @@ describe("the caps", () => {
     writeFileSync(join(w.engineDir, "orders", "another-owner", "repo", "0001-x.json"), "{ not a state");
     const p15 = withBudgets({ repo_monthly_usd: 15 });
     expect(await capProblem(w.d, ORDER.repo, p15, 4)).toEqual({ refuse: MONTH_TEXT("12.0000", "4.0000", "15.00") });
+    // D79: a stray file where an owner or a repo dir would be is skipped, never a throw.
+    writeFileSync(join(w.engineDir, "orders", "README"), "x");
+    writeFileSync(join(w.engineDir, "orders", "another-owner", "notes.txt"), "x");
+    expect(await capProblem(w.d, ORDER.repo, p15, 4)).toEqual({ refuse: MONTH_TEXT("12.0000", "4.0000", "15.00") });
     writeFileSync(join(w.engineDir, "orders", "example-owner", "sandbox", "0009-bad.json"), "{ not a state");
     await expect(capProblem(w.d, ORDER.repo, p15, 4)).rejects.toThrow("0009-bad.json is not a work order's state: JSON");
   });

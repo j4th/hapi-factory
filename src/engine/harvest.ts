@@ -29,6 +29,7 @@ import type { ask } from "../decide/record";
 import type { Forge, PrInfo } from "../forge";
 import { authedGit } from "../forge/github/git";
 import { parseOwnerRepo } from "../forge/github/app-token";
+import { WORKER_IDENTITY } from "../generate/archon";
 import { applyOverlay } from "../policy/overlay";
 import { effectiveModes, globMatches } from "../policy/paths";
 import type { Phases, Policy } from "../policy/types";
@@ -88,11 +89,9 @@ const exists = (p: string) =>
     () => false,
   );
 
-/** A path a worker named, for a gate's detail: redacted, no terminal control, no `@ < > \``, at most 120 characters. */
+/** A path (or other text) a worker chose, for a gate's detail: redacted, then a code span (`codeSpan`: no terminal control, no `@ < > \``), at most 120 characters. */
 function shown(path: string, secrets: Record<string, string>): string {
-  const safe = sanitizeTerminal(redactSecretForms(path, secrets).replace(/[\n\t]/g, " ")).replace(/[@<>`]/g, "");
-  const chars = Array.from(safe);
-  return chars.length > 120 ? `${chars.slice(0, 119).join("")}…` : safe;
+  return codeSpan(redactSecretForms(path, secrets), 120);
 }
 
 /** At most 20 problems of one gate, then `… and <n> more`. */
@@ -112,20 +111,74 @@ async function readableByAll(dir: string): Promise<void> {
   } else if (st.isFile()) await chmod(dir, st.mode | 0o444);
 }
 
-/** The trailers factory-task's commit node writes on every commit (spec §13.2), and the values the host knows. */
-function trailerProblems(log: string, o: { runId: string; workOrder: WorkOrder }): string[] {
+/** The trailers factory-task's commit node writes on every commit (spec §13.2), each once, and no other. */
+const TRAILER_KEYS = ["Work-Order", "Hapi-Run", "Hapi-Lane", "Trace-Id", "Agent", "Model"] as const;
+/** The headers a commit the commit node made carries, each once: no `encoding`, `gpgsig` or any other. */
+const HEADER_KEYS = ["tree", "parent", "author", "committer"] as const;
+/** The `--format` of the commits' log `trailerProblems` reads: sha, parents, author and committer, the trailers. */
+export const COMMIT_FORMAT = "%H%x1f%P%x1f%an%x1f%ae%x1f%cn%x1f%ce%x1f%(trailers:only,unfold)%x1e";
+
+/** Each commit's raw header keys, in order, from `git log --pretty=raw` (a header's continuation lines start with a space; the message is indented). */
+export function headerKeys(raw: string): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  for (const block of raw.split(/^(?=commit [0-9a-f]{40})/m)) {
+    const lines = block.split("\n");
+    const sha = /^commit ([0-9a-f]{40}(?:[0-9a-f]{24})?)\b/.exec(lines[0] ?? "")?.[1];
+    if (sha === undefined) continue;
+    const keys: string[] = [];
+    for (const l of lines.slice(1)) {
+      if (l === "") break;
+      if (!l.startsWith(" ")) keys.push(l.split(" ")[0]!);
+    }
+    out.set(sha, keys);
+  }
+  return out;
+}
+
+/**
+ * Each new commit's header problems (final review I1): a merge; an author or committer other than the run container's
+ * generated identity (`WORKER_IDENTITY`); a raw header beyond tree, parent, author and committer, or one of them
+ * twice; and the commit node's six trailers (spec §13.2) with the values the host knows, each exactly once, and no
+ * other trailer (a `Co-authored-by` credits someone else). `log` is `COMMIT_FORMAT`'s, `raw` `--pretty=raw`'s.
+ */
+function trailerProblems(log: string, raw: string, o: { runId: string; workOrder: WorkOrder; secrets: Record<string, string> }): string[] {
   const trace = o.workOrder.trace.traceparent.split("-")[1] ?? "";
+  const headers = headerKeys(raw);
   const problems: string[] = [];
   for (const rec of log.split("\x1e")) {
-    const [sha, parents, trailers] = rec.replace(/^\n/, "").split("\x1f");
-    if (sha === undefined || sha === "" || parents === undefined) continue;
+    const body = rec.replace(/^\n/, "");
+    if (body === "") continue;
+    const [sha, parents, an, ae, cn, ce, trailers, ...rest] = body.split("\x1f");
+    if (sha === undefined || !COMMIT.test(sha) || trailers === undefined || rest.length > 0) {
+      problems.push("a run commit's identity or trailers can't be read field by field (one holds a separator)");
+      continue;
+    }
     const at = `commit ${short(sha)}`;
-    if (parents.trim().split(" ").filter(Boolean).length !== 1) {
+    if ((parents ?? "").trim().split(" ").filter(Boolean).length !== 1) {
       problems.push(`${at} is a merge: a run commits one piece at a time, in a line`);
       continue;
     }
-    const lines = (trailers ?? "").split("\n").map((l) => l.trim());
-    const value = (key: string) => lines.filter((l) => l.startsWith(`${key}:`)).map((l) => l.slice(key.length + 1).trim());
+    for (const [role, name, email] of [["author", an, ae], ["committer", cn, ce]] as const) {
+      if (name !== WORKER_IDENTITY.name || email !== WORKER_IDENTITY.email) problems.push(`${at}'s ${role} is ${shown(`${name} <${email}>`, o.secrets)}, not the generated worker identity (src/generate/archon.ts)`);
+    }
+    const keys = headers.get(sha);
+    if (keys === undefined) problems.push(`${at}'s raw headers can't be read`);
+    else {
+      for (const k of new Set(keys)) {
+        const n = keys.filter((x) => x === k).length;
+        if (!(HEADER_KEYS as readonly string[]).includes(k)) problems.push(`${at} has a header beyond tree, parent, author and committer: ${shown(k, o.secrets)}`);
+        else if (n > 1 && k !== "parent") problems.push(`${at} has ${n} ${k} headers`);
+      }
+    }
+    const lines = trailers.split("\n").map((l) => l.trim()).filter((l) => l !== "");
+    const keyOf = (l: string) => (l.includes(":") ? l.slice(0, l.indexOf(":")).trim() : l);
+    const count = new Map<string, number>();
+    for (const l of lines) count.set(keyOf(l), (count.get(keyOf(l)) ?? 0) + 1);
+    for (const [k, n] of count) {
+      if (!(TRAILER_KEYS as readonly string[]).includes(k)) problems.push(`${at} has a trailer beyond the commit node's six: ${shown(k, o.secrets)}`);
+      else if (n > 1) problems.push(`${at} has the trailer ${k} ${n} times: the commit node writes each once`);
+    }
+    const value = (key: string) => lines.filter((l) => keyOf(l) === key).map((l) => l.slice(l.indexOf(":") + 1).trim());
     const want: [string, string | undefined][] = [
       ["Work-Order", o.workOrder.id],
       ["Hapi-Run", o.runId],
@@ -136,7 +189,8 @@ function trailerProblems(log: string, o: { runId: string; workOrder: WorkOrder }
     ];
     for (const [key, v] of want) {
       const got = value(key);
-      if (v === undefined ? !got.some((g) => g !== "") : !(got.length === 1 && got[0] === v)) problems.push(`${at} lacks the trailer ${key}: ${v ?? "<a value>"}`);
+      if (got.length > 1) continue; // said above
+      if (v === undefined ? (got[0] ?? "") === "" : got[0] !== v) problems.push(`${at} lacks the trailer ${key}: ${v ?? "<a value>"}`);
     }
   }
   return problems;
@@ -235,24 +289,35 @@ async function secretScan(d: Pick<RunDeps, "run" | "env">, o: { scratch: string;
     const logOpts = ["--full-history", "-m", "--no-mailmap", "--no-renames", "--ignore-submodules=none", "--no-ext-diff", "--no-textconv"];
     const run = (cmd: string[]) => d.run(["env", "-i", ...env, ...cmd], { env: { PATH }, inherit: false });
 
-    // 1. The patches and messages, exactly as gitleaks will read them; a git that fails or warns fails the scan closed.
-    const log = await run(["git", "-C", o.scratch, "log", "-p", "-U0", "--no-color", ...logOpts, range]);
+    // 1. The patches, as gitleaks will read them, and each commit whole (`--pretty=raw`: every header, the committer
+    // and any extra one included, and the message); a git that fails or warns fails the scan closed.
+    const log = await run(["git", "-C", o.scratch, "log", "-p", "-U0", "--no-color", "--pretty=raw", ...logOpts, range]);
     if (log.code !== 0 || (log.stderr ?? "") !== "") problems.push(`the secret scan can't be trusted: git log, run as gitleaks runs it, exited ${log.code}${(log.stderr ?? "") === "" ? "" : " and wrote to stderr"}`);
     else {
-      // Each commit's message and each file's patch, so a hit names where it is (never the value).
+      // Each commit's headers and message and each file's patch, so a hit names where it is (never the value).
       for (const seg of log.stdout.split(/\n(?=commit [0-9a-f]{40}|diff --git )/)) {
         const commit = /^commit ([0-9a-f]{40})/.exec(seg)?.[1];
-        const file = /^diff --git a\/.* b\/(.*)$/m.exec(seg)?.[1];
-        const where = commit !== undefined ? `the message of commit ${short(commit)}` : file !== undefined ? shown(file, o.secrets) : "the new commits";
-        for (const h of secretHits(seg, o.secrets)) problems.push(`${where} holds ${h.name}'s value${h.form === "base64" ? ", base64-encoded" : ""}`);
         if (commit !== undefined) {
-          const message = seg.split("\n").filter((l) => l.startsWith("    ")).join("\n");
-          for (const k of KEY_PATTERNS) if (k.re.test(message)) problems.push(`the message of commit ${short(commit)} holds a key's format (${k.name})`);
+          // The raw headers end at the first empty line; the message (indented) follows.
+          const lines = seg.split("\n");
+          const end = lines.indexOf("", 1);
+          const parts: [string, string][] = [
+            ["header", (end === -1 ? lines.slice(1) : lines.slice(1, end)).join("\n")],
+            ["message", end === -1 ? "" : lines.slice(end + 1).join("\n")],
+          ];
+          for (const [part, text] of parts) {
+            for (const h of secretHits(text, o.secrets)) problems.push(`the ${part} of commit ${short(commit)} holds ${h.name}'s value${h.form === "base64" ? ", base64-encoded" : ""}`);
+            for (const k of KEY_PATTERNS) if (k.re.test(text)) problems.push(`the ${part} of commit ${short(commit)} holds a key's format (${k.name})`);
+          }
+          continue;
         }
+        const file = /^diff --git a\/.* b\/(.*)$/m.exec(seg)?.[1];
+        const where = file !== undefined ? shown(file, o.secrets) : "the new commits";
+        for (const h of secretHits(seg, o.secrets)) problems.push(`${where} holds ${h.name}'s value${h.form === "base64" ? ", base64-encoded" : ""}`);
       }
     }
-    // 2. Every path any new commit touches, by name.
-    const names = await run(["git", "-C", o.scratch, "log", "--format=", "--name-only", "-z", ...logOpts, range]);
+    // 2. Every path any new commit touches, by name, trees included (`-t`: an empty subtree has no file to name it).
+    const names = await run(["git", "-C", o.scratch, "log", "--format=", "--name-only", "-t", "-z", ...logOpts, range]);
     if (names.code !== 0) problems.push(`the secret scan can't be trusted: git log --name-only exited ${names.code}`);
     for (const name of new Set(names.stdout.split("\0").map((n) => n.replace(/^\n+/, "")).filter((n) => n !== ""))) {
       for (const h of secretHits(name, o.secrets)) problems.push(`a changed path's name holds ${h.name}'s value${h.form === "base64" ? ", base64-encoded" : ""}: ${shown(name, o.secrets)}`);
@@ -366,9 +431,12 @@ export async function hostGates(
     const anc = await git(["merge-base", "--is-ancestor", o.base, head]);
     if (anc.code === 1) return end("bundle", `the run's head ${short(head)} does not descend from ${short(o.base)}`, head);
     if (anc.code !== 0) throw new Error(`cannot check the run's head descends from its base (git merge-base exited ${anc.code}): ${firstLine(anc.stderr)}`);
-    // 3b. Each new commit is one piece's, with the trailers the commit node writes (re-checked on what was committed).
-    const log = await must(["log", "--no-mailmap", "--format=%H%x1f%P%x1f%(trailers:only,unfold)%x1e", `${o.base}..${head}`], "read the run's commits");
-    const problems: GateProblem[] = capGate("bundle", trailerProblems(log, o));
+    // 3b. Each new commit is one piece's, as the commit node makes it: the generated identity, the four headers and
+    // the six trailers (re-checked on what was committed, since a worker-writable git config reaches the commit node).
+    const log = await must(["log", "--no-mailmap", `--format=${COMMIT_FORMAT}`, `${o.base}..${head}`], "read the run's commits");
+    const raw = await must(["log", "--no-mailmap", "--pretty=raw", `${o.base}..${head}`], "read the run's commits' headers");
+    const headerProblems = trailerProblems(log, raw, o);
+    const problems: GateProblem[] = capGate("bundle", headerProblems);
     // 4. The changed files.
     const files = (await must(["diff", "--name-only", "-z", "--no-renames", o.base, head], "list the run's changed files")).split("\0").filter((f) => f !== "");
     if (files.length === 0) return { head, files: [], problems: [...problems, { gate: "no-diff", detail: `the run changed no file (${short(o.base)}..${short(head)} is empty)` }], signals: [] };
@@ -386,12 +454,13 @@ export async function hostGates(
       if (!globs.some((g) => globMatches(g, f, { caseSensitive: true }))) scope.push(`${shown(f, o.secrets)} is outside every piece's files`);
     }
     problems.push(...capGate("protected", prot), ...capGate("scope", scope));
-    // 6. The secret scan, and the added-line signals. Only a scan with no leak keeps the run's commits.
+    // 6. The secret scan, and the added-line signals. Only a scan with no leak, of commits whose headers pass, keeps
+    // the run's commits: a forged identity or an extra header is as untrusted as an unscanned commit.
     const leaks = await secretScan(d, { scratch: o.scratch, base: o.base, head, secrets: o.secrets });
     problems.push(...capGate("secret", leaks));
     const changes = await fileChanges(d, o.scratch, o.base, head, files);
     const signals = changes !== undefined ? signalsOf(changes, o.secrets) : ["the added-line signals could not be read: check the diff yourself"];
-    clean = leaks.length === 0;
+    clean = leaks.length === 0 && headerProblems.length === 0;
     return { head, files, problems, signals };
   }
 }
@@ -488,6 +557,8 @@ export function outcome(e: Evidence, phases: Phases): Outcome {
   if (e.cr.state === "reviewed") {
     const open = e.cr.findings.filter((f) => f.severity === "critical" || f.severity === "major").length;
     if (open > 0) decide(`${open} major or critical CodeRabbit ${open === 1 ? "finding is" : "findings are"} still open`);
+    // Final review M1: the CLI's own gate failed, yet the host read no finding at major or above.
+    else if (e.cr.gateFailed) decide("CodeRabbit's CLI failed its gate (exit 2: a finding at major or above), yet no major or critical finding was read from its output: check its findings yourself");
   }
   const w = e.worker;
   if (w.result === "blocked") decide("the worker reported RESULT: blocked");
@@ -843,9 +914,13 @@ export async function harvest(d: HarvestDeps, s: WorkOrderState, h: HarvestInput
     else {
       notPushed = `${"moved" in pushed ? pushed.moved : pushed.refused}; the run's head ${short(head)} was not pushed`;
       // Asked and paid for, but of a head that wasn't pushed: the Evidence row says so, and nothing of them is used.
-      e.screens = e.screens.map((x) => ({ ...x, pushed: false, holds: [], notes: [] }));
+      e.screens = e.screens.map((x) => ({ ...x, pushed: false, holds: [], notes: [], coverage: [], held: [] }));
       // GitHub's refusal may be its push protection finding what the host's scan didn't: the commits leave the scratch.
-      if ("refused" in pushed) await purgeRun(d.run, scratch, h.run.runId);
+      if ("refused" in pushed) {
+        await purgeRun(d.run, scratch, h.run.runId);
+        // Then readable by all again, as after every gates run: a later run container's uid reads the scratch (D71).
+        await readableByAll(scratch);
+      }
     }
   }
   if (notPushed !== undefined) {
@@ -893,7 +968,10 @@ export async function harvest(d: HarvestDeps, s: WorkOrderState, h: HarvestInput
   let number: number;
   if (pr !== undefined) {
     number = pr.number;
-    await forge.editPrBody(number, rerenderPr(pr.body, input));
+    // The body read again just before it is written (final review M4): an edit outside the markers made while the
+    // screens and the push ran is kept, not lost.
+    const fresh = await forge.pr(number);
+    await forge.editPrBody(number, rerenderPr(fresh.body, input));
     // In a not-pushed case the body is the one state-changing write: nothing marks a head nobody vetted ready.
     if (notPushed === undefined && pr.draft && !result.draft) await forge.markReady(number);
   } else {
@@ -974,8 +1052,11 @@ export async function rerender(d: HarvestDeps, s: WorkOrderState, h: HarvestInpu
     ci: o.ci,
     ...(fix.length > 0 ? { unfixed: fix } : {}),
   };
-  const body = rerenderPr(o.pr.body, input);
-  if (body === o.pr.body) return false;
+  // The body read again just before it is written (final review M4), so an edit outside the markers made while
+  // the gates and the screens ran is kept.
+  const fresh = await o.forge.pr(o.pr.number);
+  const body = rerenderPr(fresh.body, input);
+  if (body === fresh.body) return false;
   await o.forge.editPrBody(o.pr.number, body);
   return true;
 }

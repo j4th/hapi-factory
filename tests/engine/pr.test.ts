@@ -217,3 +217,61 @@ test("an unpushed head's evidence is scoped to it, and none of its findings or u
   expect(body).toContain("which was not pushed (see Unresolved); the PR's head is still 1234567");
   expect(unfenced(body)).not.toContain("@");
 });
+
+describe("final review I2: the PR body stays under GitHub's limit", () => {
+  const long = (c: string, n: number) => c.repeat(n);
+  const review = {
+    state: "ran" as const,
+    verdict: "needs-work" as const,
+    findings: Array.from({ length: 50 }, (_, n) => ({ severity: "major" as const, path: `src/f${n}.ts:${n + 1}`, summary: long("r", 2000) })),
+    criteria: Array.from({ length: 50 }, (_, n) => ({ criterion: long("c", 2000), mark: n % 2 === 0 ? ("met" as const) : ("unmet" as const), evidence: long("e", 2000) })),
+  };
+  const cr = {
+    state: "reviewed" as const,
+    findings: Array.from({ length: 40 }, (_, n) => ({ severity: "major", file: `src/g${n}.ts`, line: n + 1, title: long("t", 200), text: long("x", 3000) })),
+  };
+
+  test("50 findings and 50 criteria at full length, plus 40 CodeRabbit findings: each quoted block is capped, and the body is under 60,000 characters", () => {
+    const body = renderPr(input({}, { review, cr }));
+    expect(body.length).toBeLessThanOrEqual(60_000);
+    expect(body.startsWith("<!-- hapi:begin -->")).toBe(true);
+    expect(body.endsWith("<!-- hapi:end -->")).toBe(true);
+    expect(body).toContain("<!-- hapi:pr v1 ");
+    // Each truncated block says how much is left out, and where it is.
+    expect(body).toMatch(/… \(truncated by the host: \d+ more in the review run's outputs\)/);
+    expect(body).toMatch(/… \(truncated by the host: \d+ more CodeRabbit findings in the review run's outputs\)/);
+    // Deterministic: the same input renders the same body.
+    expect(renderPr(input({}, { review, cr }))).toBe(body);
+  });
+
+  test("the last guard trims the quoted sections first, then the account, and says where the full text is", () => {
+    // A worker's account at its own cap and a review and CodeRabbit block each at theirs, with many long reasons too.
+    const reasons = Array.from({ length: 160 }, (_, n) => `reason ${n}: ${long("z", 280)}`);
+    const worker = { ...CLEAN.worker, account: long("a", 7000) };
+    const i = input({ outcome: { push: true, draft: false, verdict: "decision", reasons } }, { review, cr, worker });
+    const body = renderPr(i);
+    expect(body.length).toBeLessThanOrEqual(60_000);
+    expect(body).toContain("<!-- hapi:end -->");
+    // The quoted sections go before the account does: the account still shows, the review's block doesn't.
+    expect(body).toContain("The independent review's findings and criteria aren't shown here");
+    expect(body).toContain("CodeRabbit's findings aren't shown here");
+    expect(body).toContain("aaaa");
+    expect(renderPr(i)).toBe(body);
+  });
+
+  test("a body under the cap is untouched by the guard", () => {
+    const body = renderPr(input());
+    expect(body).not.toContain("truncated by the host");
+    expect(body).not.toContain("aren't shown here");
+  });
+});
+
+test("D73: the verdict line names coverage holds apart from finding holds, in enforce only", () => {
+  const held = screen({ holds: ["x", "y", "z"], coverage: [{ cause: "call cap 24", files: 2 }], held: ["`src/a.ts`"] });
+  const body = renderPr(input({ outcome: { push: true, draft: false, verdict: "decision", reasons: ["x", "y", "z"] } }, { screens: [held] }));
+  const verdict = body.slice(body.indexOf("## Verdict"), body.indexOf("## Unresolved"));
+  expect(verdict).toContain("\n- held: 2 files not screened (call cap 24)\n- held: text aimed at the reviewer in `src/a.ts`\n");
+  // Shadow holds nothing: no line.
+  const shadow = renderPr(input({}, { screens: [screen({ mode: "shadow", holds: ["x"], coverage: [{ cause: "call cap 24", files: 1 }], held: ["`src/a.ts`"] })] }));
+  expect(shadow).not.toContain("held: ");
+});

@@ -426,7 +426,36 @@ test("ask: false asks nothing and holds what it has no answer for", async () => 
   expect(f.calls).toHaveLength(2);
   expect((await ledgerOf(d)).length).toBe(before);
   expect(again.holds[0]).toBe(first.holds[0]!);
-  expect(again.holds[1]).toBe("`src/b.ts`: not screened (not asked: a re-render asks nothing) (gates.decisions.by_name.diff-screen.on_unscreened: hold)");
+  // Final review M3: a re-render gives the harvest's own why for a subject no classifier answered (its newest
+  // via-default line), so one file never shows two contradictory coverage holds.
+  expect(again.holds[1]).toBe(first.holds[1]!);
+  expect(again.holds[1]).toBe("`src/b.ts`: not screened (no classifier answered: jev: openrouter HTTP 503.; haiku: HaikuError) (gates.decisions.by_name.diff-screen.on_unscreened: hold)");
+  // A subject the ledger has no line for still says a re-render asks nothing.
+  const fresh = one(await screen(d, [subj("src/c.ts")], { ask: false }));
+  expect(fresh.holds).toEqual(["`src/c.ts`: not screened (not asked: a re-render asks nothing) (gates.decisions.by_name.diff-screen.on_unscreened: hold)"]);
+});
+
+test("final review M3: a re-render of a head screened past the call cap gives the harvest's why", async () => {
+  const d = deps({ decide: fakeDecide() });
+  const first = one(await screen(d, [subj("src/a.ts"), subj("src/b.ts")], { policy: policyWith({ max: 1 }) }));
+  const again = one(await screen(d, [subj("src/a.ts"), subj("src/b.ts")], { policy: policyWith({ max: 1 }), ask: false }));
+  expect(again.holds).toEqual(first.holds);
+  expect(again.holds).toEqual(["`src/b.ts`: not screened (not asked: over gates.decisions.max_calls_per_head (1)) (gates.decisions.by_name.diff-screen.on_unscreened: hold)"]);
+});
+
+test("D73: the screen separates coverage holds (by cause) from finding holds (by path), in enforce only", async () => {
+  const d = deps({ decide: fakeDecide({ "src/a.ts": HOLD, "src/b.ts": "fail" }) });
+  const s = one(await screen(d, [subj("src/a.ts"), subj("src/b.ts"), subj("src/c.ts"), subj("src/d.ts")], { policy: policyWith({ max: 2 }) }));
+  expect(s.held).toEqual(["`src/a.ts`"]);
+  expect(s.coverage).toEqual([
+    { cause: "no classifier answered", files: 1 },
+    { cause: "call cap 2", files: 2 },
+  ]);
+  // Shadow and notes hold nothing, so they list neither.
+  const shadow = one(await screen(deps({ decide: fakeDecide({ "src/a.ts": HOLD }) }), [subj("src/a.ts")], { policy: policyWith({ diff: { mode: "shadow" } }) }));
+  expect([shadow.held, shadow.coverage]).toEqual([[], []]);
+  const notes = one(await screen(deps({ decide: fakeDecide({ "src/a.ts": HOLD }) }), [subj("src/a.ts")], { policy: policyWith({ models: "notes" }) }));
+  expect([notes.held, notes.coverage]).toEqual([[], []]);
 });
 
 describe("off asks nothing, and shadow changes nothing but the record", () => {

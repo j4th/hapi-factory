@@ -22,11 +22,13 @@ import {
   outcome,
   push,
   pushOutcome,
+  rerender,
   runGates,
   scratchPath,
   settleScratch,
 } from "../../src/engine/harvest";
 import type { WorkOrderState } from "../../src/engine/state";
+import { WORKER_IDENTITY } from "../../src/generate/archon";
 import { applyOverlay } from "../../src/policy/overlay";
 import type { Policy } from "../../src/policy/types";
 import { readRecord, type RunRecord } from "../../src/run/records";
@@ -51,6 +53,7 @@ import {
   READY_REVIEW,
   realGit,
   SHIPPED,
+  trailersFor,
   transcriptOf,
   writeOut,
   writeReview,
@@ -107,20 +110,24 @@ describe("with real git: the host gates", () => {
     const w = gitWorld();
     w.commit({ "src/a.ts": "a\n", ".github/workflows/x.yml": "on: push\n", "docs/x.md": "# x\n" });
     expect((await gatesOn(w)).problems).toEqual([
-      { gate: "protected", detail: ".github/workflows/x.yml is a protected path (workers: deny)" },
-      { gate: "scope", detail: ".github/workflows/x.yml is outside every piece's files" },
-      { gate: "scope", detail: "docs/x.md is outside every piece's files" },
+      { gate: "protected", detail: "`.github/workflows/x.yml` is a protected path (workers: deny)" },
+      { gate: "scope", detail: "`.github/workflows/x.yml` is outside every piece's files" },
+      { gate: "scope", detail: "`docs/x.md` is outside every piece's files" },
     ]);
     // A piece's scope matches case: SRC/ is not src/.
     const c = gitWorld();
     c.commit({ "SRC/a.ts": "a\n" });
-    expect((await gatesOn(c)).problems).toEqual([{ gate: "scope", detail: "SRC/a.ts is outside every piece's files" }]);
+    expect((await gatesOn(c)).problems).toEqual([{ gate: "scope", detail: "`SRC/a.ts` is outside every piece's files" }]);
+    // Final review M2: a worker-chosen name is a code span, never a live link or cross-reference.
+    const md = gitWorld();
+    md.commit({ "docs/[Approved](http:/x) #123.md": "x\n" });
+    expect((await gatesOn(md)).problems).toEqual([{ gate: "scope", detail: "`docs/[Approved](http:/x) #123.md` is outside every piece's files" }]);
     const overlaid = applyOverlay(SHIPPED, { protected_paths: { "src/a.ts": { workers: "deny" } } });
-    expect((await gatesOn(w, { policy: overlaid })).problems).toContainEqual({ gate: "protected", detail: "src/a.ts is a protected path (workers: deny)" });
+    expect((await gatesOn(w, { policy: overlaid })).problems).toContainEqual({ gate: "protected", detail: "`src/a.ts` is a protected path (workers: deny)" });
 
     const a = gitWorld();
     a.commit({ [ACCEPTANCE]: "test('x', () => {});\n" });
-    expect((await gatesOn(a)).problems[0]).toEqual({ gate: "protected", detail: `${ACCEPTANCE} is a protected path (workers: deny)` });
+    expect((await gatesOn(a)).problems[0]).toEqual({ gate: "protected", detail: `\`${ACCEPTANCE}\` is a protected path (workers: deny)` });
 
     const e = gitWorld();
     const head = e.commit({}, { empty: true });
@@ -139,7 +146,7 @@ describe("with real git: the host gates", () => {
     expect(p).toHaveLength(1);
     expect(p[0]!.gate).toBe("bundle");
     expect(p[0]!.detail).toMatch(/^run\.bundle does not apply to the mirror \(git bundle verify exited \d+\)$/);
-    expect((await gatesOn(w, { bundle: w.bundle({ name: "extra.bundle", extraRef: "extra" }) })).problems).toEqual([{ gate: "bundle", detail: "run.bundle: unexpected refs in run.bundle: refs/heads/extra" }]);
+    expect((await gatesOn(w, { bundle: w.bundle({ name: "extra.bundle", extraRef: "extra" }) })).problems).toEqual([{ gate: "bundle", detail: "run.bundle: unexpected refs in run.bundle: `refs/heads/extra`" }]);
   });
 
   test("with real git: a bundle over its size cap, a head that doesn't descend from the base, and a commit without the run's trailers are refused", async () => {
@@ -176,24 +183,24 @@ describe("with real git: the host gates", () => {
       w.commit(files, message === undefined ? {} : { message });
       return (await gatesOn(w, { secrets })).problems;
     };
-    expect(await scan({ "src/b.ts": `export const k = "${key}";\n` })).toEqual([{ gate: "secret", detail: "src/b.ts holds ANTHROPIC_API_KEY's value" }]);
-    expect(await scan({ "src/b.ts": `export const k = "zz${Buffer.from(`x${key}`).toString("base64")}";\n` })).toEqual([{ gate: "secret", detail: "src/b.ts holds ANTHROPIC_API_KEY's value, base64-encoded" }]);
+    expect(await scan({ "src/b.ts": `export const k = "${key}";\n` })).toEqual([{ gate: "secret", detail: "`src/b.ts` holds ANTHROPIC_API_KEY's value" }]);
+    expect(await scan({ "src/b.ts": `export const k = "zz${Buffer.from(`x${key}`).toString("base64")}";\n` })).toEqual([{ gate: "secret", detail: "`src/b.ts` holds ANTHROPIC_API_KEY's value, base64-encoded" }]);
     // A value removed again by a later commit is still in what would be pushed.
     const w = gitWorld();
     w.commit({ "src/b.ts": `${key}\n` });
     w.commit({ "src/b.ts": "clean\n" });
-    expect((await gatesOn(w, { secrets })).problems).toEqual([{ gate: "secret", detail: "src/b.ts holds ANTHROPIC_API_KEY's value" }]);
+    expect((await gatesOn(w, { secrets })).problems).toEqual([{ gate: "secret", detail: "`src/b.ts` holds ANTHROPIC_API_KEY's value" }]);
     const named = await scan({ [`src/${key}.ts`]: "x\n" });
-    expect(named).toContainEqual({ gate: "secret", detail: "a changed path's name holds ANTHROPIC_API_KEY's value: src/[hapi: ANTHROPIC_API_KEY redacted].ts" });
+    expect(named).toContainEqual({ gate: "secret", detail: "a changed path's name holds ANTHROPIC_API_KEY's value: `src/[hapi: ANTHROPIC_API_KEY redacted].ts`" });
     for (const p of named) expect(p.detail).not.toContain(key);
     const ant = ["sk", "ant", "n".repeat(30)].join("-");
-    expect(await scan({ [`src/${ant}.ts`]: "x\n" })).toContainEqual({ gate: "secret", detail: "a changed path's name holds a key's format (anthropic): src/[hapi: anthropic redacted].ts" });
+    expect(await scan({ [`src/${ant}.ts`]: "x\n" })).toContainEqual({ gate: "secret", detail: "a changed path's name holds a key's format (anthropic): `src/[hapi: anthropic redacted].ts`" });
     expect(await scan({ "src/b.ts": "b\n" }, `0001-skeleton: server\n\nthe key is ${key}`)).toContainEqual({ gate: "secret", detail: expect.stringMatching(/^the message of commit [0-9a-f]{7} holds ANTHROPIC_API_KEY's value$/) });
     // gitleaks: a token shaped like GitHub's, built at run time, random enough for its entropy check.
     const token = `ghp_${Array.from(crypto.getRandomValues(new Uint8Array(36)), (b) => "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"[b % 62]).join("")}`;
     const leaks = await scan({ "src/c.ts": `const t = "${token}";\n` });
     expect(leaks.map((p) => p.gate)).toEqual(["secret"]);
-    expect(leaks[0]!.detail).toMatch(/^gitleaks: github-pat in src\/c\.ts \(commit [0-9a-f]{7}\)$/);
+    expect(leaks[0]!.detail).toMatch(/^gitleaks: github-pat in `src\/c\.ts` \(commit [0-9a-f]{7}\)$/);
     expect(leaks[0]!.detail).not.toContain(token);
     // Nothing a secret problem refuses is pushed.
     expect(outcome({ ...CLEAN, gates: { head: "c".repeat(40), files: ["src/c.ts"], problems: leaks, signals: [] } }, PHASES)).toMatchObject({ push: false, verdict: "do-not-merge" });
@@ -219,6 +226,104 @@ describe("with real git: the host gates", () => {
       "`tests/a.test.ts`: an added line leaves a TODO or FIXME",
     ]);
     expect(outcome({ ...CLEAN, gates: { ...CLEAN.gates, signals: g.signals } }, PHASES)).toEqual({ push: true, draft: false, verdict: "ready", reasons: [] });
+  });
+});
+
+describe("final review I1: with real git, the host gates read every commit's headers", () => {
+  const key = fakeSecret("ANTHROPIC_API_KEY");
+  const secrets = { ANTHROPIC_API_KEY: key };
+  const scratchOf = (w: ReturnType<typeof gitWorld>) => scratchPath(w.engineDir, ORDER.repo, ORDER.id);
+  /** git in the work clone, `stdin` fed to it; returns stdout, trimmed. */
+  const fed = (w: ReturnType<typeof gitWorld>, args: string[], stdin: string) => {
+    const r = Bun.spawnSync(["git", "-C", w.work.dir, ...args], { stdin: Buffer.from(stdin), env: { PATH: process.env.PATH ?? "/usr/bin:/bin", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" }, stdout: "pipe", stderr: "pipe" });
+    expect([args.join(" "), r.exitCode, r.stderr.toString()]).toEqual([args.join(" "), 0, ""]);
+    return r.stdout.toString().trim();
+  };
+  const message = `${ORDER.id}: server\n\n${trailersFor(W).join("\n")}\n`;
+  const who = `${WORKER_IDENTITY.name} <${WORKER_IDENTITY.email}> 1798761600 +0000`;
+  /** The gates on the world's HEAD, and whether the run's ref is still in the scratch afterwards. */
+  const refused = async (w: ReturnType<typeof gitWorld>) => {
+    const g = await gatesOn(w, { secrets });
+    const kept = Bun.spawnSync(["git", "--git-dir", scratchOf(w), "rev-parse", "--verify", "-q", `refs/hapi/runs/${W}`]).exitCode === 0;
+    for (const p of g.problems) expect(p.detail).not.toContain(key);
+    // Nothing a header problem refuses is pushed.
+    expect(outcome({ ...CLEAN, gates: g }, PHASES).push).toBe(false);
+    return { problems: g.problems, kept };
+  };
+
+  test("a zone value in a repo-local committer.name is a secret in the header and a committer that isn't the generated one", async () => {
+    const w = gitWorld();
+    const head = w.commit({ "src/a.ts": "a\n" }, { config: [`committer.name=${key}`] });
+    const { problems, kept } = await refused(w);
+    expect(problems).toContainEqual({ gate: "secret", detail: `the header of commit ${head.slice(0, 7)} holds ANTHROPIC_API_KEY's value` });
+    expect(problems).toContainEqual({ gate: "bundle", detail: `commit ${head.slice(0, 7)}'s committer is \`[hapi: ANTHROPIC_API_KEY redacted] workerhapi.invalid\`, not the generated worker identity (src/generate/archon.ts)` });
+    expect(kept).toBe(false);
+  });
+
+  test("a zone value in an extra header (hash-object -t commit) is a secret, and the extra header a problem of its own", async () => {
+    const w = gitWorld();
+    w.commit({ "src/a.ts": "a\n" });
+    const tree = w.work("rev-parse", "HEAD^{tree}");
+    const parent = w.work("rev-parse", "HEAD");
+    const forged = fed(w, ["hash-object", "-t", "commit", "-w", "--stdin"], `tree ${tree}\nparent ${parent}\nauthor ${who}\ncommitter ${who}\nx-hapi ${key}\n\n${message}`);
+    w.work("checkout", "-q", "--detach", forged);
+    const { problems, kept } = await refused(w);
+    expect(problems).toContainEqual({ gate: "secret", detail: `the header of commit ${forged.slice(0, 7)} holds ANTHROPIC_API_KEY's value` });
+    expect(problems).toContainEqual({ gate: "bundle", detail: `commit ${forged.slice(0, 7)} has a header beyond tree, parent, author and committer: \`x-hapi\`` });
+    expect(kept).toBe(false);
+  });
+
+  test("a zone value as an empty subtree's name is a secret in a changed path's name", async () => {
+    const w = gitWorld();
+    w.commit({ "src/a.ts": "a\n" });
+    const empty = fed(w, ["mktree"], "");
+    const listing = w.work("ls-tree", "HEAD");
+    const tree = fed(w, ["mktree"], `${listing}\n040000 tree ${empty}\t${key}\n`);
+    const c = w.work("commit-tree", tree, "-p", "HEAD", "-m", `${ORDER.id}: server`, "-m", trailersFor(W).join("\n"));
+    w.work("checkout", "-q", "--detach", c);
+    const { problems, kept } = await refused(w);
+    expect(problems).toContainEqual({ gate: "secret", detail: "a changed path's name holds ANTHROPIC_API_KEY's value: `[hapi: ANTHROPIC_API_KEY redacted]`" });
+    expect(kept).toBe(false);
+  });
+
+  test("a forged author, an extra Co-authored-by and a trailer written twice are refused, with nothing pushed and the commits purged", async () => {
+    const a = gitWorld();
+    const forged = a.commit({ "src/a.ts": "a\n" }, { author: "Someone Else <someone@example.invalid>" });
+    const fa = await refused(a);
+    expect(fa.problems).toEqual([{ gate: "bundle", detail: `commit ${forged.slice(0, 7)}'s author is \`Someone Else someoneexample.invalid\`, not the generated worker identity (src/generate/archon.ts)` }]);
+    expect(fa.kept).toBe(false);
+
+    const c = gitWorld();
+    const co = c.commit({ "src/a.ts": "a\n" }, { trailers: [...trailersFor(W), "Co-authored-by: Someone Else <someone@example.invalid>"] });
+    const fc = await refused(c);
+    expect(fc.problems).toEqual([{ gate: "bundle", detail: `commit ${co.slice(0, 7)} has a trailer beyond the commit node's six: \`Co-authored-by\`` }]);
+    expect(fc.kept).toBe(false);
+
+    const t = gitWorld();
+    const twice = t.commit({ "src/a.ts": "a\n" }, { trailers: [...trailersFor(W), "Agent: pi@1.3.0"] });
+    const ft = await refused(t);
+    expect(ft.problems).toEqual([{ gate: "bundle", detail: `commit ${twice.slice(0, 7)} has the trailer Agent 2 times: the commit node writes each once` }]);
+    expect(ft.kept).toBe(false);
+
+    // The generated identity, the six trailers once each and the four headers pass, and the run's commits stay.
+    const ok = gitWorld();
+    ok.commit({ "src/a.ts": "a\n" });
+    expect((await gatesOn(ok, { secrets })).problems).toEqual([]);
+    expect(Bun.spawnSync(["git", "--git-dir", scratchOf(ok), "rev-parse", "--verify", "-q", `refs/hapi/runs/${W}`]).exitCode).toBe(0);
+  });
+});
+
+describe("final review M1: CodeRabbit's gate cross-checked", () => {
+  test("exit 2 with no major or critical finding read is a decision reason; a Major one counts as major", () => {
+    const minor = { severity: "minor", file: "src/a.ts", title: "t", text: "c" };
+    expect(outcome({ ...CLEAN, cr: { state: "reviewed", findings: [minor], gateFailed: true } }, PHASES)).toEqual({
+      push: true,
+      draft: false,
+      verdict: "decision",
+      reasons: ["CodeRabbit's CLI failed its gate (exit 2: a finding at major or above), yet no major or critical finding was read from its output: check its findings yourself"],
+    });
+    expect(outcome({ ...CLEAN, cr: { state: "reviewed", findings: [{ ...minor, severity: "major" }], gateFailed: true } }, PHASES).reasons).toEqual(["1 major or critical CodeRabbit finding is still open"]);
+    expect(outcome({ ...CLEAN, cr: { state: "reviewed", findings: [minor] } }, PHASES).verdict).toBe("ready");
   });
 });
 
@@ -676,9 +781,29 @@ describe("fix round 2", () => {
     fw.ff.addPr({ head: "factory/0001-skeleton", draft: true });
     fw.ff.push("factory/0001-skeleton", base);
     d.pushBranch = async () => ({ refused: "GitHub refused the push to factory/0001-skeleton: `push declined due to secret scanning`" });
-    await harvest(d, { ...s, pr: 1, prHead: base }, h);
-    expect(sgit(scratchPath(d.engineDir, ORDER.repo, ORDER.id), "rev-parse", "--verify", "--quiet", `refs/hapi/runs/${W}`)).toBe(false);
+    // A tight umask, so the purge's repack writes packs only its owner reads, unless the harvest opens the scratch again (D71).
+    const umask = process.umask(0o077);
+    try {
+      await harvest(d, { ...s, pr: 1, prHead: base }, h);
+    } finally {
+      process.umask(umask);
+    }
+    const scratch = scratchPath(d.engineDir, ORDER.repo, ORDER.id);
+    expect(sgit(scratch, "rev-parse", "--verify", "--quiet", `refs/hapi/runs/${W}`)).toBe(false);
     expect(writes(fw.ff)).toEqual(["PATCH /pulls/1"]);
+    // After the purge, the scratch is readable by all again, as after every clean gates run.
+    const closed: string[] = [];
+    const walk = (dir: string): void => {
+      for (const name of readdirSync(dir)) {
+        const p = join(dir, name);
+        const st = lstatSync(p);
+        if (st.isSymbolicLink()) continue;
+        if ((st.mode & (st.isDirectory() ? 0o555 : 0o444)) !== (st.isDirectory() ? 0o555 : 0o444)) closed.push(p);
+        if (st.isDirectory()) walk(p);
+      }
+    };
+    walk(scratch);
+    expect(closed).toEqual([]);
   });
 
   test("no label, no signal, no account and no CodeRabbit line of the unpushed head outside its Evidence rows; the block's round is its head's", async () => {
@@ -774,5 +899,37 @@ describe("fix round 3", () => {
     const body = bodyOf(fw.ff, 0);
     expect(body).not.toContain("The worker's account below is its own claim");
     expect(body).toContain(`<!-- hapi:pr v1 {"workOrder":"0001-skeleton","status":"pr","head":"${base}","verdict":"decision"} -->`);
+  });
+});
+
+describe("final review M4: the PR body is read again just before it is written", () => {
+  const NOTE_TEXT = "The operator's own note, written while the harvest ran.";
+  const marked = (inner: string) => `<!-- hapi:begin -->\n${inner}\n<!-- hapi:end -->`;
+
+  test("harvest: an edit outside the markers made during the screens and the push is kept", async () => {
+    const { d, fw, s, h, base } = await world();
+    fw.ff.addPr({ head: "factory/0001-skeleton", draft: true, body: marked("old") });
+    fw.ff.push("factory/0001-skeleton", base);
+    const push = d.pushBranch;
+    d.pushBranch = async (o) => {
+      // The operator edits the body between the harvest's read of the PR and its write.
+      fw.ff.prs.get(1)!.body = `${NOTE_TEXT}\n\n${fw.ff.prs.get(1)!.body}`;
+      return push(o);
+    };
+    await harvest(d, { ...s, pr: 1, prHead: base }, h);
+    expect(fw.ff.prs.get(1)!.body.startsWith(`${NOTE_TEXT}\n\n<!-- hapi:begin -->`)).toBe(true);
+  });
+
+  test("rerender: an edit outside the markers made while the gates ran is kept", async () => {
+    const { d, fw, s, h, head } = await world();
+    const opened = await harvest(d, s, h);
+    const pr = (await fw.forge.pr(opened.pr!))!;
+    const gates = d.gates;
+    d.gates = async (o, r) => {
+      fw.ff.prs.get(pr.number)!.body = `${NOTE_TEXT}\n\n${fw.ff.prs.get(pr.number)!.body}`;
+      return gates(o, r);
+    };
+    expect(await rerender(d, { ...opened, prHead: head }, h, { forge: fw.forge, pr, ci: "passed", phase: "pr" })).toBe(true);
+    expect(fw.ff.prs.get(pr.number)!.body.startsWith(`${NOTE_TEXT}\n\n<!-- hapi:begin -->`)).toBe(true);
   });
 });

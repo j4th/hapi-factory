@@ -1669,11 +1669,13 @@ describe("the bundle check", () => {
   test("a bundle with unexpected refs fails the run and names them; the bundle is kept, never fetched", async () => {
     capture();
     for (const [heads, names] of [
-      [`${SHA} HEAD\n${SHA} refs/heads/main\n`, "refs/heads/main"],
-      [`${SHA} refs/heads/x\n`, "refs/heads/x"],
-      [`${SHA} HEAD\n${SHA} HEAD\n`, "HEAD"],
+      [`${SHA} HEAD\n${SHA} refs/heads/main\n`, "`refs/heads/main`"],
+      [`${SHA} refs/heads/x\n`, "`refs/heads/x`"],
+      [`${SHA} HEAD\n${SHA} HEAD\n`, "`HEAD`"],
       ["", "(none)"],
-      [`${SHA} refs/tags/\u001b[2Jx\n`, "refs/tags/?[2Jx"],
+      [`${SHA} refs/tags/\u001b[2Jx\n`, "`refs/tags/?[2Jx`"],
+      // A ref name is never live Markdown (final review M2): a code span, with no backtick, @, < or > in it.
+      [`${SHA} refs/heads/[a](http:/x)\`@b<c>\n`, "`refs/heads/[a](http:/x)??b?c?`"],
     ] as const) {
       const f = fakeRun({ heads });
       const done = await finalizeRun(await seedRun(f, { id: ID, running: false, outputs: { ...completedOutputs(), "run.bundle": file("bundle") } }), f.deps);
@@ -1722,7 +1724,7 @@ describe("the bundle check", () => {
     git("bundle", "create", two, `${base}..HEAD`, "extra");
     const deps = { run: runCommand, env: { PATH: process.env.PATH ?? "/usr/bin:/bin" } };
     expect(await bundleProblem(one, deps)).toBeUndefined();
-    expect(await bundleProblem(two, deps)).toBe("unexpected refs in run.bundle: refs/heads/extra");
+    expect(await bundleProblem(two, deps)).toBe("unexpected refs in run.bundle: `refs/heads/extra`");
     writeFileSync(join(dir, "junk.bundle"), "not a bundle\n");
     expect(await bundleProblem(join(dir, "junk.bundle"), deps)).toMatch(/^run\.bundle is not a bundle git can read \(git bundle list-heads exited \d+\): kept, never fetched$/);
   });

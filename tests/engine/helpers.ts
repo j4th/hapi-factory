@@ -19,6 +19,7 @@ import type { PipelineDeps } from "../../src/engine/pipeline";
 import type { PollDeps } from "../../src/engine/poll";
 import type { StatusEvent, WorkOrderState } from "../../src/engine/state";
 import { githubForge } from "../../src/forge";
+import { WORKER_IDENTITY } from "../../src/generate/archon";
 import type { TokenPurpose } from "../../src/forge/github/token";
 import { loadPolicy } from "../../src/policy/load";
 import type { DecisionModels, EngineDecision, Policy } from "../../src/policy/types";
@@ -130,7 +131,7 @@ export interface GitWorld {
    * Write `files` in the work clone (a string or bytes; null deletes), stage them and commit, with `trailersFor(runId)`
    * unless `trailers` says otherwise; `empty` allows a commit that changes nothing. Returns the commit.
    */
-  commit(files: Record<string, string | Uint8Array | null>, o?: { runId?: string; trailers?: string[]; message?: string; empty?: boolean; gitlink?: Record<string, string> }): string;
+  commit(files: Record<string, string | Uint8Array | null>, o?: { runId?: string; trailers?: string[]; message?: string; empty?: boolean; gitlink?: Record<string, string>; config?: string[]; author?: string }): string;
   /** `git bundle create <tmp>/<name> <base>..HEAD`, as run.sh makes run.bundle; returns its path. */
   bundle(o?: { from?: string; name?: string; extraRef?: string }): string;
   /** Commit `files` on main and move the mirror's main there (a merged change); returns the new main. The work clone follows it. */
@@ -139,11 +140,12 @@ export interface GitWorld {
   scratch(): string;
 }
 
-/** The work runner: real git, no system or global config, HOME the temp dir. */
+/** The work runner: real git, no system or global config, HOME the temp dir, committing as the run container's generated identity. */
 function gitIn(dir: string, home: string): Git {
   const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" };
+  const who = ["-c", `user.name=${WORKER_IDENTITY.name}`, "-c", `user.email=${WORKER_IDENTITY.email}`];
   const git = (...args: string[]) => {
-    const r = Bun.spawnSync(["git", "-C", dir, "-c", "user.name=t", "-c", "user.email=t@t.invalid", "-c", "commit.gpgSign=false", "-c", "core.hooksPath=/dev/null", ...args], { env, stdout: "pipe", stderr: "pipe" });
+    const r = Bun.spawnSync(["git", "-C", dir, ...who, "-c", "commit.gpgSign=false", "-c", "core.hooksPath=/dev/null", ...args], { env, stdout: "pipe", stderr: "pipe" });
     expect([args.join(" "), r.exitCode, r.stderr.toString()]).toEqual([args.join(" "), 0, expect.any(String)]);
     return r.stdout.toString().trim();
   };
@@ -188,7 +190,8 @@ export function gitWorld(): GitWorld {
       }
       for (const [path, sha] of Object.entries(c.gitlink ?? {})) work("update-index", "--add", "--cacheinfo", `160000,${sha},${path}`);
       const trailers = (c.trailers ?? trailersFor(c.runId ?? "ab12cd34ef56")).flatMap((t) => ["--trailer", t]);
-      work("commit", "-q", ...(c.empty ? ["--allow-empty"] : []), "-m", c.message ?? `${ORDER.id}: server`, ...trailers);
+      const config = (c.config ?? []).flatMap((x) => ["-c", x]);
+      work(...config, "commit", "-q", ...(c.empty ? ["--allow-empty"] : []), ...(c.author === undefined ? [] : ["--author", c.author]), "-m", c.message ?? `${ORDER.id}: server`, ...trailers);
       return work("rev-parse", "HEAD");
     },
     bundle(b = {}) {
@@ -397,6 +400,8 @@ export function pipelineDeps(o: { central?: Policy; decide?: HarvestDeps["decide
   const clock = { now: new Date(NOW) };
   /** The engine's git calls the fake answered, each as its argv after `git`'s own options. */
   const gitCalls: string[][] = [];
+  /** Commits the fake scratch doesn't hold: `cat-file -e <sha>^{commit}` answers 1 for them. */
+  const missing = new Set<string>();
   const answer = (code: number, stdout = "") => ({ code, stdout, stderr: "" });
   const runner: RunDeps["run"] = async (cmd, opts) => {
     const g = cmd.indexOf("git");
@@ -407,6 +412,7 @@ export function pipelineDeps(o: { central?: Policy; decide?: HarvestDeps["decide
       const args = rest.slice(i);
       if (args[0] === "diff" || args[0] === "update-ref" || (args[0] === "cat-file" && args[1] === "-e")) {
         gitCalls.push(args);
+        if (args[0] === "cat-file" && missing.has((args[2] ?? "").replace(/\^\{commit\}$/, ""))) return answer(1);
         if (args[0] !== "diff") return answer(0);
         if (args.includes("--name-only")) return answer(0, "src/a.ts\0");
         return answer(0, FAKE_PATCH);
@@ -535,7 +541,7 @@ export function pipelineDeps(o: { central?: Policy; decide?: HarvestDeps["decide
     ...over,
   });
 
-  return { f, d, ff, fw, forges, order, clock, starts, events, refuse, finish, seed, state, gitCalls, decide, engineDir };
+  return { f, d, ff, fw, forges, order, clock, starts, events, refuse, finish, seed, state, gitCalls, missing, decide, engineDir };
 }
 
 // ---------------------------------------------------------------------------------------------------------------

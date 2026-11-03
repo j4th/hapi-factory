@@ -14,7 +14,7 @@
  */
 import { sanitizeTerminal } from "../run/sanitize";
 import type { RunKind } from "../run/kinds";
-import { goalOf, type Screened } from "./decisions";
+import { ENGINE_DECISIONS, goalOf, type Screened } from "./decisions";
 import type { Discovered } from "./discover";
 import type { Evidence, Outcome, Round } from "./harvest";
 import type { Phase } from "./state";
@@ -55,16 +55,42 @@ export const BEGIN = "<!-- hapi:begin -->";
 export const END = "<!-- hapi:end -->";
 /** The most of the worker's account a PR shows. */
 const ACCOUNT_CHARS = 6000;
+/** The most characters each quoted block (the review's findings and criteria; CodeRabbit's findings) shows (final review I2). */
+const QUOTE_CHARS = 20_000;
+/** The most characters the host's part of a PR body may hold: GitHub refuses a body over 65,536 (final review I2). */
+export const BODY_CHARS = 60_000;
+
+/** How much of the run's quoted text one render shows: each quoted block's characters, the account's, and (last resort) the host lists' lines. */
+interface Caps {
+  quote: number;
+  account: number;
+  lists?: number;
+}
+/**
+ * The last guard's steps, tried in order until the body fits in BODY_CHARS (final review I2): the quoted sections
+ * first, then the account, then (when even that isn't enough) the Unresolved and Check-this-yourself lists. Fixed
+ * steps, so the same input always renders the same body.
+ */
+const STEPS: readonly Caps[] = [
+  { quote: QUOTE_CHARS, account: ACCOUNT_CHARS },
+  { quote: 10_000, account: ACCOUNT_CHARS },
+  { quote: 4_000, account: ACCOUNT_CHARS },
+  { quote: 0, account: ACCOUNT_CHARS },
+  { quote: 0, account: 2_000 },
+  { quote: 0, account: 0 },
+  { quote: 0, account: 0, lists: 40 },
+  { quote: 0, account: 0, lists: 10 },
+];
 
 /** A host line, as a last net: one line, no terminal control, no `@`, `<` or `>`. The state machine reads a reason's Unresolved line by it. */
 export const plain = (s: string) => sanitizeTerminal(s.replace(/[\r\n]+/g, " ")).replace(/[@<>]/g, "");
 
-/** Text a run or a model wrote, in a fence it can't leave (see the module comment). */
-export function fence(text: string, cap?: number): string {
+/** Text a run or a model wrote, in a fence it can't leave (see the module comment); `where`, when it is cut, says where the whole text is. */
+export function fence(text: string, cap?: number, where?: string): string {
   let t = sanitizeTerminal(text).replace(/<!--/g, "< !--").replace(/-->/g, "-- >");
   if (cap !== undefined) {
     const chars = Array.from(t);
-    if (chars.length > cap) t = `${chars.slice(0, cap).join("")}\n… (truncated by the host)`;
+    if (chars.length > cap) t = `${chars.slice(0, cap).join("")}\n… (truncated by the host${where === undefined ? "" : `: ${where}`})`;
   }
   const longest = Math.max(0, ...[...t.matchAll(/`+/g)].map((m) => m[0].length));
   const f = "`".repeat(Math.max(3, longest + 1));
@@ -79,6 +105,29 @@ const VERDICT = {
 
 const h7 = (sha: string) => sha.slice(0, 7);
 const cell = (s: string) => plain(s).replace(/\|/g, "\\|");
+
+/**
+ * The quoted items that fit in `max` characters, joined by `sep`: whole items, in order (an item over `max` alone is
+ * cut to it), and how many were left out.
+ */
+function quoted(items: string[], sep: string, max: number): { text: string; more: number } {
+  const kept: string[] = [];
+  let n = 0;
+  for (const item of items) {
+    const it = item.length > max ? `${item.slice(0, max)}…` : item;
+    const add = (kept.length === 0 ? 0 : sep.length) + it.length;
+    if (n + add > max) break;
+    kept.push(it);
+    n += add;
+  }
+  return { text: kept.join(sep), more: items.length - kept.length };
+}
+
+/** At most `max` lines of a host list, then a line saying how many more and where they all are. */
+function capList(lines: string[], max: number | undefined, where: string): string[] {
+  if (max === undefined || lines.length <= max) return lines;
+  return [...lines.slice(0, max), `… and ${lines.length - max} more (cut to keep the PR body under GitHub's size limit): ${where}`];
+}
 
 /** A capped list's full count: its lines, or 10 plus the `… and <n> more` line's n. */
 function count(lines: string[]): number {
@@ -106,6 +155,17 @@ function decisionRow(s: Screened, head: string): string {
   return `| decide: ${cell(s.decision)} v${cell(s.version)} | ${head} | ${cell(screened)} | ${cell(result)} |`;
 }
 
+/** One enforced screen's verdict-line holds (D73): `held: <n> files not screened (<cause>)` per cause, then `held: <what it found> in <paths>`. */
+function heldText(s: Screened): string[] {
+  const lines = (s.coverage ?? []).map((c) => `held: ${c.files} ${c.files === 1 ? "file" : "files"} not screened (${c.cause})`);
+  const paths = s.held ?? [];
+  if (paths.length > 0) {
+    const what = ENGINE_DECISIONS[s.decision]?.heldFor ?? `decide ${s.decision}'s hold`;
+    lines.push(`held: ${what} in ${paths.slice(0, 5).join(", ")}${paths.length > 5 ? ` and ${paths.length - 5} more` : ""}`);
+  }
+  return lines;
+}
+
 /** The verify rows' results. */
 function verifyCells(e: Evidence): { check: string; smoke: string; acceptance: string } {
   const v = e.verify;
@@ -122,8 +182,21 @@ function verifyCells(e: Evidence): { check: string; smoke: string; acceptance: s
 
 const STAGES = { "before-pr": "before the PR", "on-pr": "on the PR", rework: "rework" } as const;
 
-/** The host's part of the PR body, markers included (see the module comment). */
+/**
+ * The host's part of the PR body, markers included (see the module comment). Its last step is the size guard (final
+ * review I2): it renders with each STEPS entry in turn and returns the first body within BODY_CHARS.
+ */
 export function renderPr(i: PrInput): string {
+  let body = "";
+  for (const caps of STEPS) {
+    body = renderWith(i, caps);
+    if (body.length <= BODY_CHARS) return body;
+  }
+  return body;
+}
+
+/** The body with `caps` (see `renderPr`). */
+function renderWith(i: PrInput, caps: Caps): string {
   const e = i.evidence;
   const id = i.order.id;
   const head = h7(i.head);
@@ -141,6 +214,9 @@ export function renderPr(i: PrInput): string {
     const [word, risk] = VERDICT[i.outcome.verdict];
     out.push(`**${word}** · risk: ${risk}`);
   }
+  // D73 (the hold-fatigue ruling): an enforced screen's holds, coverage apart from findings, under the verdict line.
+  const heldLines = i.unpushed === undefined ? e.screens.filter((s) => s.models === "enforce" && s.mode === "enforce").flatMap(heldText) : [];
+  if (heldLines.length > 0) out.push("", ...heldLines.map((l) => `- ${plain(l)}`));
 
   // 2. Unresolved, then Check this yourself.
   const unresolved = [...(i.unpushed === undefined ? (i.unfixed ?? []) : []), ...i.outcome.reasons];
@@ -149,7 +225,7 @@ export function renderPr(i: PrInput): string {
   if (e.cr.state === "not-reviewed" && i.unpushed === undefined) unresolved.push(`CodeRabbit's CLI did not review this head: ${e.cr.why}`);
   out.push("", "## Unresolved", "");
   if (unresolved.length === 0) out.push("Nothing unresolved.");
-  else for (const r of unresolved) out.push(`- ${plain(r)}`);
+  else for (const r of capList(unresolved, caps.lists, "`hapi status` lists every reason")) out.push(`- ${plain(r)}`);
   const check = [
     ...(i.unpushed === undefined ? ["The worker's account below is its own claim; the host did not check it."] : []),
     "CI's `ci / gates` check on the head is GitHub's own run, on a fresh runner: read its result on this PR.",
@@ -157,7 +233,7 @@ export function renderPr(i: PrInput): string {
     ...(i.unpushed === undefined ? e.screens.filter((s) => s.mode === "enforce" && s.models !== "off").flatMap((s) => s.notes) : []),
     ...(e.screens.some((s) => s.models === "off") ? ["Decision models are off (gates.decisions.mode: off): no decide() question screened this change."] : []),
   ];
-  out.push("", "**Check this yourself**", "", ...check.map((c) => `- ${plain(c)}`));
+  out.push("", "**Check this yourself**", "", ...capList(check, caps.lists, "the run's outputs on the host hold the rest").map((c) => `- ${plain(c)}`));
 
   // 3. Links.
   out.push("", "## Links", "");
@@ -204,10 +280,21 @@ export function renderPr(i: PrInput): string {
       ...r.findings.map((f) => `[${f.severity}] ${f.path}: ${f.summary}`),
       ...r.criteria.map((c, n) => `criterion ${n + 1} (${c.mark}): ${c.criterion}\n  evidence: ${c.evidence}`),
     ];
-    out.push("", "The independent review's findings and criteria, as it wrote them:", "", fence(lines.join("\n")));
+    if (caps.quote === 0) out.push("", "_The independent review's findings and criteria aren't shown here, to keep the PR body under GitHub's size limit: they are in the review run's outputs._");
+    else {
+      const q = quoted(lines, "\n", caps.quote);
+      out.push("", "The independent review's findings and criteria, as it wrote them:", "", fence(q.text));
+      if (q.more > 0) out.push("", `… (truncated by the host: ${q.more} more in the review run's outputs)`);
+    }
   }
   if (i.unpushed === undefined && e.cr.state === "reviewed" && e.cr.findings.length > 0) {
-    out.push("", "CodeRabbit's findings, as it wrote them:", "", fence(e.cr.findings.map((f) => `[${f.severity}] ${f.file}${f.line === undefined ? "" : `:${f.line}`}: ${f.title}\n${f.text}`).join("\n\n")));
+    const items = e.cr.findings.map((f) => `[${f.severity}] ${f.file}${f.line === undefined ? "" : `:${f.line}`}: ${f.title}\n${f.text}`);
+    if (caps.quote === 0) out.push("", "_CodeRabbit's findings aren't shown here, to keep the PR body under GitHub's size limit: they are in the review run's outputs._");
+    else {
+      const q = quoted(items, "\n\n", caps.quote);
+      out.push("", "CodeRabbit's findings, as it wrote them:", "", fence(q.text));
+      if (q.more > 0) out.push("", `… (truncated by the host: ${q.more} more CodeRabbit findings in the review run's outputs)`);
+    }
   }
 
   // 6. Review rounds.
@@ -227,7 +314,8 @@ export function renderPr(i: PrInput): string {
   const account = e.worker.account;
   if (i.unpushed !== undefined) out.push(`_The run whose head ${h7(i.unpushed)} was not pushed isn't this PR's: its account isn't shown._`);
   else if (account === undefined) out.push("_The worker wrote no account._");
-  else out.push("_The worker's own claim; the host did not check it._", "", fence(account, ACCOUNT_CHARS));
+  else if (caps.account === 0) out.push("_The worker's account isn't shown here, to keep the PR body under GitHub's size limit: it is in the worker run's transcript on the host._");
+  else out.push("_The worker's own claim; the host did not check it._", "", fence(account, caps.account, caps.account < ACCOUNT_CHARS ? "the whole account is in the worker run's transcript on the host" : undefined));
 
   // 9. The hidden state block.
   const state = { workOrder: id, status: i.phase, ...(i.round === undefined ? {} : { round: i.round }), head: i.head, verdict: i.outcome.verdict };

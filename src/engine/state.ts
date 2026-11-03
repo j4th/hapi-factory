@@ -183,6 +183,16 @@ async function entries(dir: string): Promise<string[]> {
   }
 }
 
+/** The directories in `dir`, sorted: a stray file where an owner or a repo dir would be is skipped (D79); any error but ENOENT throws. */
+async function dirs(dir: string): Promise<string[]> {
+  try {
+    return (await readdir(dir, { withFileTypes: true })).filter((e) => e.isDirectory()).map((e) => e.name).sort();
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw e;
+  }
+}
+
 /** Every state of `repo`, by id; with no repo, every repo's, by repo then id. A file that isn't a state throws. */
 export async function listStates(engineDir: string, repo?: string): Promise<WorkOrderState[]> {
   const root = join(engineDir, "orders");
@@ -192,7 +202,7 @@ export async function listStates(engineDir: string, repo?: string): Promise<Work
     if (r === undefined) throw new Error(`not an owner/name: ${JSON.stringify(repo.slice(0, 120))}`);
     repos.push(r);
   } else {
-    for (const owner of await entries(root)) for (const name of await entries(join(root, owner))) repos.push({ owner, name });
+    for (const owner of await dirs(root)) for (const name of await dirs(join(root, owner))) repos.push({ owner, name });
   }
   const out: WorkOrderState[] = [];
   for (const { owner, name } of repos) {
