@@ -11,6 +11,7 @@ import { diffSubjects, ledgerPath, readLedger, type Screened } from "../../src/e
 import {
   diffStat,
   type Evidence,
+  fileChanges,
   fixHunks,
   GITLEAKS_VERSION,
   type GateResult,
@@ -524,13 +525,15 @@ describe("fix round 1", () => {
     d.pushBranch = async () => ({ moved: "factory/0001-skeleton moved on GitHub (not a fast-forward): not overwritten" });
     const r = await harvest(d, { ...s, pr: 1, prHead: base }, h);
     expect(writes(fw.ff)).not.toContain("POST /graphql");
-    expect(writes(fw.ff)).toEqual(["PATCH /pulls/1", "POST /issues/1/labels"]);
+    // The body is the one write: no markReady, and no label for a head the PR doesn't show.
+    expect(writes(fw.ff)).toEqual(["PATCH /pulls/1"]);
     expect(fw.ff.prs.get(1)!.draft).toBe(true);
     expect([r.prHead, r.verdict, r.reasons[0]]).toEqual([base, "decision", `factory/0001-skeleton moved on GitHub (not a fast-forward): not overwritten; the run's head ${head.slice(0, 7)} was not pushed`]);
     const body = bodyOf(fw.ff, 0);
     expect(body).toContain(`| host gates | ${head.slice(0, 7)} (not pushed) |`);
     expect(body).toContain(`| check | ${head.slice(0, 7)} (not pushed) |`);
-    expect(body).toMatch(new RegExp(`\\| decide: diff-screen v[0-9a-f]{12} \\| ${head.slice(0, 7)} \\(not pushed\\) \\| not asked \\| not screened \\(this head was not pushed\\) \\|`));
+    // Asked and paid for before the push was refused: the row says so.
+    expect(body).toMatch(new RegExp(`\\| decide: diff-screen v[0-9a-f]{12} \\| ${head.slice(0, 7)} \\(not pushed\\) \\| 1 file screened \\(1 asked, 0 reused; jev 1\\) \\| asked; this head was not pushed \\|`));
     expect(body).toContain(`| \`ci / gates\` | ${base.slice(0, 7)} |`);
     expect(body).toContain(`"head":"${base}"`);
   });
@@ -613,5 +616,92 @@ describe("fix round 1", () => {
     const has = (args: string[]) => Bun.spawnSync(["git", "--git-dir", scratch, ...args], { env: { PATH: process.env.PATH!, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } }).exitCode === 0;
     expect(has(["rev-parse", "--verify", "--quiet", `refs/hapi/runs/${W}`])).toBe(false);
     expect(has(["cat-file", "-e", blob])).toBe(false);
+  });
+});
+
+describe("fix round 2", () => {
+  const sgit = (scratch: string, ...args: string[]) => Bun.spawnSync(["git", "--git-dir", scratch, ...args], { env: { PATH: process.env.PATH!, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } }).exitCode === 0;
+  const scratchOf = (w: ReturnType<typeof gitWorld>) => scratchPath(w.engineDir, ORDER.repo, ORDER.id);
+
+  test("with real git: a run refused before its scan (no descent) leaves no ref and no object in the scratch", async () => {
+    const key = fakeSecret("ANTHROPIC_API_KEY");
+    const w = gitWorld();
+    w.commit({ "src/b.ts": `export const k = "${key}";\n` });
+    const blob = w.work("rev-parse", "HEAD:src/b.ts");
+    const bundle = w.bundle();
+    const head = w.work("rev-parse", "HEAD");
+    const main = w.onMain({ "README.md": "# moved on\n" });
+    w.work("checkout", "-q", "--detach", head);
+    const g = await gatesOn(w, { bundle, base: main, secrets: { ANTHROPIC_API_KEY: key } });
+    expect(g.problems).toEqual([{ gate: "bundle", detail: `the run's head ${head.slice(0, 7)} does not descend from ${main.slice(0, 7)}` }]);
+    expect(sgit(scratchOf(w), "rev-parse", "--verify", "--quiet", `refs/hapi/runs/${W}`)).toBe(false);
+    expect(sgit(scratchOf(w), "cat-file", "-e", blob)).toBe(false);
+  });
+
+  test("with real git: an empty-diff run whose commit message holds a key leaves no ref and no commit in the scratch", async () => {
+    const key = fakeSecret("ANTHROPIC_API_KEY");
+    const w = gitWorld();
+    const head = w.commit({}, { empty: true, message: `0001-skeleton: server ${key}` });
+    const g = await gatesOn(w, { secrets: { ANTHROPIC_API_KEY: key } });
+    expect(g.problems.map((p) => p.gate)).toEqual(["no-diff"]);
+    expect(sgit(scratchOf(w), "rev-parse", "--verify", "--quiet", `refs/hapi/runs/${W}`)).toBe(false);
+    expect(sgit(scratchOf(w), "cat-file", "-e", head)).toBe(false);
+  });
+
+  test("with real git: the scratch is private from the bundle's fetch until a clean scan, then readable by all", async () => {
+    const w = gitWorld();
+    const h1 = w.commit({ "src/a.ts": "a\n" });
+    const scratch = scratchOf(w);
+    // An earlier clean harvest opened the scratch.
+    expect((await gatesOn(w)).problems).toEqual([]);
+    expect(lstatSync(scratch).mode & 0o555).toBe(0o555);
+    w.commit({ "src/b.ts": "b\n" }, { runId: "000000000001" });
+    const bundle = w.bundle({ name: "two.bundle", from: h1 });
+    let atFetch: number | undefined;
+    const run: Runner = async (cmd, o) => {
+      const r = await runCommand(cmd, o);
+      if (cmd.includes("fetch") && cmd.includes(bundle)) atFetch = lstatSync(scratch).mode;
+      return r;
+    };
+    const g = await hostGates({ run, env: { PATH: process.env.PATH! } }, { mirror: w.mirror, scratch, bundle, runId: "000000000001", base: h1, workOrder: ORDER.workOrder, policy: SHIPPED, secrets: {} });
+    expect(g.problems).toEqual([]);
+    expect(atFetch! & 0o077).toBe(0);
+    expect(lstatSync(scratch).mode & 0o555).toBe(0o555);
+  });
+
+  test("a refused push drops the run's commits from the scratch, and labels nothing", async () => {
+    const { d, fw, s, h, base } = await world();
+    fw.ff.addPr({ head: "factory/0001-skeleton", draft: true });
+    fw.ff.push("factory/0001-skeleton", base);
+    d.pushBranch = async () => ({ refused: "GitHub refused the push to factory/0001-skeleton: `push declined due to secret scanning`" });
+    await harvest(d, { ...s, pr: 1, prHead: base }, h);
+    expect(sgit(scratchPath(d.engineDir, ORDER.repo, ORDER.id), "rev-parse", "--verify", "--quiet", `refs/hapi/runs/${W}`)).toBe(false);
+    expect(writes(fw.ff)).toEqual(["PATCH /pulls/1"]);
+  });
+
+  test("no label, no signal, no account and no CodeRabbit line of the unpushed head outside its Evidence rows; the block's round is its head's", async () => {
+    const { d, fw, s, h, base } = await world();
+    fw.ff.addPr({ head: "factory/0001-skeleton", draft: true, body: `<!-- hapi:begin -->\nold\n<!-- hapi:pr v1 {"workOrder":"0001-skeleton","status":"pr","round":0,"head":"${base}","verdict":"ready"} -->\n<!-- hapi:end -->` });
+    fw.ff.push("factory/0001-skeleton", base);
+    d.gates = async () => ({ ...(await runGates(d, h.order, h.run)), signals: ["`src/a.ts`: an added line calls process.exit"] });
+    d.pushBranch = async () => ({ moved: "factory/0001-skeleton moved on GitHub (not a fast-forward): not overwritten" });
+    await harvest(d, { ...s, pr: 1, prHead: base }, { ...h, run: { ...h.run, round: 2 } });
+    const body = bodyOf(fw.ff, 0);
+    expect(body).not.toContain("an added line calls process.exit");
+    expect(body).not.toContain("Chose X over Y.");
+    expect(body).toContain("its account isn't shown.");
+    expect(body).toContain(`"round":0,"head":"${base}"`);
+  });
+
+  test("with real git: a file's section ends at a second diff --git, so a deleted src/f never takes src/f/x.ts's lines", async () => {
+    const w = gitWorld();
+    const first = w.commit({ "src/f": "plain\n" });
+    w.commit({ "src/f": null });
+    const head = w.commit({ "src/f/x.ts": "process.kill(1)\n" });
+    const scratch = w.scratch();
+    const changes = await fileChanges(realGit(), scratch, first, head, ["src/f", "src/f/x.ts"]);
+    expect(changes!.get("src/f")).toEqual({ added: [], ranges: [] });
+    expect(changes!.get("src/f/x.ts")).toEqual({ added: ["process.kill(1)"], ranges: [[1, 1]] });
+    expect(Object.fromEntries(await fixHunks(realGit(), scratch, first, head))).toEqual({ "src/f": [], "src/f/x.ts": [[1, 1]] });
   });
 });

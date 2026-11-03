@@ -396,18 +396,32 @@ function windows(state: (part: string, diff: string) => State, header: string[],
 
 const NOT_SHOWN = "content not shown in the diff";
 
+/** The strings and keys a JSON value holds, counted recursively: what a lockfile's string tokens must equal. */
+function stringsIn(v: unknown): number {
+  if (typeof v === "string") return 1;
+  if (Array.isArray(v)) return v.reduce<number>((n, x) => n + stringsIn(x), 0);
+  if (v !== null && typeof v === "object") return Object.entries(v).reduce<number>((n, [, x]) => n + 1 + stringsIn(x), 0);
+  return 0;
+}
+
 /**
  * Bun's text lockfile as JSON: trailing commas are dropped, and any comment (`//` or `/*` outside a string) makes it
- * not a lockfile at all, since text in a comment is text the screen would never see. undefined when it doesn't parse.
+ * not a lockfile at all, since text in a comment is text the screen would never see. Every character must be printable
+ * ASCII or JSON's whitespace. A duplicate key (`JSON.parse` keeps the last, so the first could hold anything, escaped
+ * or not) is caught by counting: the string tokens the scanner met must equal the keys and strings the parsed value
+ * holds. undefined when it isn't such a JSON value.
  */
 function lockJson(text: string): unknown {
+  if (/[^\x09\x0a\x0d\x20-\x7e]/.test(text)) return undefined;
   let out = "";
+  let tokens = 0;
   for (let i = 0; i < text.length; i++) {
     const c = text[i]!;
     if (c === '"') {
       let j = i + 1;
       while (j < text.length && text[j] !== '"') j += text[j] === "\\" ? 2 : 1;
       out += text.slice(i, j + 1);
+      tokens++;
       i = j;
     } else if (c === "/" && (text[i + 1] === "/" || text[i + 1] === "*")) return undefined;
     else if (c === ",") {
@@ -416,16 +430,19 @@ function lockJson(text: string): unknown {
       if (text[j] !== "}" && text[j] !== "]") out += c;
     } else out += c;
   }
+  let v: unknown;
   try {
-    return JSON.parse(out);
+    v = JSON.parse(out);
   } catch {
     return undefined;
   }
+  return stringsIn(v) === tokens ? v : undefined;
 }
 
-// The grammar every string of a skipped bun.lock must fit (the controller's ruling, Task 12 fix round 1): names,
-// resolutions, specs, registries, integrities, paths and platforms, each at most 256 characters. Free text fits none
-// of them; what still fits (a hyphenated word as a name or a dist-tag) is bounded by the grammar and the cap (H-275).
+// The grammar every string of a skipped bun.lock must fit (the controller's rulings, Task 12 fix rounds 1 and 2):
+// names, resolutions, specs, registries, integrities, paths and platforms, each printable ASCII and at most 256
+// characters, with at most 16 dist-tag specs in all. Free text fits none of them; what still fits (a hyphenated word
+// as a name, one word per dist-tag, words joined without spaces in a path or a URL) is H-275's residual.
 const NPM_NAME = /^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/;
 const NESTED_NAME = /^(?:@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*(?:\/(?:@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*)*$/;
 const PART = "(?:0|[1-9][0-9]*|x|X|\\*)";
@@ -439,7 +456,11 @@ const PLATFORM = /^!?[a-z0-9_]+$/;
 const INTEGRITY = /^sha(512|384|256|1)-[A-Za-z0-9+/]+={0,2}$/;
 const GIT_REF = /^[A-Za-z0-9._-]+-[0-9a-f]{7,64}$/;
 
-const isStr = (v: unknown): v is string => typeof v === "string" && v.length <= 256;
+const isStr = (v: unknown): v is string => typeof v === "string" && v.length <= 256 && /^[\x20-\x7e]*$/.test(v);
+/** The most dist-tag specs (`latest`, `next`, a word) one lockfile may hold: each is a word the screen won't see. */
+const MAX_DIST_TAGS = 16;
+/** The dist-tag specs of the lockfile `isBunLock` is checking (reset at each call; the check is synchronous). */
+let distTags = 0;
 const isName = (v: unknown): v is string => isStr(v) && v.length <= 214 && NPM_NAME.test(v);
 const isObj = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
 const onlyKeys = (o: Record<string, unknown>, allowed: readonly string[]) => Object.keys(o).every((k) => allowed.includes(k));
@@ -458,14 +479,18 @@ function isRange(s: string): boolean {
 /** A dependency spec: a range, a protocol with no whitespace, or a dist-tag. */
 function isSpec(v: unknown): boolean {
   if (!isStr(v)) return false;
-  if (isRange(v) || DIST_TAG.test(v)) return true;
+  if (isRange(v)) return true;
+  if (DIST_TAG.test(v)) return ++distTags <= MAX_DIST_TAGS;
   if (v.startsWith("npm:")) {
     const rest = v.slice(4);
     const at = rest.lastIndexOf("@");
     return at > 0 ? isName(rest.slice(0, at)) && isSpec(rest.slice(at + 1)) : isName(rest);
   }
   if (/^catalog:[a-z0-9._-]*$/.test(v)) return true;
-  return /^(workspace:|github:|git\+https:\/\/|https:\/\/|file:|link:)\S+$/.test(v) || v === "workspace:*";
+  if (/^workspace:/.test(v)) return /^workspace:(?:[*^~]|[A-Za-z0-9._/-]+)$/.test(v) || isRange(v.slice("workspace:".length));
+  if (/^(file|link):[A-Za-z0-9._~/@+-]+$/.test(v)) return true;
+  if (/^github:[A-Za-z0-9._/#-]+$/.test(v)) return true;
+  return /^(git\+https|https):\/\/[\x21-\x7e]+$/.test(v);
 }
 
 /** `<name>@<spec>`, the name possibly scoped. */
@@ -505,7 +530,7 @@ function isPackage(v: unknown): boolean {
   if (v.length === 1) return true;
   if (v.length === 2) return isMeta(v[1]);
   if (v.length === 3) return isMeta(v[1]) && isStr(v[2]) && GIT_REF.test(v[2]);
-  if (v.length === 4) return isStr(v[1]) && (v[1] === "" || /^https:\/\/\S+$/.test(v[1])) && isMeta(v[2]) && isStr(v[3]) && INTEGRITY.test(v[3]);
+  if (v.length === 4) return isStr(v[1]) && (v[1] === "" || /^https:\/\/[\x21-\x7e]+$/.test(v[1])) && isMeta(v[2]) && isStr(v[3]) && INTEGRITY.test(v[3]);
   return false;
 }
 
@@ -513,10 +538,12 @@ function isPackage(v: unknown): boolean {
  * Whether `text` is Bun's text lockfile, checked structurally: JSON with trailing commas but no comment; the top-level
  * keys `lockfileVersion` (0 to 2), `workspaces` and `packages`, and optionally `configVersion` (0 or 1),
  * `trustedDependencies`, `patchedDependencies`, `overrides`, `catalog` and `catalogs`; each value in the shape Bun
- * writes; and every string a name, resolution, spec, registry, integrity, path or platform of at most 256 characters.
- * Anything else is not a lockfile, so the file is unscreened and holds.
+ * writes; every string a name, resolution, spec, registry, integrity, path or platform, printable ASCII, of at most
+ * 256 characters; no duplicate key; and at most 16 dist-tag specs. Anything else is not a lockfile, so the file is
+ * unscreened and holds.
  */
 export function isBunLock(text: string): boolean {
+  distTags = 0;
   const v = lockJson(text);
   if (!isObj(v) || !onlyKeys(v, ["lockfileVersion", "configVersion", "workspaces", "packages", "trustedDependencies", "patchedDependencies", "overrides", "catalog", "catalogs"])) return false;
   if (!Number.isInteger(v.lockfileVersion) || (v.lockfileVersion as number) < 0 || (v.lockfileVersion as number) > 2) return false;

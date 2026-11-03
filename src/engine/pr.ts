@@ -35,6 +35,7 @@ export interface PrInput {
   /** decisions: the work order's whole ledger. */
   cost: { usd: number; unknown: number; turns: number; decisions: { usd: number; calls: number } };
   phase: Phase;
+  /** The round of `head`: the pushed run's, or, when nothing was pushed, the PR's own head's (the hidden block's). */
   round: number;
   /** `ci / gates` on the head: undefined is pending. Ready to merge is shown only once it passed. */
   ci?: "pending" | "passed" | "failed";
@@ -85,13 +86,14 @@ function count(lines: string[]): number {
 /** One decision's Evidence row: `| decide: <name> v<version> | <h7> | <screened> | <result> |`; `head` is the cell's text. */
 function decisionRow(s: Screened, head: string): string {
   const via = (["jev", "haiku", "default"] as const).filter((k) => (s.via[k] ?? 0) > 0).map((k) => `${k} ${s.via[k]}`);
+  const asked = s.asked + s.reused + s.unscreened > 0;
   const screened =
-    s.models === "off" || !s.pushed || s.mode === "off" || s.subjects === 0
+    s.models === "off" || (!s.pushed && !asked) || s.mode === "off" || s.subjects === 0
       ? "not asked"
       : `${s.subjects} ${s.subjects === 1 ? "file" : "files"} screened (${s.asked} asked, ${s.reused} reused${via.length > 0 ? `; ${via.join(", ")}` : ""})`;
   let result: string;
   if (s.models === "off") result = "off: decision models are off (gates.decisions.mode)";
-  else if (!s.pushed) result = "not screened (this head was not pushed)";
+  else if (!s.pushed) result = asked ? "asked; this head was not pushed" : "not screened (this head was not pushed)";
   else if (s.mode === "off") result = `off (gates.decisions.by_name.${s.decision}.mode)`;
   else if (s.mode === "shadow") result = `shadow: would hold ${count(s.holds)}`;
   else if (s.models === "notes") result = `notes only (gates.decisions.mode): ${count(s.notes)} note`;
@@ -140,15 +142,16 @@ export function renderPr(i: PrInput): string {
   // 2. Unresolved, then Check this yourself.
   const unresolved = [...(i.unpushed === undefined ? (i.unfixed ?? []) : []), ...i.outcome.reasons];
   if (ready && ci === "failed") unresolved.push(`\`ci / gates\` failed on ${head}`);
-  if (e.cr.state === "not-reviewed") unresolved.push(`CodeRabbit's CLI did not review this head: ${e.cr.why}`);
+  // What describes the unpushed head stays in its Evidence rows (and its reason): the PR shows another head.
+  if (e.cr.state === "not-reviewed" && i.unpushed === undefined) unresolved.push(`CodeRabbit's CLI did not review this head: ${e.cr.why}`);
   out.push("", "## Unresolved", "");
   if (unresolved.length === 0) out.push("Nothing unresolved.");
   else for (const r of unresolved) out.push(`- ${plain(r)}`);
   const check = [
     "The worker's account below is its own claim; the host did not check it.",
     "CI's `ci / gates` check on the head is GitHub's own run, on a fresh runner: read its result on this PR.",
-    ...e.gates.signals,
-    ...e.screens.filter((s) => s.mode === "enforce" && s.models !== "off").flatMap((s) => s.notes),
+    ...(i.unpushed === undefined ? e.gates.signals : []),
+    ...(i.unpushed === undefined ? e.screens.filter((s) => s.mode === "enforce" && s.models !== "off").flatMap((s) => s.notes) : []),
     ...(e.screens.some((s) => s.models === "off") ? ["Decision models are off (gates.decisions.mode: off): no decide() question screened this change."] : []),
   ];
   out.push("", "**Check this yourself**", "", ...check.map((c) => `- ${plain(c)}`));
@@ -192,7 +195,7 @@ export function renderPr(i: PrInput): string {
   for (const s of e.screens) out.push(decisionRow(s, evidenceHead));
   out.push(`| \`ci / gates\` | ${head} | GitHub Actions, on the pushed head | ${ci} |`);
   if (i.unpushed !== undefined) {
-    out.push("", `The rows above but \`ci / gates\` are of round ${i.round}'s head ${h7(i.unpushed)}, which was not pushed (see Unresolved); the PR's head is still ${head}, and its findings aren't shown.`);
+    out.push("", `The rows above but \`ci / gates\` are of the run's head ${h7(i.unpushed)}, which was not pushed (see Unresolved); the PR's head is still ${head}, and its findings aren't shown.`);
   } else if (r.state === "ran" && (r.findings.length > 0 || r.criteria.length > 0)) {
     const lines = [
       ...r.findings.map((f) => `[${f.severity}] ${f.path}: ${f.summary}`),
@@ -219,7 +222,8 @@ export function renderPr(i: PrInput): string {
   // 8. The worker's account, fenced as its claim.
   out.push("", "## The worker's account", "");
   const account = e.worker.account;
-  if (account === undefined) out.push("_The worker wrote no account._");
+  if (i.unpushed !== undefined) out.push(`_The run whose head ${h7(i.unpushed)} was not pushed isn't this PR's: its account isn't shown._`);
+  else if (account === undefined) out.push("_The worker wrote no account._");
   else out.push("_The worker's own claim; the host did not check it._", "", fence(account, ACCOUNT_CHARS));
 
   // 9. The hidden state block.

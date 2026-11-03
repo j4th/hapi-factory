@@ -176,7 +176,11 @@ export async function fileChanges(d: Pick<RunDeps, "run" | "env">, scratch: stri
     if (r.code !== 0) return undefined;
     const change: FileChange = { added: [], ranges: [] };
     let body = false;
+    let sections = 0;
     for (const line of r.stdout.split("\n")) {
+      // A pathspec that names a file also names a directory of that name (a deleted `src/f` and a new `src/f/x.ts`):
+      // the file's own section is the first; a second `diff --git` is another file's (a content line never starts so).
+      if (line.startsWith("diff --git ") && ++sections > 1) break;
       const h = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(line);
       if (h) {
         body = true;
@@ -320,51 +324,87 @@ export async function hostGates(
     const r = await d.run([...g.cmd, "clone", "--bare", "--no-hardlinks", "--quiet", "--", o.mirror, o.scratch], { env: g.env, inherit: false });
     if (r.code !== 0) throw new Error(`cannot make the scratch ${o.scratch} from the mirror (git clone exited ${r.code}): ${firstLine(r.stderr)}`);
   }
+  // The scratch is private while it holds commits nobody has scanned: a run container's uid reads it only once a
+  // scan was clean, or the unscanned commits are gone (step 7). No run of this work order is live during its harvest
+  // (one pipeline per repo, Task 13), so locking the scratch out meanwhile stops nothing.
+  await chmod(o.scratch, 0o700);
   await must(["fetch", "--quiet", "--no-tags", o.mirror, "+refs/heads/main:refs/heads/main", "+refs/heads/factory/*:refs/heads/factory/*", "+refs/hapi/orders/*:refs/hapi/orders/*"], "fetch the mirror");
-  // 3. The bundle applies, its head descends from the run's base.
+  // 3. The bundle applies (nothing of it is in the scratch before this).
   const verify = await git(["bundle", "verify", "--quiet", o.bundle]);
-  if (verify.code !== 0) return end("bundle", `run.bundle does not apply to the mirror (git bundle verify exited ${verify.code})`);
-  const ref = `refs/hapi/runs/${o.runId}`;
-  const fetched = await git(["fetch", "--quiet", "--no-tags", o.bundle, `HEAD:${ref}`]);
-  if (fetched.code !== 0) return end("bundle", `run.bundle could not be fetched into the scratch (git fetch exited ${fetched.code})`);
-  const head = (await must(["rev-parse", "--verify", `${ref}^{commit}`], "read the run's head")).trim();
-  if (!COMMIT.test(head)) throw new Error(`the run's head in the scratch is not a commit id: ${head.slice(0, 80)}`);
-  const anc = await git(["merge-base", "--is-ancestor", o.base, head]);
-  if (anc.code === 1) return end("bundle", `the run's head ${short(head)} does not descend from ${short(o.base)}`, head);
-  if (anc.code !== 0) throw new Error(`cannot check the run's head descends from its base (git merge-base exited ${anc.code}): ${firstLine(anc.stderr)}`);
-  // 3b. Each new commit is one piece's, with the trailers the commit node writes (re-checked on what was committed).
-  const log = await must(["log", "--no-mailmap", "--format=%H%x1f%P%x1f%(trailers:only,unfold)%x1e", `${o.base}..${head}`], "read the run's commits");
-  const problems: GateProblem[] = capGate("bundle", trailerProblems(log, o));
-  // 4. The changed files.
-  const files = (await must(["diff", "--name-only", "-z", "--no-renames", o.base, head], "list the run's changed files")).split("\0").filter((f) => f !== "");
-  if (files.length === 0) return { head, files: [], problems: [...problems, { gate: "no-diff", detail: `the run changed no file (${short(o.base)}..${short(head)} is empty)` }], signals: [] };
-  // 5. Protected paths (the overlaid policy), then the pieces' scopes.
-  const prot: string[] = [];
-  const scope: string[] = [];
-  const globs = o.workOrder.pieces.flatMap((p) => p.files.map((g) => g.split("/").filter((s) => s !== "" && s !== ".").join("/")));
-  for (const f of files) {
-    try {
-      if (effectiveModes(o.policy, f).workers !== "allow") prot.push(`${shown(f, o.secrets)} is a protected path (workers: ${effectiveModes(o.policy, f).workers})`);
-    } catch (e) {
-      prot.push(`${shown(f, o.secrets)} can't be checked against protected paths: ${shown(e instanceof Error ? e.message : String(e), o.secrets)}`);
-    }
-    // A piece's scope grants, so it matches case as the run's own git pathspecs do (protection ignores case).
-    if (!globs.some((g) => globMatches(g, f, { caseSensitive: true }))) scope.push(`${shown(f, o.secrets)} is outside every piece's files`);
+  if (verify.code !== 0) {
+    await readableByAll(o.scratch);
+    return end("bundle", `run.bundle does not apply to the mirror (git bundle verify exited ${verify.code})`);
   }
-  problems.push(...capGate("protected", prot), ...capGate("scope", scope));
-  // 6. The secret scan, and the added-line signals.
-  const leaks = await secretScan(d, { scratch: o.scratch, base: o.base, head, secrets: o.secrets });
-  problems.push(...capGate("secret", leaks));
-  const changes = await fileChanges(d, o.scratch, o.base, head, files);
-  const signals = changes !== undefined ? signalsOf(changes, o.secrets) : ["the added-line signals could not be read: check the diff yourself"];
-  // 7. A secret's commits leave the scratch at once; a clean scratch is made readable by all, as the mirror is (a
-  // run container's uid reads it).
-  if (leaks.length > 0) {
-    for (const args of [["update-ref", "-d", ref], ["reflog", "expire", "--expire=now", "--all"], ["repack", "-a", "-d", "-q"], ["prune", "--expire=now"]]) {
-      await must(args, "drop the run's commits after a secret was found");
+  const ref = `refs/hapi/runs/${o.runId}`;
+  // From the bundle's fetch on, every exit but a clean scan drops the run's commits from the scratch (`purgeRun`):
+  // a run refused before its scan (no descent, no diff, a throw) may still hold a secret nobody looked for.
+  let clean = false;
+  let failure: unknown;
+  try {
+    return await scanned();
+  } catch (e) {
+    failure = e;
+    throw e;
+  } finally {
+    if (!clean) {
+      try {
+        await purgeRun(d, o.scratch, o.runId);
+      } catch (e) {
+        throw new Error(`cannot drop run ${o.runId}'s commits from the scratch ${o.scratch}: ${e instanceof Error ? e.message : String(e)}`, { cause: failure ?? e });
+      }
     }
-  } else await readableByAll(o.scratch);
-  return { head, files, problems, signals };
+    // 7. Readable by all, as the mirror is, once what it holds was scanned clean or the unscanned commits are gone.
+    await readableByAll(o.scratch);
+  }
+
+  async function scanned(): Promise<GateResult> {
+    const fetched = await git(["fetch", "--quiet", "--no-tags", o.bundle, `HEAD:${ref}`]);
+    if (fetched.code !== 0) return end("bundle", `run.bundle could not be fetched into the scratch (git fetch exited ${fetched.code})`);
+    const head = (await must(["rev-parse", "--verify", `${ref}^{commit}`], "read the run's head")).trim();
+    if (!COMMIT.test(head)) throw new Error(`the run's head in the scratch is not a commit id: ${head.slice(0, 80)}`);
+    const anc = await git(["merge-base", "--is-ancestor", o.base, head]);
+    if (anc.code === 1) return end("bundle", `the run's head ${short(head)} does not descend from ${short(o.base)}`, head);
+    if (anc.code !== 0) throw new Error(`cannot check the run's head descends from its base (git merge-base exited ${anc.code}): ${firstLine(anc.stderr)}`);
+    // 3b. Each new commit is one piece's, with the trailers the commit node writes (re-checked on what was committed).
+    const log = await must(["log", "--no-mailmap", "--format=%H%x1f%P%x1f%(trailers:only,unfold)%x1e", `${o.base}..${head}`], "read the run's commits");
+    const problems: GateProblem[] = capGate("bundle", trailerProblems(log, o));
+    // 4. The changed files.
+    const files = (await must(["diff", "--name-only", "-z", "--no-renames", o.base, head], "list the run's changed files")).split("\0").filter((f) => f !== "");
+    if (files.length === 0) return { head, files: [], problems: [...problems, { gate: "no-diff", detail: `the run changed no file (${short(o.base)}..${short(head)} is empty)` }], signals: [] };
+    // 5. Protected paths (the overlaid policy), then the pieces' scopes.
+    const prot: string[] = [];
+    const scope: string[] = [];
+    const globs = o.workOrder.pieces.flatMap((p) => p.files.map((g) => g.split("/").filter((x) => x !== "" && x !== ".").join("/")));
+    for (const f of files) {
+      try {
+        if (effectiveModes(o.policy, f).workers !== "allow") prot.push(`${shown(f, o.secrets)} is a protected path (workers: ${effectiveModes(o.policy, f).workers})`);
+      } catch (e) {
+        prot.push(`${shown(f, o.secrets)} can't be checked against protected paths: ${shown(e instanceof Error ? e.message : String(e), o.secrets)}`);
+      }
+      // A piece's scope grants, so it matches case as the run's own git pathspecs do (protection ignores case).
+      if (!globs.some((g) => globMatches(g, f, { caseSensitive: true }))) scope.push(`${shown(f, o.secrets)} is outside every piece's files`);
+    }
+    problems.push(...capGate("protected", prot), ...capGate("scope", scope));
+    // 6. The secret scan, and the added-line signals. Only a scan with no leak keeps the run's commits.
+    const leaks = await secretScan(d, { scratch: o.scratch, base: o.base, head, secrets: o.secrets });
+    problems.push(...capGate("secret", leaks));
+    const changes = await fileChanges(d, o.scratch, o.base, head, files);
+    const signals = changes !== undefined ? signalsOf(changes, o.secrets) : ["the added-line signals could not be read: check the diff yourself"];
+    clean = leaks.length === 0;
+    return { head, files, problems, signals };
+  }
+}
+
+/**
+ * Drop run `runId`'s commits from the scratch: its ref, the reflogs, and every object no ref reaches (`repack -a -d`,
+ * `prune --expire=now`). After a secret, an exit before the scan, or GitHub's refusal of the push (its push
+ * protection may have found what the host's scan didn't). A missing ref is no error. Throws when git fails.
+ */
+export async function purgeRun(d: Pick<RunDeps, "run" | "env">, scratch: string, runId: string): Promise<void> {
+  for (const args of [["update-ref", "-d", `refs/hapi/runs/${runId}`], ["reflog", "expire", "--expire=now", "--all"], ["repack", "-a", "-d", "-q"], ["prune", "--expire=now"]]) {
+    const r = await scratchGit(d, scratch, args);
+    if (r.code !== 0) throw new Error(`git ${args[0]} exited ${r.code}: ${firstLine(r.stderr)}`);
+  }
 }
 
 export interface Evidence {
@@ -623,6 +663,18 @@ function unfixedFindings(e: Evidence, hunks: Map<string, [number, number][]>, ro
   return [...new Set(lines)];
 }
 
+/** The round a PR body's hidden block (`<!-- hapi:pr v1 {...} -->`) names, when its head is `head`. */
+function roundOfBody(body: string, head: string): number | undefined {
+  const m = /<!-- hapi:pr v1 (\{[^\n]*?\}) -->/.exec(body);
+  if (!m) return undefined;
+  try {
+    const b = JSON.parse(m[1]!) as { head?: unknown; round?: unknown };
+    return b.head === head && typeof b.round === "number" && Number.isInteger(b.round) && b.round >= 0 ? b.round : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Why the outcome is a draft, as the not-pushed reason says it: what failed in the verify container, or why it can't be read. */
 function draftCause(e: Evidence): string {
   const v = e.verify;
@@ -746,10 +798,16 @@ export async function harvest(d: HarvestDeps, s: WorkOrderState, h: HarvestInput
     result = outcome(e, phases);
     const pushed = await d.pushBranch({ scratch, remote: `https://github.com/${d.repo}.git`, id, head, token: await d.token("push") });
     if ("pushed" in pushed) prHead = head;
-    else notPushed = `${"moved" in pushed ? pushed.moved : pushed.refused}; the run's head ${short(head)} was not pushed`;
+    else {
+      notPushed = `${"moved" in pushed ? pushed.moved : pushed.refused}; the run's head ${short(head)} was not pushed`;
+      // Asked and paid for, but of a head that wasn't pushed: the Evidence row says so, and nothing of them is used.
+      e.screens = e.screens.map((x) => ({ ...x, pushed: false, holds: [], notes: [] }));
+      // GitHub's refusal may be its push protection finding what the host's scan didn't: the commits leave the scratch.
+      if ("refused" in pushed) await purgeRun(d.run, scratch, h.run.runId);
+    }
   }
   if (notPushed !== undefined) {
-    e.screens = emptyScreens(policy, false);
+    if (e.screens.length === 0 || e.screens.every((x) => x.pushed)) e.screens = emptyScreens(policy, false);
     result = { ...first, verdict: "decision", reasons: [notPushed, ...first.reasons] };
     // A branch the factory didn't push is never shown as its head, nor opened as its PR.
     if (pr === undefined) return done({ ...s, verdict: result.verdict, reasons: result.reasons, updatedAt: now });
@@ -781,7 +839,9 @@ export async function harvest(d: HarvestDeps, s: WorkOrderState, h: HarvestInput
       decisions: { usd: await decisionSpend(d.engineDir, { repo: d.repo, ids: [id], from: new Date(0), to: d.run.now(), unknownUsd: policy.gates.classifiers.jev.unknown_call_usd }), calls: callsOf(ledger) },
     },
     phase: "pr",
-    round: h.run.round ?? 0,
+    // The hidden block's round is its head's: the pushed run's, or, when nothing was pushed, the round the PR's own
+    // block names for that head (else the harvested run's, the closest the host has).
+    round: notPushed !== undefined && pr !== undefined ? (roundOfBody(pr.body, shownHead) ?? h.run.round ?? 0) : (h.run.round ?? 0),
     ci: "pending",
     ...(notPushed === undefined ? {} : { unpushed: head }),
     ...(fix.length > 0 ? { unfixed: fix } : {}),
@@ -795,9 +855,12 @@ export async function harvest(d: HarvestDeps, s: WorkOrderState, h: HarvestInput
   } else {
     number = (await forge.openPr({ head: ref, base: "main", title: titleOf(h.order), body: renderPr(input), draft: result.draft })).number;
   }
-  const flagged =
-    policy.flags.on_flag.includes("label_pr") &&
-    (spends.reduce((n, x) => n + x.usd, 0) > policy.flags.thresholds.run_usd || s.reworkRounds > policy.flags.thresholds.review_rounds);
-  await forge.addLabels(number, flagged ? ["lane:factory", "hapi:flagged"] : ["lane:factory"]);
+  // Labels only with a push: nothing flags a PR for a head it doesn't show.
+  if (notPushed === undefined) {
+    const flagged =
+      policy.flags.on_flag.includes("label_pr") &&
+      (spends.reduce((n, x) => n + x.usd, 0) > policy.flags.thresholds.run_usd || s.reworkRounds > policy.flags.thresholds.review_rounds);
+    await forge.addLabels(number, flagged ? ["lane:factory", "hapi:flagged"] : ["lane:factory"]);
+  }
   return done({ ...s, pr: number, ...(prHead === undefined ? {} : { prHead }), verdict: result.verdict, reasons: result.reasons, updatedAt: now });
 }
