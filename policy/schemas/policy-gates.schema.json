@@ -183,11 +183,12 @@
           ]
         },
         "skip_paths": {
-          "description": "Globs of changed files never screened (globMatches syntax). Only for a decision whose subjects are changed files.",
+          "description": "Exact repo paths (matched case-sensitively, never as globs) of lockfiles never screened, each skipped only while its content at the head parses as the lockfile its name says; one that doesn't is unscreened. Only for a decision whose subjects are changed files.",
           "type": "array",
           "items": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "pattern": "^[^*?\\[\\]{}\\\\]+$"
           },
           "uniqueItems": true
         }

@@ -28,4 +28,4 @@ decisions:                       # the run engine's decide() questions (Plan 03 
     diff-screen:                 # per changed file, in windows of whole lines when long
       mode: enforce              # off: never asked; shadow: asked and recorded, no effect on the PR; enforce: a hold keeps the PR at Needs your decision, a note goes under Check this yourself
       on_unscreened: hold        # a subject no classifier answered (no key, a provider error, over max_state_chars, content the diff doesn't show, past max_calls_per_head): hold (as a hold) or note (as a note)
-      skip_paths: [bun.lock]     # globs (globMatches) of changed files never screened: lockfiles; OSV-Scanner and the review cover dependencies
+      skip_paths: [bun.lock]     # exact repo paths (case-sensitive, no globs) of lockfiles never screened, each only while it parses as the lockfile its name says (else unscreened); OSV-Scanner and the review cover dependencies

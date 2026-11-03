@@ -177,7 +177,7 @@ export interface EngineDecision {
   mode: DecisionMode;
   /** What a subject no classifier answered does: hold back Ready to merge, or add a note. */
   on_unscreened: "hold" | "note";
-  /** Globs (`globMatches`) of changed files never screened. */
+  /** Exact repo paths (case-sensitive, never globs) of lockfiles never screened, each skipped only while its content parses as that lockfile. */
   skip_paths?: string[];
 }
 

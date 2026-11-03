@@ -7,8 +7,11 @@
  *   and the source of its subjects. gates.yaml's `decisions.by_name` has one entry per name (the schema and a test
  *   hold them equal). Adding a decision is a file, a line here and a knob; a new kind of subject also needs a
  *   builder here and its call site.
- * - **Subjects** (`diffSubjects`, the source `"diff"`): each changed file of `<mergeSha>..<head>` but `skip_paths`,
- *   its diff in the scratch, read with hardened git. Every string is redacted first (`redactSecretForms`), then a
+ * - **Subjects** (`diffSubjects`, the source `"diff"`): each changed file of `<mergeSha>..<head>`, its diff in the
+ *   scratch, read with hardened git. A `skip_paths` entry is an exact repo path, matched case-sensitively, never a
+ *   glob, and the file it names is skipped only when its content at the head parses as the lockfile its name says
+ *   (`LOCKFILES`); one that doesn't is unscreened, so a worker can't hide text from the screen behind a lockfile's
+ *   name. Every string is redacted first (`redactSecretForms`), then a
  *   long diff is cut into windows of whole lines, each with the file's header lines, covering every line once.
  *   Content the diff doesn't show (a binary, a `-diff` attribute, a gitlink) is a subject with no state: unscreened.
  * - **The ledger**, `<engineDir>/decisions/<owner>/<name>/<id>.jsonl` (0600, dirs 0700, append-only): an `asking`
@@ -27,13 +30,12 @@
 import { createHash, randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { appendFile, chmod, mkdir, readdir, readFile, truncate } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import diffScreen from "../../policy/decisions/diff-screen";
 import type { DecideOptions, DecideResult, EngineDecisionFile, EngineVerdict, State } from "../decide/index";
 import { stateLength } from "../decide/index";
 import { type ask, type RecordedAnswer, recordedAnswers } from "../decide/record";
 import { parseOwnerRepo } from "../forge/github/app-token";
-import { globMatches } from "../policy/paths";
 import type { DecisionMode, DecisionModels, EngineDecision, Policy } from "../policy/types";
 import { hardenedGit } from "../run/git";
 import type { RunRecord } from "../run/records";
@@ -281,6 +283,7 @@ export interface DiffInput {
   base: string;
   head: string;
   goal: string;
+  /** Exact repo paths (case-sensitive, no globs) of lockfiles never screened, each only while it parses as one (`LOCKFILES`). */
   skip: readonly string[];
   maxChars: number;
   secrets: Record<string, string>;
@@ -386,6 +389,48 @@ function windows(state: (part: string, diff: string) => State, header: string[],
 const NOT_SHOWN = "content not shown in the diff";
 
 /**
+ * JSONC as Bun writes its text lockfile: JSON with trailing commas, and comments allowed. Comments and trailing
+ * commas outside strings are dropped, then the text is parsed as JSON. Throws on anything else.
+ */
+function parseJsonc(text: string): unknown {
+  let out = "";
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (c === '"') {
+      let j = i + 1;
+      while (j < text.length && text[j] !== '"') j += text[j] === "\\" ? 2 : 1;
+      out += text.slice(i, j + 1);
+      i = j;
+    } else if (c === "/" && text[i + 1] === "/") {
+      while (i < text.length && text[i] !== "\n") i++;
+      out += "\n";
+    } else if (c === "/" && text[i + 1] === "*") {
+      const end = text.indexOf("*/", i + 2);
+      if (end === -1) throw new Error("an unclosed comment");
+      i = end + 1;
+    } else if (c === ",") {
+      let j = i + 1;
+      while (j < text.length && /\s/.test(text[j]!)) j++;
+      if (text[j] !== "}" && text[j] !== "]") out += c;
+    } else out += c;
+  }
+  return JSON.parse(out);
+}
+
+/** Whether `text` is Bun's text lockfile: a JSONC object with an integer `lockfileVersion`. */
+export function isBunLock(text: string): boolean {
+  try {
+    const v = parseJsonc(text);
+    return v !== null && typeof v === "object" && !Array.isArray(v) && Number.isInteger((v as { lockfileVersion?: unknown }).lockfileVersion);
+  } catch {
+    return false;
+  }
+}
+
+/** The lockfiles a `skip_paths` entry may name, by file name, and the check its content at the head must pass to be skipped. */
+export const LOCKFILES: Readonly<Record<string, (text: string) => boolean>> = Object.freeze({ "bun.lock": isBunLock });
+
+/**
  * The `"diff"` subjects of `o.decision`: each file of `diff --name-only -z --no-renames <base> <head>` that matches
  * no `o.skip` glob, ordered by path, then part. The state is `{ goal, path, part, diff }`, every string redacted
  * (`redactSecretForms`, with `o.secrets`) before the diff is cut into windows; content the diff doesn't show (a
@@ -398,10 +443,22 @@ export async function diffSubjects(d: Pick<RunDeps, "run" | "env">, o: DiffInput
   const goal = redact(o.goal);
   const out: Subject[] = [];
   for (const path of [...new Set(names)].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))) {
-    if (o.skip.some((g) => globMatches(g, path))) continue;
     const shown = redact(path);
     const s = stat.get(path);
     const subject = (part: string, state: State | undefined, unscreened?: string): Subject => ({ decision: o.decision, subject: shown, part, state, ...(unscreened === undefined ? {} : { unscreened }) });
+    if (o.skip.includes(path)) {
+      // A deletion adds nothing to read; otherwise the file must be the lockfile its name says, or it is unscreened.
+      if (s?.status === "D") continue;
+      const check = LOCKFILES[basename(path)];
+      if (check === undefined) {
+        out.push(subject("whole", undefined, "skip_paths names it, but the engine has no check that it is a lockfile"));
+        continue;
+      }
+      const blob = await scratchGit(d, o.scratch, ["cat-file", "blob", `${o.head}:${path}`]);
+      if (blob.code === 0 && check(blob.stdout)) continue;
+      out.push(subject("whole", undefined, `skip_paths names it as a lockfile, but it doesn't parse as ${basename(path)}`));
+      continue;
+    }
     if (s?.oldMode === "160000" || s?.newMode === "160000" || s?.added === "-" || s?.deleted === "-") {
       out.push(subject("whole", undefined, NOT_SHOWN));
       continue;

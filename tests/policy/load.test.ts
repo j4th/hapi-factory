@@ -348,6 +348,7 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
         shipped.replace("  by_name:", "  by_name:\n    nope:\n      mode: off\n      on_unscreened: hold"),
         shipped.replace(/    diff-screen:[\s\S]*$/, "    {}\n").replace("  by_name:\n    {}", "  by_name: {}"),
         models("shadow", shipped),
+        shipped.replace("skip_paths: [bun.lock]", 'skip_paths: ["**/bun.lock"]'),
         shipped.replace(/^  mode: enforce[^\n]*\n/m, ""),
       ];
       for (const text of bad) {
