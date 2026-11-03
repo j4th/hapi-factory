@@ -201,7 +201,7 @@ function lowerRuns(base: Runs, overlay: NonNullable<RepoOverlay["runs"]>): Runs 
     disk: { ...base.disk },
     phases: { ...base.phases },
   };
-  for (const [key, value] of Object.entries(scalars) as [Exclude<keyof Runs, "output_limits_mb" | "disk" | "phases" | "poll_interval_s" | "max_retries" | "inputs_mb" | "work_order_kb">, number][]) {
+  for (const [key, value] of Object.entries(scalars) as [Exclude<keyof Runs, "output_limits_mb" | "disk" | "phases" | "poll_interval_s" | "max_retries" | "max_rework_rounds" | "inputs_mb" | "work_order_kb">, number][]) {
     result[key] = lower(`/runs/${pointerSegment(key)}`, `runs.${key}`, base[key], value);
   }
   for (const [key, value] of Object.entries(output_limits_mb ?? {}) as [keyof Runs["output_limits_mb"], number][]) {

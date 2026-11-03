@@ -114,6 +114,9 @@ describe("the CodeRabbit round", () => {
     expect("findings" in r && r.findings[0]!.body).toBe(`${head}\n\n${tools}tail\n`);
     // Text whose lower case is longer (İ), and a tag in capitals: the block found and cut exactly.
     expect(stripStaticAnalysis(`İİİ before\n<DETAILS><Summary>Static Analysis</Summary>gone</DETAILS>\nafter`)).toBe("İİİ before\n\nafter");
+    // `<details open>`, attributes on either tag, and a nested open block: the whole outer block goes.
+    expect(stripStaticAnalysis(`a\n<details open>\n<summary class="x">🪛 Supported by static analysis</summary>\n<details open><summary>in</summary>x</details>\nall\n</details >\nb`)).toBe("a\n\nb");
+    expect(stripStaticAnalysis("<details open><summary>Tools</summary>kept</details>")).toBe("<details open><summary>Tools</summary>kept</details>");
     // An unclosed block is kept as it is.
     expect(stripStaticAnalysis("<details><summary>static analysis</summary>open")).toBe("<details><summary>static analysis</summary>open");
   });
@@ -157,6 +160,23 @@ describe("the CodeRabbit round", () => {
     // Nor is one taken off again.
     off(MAINT);
     expect(await reworkRequest(w.forges.pr, 1, since)).toBeUndefined();
+  });
+
+  test("times are compared as instants: GitHub's whole seconds against the host's milliseconds", async () => {
+    const { w, pr } = await prWorld();
+    // In the same second, before the host's time: GitHub writes "…:05Z", the host "…:05.123Z" (as strings, "Z" sorts after ".").
+    const since = "2026-11-01T00:00:05.123Z";
+    w.ff.label(1, "hapi:rework", MAINT, { at: "2026-11-01T00:00:05Z" });
+    w.ff.comment(1, MAINT, "rename x", false, "2026-11-01T00:00:05Z");
+    w.ff.comment(1, OPERATOR, "taking this", false, "2026-11-01T00:00:05Z");
+    expect(await reworkRequest(w.forges.pr, 1, since)).toBeUndefined();
+    expect(await maintainerComments(w.forges.pr, 1, since, OPERATOR.login)).toBe("");
+    expect(await operatorActions(w.forges.pr, await pr(), { operator: OPERATOR.login, since, prHead: HH })).toEqual([]);
+    // A second later they count.
+    const earlier = "2026-11-01T00:00:04.999Z";
+    expect(await reworkRequest(w.forges.pr, 1, earlier)).toEqual({ at: "2026-11-01T00:00:05Z", by: "maint" });
+    expect(await maintainerComments(w.forges.pr, 1, earlier, OPERATOR.login)).toContain("> rename x");
+    expect((await operatorActions(w.forges.pr, await pr(), { operator: OPERATOR.login, since: earlier, prHead: HH })).map((a) => a.what)).toEqual(["commented on #1"]);
   });
 
   test("operatorActions reads the operator's comments, labels and reviews since a time, and a head that moved", async () => {

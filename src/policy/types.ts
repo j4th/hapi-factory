@@ -147,6 +147,8 @@ export interface Runs {
   max_auto_rounds: number;
   /** Times the operator may queue a failed work order again (`hapi retry`). Always hard; central only. */
   max_retries: number;
+  /** Rework runs a maintainer's `hapi:rework` label may start on one factory PR. Always hard; central only. */
+  max_rework_rounds: number;
   /** The most, in MiB, a review or fix run's inputs copy may be: refused, never truncated. Central only. */
   inputs_mb: number;
   /** The most, in KiB, discovery reads of each work-order file: refused, never truncated. Central only. */
@@ -368,7 +370,7 @@ export interface RepoOverlay {
     enforcement?: Partial<Budgets["enforcement"]>;
   };
   /** Run limits to lower; each must be at most the base value. */
-  runs?: Partial<Omit<Runs, "output_limits_mb" | "poll_interval_s" | "max_retries" | "inputs_mb" | "work_order_kb" | "disk" | "phases">> & {
+  runs?: Partial<Omit<Runs, "output_limits_mb" | "poll_interval_s" | "max_retries" | "max_rework_rounds" | "inputs_mb" | "work_order_kb" | "disk" | "phases">> & {
     output_limits_mb?: Partial<Runs["output_limits_mb"]>;
     disk?: Partial<Runs["disk"]>;
     phases?: Partial<Phases>;

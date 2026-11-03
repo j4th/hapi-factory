@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "policy-runs.schema.json",
   "title": "policy/runs.yaml",
-  "description": "The run engine's limits (Plans 02 and 03): how many runs may be live, how long finished runs are kept, how large each run output and each run's disk may be, how often the poller polls, which phases and fix rounds a run has, how many times the operator may queue a failed work order again, and how large a review or fix run's inputs and each work-order file may be. Every key is required: the loader fills no defaults.",
+  "description": "The run engine's limits (Plans 02 and 03): how many runs may be live, how long finished runs are kept, how large each run output and each run's disk may be, how often the poller polls, which phases and fix rounds a run has, how many times the operator may queue a failed work order again and a maintainer may ask a PR for a rework, and how large a review or fix run's inputs and each work-order file may be. Every key is required: the loader fills no defaults.",
   "type": "object",
   "properties": {
     "max_live": {
@@ -47,7 +47,7 @@
       "type": "object",
       "properties": {
         "gb": {
-          "description": "The cap in GB.",
+          "description": "The cap in GiB.",
           "$ref": "policy-defs.schema.json#/$defs/count"
         },
         "enforcement": {
@@ -73,6 +73,10 @@
     },
     "max_retries": {
       "description": "Times the operator may queue a failed work order again (hapi retry); the command refuses one more. Always hard: never softened by budgets.enforcement.poller. Central only; 0 turns hapi retry off.",
+      "$ref": "policy-defs.schema.json#/$defs/rounds"
+    },
+    "max_rework_rounds": {
+      "description": "Rework runs a maintainer's hapi:rework label may start on one factory PR; past it the poller starts none and the PR waits for the operator. Always hard: never softened by budgets.enforcement.poller. Central only; 0 turns rework off.",
       "$ref": "policy-defs.schema.json#/$defs/rounds"
     },
     "inputs_mb": {
@@ -141,6 +145,7 @@
     "poll_interval_s",
     "max_auto_rounds",
     "max_retries",
+    "max_rework_rounds",
     "inputs_mb",
     "work_order_kb",
     "phases"

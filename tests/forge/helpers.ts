@@ -121,8 +121,8 @@ export function fakeForge(o: { repo?: string; private?: boolean; pageSize?: numb
     ...(single ? { merged: p.merged } : {}),
   });
 
-  const addEvent = (issue: number, event: "labeled" | "unlabeled", label: string, actor: Actor, app: boolean) =>
-    events.push({ id: nextEvent++, issue, event, label, actor, viaApp: app, at: tick() });
+  const addEvent = (issue: number, event: "labeled" | "unlabeled", label: string, actor: Actor, app: boolean, at?: string) =>
+    events.push({ id: nextEvent++, issue, event, label, actor, viaApp: app, at: at ?? tick() });
 
   const page = <T>(url: URL, items: T[], wrap: (xs: T[]) => unknown): Reply => {
     const per = Math.max(1, Math.min(Number(url.searchParams.get("per_page") ?? 30), pageSize));
@@ -284,9 +284,10 @@ export function fakeForge(o: { repo?: string; private?: boolean; pageSize?: numb
     return n;
   }
 
-  function comment(n: number, who: Actor, body: string, app = false): number {
+  /** `at`: a time as GitHub writes it (whole seconds, `…:05Z`), instead of the fake's own clock. */
+  function comment(n: number, who: Actor, body: string, app = false, at?: string): number {
     const id = nextId++;
-    comments.push({ id, issue: n, user: who, viaApp: app, body, at: tick() });
+    comments.push({ id, issue: n, user: who, viaApp: app, body, at: at ?? tick() });
     return id;
   }
 
@@ -302,14 +303,14 @@ export function fakeForge(o: { repo?: string; private?: boolean; pageSize?: numb
     },
     addPr,
     comment,
-    label(n: number, name: string, actor: Actor, a: { viaApp?: boolean; action?: "labeled" | "unlabeled" } = {}): void {
+    label(n: number, name: string, actor: Actor, a: { viaApp?: boolean; action?: "labeled" | "unlabeled"; at?: string } = {}): void {
       const action = a.action ?? "labeled";
       const pr = prs.get(n);
       const had = pr?.labels.includes(name) ?? false;
       // GitHub records no event for a label that is already there, or already gone.
       if ((action === "labeled") === had) return;
       if (pr !== undefined) pr.labels = action === "labeled" ? [...pr.labels, name] : pr.labels.filter((l) => l !== name);
-      addEvent(n, action, name, actor, a.viaApp ?? false);
+      addEvent(n, action, name, actor, a.viaApp ?? false, a.at);
     },
     review(n: number, who: Actor, commitId: string): number {
       const id = nextId++;

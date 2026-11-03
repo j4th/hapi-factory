@@ -41,6 +41,17 @@ const MAINTAINERS = new Set(["admin", "maintain", "write", "triage"]);
 const REWORK = "hapi:rework";
 
 const h7 = (sha: string) => sha.slice(0, 7);
+/**
+ * Whether time `a` is after `b`, as instants: GitHub gives whole seconds (`…:05Z`) and the host milliseconds
+ * (`…:05.123Z`), and as strings `"…05Z" > "…05.123Z"`. A time that doesn't parse is never after anything.
+ */
+export const later = (a: string, b: string): boolean => {
+  const x = Date.parse(a);
+  const y = Date.parse(b);
+  return Number.isFinite(x) && Number.isFinite(y) && x > y;
+};
+/** Oldest first, as instants. */
+const byTime = (a: string, b: string) => (Date.parse(a) || 0) - (Date.parse(b) || 0);
 /** A login or title for one line of host text: printable, no `@ < > \``, at most 80 characters. */
 const shown = (s: string) => {
   const t = sanitizeTerminal(s.replace(/[\r\n\t]/g, " ")).replace(/[@<>`]/g, "").trim();
@@ -64,14 +75,14 @@ async function operatorIds(forge: Forge, n: number, operator: string, comments?:
 const severityOf = (body: string) => /\*\*([A-Za-z]+)\*\*/.exec(body)?.[1];
 
 /**
- * `body` with every `<details>` block whose own `<summary>` holds "static analysis" removed, nested blocks and all;
- * the rest kept byte for byte. An unclosed block is kept as it is.
+ * `body` with every `<details>` block (`<details open>` and any attributes too) whose own `<summary>` holds "static
+ * analysis" removed, nested blocks and all; the rest kept byte for byte. An unclosed block is kept as it is.
  */
 export function stripStaticAnalysis(body: string): string {
   let out = body;
   // Case-insensitive patterns on the body itself: a lower-cased copy can differ in length, and its indexes with it.
   for (let from = 0; ; ) {
-    const open = /<details>/gi;
+    const open = /<details(?:\s[^>]*)?>/gi;
     open.lastIndex = from;
     const first = open.exec(out);
     if (first === null) return out;
@@ -79,7 +90,7 @@ export function stripStaticAnalysis(body: string): string {
     // The block's end: its matching </details>, counting the blocks nested in it.
     let depth = 0;
     let end = -1;
-    const tag = /<\/?details>/gi;
+    const tag = /<details(?:\s[^>]*)?>|<\/details\s*>/gi;
     tag.lastIndex = start;
     for (let m = tag.exec(out); m !== null; m = tag.exec(out)) {
       depth += m[0][1] === "/" ? -1 : 1;
@@ -89,7 +100,7 @@ export function stripStaticAnalysis(body: string): string {
       }
     }
     if (end === -1) return out;
-    const summary = /^\s*<summary>([\s\S]*?)<\/summary>/i.exec(out.slice(start + first[0].length, end));
+    const summary = /^\s*<summary(?:\s[^>]*)?>([\s\S]*?)<\/summary\s*>/i.exec(out.slice(start + first[0].length, end));
     if (summary !== null && /static analysis/i.test(summary[1]!)) out = out.slice(0, start) + out.slice(end);
     else from = start + first[0].length;
   }
@@ -151,7 +162,7 @@ export async function othersOnPr(forge: Forge, n: number, operator: string): Pro
  */
 export async function operatorActions(forge: Forge, pr: PrInfo, o: { operator: string; since: string | undefined; prHead: string | undefined; now?: string }): Promise<{ at: string; what: string }[]> {
   const n = pr.number;
-  const after = (at: string) => o.since === undefined || at > o.since;
+  const after = (at: string) => (o.since === undefined ? Number.isFinite(Date.parse(at)) : later(at, o.since));
   const comments = await forge.issueComments(n);
   const events = await forge.labelEvents(n);
   const acts: { at: string; what: string }[] = [];
@@ -159,7 +170,7 @@ export async function operatorActions(forge: Forge, pr: PrInfo, o: { operator: s
   for (const e of events) if (byOperator(actor(e), o.operator) && after(e.at)) acts.push({ at: e.at, what: `${e.action} #${n} ${shown(e.label)}` });
   const mine = await operatorIds(forge, n, o.operator, comments, events);
   if (mine.size > 0) for (const r of await forge.reviews(n)) if (mine.has(r.userId) && r.submittedAt !== "" && after(r.submittedAt)) acts.push({ at: r.submittedAt, what: `reviewed #${n}` });
-  acts.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+  acts.sort((a, b) => byTime(a.at, b.at));
   if (o.prHead !== undefined && pr.headSha !== o.prHead) acts.push({ at: o.now ?? new Date().toISOString(), what: `${shown(pr.headRef)} moved to ${h7(pr.headSha)}` });
   return acts;
 }
@@ -169,9 +180,10 @@ export async function reworkRequest(forge: Forge, n: number, since: string): Pro
   const events = (await forge.labelEvents(n)).filter((e) => e.label === REWORK);
   const human = (e: LabelEvent) => e.actor.type === "User" && !e.viaApp && !e.actor.login.endsWith("[bot]");
   const permissions = new Map<string, boolean>();
+  events.sort((a, b) => byTime(a.at, b.at));
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i]!;
-    if (e.at <= since) break;
+    if (!later(e.at, since)) continue;
     if (e.action !== "labeled" || !human(e)) continue;
     // Taken off again since: withdrawn.
     if (events.slice(i + 1).some((x) => x.action === "unlabeled")) continue;
@@ -190,13 +202,13 @@ export async function maintainerComments(forge: Forge, n: number, since: string,
   const blocks: string[] = [];
   const permissions = new Map<string, boolean>();
   for (const c of comments) {
-    if (c.createdAt <= since || c.userType !== "User" || c.viaApp) continue;
+    if (!later(c.createdAt, since) || c.userType !== "User" || c.viaApp) continue;
     if (!permissions.has(c.userLogin)) permissions.set(c.userLogin, MAINTAINERS.has(await forge.permission(c.userLogin)));
     if (permissions.get(c.userLogin)) blocks.push(quoteUntrusted(`a maintainer's comment ${c.id} on #${n} by ${shown(c.userLogin)}`, c.body));
   }
   const mine = await operatorIds(forge, n, operator, comments);
   for (const c of await forge.reviewComments(n)) {
-    if (c.createdAt <= since || !mine.has(c.userId)) continue;
+    if (!later(c.createdAt, since) || !mine.has(c.userId)) continue;
     blocks.push(quoteUntrusted(`the operator's review comment ${c.id} on ${shown(c.path)}`, c.body));
   }
   return blocks.join("\n\n");

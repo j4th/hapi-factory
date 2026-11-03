@@ -362,7 +362,7 @@ export function fakeRun(o: FakeOptions = {}) {
     root: REPO,
     buildDir,
     packDir: join(REPO, "archon", "workflows", "hapi"),
-    runs: { max_live: 1, retention_days: 14, disk: { gb: 20, enforcement: "hard" }, poll_interval_s: 120, max_auto_rounds: 3, max_retries: 2, inputs_mb: 16, work_order_kb: 1024, phases: { verify: true, review: true, coderabbit: false, require_acceptance: true, fix_rounds_before_pr: 1, fix_rounds_on_pr: 1, round_turns: 40, round_usd: 1 }, ...o.runs, output_limits_mb: { bundle: 256, transcript: 64, decisions: 16, result: 4, ...o.runs?.output_limits_mb } },
+    runs: { max_live: 1, retention_days: 14, disk: { gb: 20, enforcement: "hard" }, poll_interval_s: 120, max_auto_rounds: 3, max_retries: 2, max_rework_rounds: 3, inputs_mb: 16, work_order_kb: 1024, phases: { verify: true, review: true, coderabbit: false, require_acceptance: true, fix_rounds_before_pr: 1, fix_rounds_on_pr: 1, round_turns: 40, round_usd: 1 }, ...o.runs, output_limits_mb: { bundle: 256, transcript: 64, decisions: 16, result: 4, ...o.runs?.output_limits_mb } },
     spawnDetached: async (argv) => void spawned.push(argv),
   };
   return {

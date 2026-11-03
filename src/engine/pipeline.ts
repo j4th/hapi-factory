@@ -41,7 +41,7 @@ import { PolicyLoosenError } from "../policy/overlay";
 import type { Phases, Policy } from "../policy/types";
 import { RUN_INPUTS, type RunKind } from "../run/kinds";
 import type { StartOptions } from "../run/lifecycle";
-import { keyPart, listRecords, lockHeld, recordDir, runKey, type RunRecord } from "../run/records";
+import { keyPart, listRecords, lockHeld, RUN_ID, recordDir, runKey, type RunRecord, writeWhole } from "../run/records";
 import { sanitizeTerminal } from "../run/sanitize";
 import { runSpend } from "../run/spend";
 import { autoRoundsProblem, capProblem } from "./caps";
@@ -77,7 +77,15 @@ const IN_ROUND: readonly Phase[] = ["pr-fix", "verify", "review", "harvest"];
 const h7 = (sha: string) => sha.slice(0, 7);
 const kindOf = (r: RunRecord): RunKind => r.kind ?? "worker";
 const isSource = (r: RunRecord) => kindOf(r) === "worker" || kindOf(r) === "fix";
-const latest = (xs: (string | undefined)[]) => xs.filter((x): x is string => x !== undefined).sort().at(-1);
+/** A time as an instant (ms), for every comparison here: GitHub gives whole seconds, the host milliseconds; one that doesn't parse sorts first. */
+const ms = (t: string) => {
+  const x = Date.parse(t);
+  return Number.isFinite(x) ? x : Number.NEGATIVE_INFINITY;
+};
+/** The latest of some times, as an instant (its own text kept). */
+const latest = (xs: (string | undefined)[]) => xs.filter((x): x is string => x !== undefined && Number.isFinite(Date.parse(x))).sort((a, b) => ms(a) - ms(b)).at(-1);
+/** By startedAt, as instants. */
+const byStart = (a: RunRecord, b: RunRecord) => ms(a.startedAt) - ms(b.startedAt);
 const dedupe = (xs: string[]) => [...new Set(xs)];
 const sticky = (reasons: readonly string[]) => reasons.filter((r) => r.endsWith(SOFT));
 
@@ -194,13 +202,13 @@ function adopt(c: Ctx): void {
     }
   }
   for (const r of c.all) if (engine(r) && kindOf(r) !== "worker" && r.parent !== undefined && workers.has(r.parent)) lost.push(r);
-  lost.sort((a, b) => (a.startedAt < b.startedAt ? -1 : a.startedAt > b.startedAt ? 1 : 0));
+  lost.sort(byStart);
   if (lost.length > 0) c.s = { ...c.s, runs: [...c.s.runs, ...lost.map((r) => r.runId)] };
   c.lost = new Set(lost.map((r) => r.runId));
   const place = new Map(c.s.runs.map((id, i) => [id, i]));
   c.pass = c.all
     .filter((r) => place.has(r.runId) && (r.retry ?? 0) === c.s.retry)
-    .sort((a, b) => (a.startedAt < b.startedAt ? -1 : a.startedAt > b.startedAt ? 1 : place.get(a.runId)! - place.get(b.runId)!));
+    .sort((a, b) => byStart(a, b) || place.get(a.runId)! - place.get(b.runId)!);
 }
 
 const ofKind = (c: Ctx, k: RunKind) => c.pass.filter((r) => kindOf(r) === k);
@@ -216,6 +224,50 @@ const outOf = (c: Ctx, r: RunRecord) => join(recordDir(c.d.run.stateDir, r.runId
 const spent = (c: Ctx, r: RunRecord) => runSpend(c.d.run.stateDir, r, c.policy.budgets.run_usd).usd;
 const scratch = (c: Ctx) => scratchPath(c.d.engineDir, c.d.repo, c.s.id);
 const roundBudget = (c: Ctx) => Math.min(c.order.workOrder.budget.usd, c.phases.round_usd);
+const COMMIT = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
+
+/**
+ * `<engineDir>/heads/<owner>/<name>/<id>.json` (0600, dirs 0700): each source run's head once its host gates passed.
+ * A run's bundle never changes, so a step that needs that head again (a verify or review a cap blocked, a harvest
+ * replayed) reads it here instead of running the gates again (a fetch, a repack and a gitleaks pass each time). A
+ * cache only: a file that doesn't parse reads as empty, and the gates run again.
+ */
+function headsPath(c: Ctx): string {
+  const r = parseOwnerRepo(c.s.repo)!;
+  return join(c.d.engineDir, "heads", r.owner, r.name, `${c.s.id}.json`);
+}
+async function readHeads(c: Ctx): Promise<Record<string, string>> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(headsPath(c), "utf8"));
+  } catch {
+    return {};
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+  return Object.fromEntries(Object.entries(parsed as Record<string, unknown>).filter((e): e is [string, string] => RUN_ID.test(e[0]) && typeof e[1] === "string" && COMMIT.test(e[1])));
+}
+async function cacheHead(c: Ctx, runId: string, head: string): Promise<void> {
+  const heads = await readHeads(c);
+  if (heads[runId] === head) return;
+  const file = headsPath(c);
+  const made = await mkdir(dirname(file), { recursive: true, mode: 0o700 });
+  if (made !== undefined) for (let d = dirname(file); d.length >= made.length; d = dirname(d)) await chmod(d, 0o700);
+  await writeWhole(file, `${JSON.stringify({ ...heads, [runId]: head })}\n`);
+}
+
+/**
+ * The head source run `src` gave, by its host gates (or the cache of a pass the gates gave before); the gates' details
+ * when they refuse it; `live` when a run of the pass is live, since the gates write the scratch a run clones from.
+ */
+async function gatedHead(c: Ctx, src: RunRecord): Promise<{ head: string } | { problems: string[] } | { live: true }> {
+  const cached = (await readHeads(c))[src.runId];
+  if (cached !== undefined) return { head: cached };
+  if (c.pass.some((r) => r.status === "live")) return { live: true };
+  const g = await c.d.gates(c.order, src);
+  if (g.problems.length > 0 || g.head === undefined) return { problems: g.problems.length > 0 ? g.problems.map((p) => p.detail) : [`${kindOf(src)} run ${src.runId}'s bundle has no head`] };
+  await cacheHead(c, src.runId, g.head);
+  return { head: g.head };
+}
 
 // --- moving -----------------------------------------------------------------------------------------------------
 
@@ -268,6 +320,18 @@ function inputsRefused(c: Ctx, reason: string): Promise<WorkOrderState> {
   return c.s.pr === undefined ? fail(c, [reason]) : c.s.phase === "waiting" ? hold(c, reason) : wait(c, reason);
 }
 
+/** In `waiting`, a run that will never start (the rework cap): Needs your decision with why, once, and the PR says so. */
+async function refuse(c: Ctx, reason: string): Promise<WorkOrderState> {
+  if (c.s.reasons.includes(reason)) {
+    await converge(c);
+    return c.s;
+  }
+  c.s = { ...c.s, verdict: worse(c.s.verdict ?? "ready", "decision"), reasons: dedupe([...c.s.reasons, reason]) };
+  await c.d.emit(transition(c.s, c.s.phase, { at: c.at, reason }).event);
+  await renderPr(c, undefined);
+  return c.s;
+}
+
 /** The phase `succ` (a run started after the step's own) says a lost state had reached. */
 async function successor(c: Ctx, succ: RunRecord, usd?: number): Promise<WorkOrderState> {
   const k = kindOf(succ);
@@ -282,7 +346,7 @@ async function successor(c: Ctx, succ: RunRecord, usd?: number): Promise<WorkOrd
 /** Start `step`, or find its run by key (see the module comment). */
 async function begin(c: Ctx, step: Step): Promise<Begun> {
   const key = runKey(c.s.id, step.sha, keyPart(step.kind, step.round, c.s.retry));
-  const found = c.all.filter((r) => r.key === key).sort((a, b) => (a.startedAt < b.startedAt ? -1 : 1)).at(-1);
+  const found = c.all.filter((r) => r.key === key).sort(byStart).at(-1);
   if (found !== undefined) return { run: found };
   const cap = await capProblem(c.d, c.order.repo, c.policy, step.budgetUsd, c.s);
   if (cap !== undefined && "refuse" in cap) return { refused: cap.refuse, why: "cap" };
@@ -452,18 +516,24 @@ async function fromSource(c: Ctx, src: RunRecord): Promise<WorkOrderState> {
   if (src.status !== "succeeded") {
     const why = `${src.status}: ${src.reason ?? "no reason recorded"}`;
     if (kindOf(src) === "worker") return fail(c, [`worker run ${src.runId} ended ${why}`], o);
-    if (c.s.pr === undefined) return move(c, "harvest", { reason: `fix run ${src.runId} ended ${why}`, ...o });
+    if (c.s.pr === undefined) return toHarvest(c, `round ${k}'s fix run ${src.runId} ended ${why}`, o);
     return wait(c, `round ${k}'s fix run ended ${why}; the PR is unchanged`, o);
   }
-  const g = await c.d.gates(c.order, src);
-  if (g.problems.length > 0 || g.head === undefined) {
-    const details = g.problems.map((p) => p.detail);
-    if (kindOf(src) === "worker") return fail(c, details.length > 0 ? details : [`worker run ${src.runId}'s bundle has no head`], o);
-    const refused = `round ${k}'s fix run was refused by the host gates: ${details.join("; ") || "its bundle has no head"}`;
-    if (c.s.pr === undefined) return move(c, "harvest", { reason: refused, ...o });
+  const g = await gatedHead(c, src);
+  if ("live" in g) return c.s;
+  if ("problems" in g) {
+    if (kindOf(src) === "worker") return fail(c, g.problems, o);
+    const refused = `round ${k}'s fix run was refused by the host gates: ${g.problems.join("; ")}`;
+    if (c.s.pr === undefined) return toHarvest(c, refused, o);
     return wait(c, `${refused}; the PR is unchanged`, o);
   }
   return checks(c, g.head, k, usd);
+}
+
+/** To the harvest with `reason` kept in the state's reasons, so the harvest carries it to the PR (design §3.9). */
+function toHarvest(c: Ctx, reason: string, o: { run?: string; usd?: number } = {}): Promise<WorkOrderState> {
+  c.s = { ...c.s, reasons: dedupe([...c.s.reasons, reason]) };
+  return move(c, "harvest", { reason, ...o });
 }
 
 /** After a source run whose gates pass: verify, else review, else the harvest. */
@@ -473,22 +543,17 @@ function checks(c: Ctx, head: string, round: number, usd?: number): Promise<Work
   return move(c, "harvest", { usd });
 }
 
-/** The head the source `src` gave, by its gates (only when nothing of the pass is live: the gates write the scratch). */
-async function headOf(c: Ctx, src: RunRecord): Promise<string | undefined> {
-  if (c.pass.some((r) => r.status === "live")) return undefined;
-  const g = await c.d.gates(c.order, src);
-  return g.problems.length === 0 ? g.head : undefined;
-}
 
 async function verify(c: Ctx): Promise<WorkOrderState> {
   const src = source(c);
   if (src === undefined) return queued(c);
   const v = after(c, src).filter((r) => kindOf(r) === "verify").at(-1);
   if (v === undefined) {
-    // Its start was refused (a cap, an error): try again.
-    const head = await headOf(c, src);
-    if (head === undefined) return c.s;
-    return enter(c, "verify", { kind: "verify", round: src.round ?? 0, sha: head, source: scratch(c), budgetUsd: 0, auto: false });
+    // Its start was refused (a cap, an error): try again, on the head the gates gave (cached), or say why not.
+    const g = await gatedHead(c, src);
+    if ("live" in g) return c.s;
+    if ("problems" in g) return hold(c, `the host gates refuse ${kindOf(src)} run ${src.runId}'s bundle now: ${g.problems.join("; ")}`);
+    return enter(c, "verify", { kind: "verify", round: src.round ?? 0, sha: g.head, source: scratch(c), budgetUsd: 0, auto: false });
   }
   if (v.status === "stopped") return stopped(c, v);
   if (c.halt !== undefined) return wait(c, c.halt);
@@ -509,9 +574,11 @@ async function review(c: Ctx): Promise<WorkOrderState> {
   const rv = after(c, src).filter((r) => kindOf(r) === "review").at(-1);
   if (rv === undefined) {
     const v = after(c, src).filter((r) => kindOf(r) === "verify").at(-1);
-    const head = v?.sha ?? (await headOf(c, src));
-    if (head === undefined) return c.s;
-    return enter(c, "review", reviewStep(c, head, src.round ?? 0, v));
+    if (v !== undefined) return enter(c, "review", reviewStep(c, v.sha, src.round ?? 0, v));
+    const g = await gatedHead(c, src);
+    if ("live" in g) return c.s;
+    if ("problems" in g) return hold(c, `the host gates refuse ${kindOf(src)} run ${src.runId}'s bundle now: ${g.problems.join("; ")}`);
+    return enter(c, "review", reviewStep(c, g.head, src.round ?? 0, undefined));
   }
   if (rv.status === "stopped") return stopped(c, rv);
   if (c.halt !== undefined) return wait(c, c.halt);
@@ -537,7 +604,7 @@ async function review(c: Ctx): Promise<WorkOrderState> {
   };
   const b = await begin(c, step);
   if ("run" in b) return started(c, "fix", step, b, { usd });
-  if (b.why === "auto") return move(c, "harvest", { reason: b.refused, usd });
+  if (b.why === "auto") return toHarvest(c, b.refused, { usd });
   if (b.why === "inputs") return inputsRefused(c, b.refused);
   return hold(c, b.refused);
 }
@@ -546,7 +613,7 @@ async function fix(c: Ctx): Promise<WorkOrderState> {
   const f = ofKind(c, "fix").at(-1);
   if (f !== undefined) return fromSource(c, f);
   // No fix run (a state no step writes): as a fix that never happened.
-  if (c.s.pr === undefined) return move(c, "harvest", { reason: "the fix run never started" });
+  if (c.s.pr === undefined) return toHarvest(c, "the fix run never started");
   return wait(c, "the fix run never started; the PR is unchanged");
 }
 
@@ -561,19 +628,16 @@ async function harvestable(c: Ctx): Promise<RunRecord | undefined> {
     const between = c.pass.slice(c.pass.indexOf(r) + 1, next === undefined ? undefined : c.pass.indexOf(next));
     // A verify or review started on its head only once its gates passed.
     if (between.some((x) => kindOf(x) === "verify" || kindOf(x) === "review")) return r;
-    if (!c.phases.verify && !c.phases.review) {
-      const g = await c.d.gates(c.order, r);
-      if (g.problems.length === 0) return r;
-    }
+    if (!c.phases.verify && !c.phases.review && "head" in (await gatedHead(c, r))) return r;
   }
   return srcs.at(-1);
 }
 
 /** The pass's fix rounds, staged by the pass's first harvest and the rework count. */
 function roundsOf(c: Ctx): Round[] {
-  const first = c.pass.map((r) => r.harvestedAt).filter((x): x is string => x !== undefined).sort()[0];
+  const first = c.pass.map((r) => r.harvestedAt).filter((x): x is string => x !== undefined && Number.isFinite(Date.parse(x))).sort((a, b) => ms(a) - ms(b))[0];
   const fixes = ofKind(c, "fix");
-  const before = fixes.filter((f) => first === undefined || f.startedAt < first);
+  const before = fixes.filter((f) => first === undefined || ms(f.startedAt) < ms(first));
   const later = fixes.slice(before.length);
   const rework = Math.min(c.s.reworkRounds, later.length);
   return [
@@ -611,14 +675,14 @@ async function harvestStep(c: Ctx): Promise<WorkOrderState> {
   if (c.halt !== undefined) return wait(c, c.halt);
   const run = await harvestable(c);
   if (run === undefined) return c.s.pr === undefined ? fail(c, ["the pass has no worker or fix run that succeeded: nothing to harvest"]) : wait(c, "the fix round left nothing to harvest; the PR is unchanged");
-  const out = await harvest(c.d, c.s, await harvestInput(c, run));
+  // The pass's reasons so far (a fix before the PR that failed or was refused, a soft cap's start) go to the PR too.
+  const soft = sticky(c.s.reasons);
+  const out = await harvest(c.d, c.s, { ...(await harvestInput(c, run)), carried: c.s.reasons });
   if (out.pr === undefined) {
     c.s = out;
     return fail(c, out.reasons.length > 0 ? out.reasons : ["the harvest had nothing it could push"]);
   }
-  const soft = sticky(c.s.reasons);
-  // A soft cap's reason stays with the PR (a re-render puts it under Unresolved): Needs your decision at best.
-  c.s = { ...out, reasons: dedupe([...out.reasons, ...soft]), ...(soft.length > 0 ? { verdict: worse(out.verdict ?? "ready", "decision") } : {}) };
+  c.s = out;
   if (soft.length > 0 && c.policy.flags.on_flag.includes("label_pr")) await (c.forge ?? (await c.d.forge("pr"))).addLabels(out.pr, ["hapi:flagged"]);
   return move(c, "pr", { reason: out.reasons[0] });
 }
@@ -636,6 +700,13 @@ async function prTop(c: Ctx): Promise<WorkOrderState | undefined> {
     await unpinWorkOrder({ run: c.d.run.run, env: c.d.run.env, engineDir: c.d.engineDir }, c.s.repo, c.s.id);
     return move(c, pr.merged ? "merged" : "closed");
   }
+  // A harvest replayed after its push (a write after it failed, or a crash, lost the state): the branch at the head
+  // that harvest pushes is the factory's own, never the operator's move.
+  if (c.s.phase === "harvest" && pr.headSha !== c.s.prHead) {
+    const run = await harvestable(c);
+    const g = run === undefined ? undefined : await gatedHead(c, run);
+    if (g !== undefined && "head" in g && g.head === pr.headSha) c.s = { ...c.s, prHead: pr.headSha };
+  }
   const before = c.s.lastHumanAt;
   const acts = await operatorActions(forge, pr, { operator: c.d.operator, since: before, prHead: c.s.prHead, now: c.at });
   const newest = c.pass.filter((r) => isSource(r) && !c.lost.has(r.runId)).at(-1);
@@ -644,7 +715,7 @@ async function prTop(c: Ctx): Promise<WorkOrderState | undefined> {
   if (rework !== undefined) c.rework = rework;
   if (acts.length > 0) {
     // lastHumanAt never passes a pending rework request, so it still starts the rework.
-    const seen = latest([before, ...acts.filter((a) => rework === undefined || a.at < rework.at).map((a) => a.at)]);
+    const seen = latest([before, ...acts.filter((a) => rework === undefined || ms(a.at) < ms(rework.at)).map((a) => a.at)]);
     c.s = { ...c.s, autoRounds: 0, ...(seen === undefined ? {} : { lastHumanAt: seen }) };
   }
   if (c.s.reworkRounds === 0 && CHAIN.includes(c.s.phase)) {
@@ -712,6 +783,11 @@ async function waiting(c: Ctx): Promise<WorkOrderState> {
   if (rework === undefined) {
     await converge(c);
     return c.s;
+  }
+  // The rework cap, always hard and central (the operator's ruling, 2026-11-03): past it the PR is the operator's.
+  const max = c.d.central.runs.max_rework_rounds;
+  if (c.s.reworkRounds >= max) {
+    return refuse(c, `${c.s.reworkRounds} rework rounds on #${pr.number} (runs.max_rework_rounds: ${max}): close the PR, or plan the work again under a new work order id`);
   }
   const newest = c.pass.filter((r) => isSource(r) && !c.lost.has(r.runId)).at(-1);
   const since = newest?.startedAt ?? new Date(0).toISOString();

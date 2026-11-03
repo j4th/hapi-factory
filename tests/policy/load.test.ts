@@ -151,6 +151,7 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
       poll_interval_s: 120,
       max_auto_rounds: 3,
       max_retries: 2,
+      max_rework_rounds: 3,
       inputs_mb: 16,
       work_order_kb: 1024,
       phases: {

@@ -391,6 +391,33 @@ describe("Review Focus", () => {
     expect(h.ff.prs.size).toBe(1);
   });
 
+  test("a PR-time harvest replayed after its push is the factory's own push, never the operator's move", async () => {
+    // The reviewer's case: the harvest pushed, and the state's write was lost.
+    async function atHarvest() {
+      const w = pipelineDeps();
+      await reviewed(w, { harvestedAt: "2026-10-29T11:00:00.000Z" });
+      prAt(w);
+      await w.seed("fix", { id: F1, round: 1, parent: W0, sha: headAt(0) });
+      await w.seed("verify", { id: V1, round: 1, parent: W0 });
+      await w.seed("review", { id: R1, round: 1, parent: W0 });
+      return { w, saved: w.state({ phase: "harvest", pr: 1, prHead: headAt(0), verdict: "ready", runs: [W0, V0, R0, F1, V1, R1], autoRounds: 3 }) };
+    }
+    const { w, saved } = await atHarvest();
+    const first = await step(w, saved);
+    expect([first.s.phase, first.s.prHead, w.fw.pushes.length]).toEqual(["pr", headAt(1), 1]);
+    const replay = await step(w, saved);
+    expect([replay.s.phase, replay.s.prHead, replay.s.lastHumanAt, replay.s.autoRounds, w.fw.pushes.length]).toEqual(["pr", headAt(1), undefined, 3, 1]);
+    expect(replay.s.reasons.some((r) => r.includes("moved"))).toBe(false);
+    // A write after the push that fails (GitHub's 502 on the labels): the tick throws, nothing is saved, and the replay finishes it.
+    const f = await atHarvest();
+    f.w.ff.failNext("POST", `/repos/${ORDER.repo}/issues/1/labels`, 502);
+    await expect(advance(f.w.d, f.saved, f.w.order)).rejects.toThrow();
+    expect(f.w.fw.pushes.length).toBe(1);
+    const again = await step(f.w, f.saved);
+    expect([again.s.phase, again.s.prHead, again.s.lastHumanAt, f.w.fw.pushes.length]).toEqual(["pr", headAt(1), undefined, 1]);
+    expect(writes(f.w.ff).filter((x) => x === "PATCH /pulls/1")).toHaveLength(2);
+  });
+
   test("an operator action during an automatic fix run wins, and a moved head is never overwritten", async () => {
     /** A PR with its automatic fix F1 live. */
     async function inRound() {
@@ -757,6 +784,94 @@ describe("Review Focus", () => {
     expect(r.s.reasons[0]).toContain("raises budgets.repo_monthly_usd from 25 to 100");
     // Said once.
     expect((await step(w, r.s)).events).toEqual([]);
+  });
+
+  test("a rework label in the same second as the newest run's start, in GitHub's format, is not a new request", async () => {
+    const w = pipelineDeps();
+    await reviewed(w, { harvestedAt: "2026-10-29T11:00:00.000Z" });
+    prAt(w);
+    await w.seed("fix", { id: F1, round: 1, parent: W0, status: "stopped", reason: STOP, startedAt: "2026-11-01T00:00:05.123Z" });
+    w.ff.label(1, "hapi:rework", MAINT, { at: "2026-11-01T00:00:05Z" });
+    const s0 = w.state({ phase: "waiting", pr: 1, prHead: headAt(0), verdict: "decision", runs: [W0, V0, R0, F1], autoRounds: 2 });
+    expect((await step(w, s0)).starts).toEqual([]);
+    // One a second later is.
+    w.ff.label(1, "hapi:rework", MAINT, { action: "unlabeled", at: "2026-11-01T00:00:06Z" });
+    w.ff.label(1, "hapi:rework", MAINT, { at: "2026-11-01T00:00:07Z" });
+    expect((await step(w, s0)).starts.map((x) => x.o.kind)).toEqual(["fix"]);
+  });
+
+  test("runs.max_rework_rounds: the third rework still starts and is flagged; past it the PR waits and says so", async () => {
+    expect(SHIPPED.runs.max_rework_rounds).toBe(3);
+    /** A PR in waiting after `n` reworks, with a maintainer's label pending. */
+    async function afterReworks(n: number) {
+      const w = pipelineDeps();
+      await reviewed(w, { harvestedAt: "2026-10-29T11:00:00.000Z" });
+      prAt(w);
+      w.ff.label(1, "hapi:rework", MAINT);
+      return { w, s: w.state({ phase: "waiting", pr: 1, prHead: headAt(0), verdict: "ready", reworkRounds: n, runs: [W0, V0, R0], autoRounds: 0 }) };
+    }
+    const third = await afterReworks(2);
+    const r = await step(third.w, third.s);
+    expect([r.s.phase, r.s.reworkRounds, r.starts.map((x) => x.o.kind)]).toEqual(["fix", 3, ["fix"]]);
+    // Its harvest crosses flags.thresholds.review_rounds (2): flagged.
+    let s = r.s;
+    await third.w.finish(r.starts[0]!.rec.runId, "succeeded");
+    // verify, review, harvest, pr.
+    for (let i = 0; i < 4; i++) {
+      const x = await step(third.w, s);
+      s = x.s;
+      for (const st of x.starts) await third.w.finish(st.rec.runId, "succeeded");
+    }
+    expect(s.phase).toBe("pr");
+    expect(third.w.ff.prs.get(1)!.labels).toContain("hapi:flagged");
+    // The fourth is refused: waiting, Needs your decision, the reason once, and the PR says so.
+    const fourth = await afterReworks(3);
+    const reason = "3 rework rounds on #1 (runs.max_rework_rounds: 3): close the PR, or plan the work again under a new work order id";
+    const f = await step(fourth.w, fourth.s);
+    expect([f.s.phase, f.s.verdict, f.s.reasons.at(-1), f.starts, f.events.map((e) => [e.phase, e.reason])]).toEqual(["waiting", "decision", reason, [], [["waiting", reason]]]);
+    expect(lastBody(fourth.w)).toContain(`- ${reason}`);
+    const again = await step(fourth.w, f.s);
+    expect([again.events, again.starts]).toEqual([[], []]);
+  });
+
+  test("a fix before the PR that failed, was refused or hit the round cap: its reason stays to the harvest, and the PR says so", async () => {
+    const w = pipelineDeps();
+    await reviewed(w, { review: NEEDS_WORK });
+    await w.seed("fix", { id: F1, round: 1, parent: W0, status: "failed", reason: "preflight exited 1" });
+    const r = await step(w, w.state({ phase: "fix", runs: [W0, V0, R0, F1], autoRounds: 2 }));
+    const reason = `round 1's fix run ${F1} ended failed: preflight exited 1`;
+    expect([r.s.phase, r.s.reasons]).toEqual(["harvest", [reason]]);
+    const h = await step(w, r.s);
+    expect([h.s.phase, h.s.verdict, h.s.reasons.includes(reason)]).toEqual(["pr", "decision", true]);
+    expect(lastBody(w)).toContain(`- ${reason}`);
+    // The round cap's refusal of a fix before the PR (an overlay could lower it to 1): the same.
+    const one = pipelineDeps({ central: policy((p) => (p.runs.max_auto_rounds = 1)) });
+    await reviewed(one, { review: NEEDS_WORK });
+    const capped = await step(one, one.state({ phase: "review", runs: [W0, V0, R0], autoRounds: 1 }));
+    expect([capped.s.phase, capped.s.reasons, capped.starts]).toEqual(["harvest", ["1 automatic runs since the last human action (runs.max_auto_rounds: 1): waiting for the operator"], []]);
+  });
+
+  test("a verify the gates now refuse says why; a blocked verify reuses its head and runs the gates once", async () => {
+    const w = pipelineDeps();
+    await w.seed("worker", { id: W0 });
+    w.refuse.set(W0, [{ gate: "secret", detail: "gitleaks: generic-api-key in src/a.ts" }]);
+    const s0 = w.state({ phase: "verify", runs: [W0], autoRounds: 1 });
+    const r = await step(w, s0);
+    expect([r.s.phase, r.s.reasons, r.starts]).toEqual(["verify", [`the host gates refuse worker run ${W0}'s bundle now: gitleaks: generic-api-key in src/a.ts`], []]);
+    expect((await step(w, r.s)).events).toEqual([]);
+    // A cap blocks the verify after the gates passed: the next ticks reuse the head, and the gates run once.
+    const c = pipelineDeps({ central: policy((p) => (p.budgets.daily_usd = 0.4)) });
+    let gated = 0;
+    const gates = c.d.gates;
+    c.d.gates = async (o, rec) => (gated++, gates(o, rec));
+    await c.seed("worker", { id: W0, usd: 0.5 });
+    const blocked = await step(c, c.state({ phase: "worker", runs: [W0], autoRounds: 1 }));
+    expect([blocked.s.phase, blocked.starts, gated]).toEqual(["verify", [], 1]);
+    for (let i = 0; i < 2; i++) await step(c, blocked.s);
+    expect(gated).toBe(1);
+    c.clock.now = new Date("2026-10-30T00:00:00.000Z");
+    const go = await step(c, blocked.s);
+    expect([go.starts.map((x) => [x.o.kind, x.o.sha]), gated]).toEqual([[["verify", headAt(0)]], 1]);
   });
 
   test("at pr, a comment from anyone else turns the round off: waiting with why, and no start", async () => {

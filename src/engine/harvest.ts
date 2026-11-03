@@ -645,6 +645,11 @@ export interface HarvestInput {
   runs: RunRecord[];
   rounds: Round[];
   position: { k: number; n: number; siblings: number[] };
+  /**
+   * Reasons the state machine carries to this harvest (Task 13: a fix before the PR that failed or was refused, a
+   * soft cap's start): added to the outcome's, so the PR and the state say so, the verdict at best Needs your decision.
+   */
+  carried?: string[];
 }
 
 /** A test call at a line's start: `test(`, `it(`, and their modifiers but `.each` (which adds tests a static count can't see). */
@@ -800,9 +805,11 @@ export async function harvest(d: HarvestDeps, s: WorkOrderState, h: HarvestInput
     worker: await workerResult(outOf(h.run)!, secrets),
     screens: [],
   };
+  const carried = h.carried ?? [];
+  const carry = (o: Outcome): Outcome => (carried.length === 0 ? o : { ...o, verdict: worse(o.verdict, "decision"), reasons: [...new Set([...o.reasons, ...carried])] });
   // The gates and evidence settle push and draft; the screens can't change either.
   const first = outcome(e, phases);
-  if (!first.push) return done({ ...s, verdict: first.verdict, reasons: first.reasons, updatedAt: now });
+  if (!first.push) return done({ ...s, verdict: first.verdict, reasons: carry(first).reasons, updatedAt: now });
   const head = gates.head!;
 
   const forge = await d.forge("pr");
@@ -811,12 +818,15 @@ export async function harvest(d: HarvestDeps, s: WorkOrderState, h: HarvestInput
   // A closed factory PR is this work order's own: it leaves with its PR set, and Task 13 settles it closed.
   if (pr?.state === "closed") return done({ ...s, pr: pr.number, reasons: ["the PR was closed"], updatedAt: now });
 
+  // The branch already at this head: the factory's own push, before a write that failed or a crash lost the state
+  // (Task 13's replay). Nothing moved it, and it isn't pushed again.
+  const already = pr !== undefined && pr.headSha === head;
   // Not pushed: a branch moved since the factory's push, or a ready PR whose new head is a draft's (m49(5): the PR
   // keeps its head, and the unpushed head is named only in the reason and its Evidence rows).
   let notPushed: string | undefined;
-  if (pr !== undefined && s.prHead !== undefined && pr.headSha !== s.prHead) {
+  if (!already && pr !== undefined && s.prHead !== undefined && pr.headSha !== s.prHead) {
     notPushed = `${ref} moved to ${short(pr.headSha)} since the factory pushed ${short(s.prHead)}: not overwritten; the run's head ${short(head)} was not pushed`;
-  } else if (pr !== undefined && !pr.draft && first.draft) {
+  } else if (!already && pr !== undefined && !pr.draft && first.draft) {
     const failed = h.verify ?? h.run;
     notPushed = `round ${failed.round ?? h.run.round ?? 0}'s head ${short(head)} ${draftCause(e)}, so it was not pushed over the ready PR (run ${failed.runId})`;
   }
@@ -828,7 +838,7 @@ export async function harvest(d: HarvestDeps, s: WorkOrderState, h: HarvestInput
     const subjects = await subjectsFor(d, policy, h.order, scratch, head, secrets);
     e.screens = await screenHarvest(d, { s, run: h.run, head, subjects, policy, ask: true });
     result = outcome(e, phases);
-    const pushed = await d.pushBranch({ scratch, remote: `https://github.com/${d.repo}.git`, id, head, token: await d.token("push") });
+    const pushed: PushResult = already ? { pushed: true } : await d.pushBranch({ scratch, remote: `https://github.com/${d.repo}.git`, id, head, token: await d.token("push") });
     if ("pushed" in pushed) prHead = head;
     else {
       notPushed = `${"moved" in pushed ? pushed.moved : pushed.refused}; the run's head ${short(head)} was not pushed`;
@@ -843,8 +853,9 @@ export async function harvest(d: HarvestDeps, s: WorkOrderState, h: HarvestInput
     // The other reasons are of the head that wasn't pushed: each says so, since the PR shows another.
     result = { ...first, verdict: "decision", reasons: [notPushed, ...first.reasons.map((r) => `${short(head)} (not pushed): ${r}`)] };
     // A branch the factory didn't push is never shown as its head, nor opened as its PR.
-    if (pr === undefined) return done({ ...s, verdict: result.verdict, reasons: result.reasons, updatedAt: now });
+    if (pr === undefined) return done({ ...s, verdict: carry(result).verdict, reasons: carry(result).reasons, updatedAt: now });
   }
+  result = carry(result);
   const shownHead = notPushed === undefined ? head : (s.prHead ?? pr!.headSha);
 
   // The body, its labels, then harvestedAt.

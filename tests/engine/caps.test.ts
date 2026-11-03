@@ -127,6 +127,20 @@ describe("the caps", () => {
     expect(await capProblem(n.d, ORDER.repo, p15, 4, n.state({ runs: ["a0000000000a"] }))).toEqual({ refuse: MONTH_TEXT("12.0000", "4.0000", "15.00") });
   });
 
+  test("another repo's state file never stops this repo's check; one of its own that isn't a state fails it closed", async () => {
+    const w = pipelineDeps();
+    await spent(w, "a0000000000a", { startedAt: "2026-10-01T00:00:00.000Z", usd: 12 });
+    await listing(w, ORDER.id, ["a0000000000a"]);
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    mkdirSync(join(w.engineDir, "orders", "another-owner", "repo"), { recursive: true });
+    writeFileSync(join(w.engineDir, "orders", "another-owner", "repo", "0001-x.json"), "{ not a state");
+    const p15 = withBudgets({ repo_monthly_usd: 15 });
+    expect(await capProblem(w.d, ORDER.repo, p15, 4)).toEqual({ refuse: MONTH_TEXT("12.0000", "4.0000", "15.00") });
+    writeFileSync(join(w.engineDir, "orders", "example-owner", "sandbox", "0009-bad.json"), "{ not a state");
+    await expect(capProblem(w.d, ORDER.repo, p15, 4)).rejects.toThrow("0009-bad.json is not a work order's state: JSON");
+  });
+
   test("autoRoundsProblem", () => {
     const w = pipelineDeps();
     expect(autoRoundsProblem(w.state({ autoRounds: 3 }), 3)).toBe("3 automatic runs since the last human action (runs.max_auto_rounds: 3): waiting for the operator");

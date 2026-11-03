@@ -217,7 +217,7 @@ describe("applyOverlay", () => {
     expect(loosenError(() => applyOverlay(p, { runs: { retention_days: 30 } })).path).toBe("/runs/retention_days");
   });
 
-  test("repo_monthly_usd may be lowered; daily_usd, poll_interval_s and max_retries are central only", () => {
+  test("repo_monthly_usd may be lowered; daily_usd, poll_interval_s, max_retries and max_rework_rounds are central only", () => {
     expect(applyOverlay(p, { budgets: { repo_monthly_usd: 15 } }).budgets.repo_monthly_usd).toBe(15);
     const e = loosenError(() => applyOverlay(p, { budgets: { repo_monthly_usd: 30 } }));
     expect(e.path).toBe("/budgets/repo_monthly_usd");
@@ -225,6 +225,7 @@ describe("applyOverlay", () => {
     expect(() => applyOverlay(p, { budgets: { daily_usd: 5 } } as unknown as RepoOverlay)).toThrow("/budgets/daily_usd: unknown key");
     expect(() => applyOverlay(p, { runs: { poll_interval_s: 60 } } as unknown as RepoOverlay)).toThrow("/runs/poll_interval_s: unknown key");
     expect(() => applyOverlay(p, { runs: { max_retries: 0 } } as unknown as RepoOverlay)).toThrow("/runs/max_retries: unknown key");
+    expect(() => applyOverlay(p, { runs: { max_rework_rounds: 1 } } as unknown as RepoOverlay)).toThrow("/runs/max_rework_rounds: unknown key");
     // The inputs and work-order file caps are central only too (the operator's OK of 2026-11-03).
     expect(() => applyOverlay(p, { runs: { inputs_mb: 1 } } as unknown as RepoOverlay)).toThrow("/runs/inputs_mb: unknown key");
     expect(() => applyOverlay(p, { runs: { work_order_kb: 1 } } as unknown as RepoOverlay)).toThrow("/runs/work_order_kb: unknown key");
