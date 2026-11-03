@@ -84,3 +84,21 @@ export function redactSecretForms(text: string, values: Record<string, string>):
   for (const [name, form] of encoded) out = out.split(form).join(`[hapi: ${name} redacted (base64)]`);
   return out;
 }
+
+/**
+ * An error's message and its causes', for a reason or a report: each cause once, unless its text is already in the
+ * message above it, joined by `; caused by: `. With `firstLines`, each part is its first line only (the tick report's
+ * one line per repo). The run engine's reasons (src/engine/pipeline.ts) and the CLI's last line (src/cli.ts, `asHapi`)
+ * both use it, so a cleanup failure's original error always reaches the operator.
+ */
+export function errorText(e: unknown, o: { firstLines?: boolean } = {}): string {
+  const parts: string[] = [];
+  let x: unknown = e;
+  for (let i = 0; i < 5 && x !== undefined && x !== null; i++) {
+    const text = x instanceof Error ? x.message : String(x);
+    const m = o.firstLines ? (text.trim().split("\n")[0] ?? "").trim() : text;
+    if (!parts.some((p) => p.includes(m))) parts.push(m);
+    x = x instanceof Error ? x.cause : undefined;
+  }
+  return parts.join("; caused by: ");
+}

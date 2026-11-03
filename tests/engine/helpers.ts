@@ -5,19 +5,21 @@
  * ~/.gitconfig or ~/.config, and nothing touches the network: a mirror fetches from the work dir's path.
  */
 import { expect } from "bun:test";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import YAML from "yaml";
 import type { Answers, DecideOptions, DecideResult, DecisionFile, State } from "../../src/decide/index";
 import type { ask } from "../../src/decide/record";
-import type { Discovered } from "../../src/engine/discover";
+import type { DiscoverProblem, Discovered } from "../../src/engine/discover";
 import type { ReviewFinding } from "../../src/engine/evidence";
 import type { Evidence, GateProblem, HarvestDeps, PushOptions, PushResult } from "../../src/engine/harvest";
 import { mirrorPath } from "../../src/engine/mirror";
 import type { PipelineDeps } from "../../src/engine/pipeline";
+import type { PollDeps } from "../../src/engine/poll";
 import type { StatusEvent, WorkOrderState } from "../../src/engine/state";
 import { githubForge } from "../../src/forge";
+import type { TokenPurpose } from "../../src/forge/github/token";
 import { loadPolicy } from "../../src/policy/load";
 import type { DecisionModels, EngineDecision, Policy } from "../../src/policy/types";
 import type { StartOptions } from "../../src/run/lifecycle";
@@ -534,4 +536,132 @@ export function pipelineDeps(o: { central?: Policy; decide?: HarvestDeps["decide
   });
 
   return { f, d, ff, fw, forges, order, clock, starts, events, refuse, finish, seed, state, gitCalls, decide, engineDir };
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Plan 03 Task 14: the poller's helpers.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** The two repos the poller's tests register. */
+export const SANDBOX = "example-owner/hapi-sandbox-fortune";
+export const SECOND = "example-owner/second";
+
+/** The shipped policy with `repos` registering `repos` (default: SANDBOX and SECOND). */
+export function registered(base: Policy = SHIPPED, repos: string[] = [SANDBOX, SECOND]): Policy {
+  const p = structuredClone(base);
+  p.repos = { ...p.repos, repos: Object.fromEntries(repos.map((r) => [r, { registered: "2026-11-01" }])) };
+  return p;
+}
+
+/**
+ * A checkout root for the CLI's tests (`RunDeps.root`): a temp dir holding a copy of policy/ whose repos.yaml
+ * registers SANDBOX and SECOND, and whose gates.yaml sets `decisions.mode` to `models` when given.
+ */
+export function policyRoot(o: { models?: DecisionModels } = {}): string {
+  const root = tempDir("hapi-engine-root-");
+  const dir = join(root, "policy");
+  Bun.spawnSync(["cp", "-R", join(import.meta.dir, "..", "..", "policy"), dir]);
+  const repos = readFileSync(join(dir, "repos.yaml"), "utf8").replace(/^repos: \{\}.*$/m, `repos:\n  ${SANDBOX}: { registered: "2026-11-01" }\n  ${SECOND}: { registered: "2026-11-01" }`);
+  writeFileSync(join(dir, "repos.yaml"), repos);
+  if (o.models !== undefined) {
+    const gates = readFileSync(join(dir, "gates.yaml"), "utf8").replace(/^(  mode: )enforce(\s)/m, `$1${o.models}$2`);
+    writeFileSync(join(dir, "gates.yaml"), gates);
+  }
+  return root;
+}
+
+/** A fake forge world with three merged planning PRs (#1-#3), each closed too, as GitHub reports a merged PR. */
+export function planningWorld(repo: string, o: { private?: boolean } = {}) {
+  const w = fakeForge({ repo, ...(o.private === undefined ? {} : { private: o.private }) });
+  for (let i = 1; i <= 3; i++) w.addPr({ head: `plan/p${i}`, merged: true, state: "closed" });
+  return w;
+}
+
+export interface TickOptions {
+  worlds?: Record<string, ReturnType<typeof fakeForge>>;
+  /** Discovery's problems, by repo. */
+  problems?: Record<string, DiscoverProblem[]>;
+  /** What discovery returns, by repo. */
+  discovered?: Record<string, Discovered[]>;
+  /** `readOrder` throws this for the work order id. */
+  unreadable?: Record<string, Error>;
+  advance?: PollDeps["advance"];
+  /** `fetchMirror` throws this for the repo. */
+  fetchFails?: Record<string, Error>;
+  policy?: Policy;
+}
+
+/**
+ * The poller's world (Task 14): `fakeRun()`'s deps, a temp engineDir, the shipped policy registering SANDBOX and
+ * SECOND, a `planningWorld` per repo (`o.worlds` seeds one) reached through the real adapter, a `mint` that records
+ * each token and its revoke, a fake mirror fetch and pin, a `discover` that records the `known` set it is given, a
+ * `readOrder` of ORDER keyed as asked, planning PR 3 for everything, and a recording `advance` unless `o.advance`.
+ */
+export function tickWorld(o: TickOptions = {}) {
+  const f = fakeRun();
+  const engineDir = join(f.tmp, "engine");
+  const policy = registered(o.policy ?? SHIPPED);
+  const worlds: Record<string, ReturnType<typeof fakeForge>> = {};
+  for (const repo of [SANDBOX, SECOND]) worlds[repo] = o.worlds?.[repo] ?? planningWorld(repo);
+  const mints: { repo: string; purpose: TokenPurpose; revoked: boolean }[] = [];
+  const known: Record<string, string[][]> = {};
+  const advanced: { id: string; order: Discovered }[] = [];
+  const fetched: { repo: string; token: string }[] = [];
+  const pins: [string, string, string][] = [];
+  const d: PollDeps = {
+    run: f.deps,
+    policy,
+    engineDir,
+    mint: async (repo, purpose) => {
+      const m = { repo, purpose, revoked: false };
+      mints.push(m);
+      return { token: `fake-${purpose}-token`, revoke: async () => void (m.revoked = true) };
+    },
+    forge: (repo, token) => githubForge({ repo, token, fetch: worlds[repo]!.fetch }),
+    fetchMirror: async (repo, token) => {
+      fetched.push({ repo, token });
+      const e = o.fetchFails?.[repo];
+      if (e !== undefined) throw e;
+    },
+    discover: async (repo, k, problems) => {
+      (known[repo] ??= []).push([...k].sort());
+      problems.push(...(o.problems?.[repo] ?? []));
+      return o.discovered?.[repo] ?? [];
+    },
+    readOrder: async (repo, id, mergeSha) => {
+      const e = o.unreadable?.[id];
+      if (e !== undefined) throw e;
+      return { ...ORDER, repo, id, mergeSha };
+    },
+    planningPr: async () => 3,
+    problemPr: async () => 3,
+    pin: async (repo, id, sha) => void pins.push([repo, id, sha]),
+    advance:
+      o.advance ??
+      (async (s, order) => {
+        advanced.push({ id: s.id, order });
+        return { state: s, events: [] };
+      }),
+  };
+  /** A state of SANDBOX's `id` (default 0001-skeleton-and-crack-cookie), keyed at MERGE, planning PR 3, queued. */
+  const state = (over: Partial<WorkOrderState> = {}): WorkOrderState => ({
+    repo: SANDBOX,
+    id: "0001-skeleton-and-crack-cookie",
+    mergeSha: MERGE,
+    planningPr: 3,
+    phase: "queued",
+    runs: [],
+    autoRounds: 0,
+    reworkRounds: 0,
+    retry: 0,
+    reasons: [],
+    updatedAt: NOW.toISOString(),
+    ...over,
+  });
+  /** The events appended so far, parsed. */
+  const events = (): StatusEvent[] => {
+    const file = join(engineDir, "events.jsonl");
+    return existsSync(file) ? readFileSync(file, "utf8").split("\n").filter((l) => l !== "").map((l) => JSON.parse(l) as StatusEvent) : [];
+  };
+  return { f, d, engineDir, policy, worlds, mints, known, advanced, fetched, pins, state, events };
 }

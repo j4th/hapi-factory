@@ -11,6 +11,7 @@ import { emitHermes } from "../../src/generate/hermes";
 import { buildAll, bundleEntry, DECIDE_ENTRY, GUARD_ENTRY, REPO_ROOT } from "../../src/generate/index";
 import { emitMcp } from "../../src/generate/mcp";
 import { emitPi } from "../../src/generate/pi";
+import { emitSystemd } from "../../src/generate/systemd";
 import { loadPolicy } from "../../src/policy/load";
 import type { RosterName } from "../../src/policy/types";
 
@@ -36,6 +37,8 @@ const FILES = [
   "pi/models.json",
   "pi/settings.json",
   "roster",
+  "systemd/hapi-poll.service",
+  "systemd/hapi-poll.timer",
 ];
 
 let temps: string[] = [];
@@ -64,8 +67,8 @@ describe("buildAll", () => {
   // Task 3 wrote 8 files (1 Hermes, 2 Archon, 2 Pi, 3 egress); Task 3b adds the 2 per-zone mcp.json files;
   // Plan 02 Task 4 adds 3 Archon run files, 2 Pi files, and the guard and hapi-decide bundles; Plan 03 Task 7 adds
   // build/roster, the roster the build was made for, which each run's own guard settings and run config are made for;
-  // Task 11 adds Claude Code's managed settings for the review.
-  test("writes the twenty generated files and returns their paths", async () => {
+  // Task 11 adds Claude Code's managed settings for the review; Task 14 the poller's two systemd user units.
+  test("writes the twenty-two generated files and returns their paths", async () => {
     const out = tempDir();
     const paths = await buildAll(p, out);
     expect(paths.map((f) => relative(out, f)).sort()).toEqual(FILES);
@@ -84,6 +87,7 @@ describe("buildAll", () => {
     add("egress", emitEgress(p));
     add("mcp", emitMcp(p));
     add("claude", emitClaude(p));
+    add("systemd", emitSystemd(p));
     expected["pi/extensions/hapi-guard.js"] = await bundleEntry(GUARD_ENTRY, REPO_ROOT);
     expected["decide/hapi-decide.js"] = await bundleEntry(DECIDE_ENTRY, REPO_ROOT);
     expected.roster = "anthropic\n";

@@ -205,7 +205,7 @@ import {
   withStartLock,
   writeRecord,
 } from "./records";
-import { redactSecrets, sanitizeTerminal } from "./sanitize";
+import { errorText, redactSecrets, sanitizeTerminal } from "./sanitize";
 import { exportSidecarData, SIDECAR_DATA, startSidecar } from "./sidecar";
 import { APP_USER, helperLabels, readRoster, runArgs, type RunDeps, type RunInputs, runLabels, runName, STOP_GRACE_S } from "./spec";
 import { spendOfRun, turnsOfRun } from "./spend";
@@ -227,23 +227,25 @@ const firstLine = (s: string | undefined) => (s ?? "").trim().split("\n")[0]?.sl
 const safe = (s: string) => s.replace(/[^\x21-\x7e]/g, "?").slice(0, 100);
 
 /**
- * Run `body` with the whole `RunDeps`, as hapi: anyone else re-execs `hapi run <sub> <args>` as hapi first.
- * A failure prints `hapi run <sub>: <message>` and returns 1.
+ * Run `body` with the whole `RunDeps`, as hapi: anyone else re-execs `hapi <words> <args>` as hapi first. `words`
+ * names the command: `["run", "<sub>"]` for `hapi run`, `["poll"]`, `["status"]` and `["retry"]` for the engine's
+ * (src/engine/cli.ts). A failure prints `hapi <words>: <message>`, with its causes (`errorText`), and returns 1.
  */
-export async function asHapi(sub: string, args: string[], partial: Partial<RunDeps>, body: (d: RunDeps) => Promise<number>): Promise<number> {
+export async function asHapi(words: readonly string[], args: string[], partial: Partial<RunDeps>, body: (d: RunDeps) => Promise<number>): Promise<number> {
+  const name = words.join(" ");
   const env = partial.env ?? process.env;
   const run = partial.run ?? runCommand;
   const who = currentUserOverride(env, partial.user);
-  if (!who.isHapi && !who.override) return reexec("hapi", ["run", sub, ...args], run, env, who.user, `run ${sub}`);
+  if (!who.isHapi && !who.override) return reexec("hapi", [...words, ...args], run, env, who.user, name);
   try {
     if (who.override) {
       console.error(
-        `hapi run ${sub}: warning: HAPI_ALLOW_CURRENT_USER=1: running as ${who.user}, not ${HAPI_USER}: a dev-only downgrade (your own Docker, not hapi's rootless one); the run container is labelled org.hapi.dev-override=1`,
+        `hapi ${name}: warning: HAPI_ALLOW_CURRENT_USER=1: running as ${who.user}, not ${HAPI_USER}: a dev-only downgrade (your own Docker, not hapi's rootless one); the run container is labelled org.hapi.dev-override=1`,
       );
     }
     return await body(await runDeps({ ...partial, env, run, user: who.user }));
   } catch (e) {
-    console.error(`hapi run ${sub}: ${(e as Error).message}`);
+    console.error(`hapi ${name}: ${errorText(e)}`);
     return 1;
   }
 }
@@ -733,7 +735,7 @@ export async function runStart(args: string[], deps: Partial<RunDeps> = {}): Pro
   }
   // parseStart has checked that each value follows its flag and that none starts with "-", so only the two values match.
   const absolute = args.map((a, i) => (args[i - 1] === "--repo" ? opts.repo : args[i - 1] === "--work-order" ? opts.workOrder : a));
-  return asHapi("start", absolute, deps, async (d) => {
+  return asHapi(["run", "start"], absolute, deps, async (d) => {
     const workOrder = loadWorkOrder(opts.workOrder);
     if (opts.budgetUsd !== undefined && opts.budgetUsd > workOrder.budget.usd) {
       console.error(`hapi run start: --budget-usd ${opts.budgetUsd} is above the work order's budget.usd (${workOrder.budget.usd}): it may only lower it`);
@@ -1138,7 +1140,7 @@ export async function runSupervise(args: string[], deps: Partial<RunDeps> = {}):
     console.error(SUPERVISE_USAGE);
     return 2;
   }
-  return asHapi("supervise", args, deps, async (d) => {
+  return asHapi(["run", "supervise"], args, deps, async (d) => {
     // No reap: the start that spawns this has just reaped, and still holds the launcher's lock.
     const rec = await readRecord(d.stateDir, id);
     if (rec === undefined) throw new Error(`there is no run ${id} in ${d.stateDir}`);
@@ -1166,7 +1168,7 @@ export async function runStop(args: string[], deps: Partial<RunDeps> = {}): Prom
     console.error(STOP_USAGE);
     return 2;
   }
-  return asHapi("stop", args, deps, async (d) => {
+  return asHapi(["run", "stop"], args, deps, async (d) => {
     try {
       // Its own reap never times out the run it is about to stop: the operator's stop outranks the deadline.
       await reapRuns(d, { stopping: id });

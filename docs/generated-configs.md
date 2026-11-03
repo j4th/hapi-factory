@@ -8,7 +8,7 @@
 - [how protected paths stay strictest-wins](#protected-paths-stay-strictest-wins) in every output;
 - [the MCP servers](#mcp-servers-mcp_servers) in Hermes's config and [the per-zone `mcp.json` files](#buildmcpmcpjson) for the CI scanners.
 
-`build/` is generated and gitignored. **Never edit a file in it by hand**: change `policy/` and rebuild. Every file starts with a notice that names its policy sources and says not to edit it. The YAML, env and Squid files carry it as `#` comments. JSON has no comments, so `models.json`, `settings.json`, `hapi-guard.json` and the `mcp.json` files carry it as a `$comment` string, their first key. The two bundled `.js` files carry it as `//` comments. The two exceptions are `build/pi/models-store.json`, which is exactly `{}` ([below](#buildpimodels-storejson-and-settingsjson)), and `build/roster`, one bare word ([below](#buildroster)).
+`build/` is generated and gitignored. **Never edit a file in it by hand**: change `policy/` and rebuild. Every file starts with a notice that names its policy sources and says not to edit it. The YAML, env and Squid files, and the systemd units, carry it as `#` comments. JSON has no comments, so `models.json`, `settings.json`, `hapi-guard.json` and the `mcp.json` files carry it as a `$comment` string, their first key. The two bundled `.js` files carry it as `//` comments. The two exceptions are `build/pi/models-store.json`, which is exactly `{}` ([below](#buildpimodels-storejson-and-settingsjson)), and `build/roster`, one bare word ([below](#buildroster)).
 
 ## Regenerating
 
@@ -23,7 +23,7 @@ mise run hapi -- policy build --policy policy --out build --roster portable
 | Flag | Default | Meaning |
 |---|---|---|
 | `--policy` | `policy` | The policy directory to load. It is schema-checked first, as `loadPolicy` does. |
-| `--out` | `build` | Where to write. The seven subdirectories (`hermes`, `archon`, `pi`, `egress`, `mcp`, `decide` and `claude`) are created as needed. |
+| `--out` | `build` | Where to write. The eight subdirectories (`hermes`, `archon`, `pi`, `egress`, `mcp`, `decide`, `claude` and `systemd`) are created as needed. |
 | `--roster` | `anthropic` | `budget`, `anthropic` or `portable` (spec §12). It selects **Archon's tiers and Pi's models only**. Hermes always uses the `anthropic` roster, because it runs on the Anthropic provider with a Console key. |
 
 It prints each path it wrote, one per line, and exits 0. A usage error (an unknown flag or roster, or a missing value) exits 2. A policy file that fails to load exits 1 with `hapi policy build: <file>: <problem>`.
@@ -56,6 +56,8 @@ It prints each path it wrote, one per line, and exits 0. A usage error (an unkno
 | `build/mcp/research.mcp.json` | A standard `mcp.json` with the `research` zone's whole MCP catalog | `mcp.yaml` | The CI scanners (Plan 05) |
 | `build/claude/managed-settings.json` | Claude Code's managed settings for the review: no hooks, plugins or project MCP servers, managed permission rules only, the review's three reads granted, every write, run and fetch tool and every read of `/proc` denied, telemetry off | `flags.yaml` (`otel.enabled`), the run container's paths (`RUN_PATHS`) | Bound read-only at `/etc/claude-code/managed-settings.json` in a review run's container alone ([below](#buildclaudemanaged-settingsjson)). **No `$comment` notice**, unlike every other generated JSON file: Claude Code reads it as its managed settings, and a key it didn't know could make it ignore the file, which would fail open |
 | `build/roster` | The roster the build was made for (`budget`, `anthropic` or `portable`), one bare word and a newline | `--roster` | `hapi run start` and the poller (`readRoster`, `src/run/spec.ts`): each run's own `hapi-guard.json` and `run-config.yaml` are made for it ([below](#buildroster)) |
+| `build/systemd/hapi-poll.service` | The poller's systemd user service: one tick, `mise run hapi -- poll --once`, as hapi in its checkout | `runs.yaml` (none of its values; the notice names it) | Not Compose: `hapi stack up` links it into hapi's user manager (`systemctl --user link --runtime`) ([below](#buildsystemd)) |
+| `build/systemd/hapi-poll.timer` | The poller's systemd user timer: the first tick `runs.poll_interval_s` after it starts, then one every `runs.poll_interval_s` | `runs.yaml` (`poll_interval_s`) | Not Compose: `hapi stack up` links it and enables it (`enable --runtime --now`); `down` and kill switch 3 stop it ([below](#buildsystemd)) |
 
 Plan 02 Task 4 added the files the per-run container binds read-only (Task 7): Pi's `settings.json` and `models-store.json`, the bundled guard, Archon's `run-config.yaml`, `gitconfig` and `empty.env`, and the `hapi-decide` bundle.
 
@@ -341,6 +343,33 @@ The settings Plan 02's hapi-guard extension enforces inside every Pi worker (spe
 ## `build/roster`
 
 The roster the build was made for: `budget`, `anthropic` or `portable` and a newline, as `--roster` (or `hapi stack up --roster`) named it. `hapi run start` and the poller read it (`readRoster`, `src/run/spec.ts`) to make each run's own `hapi-guard.json` and `run-config.yaml` for that roster, and record it on the run (`roster`). A build without it, or with anything else in it, refuses every run with `<build dir>/roster is missing or names no roster (budget, anthropic or portable): \`mise run up\` writes it`. It carries no notice, because it is read as one bare word.
+
+## `build/systemd/`
+
+The poller's two systemd user units (`src/generate/systemd.ts`; design §3.4; spike 09's T20 rulings). `hapi stack up`, as hapi, links them from here into hapi's user manager with `systemctl --user link --runtime <service> <timer>`, reloads it (`daemon-reload`) and starts the timer (`enable --runtime --now hapi-poll.timer`). The links are runtime ones, under `$XDG_RUNTIME_DIR/systemd/user/`, so a reboot clears them, as it does the tmpfs env files, and the next `mise run up` makes them again ([the stack runbook](runbooks/stack.md#4-mise-run-up-and-mise-run-down)). They point at these files, so a rebuild changes what the next tick runs once `up` reloads the manager. `hapi stack down` and kill switch 3 stop both units first, so no tick starts a new run. Under `HAPI_ALLOW_CURRENT_USER=1`, `up` installs neither.
+
+`hapi-poll.service`:
+
+| Line | Why |
+|---|---|
+| `Description=hapi-factory poller: one tick (hapi poll --once)`, `Documentation=file:%h/hapi-factory/docs/runbooks/stack.md` | What `systemctl --user status` shows. `%h` is hapi's home. |
+| `Type=oneshot` | One tick a start: `hapi poll --once` runs every registered repo once and exits. The timer starts the next. |
+| `WorkingDirectory=%h/hapi-factory` | hapi's checkout (`HAPI_CHECKOUT` in `src/stack/up.ts`): `mise run` reads its `mise.toml`, and the tick reads its `policy/` and `build/`. |
+| `Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin` | The service sets its own `PATH`, not the user manager's, which carries whatever the session that started it had (T20). `mise run` adds the checkout's pinned tools to the task's `PATH`: bun, and gitleaks at 8.30.1, which the harvester's secret scan needs (without it every harvest fails closed). The user manager gives the service `HOME` and `XDG_RUNTIME_DIR`, where the zone env files and the locks are. |
+| `ExecStart=%h/.local/bin/mise run hapi -- poll --once` | hapi's mise by its absolute path (`HAPI_MISE`, where `scripts/host-setup.sh` installs it). It exits 1 when a repo's tick failed closed, so the unit's status shows it. |
+| `TimeoutStartSec=1800` | A tick's bound: more than a reap's finalize can wait (`FINALIZE_WAIT_S`, 1410 s) plus a harvest, so systemd never kills a tick that is still working. A tick a kill does stop writes nothing half-way: a work order's state is written only once its step has resolved. |
+| `KillMode=process` | Each run a tick starts has a detached `hapi run supervise` that lives in this service's cgroup and must outlive the tick: the default, `control-group`, would kill every one of them when the oneshot exits. `process` kills the tick alone. systemd may log the supervisors as left over when the next tick starts. |
+
+`hapi-poll.timer`:
+
+| Line | Why |
+|---|---|
+| `Description=hapi-factory poller, every 120 s (runs.poll_interval_s)` | The interval, from `runs.poll_interval_s` (30 to 3600; central only). |
+| `OnActiveSec=120` | The first tick, that long after the timer starts. Without it the timer never fires: `OnUnitActiveSec` counts from the service's last start, and there is none yet (T20). |
+| `OnUnitActiveSec=120` | Each later tick, that long after the last one started: `runs.poll_interval_s`. |
+| `AccuracySec=5s` | How late systemd may run a tick to batch its wakeups; the default, a minute, is half the interval. |
+| `Unit=hapi-poll.service` | The service it starts. |
+| `WantedBy=timers.target` | What `enable` hooks it to; with `--runtime` the hook is a runtime one too, which a reboot clears. |
 
 ## `build/egress/*.squid.conf`
 

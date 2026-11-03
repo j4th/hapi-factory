@@ -148,7 +148,7 @@ export async function runWatch(args: string[], deps: Partial<RunDeps> = {}): Pro
     console.error(WATCH_USAGE);
     return 2;
   }
-  return asHapi("watch", args, deps, async (d) => {
+  return asHapi(["run", "watch"], args, deps, async (d) => {
     let rec = await readRecord(d.stateDir, id);
     if (rec === undefined) throw new Error(`there is no run ${id} in ${d.stateDir}`);
     // Before any line of the run is read: a zone's file that is missing fails the watch, and nothing of the run prints.
@@ -181,7 +181,7 @@ export async function runList(args: string[], deps: Partial<RunDeps> = {}): Prom
     console.error(LIST_USAGE);
     return 2;
   }
-  return asHapi("list", args, deps, async (d) => {
+  return asHapi(["run", "list"], args, deps, async (d) => {
     const records = (await listRecords(d.stateDir)).sort((a, b) => (a.startedAt < b.startedAt ? 1 : a.startedAt > b.startedAt ? -1 : 0));
     if (records.length === 0) {
       console.log(`no runs in ${d.stateDir}`);

@@ -42,7 +42,7 @@ import type { Phases, Policy } from "../policy/types";
 import { RUN_INPUTS, type RunKind } from "../run/kinds";
 import type { StartOptions } from "../run/lifecycle";
 import { keyPart, listRecords, lockHeld, RUN_ID, recordDir, runKey, type RunRecord, writeWhole } from "../run/records";
-import { sanitizeTerminal } from "../run/sanitize";
+import { errorText, sanitizeTerminal } from "../run/sanitize";
 import { runSpend } from "../run/spend";
 import { autoRoundsProblem, capProblem } from "./caps";
 import { CR_CLEAN, crFindings, maintainerComments, operatorActions, othersOnPr, reworkRequest } from "./coderabbit";
@@ -89,17 +89,8 @@ const byStart = (a: RunRecord, b: RunRecord) => ms(a.startedAt) - ms(b.startedAt
 const dedupe = (xs: string[]) => [...new Set(xs)];
 const sticky = (reasons: readonly string[]) => reasons.filter((r) => r.endsWith(SOFT));
 
-/** An error's message and its causes', for a reason: each cause once, unless its text is already in the message above it. */
-export function errorText(e: unknown): string {
-  const parts: string[] = [];
-  let x: unknown = e;
-  for (let i = 0; i < 5 && x !== undefined && x !== null; i++) {
-    const m = x instanceof Error ? x.message : String(x);
-    if (!parts.some((p) => p.includes(m))) parts.push(m);
-    x = x instanceof Error ? x.cause : undefined;
-  }
-  return parts.join("; caused by: ");
-}
+/** An error's message and its causes', for a reason (src/run/sanitize.ts, where the CLI's own error line gets it too). */
+export { errorText };
 
 /** One advance's working set. `s` is the state as the advance has changed it so far. */
 interface Ctx {
@@ -230,12 +221,15 @@ const COMMIT = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
  * `<engineDir>/heads/<owner>/<name>/<id>.json` (0600, dirs 0700): each source run's head once its host gates passed.
  * A run's bundle never changes, so a step that needs that head again (a verify or review a cap blocked, a harvest
  * replayed) reads it here instead of running the gates again (a fetch, a repack and a gitleaks pass each time). A
- * cache only: a file that doesn't parse reads as empty, and the gates run again.
+ * cache only: a file that doesn't parse reads as empty, and the gates run again. The poller (./poll.ts) deletes it
+ * when it writes the work order's state merged or closed.
  */
-function headsPath(c: Ctx): string {
-  const r = parseOwnerRepo(c.s.repo)!;
-  return join(c.d.engineDir, "heads", r.owner, r.name, `${c.s.id}.json`);
+export function headsFile(engineDir: string, repo: string, id: string): string {
+  const r = parseOwnerRepo(repo);
+  if (r === undefined) throw new Error(`not an owner/name: ${repo}`);
+  return join(engineDir, "heads", r.owner, r.name, `${id}.json`);
 }
+const headsPath = (c: Ctx): string => headsFile(c.d.engineDir, c.s.repo, c.s.id);
 async function readHeads(c: Ctx): Promise<Record<string, string>> {
   let parsed: unknown;
   try {

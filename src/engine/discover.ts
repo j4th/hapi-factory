@@ -125,14 +125,8 @@ export async function discoverWorkOrders(d: DiscoverDeps, repo: string, known: R
       continue;
     }
     if (known.has(id)) continue; // never re-keyed, never reported: the poller already has its state
-    const log = await git(
-      d,
-      repo,
-      ["log", "--first-parent", "--diff-merges=first-parent", "--diff-filter=A", "--format=%H", "--no-patch", "--reverse", "refs/heads/main", "--", path],
-      `find the commit that added ${path}`,
-    );
-    const mergeSha = log.split("\n")[0]?.trim() ?? "";
-    if (!COMMIT.test(mergeSha)) {
+    const mergeSha = await firstAddedBy(d, repo, path);
+    if (mergeSha === undefined) {
       problems.push({ path, reason: "no commit on main's first-parent line adds it" });
       continue;
     }
@@ -143,6 +137,22 @@ export async function discoverWorkOrders(d: DiscoverDeps, repo: string, known: R
     }
   }
   return found;
+}
+
+/**
+ * The commit on the mirror's main, along its first-parent line, that first added `path` (a planning PR's merge, for
+ * a work order's order.yaml), or undefined when none does: the key discovery gives a work order, and how the poller
+ * finds the planning PR of a work order that can't run (Task 14's `problemPr`). Throws when git fails.
+ */
+export async function firstAddedBy(d: MirrorDeps, repo: string, path: string): Promise<string | undefined> {
+  const log = await git(
+    d,
+    repo,
+    ["log", "--first-parent", "--diff-merges=first-parent", "--diff-filter=A", "--format=%H", "--no-patch", "--reverse", "refs/heads/main", "--", path],
+    `find the commit that added ${shown(path)}`,
+  );
+  const sha = log.split("\n")[0]?.trim() ?? "";
+  return COMMIT.test(sha) ? sha : undefined;
 }
 
 /**

@@ -11,6 +11,7 @@
  *   build/egress/{hermes,archon,research,review}.squid.conf
  *   build/mcp/{hermes,research}.mcp.json
  *   build/roster                        (the roster's name: each run's own guard settings and run config are made for it)
+ *   build/systemd/hapi-poll.{service,timer}  (the poller's systemd user units: `up` links them and starts the timer)
  *
  * The emitters are pure and deterministic (stable key order, no timestamps),
  * so a fresh build is byte-identical to the deployed files unless someone
@@ -28,6 +29,7 @@ import { notice, REPO_ROOT, slashComment } from "./header";
 import { emitHermes } from "./hermes";
 import { emitMcp } from "./mcp";
 import { emitPi } from "./pi";
+import { emitSystemd } from "./systemd";
 
 export { REPO_ROOT };
 
@@ -113,6 +115,7 @@ export async function buildAll(p: Policy, outDir: string, opts: BuildOptions = {
     ["mcp", emitMcp(p)],
     ["claude", emitClaude(p)],
     ["decide", withBundle({}, "hapi-decide.js", DECIDE_ENTRY)],
+    ["systemd", emitSystemd(p)],
     // One bare word, with no notice: `hapi run start` reads it (src/run/spec.ts `readRoster`) to make each run's own files.
     ["", { roster: `${roster}\n` }],
   ];

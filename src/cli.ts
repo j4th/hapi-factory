@@ -13,10 +13,12 @@
 import { auditCommand } from "./audit/index";
 import { tokenMint } from "./forge/github/app-token";
 import { decideCommand } from "./decide/cli";
+import { pollCommand, retryCommand, statusCommand } from "./engine/cli";
 import { policyBuild } from "./generate/index";
 import { mcpPin, mcpVerify } from "./mcp/lock";
 import { newRepoCommand } from "./newrepo/cli";
 import { runStart, runStop, runSupervise } from "./run/lifecycle";
+import { errorText } from "./run/sanitize";
 import { runList, runWatch } from "./run/view";
 import {
   secretsAddMachine,
@@ -118,7 +120,8 @@ export async function main(argv: string[]): Promise<number> {
   try {
     return await found.command.handler(found.rest);
   } catch (e) {
-    console.error(`hapi ${found.name}: ${e instanceof Error ? e.message : String(e)}`);
+    // The causes too: a cleanup that failed keeps the error that set it off as its cause.
+    console.error(`hapi ${found.name}: ${errorText(e)}`);
     // A cancelled prompt exits 130, as a shell gives Ctrl-C.
     return e instanceof CancelledError ? e.exitCode : 1;
   }
@@ -150,6 +153,9 @@ register("run stop", (args) => runStop(args), "Stop one run (docker stop, 30 s g
 register("run supervise", (args) => runSupervise(args), "Internal: wait for one run until its deadline, then finalize it (run start spawns it, detached)");
 register("run watch", (args) => runWatch(args), "Follow one run's docker logs while it runs, then print its copied transcript and how it ended; sanitized and redacted, read only");
 register("run list", (args) => runList(args), "List the runs this host knows, newest first: id, status, repo, work order, start and spend");
+register("poll", (args) => pollCommand(args), "One poller tick over every registered repo (--once), or a tick every runs.poll_interval_s: new work orders, one pipeline per repo, the status comments (as hapi; the systemd timer runs it)");
+register("status", (args) => statusCommand(args), "Each planning PR's work orders, their state, runs, PR, rounds and cost, from hapi's local state alone (as hapi)");
+register("retry", (args) => retryCommand(args), "Queue a failed work order again: a poll tick starts a fresh pass from its worker, at the same merge commit, when its turn in the repo's queue comes (as hapi)");
 register("token mint", tokenMint, "Mint a 1-hour GitHub App token for one repo into a 0600 file under $XDG_RUNTIME_DIR/hapi/tokens/");
 register("decide", (args) => decideCommand(args), "Run one typed decision (bash-gate, result-screen) on a state read from stdin; prints the result as JSON");
 register("audit", (args) => auditCommand(args), "Check the deployed config, pins, running stack, secrets setup and each --repo's GitHub settings against policy (docs/audit.md)");
