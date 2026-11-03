@@ -110,6 +110,24 @@ describe("readRecord", () => {
     expect((await readRecord(written({ ...base, decisions: "off" }), "aaaaaaaaaaaa"))!.decisions).toBe("off");
     expect("decisions" in (await readRecord(written(base), "aaaaaaaaaaaa"))!).toBe(false);
   });
+
+  test("a record whose review isn't a verdict and its marks is not one hapi wrote (m20)", async () => {
+    const bad = [
+      { verdict: "great", marks: [] },
+      { verdict: "ready", marks: ["mostly"] },
+      { verdict: "ready" },
+      { verdict: "ready", marks: [], extra: 1 },
+      "ready",
+      null,
+    ];
+    for (const review of bad) {
+      const e = await caught(readRecord(written({ ...base, review }), "aaaaaaaaaaaa"));
+      expect([review, e.message]).toEqual([review, expect.stringContaining("is not a run record hapi wrote")]);
+    }
+    const review = { verdict: "needs-work", marks: ["met", "partly", "unmet"] };
+    expect((await readRecord(written({ ...base, review }), "aaaaaaaaaaaa"))!.review).toEqual(review as RunRecord["review"]);
+    expect((await readRecord(written(base), "aaaaaaaaaaaa"))!.review).toBeUndefined();
+  });
 });
 
 describe("forgeRepo (m23)", () => {

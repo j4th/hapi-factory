@@ -200,3 +200,18 @@ test("an unfixed major finding in a fix round's own change is at the top of Unre
   const unresolved = body.slice(body.indexOf("## Unresolved"), body.indexOf("**Check this yourself**")).split("\n").filter((l) => l.startsWith("- "));
   expect(unresolved[0]).toBe("- a major finding (the independent review) is on line 3 of `src/a.ts`, in round 1's fix's own change: unfixed");
 });
+
+test("an unpushed head's evidence is scoped to it, and none of its findings or unfixed lines is shown", () => {
+  const unpushed = "fedcba9".padEnd(40, "0");
+  const review = { state: "ran" as const, verdict: "needs-work" as const, findings: [{ severity: "major" as const, path: "src/a.ts", summary: "a finding of the unpushed head" }], criteria: [] };
+  const body = renderPr(input({ unpushed, stat: undefined, unfixed: ["an unfixed line"] }, { review, screens: [screen({ pushed: false, subjects: 0, asked: 0, via: {} })] }));
+  for (const row of ["host gates", "check", "smoke", "acceptance", "the independent review", "CodeRabbit's CLI"]) expect(body).toContain(`| ${row} | fedcba9 (not pushed) |`);
+  expect(body).toContain("| decide: diff-screen v");
+  expect(body).toContain("| fedcba9 (not pushed) | not asked | not screened (this head was not pushed) |");
+  expect(body).toContain("| `ci / gates` | 1234567 |");
+  expect(body).not.toContain("a finding of the unpushed head");
+  expect(body).not.toContain("an unfixed line");
+  expect(body).toContain("The diff's size isn't known: the host's copy of the repo doesn't hold the PR's head 1234567.");
+  expect(body).toContain("which was not pushed (see Unresolved); the PR's head is still 1234567");
+  expect(unfenced(body)).not.toContain("@");
+});

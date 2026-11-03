@@ -9,9 +9,10 @@
  *   builder here and its call site.
  * - **Subjects** (`diffSubjects`, the source `"diff"`): each changed file of `<mergeSha>..<head>`, its diff in the
  *   scratch, read with hardened git. A `skip_paths` entry is an exact repo path, matched case-sensitively, never a
- *   glob, and the file it names is skipped only when its content at the head parses as the lockfile its name says
- *   (`LOCKFILES`); one that doesn't is unscreened, so a worker can't hide text from the screen behind a lockfile's
- *   name. Every string is redacted first (`redactSecretForms`), then a
+ *   glob, and the file it names is skipped only when its content at the head is, structurally, the lockfile its name
+ *   says (`LOCKFILES`: for bun.lock, no comment, only Bun's keys and shapes, and every string a name, spec,
+ *   resolution, integrity or path); one that isn't is unscreened, so a worker can't hide text from the screen behind
+ *   a lockfile's name. Every string is redacted first (`redactSecretForms`), then a
  *   long diff is cut into windows of whole lines, each with the file's header lines, covering every line once.
  *   Content the diff doesn't show (a binary, a `-diff` attribute, a gitlink) is a subject with no state: unscreened.
  * - **The ledger**, `<engineDir>/decisions/<owner>/<name>/<id>.jsonl` (0600, dirs 0700, append-only): an `asking`
@@ -259,12 +260,19 @@ export async function decisionSpend(engineDir: string, o: { repo?: string; ids?:
 /** The number of `asking` lines in a ledger: the calls made, answered or not. */
 export const callsOf = (lines: readonly LedgerLine[]): number => lines.filter((l) => l.kind === "asking").length;
 
-/** A path for display, built on the host: `\n` and `\t` to a space, no terminal control, no `@ < > \``, at most 120 characters, in a code span. */
-export function shownPath(path: string): string {
-  const safe = sanitizeTerminal(path.replace(/[\n\t]/g, " ")).replace(/[@<>`]/g, "");
+/**
+ * Text a run or a worker controls, for one line of host Markdown: `\n` and `\t` to a space, no terminal control, no
+ * `@ < > \``, at most `max` characters, in a code span, so no link, image, autolink, mention or issue reference renders.
+ */
+export function codeSpan(text: string, max = 200): string {
+  const safe = sanitizeTerminal(text.replace(/[\r\n\t]/g, " ")).replace(/[@<>`]/g, "");
   const chars = Array.from(safe);
-  return `\`${chars.length > 120 ? `${chars.slice(0, 119).join("")}…` : safe}\``;
+  const t = chars.length > max ? `${chars.slice(0, max - 1).join("")}…` : safe;
+  return `\`${t.trim() === "" ? "(empty)" : t}\``;
 }
+
+/** A path for display, built on the host: `codeSpan`, at most 120 characters. */
+export const shownPath = (path: string): string => codeSpan(path, 120);
 
 /** One subject a decision is asked about. `state` undefined: `unscreened` says why, and it is never asked. */
 export interface Subject {
@@ -389,10 +397,10 @@ function windows(state: (part: string, diff: string) => State, header: string[],
 const NOT_SHOWN = "content not shown in the diff";
 
 /**
- * JSONC as Bun writes its text lockfile: JSON with trailing commas, and comments allowed. Comments and trailing
- * commas outside strings are dropped, then the text is parsed as JSON. Throws on anything else.
+ * Bun's text lockfile as JSON: trailing commas are dropped, and any comment (`//` or `/*` outside a string) makes it
+ * not a lockfile at all, since text in a comment is text the screen would never see. undefined when it doesn't parse.
  */
-function parseJsonc(text: string): unknown {
+function lockJson(text: string): unknown {
   let out = "";
   for (let i = 0; i < text.length; i++) {
     const c = text[i]!;
@@ -401,30 +409,125 @@ function parseJsonc(text: string): unknown {
       while (j < text.length && text[j] !== '"') j += text[j] === "\\" ? 2 : 1;
       out += text.slice(i, j + 1);
       i = j;
-    } else if (c === "/" && text[i + 1] === "/") {
-      while (i < text.length && text[i] !== "\n") i++;
-      out += "\n";
-    } else if (c === "/" && text[i + 1] === "*") {
-      const end = text.indexOf("*/", i + 2);
-      if (end === -1) throw new Error("an unclosed comment");
-      i = end + 1;
-    } else if (c === ",") {
+    } else if (c === "/" && (text[i + 1] === "/" || text[i + 1] === "*")) return undefined;
+    else if (c === ",") {
       let j = i + 1;
       while (j < text.length && /\s/.test(text[j]!)) j++;
       if (text[j] !== "}" && text[j] !== "]") out += c;
     } else out += c;
   }
-  return JSON.parse(out);
+  try {
+    return JSON.parse(out);
+  } catch {
+    return undefined;
+  }
 }
 
-/** Whether `text` is Bun's text lockfile: a JSONC object with an integer `lockfileVersion`. */
-export function isBunLock(text: string): boolean {
-  try {
-    const v = parseJsonc(text);
-    return v !== null && typeof v === "object" && !Array.isArray(v) && Number.isInteger((v as { lockfileVersion?: unknown }).lockfileVersion);
-  } catch {
-    return false;
+// The grammar every string of a skipped bun.lock must fit (the controller's ruling, Task 12 fix round 1): names,
+// resolutions, specs, registries, integrities, paths and platforms, each at most 256 characters. Free text fits none
+// of them; what still fits (a hyphenated word as a name or a dist-tag) is bounded by the grammar and the cap (H-275).
+const NPM_NAME = /^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/;
+const NESTED_NAME = /^(?:@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*(?:\/(?:@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*)*$/;
+const PART = "(?:0|[1-9][0-9]*|x|X|\\*)";
+const PRE = "(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?";
+const COMPARATOR = new RegExp(`^(?:\\^|~>?|>=|<=|>|<|=)?v?${PART}(?:\\.${PART}){0,2}${PRE}$`);
+const VERSION = new RegExp(`^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)${PRE}$`);
+const DIST_TAG = /^[a-z][a-z0-9-]{0,31}$/;
+const WORKSPACE_PATH = /^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/;
+const BIN_PATH = /^[A-Za-z0-9._/-]{1,200}$/;
+const PLATFORM = /^!?[a-z0-9_]+$/;
+const INTEGRITY = /^sha(512|384|256|1)-[A-Za-z0-9+/]+={0,2}$/;
+const GIT_REF = /^[A-Za-z0-9._-]+-[0-9a-f]{7,64}$/;
+
+const isStr = (v: unknown): v is string => typeof v === "string" && v.length <= 256;
+const isName = (v: unknown): v is string => isStr(v) && v.length <= 214 && NPM_NAME.test(v);
+const isObj = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
+const onlyKeys = (o: Record<string, unknown>, allowed: readonly string[]) => Object.keys(o).every((k) => allowed.includes(k));
+
+/** A semver range: comparators separated by spaces, `||` and ` - ` (hyphen ranges). */
+function isRange(s: string): boolean {
+  return s.split("||").every((part) => {
+    const t = part.trim();
+    if (t === "") return false;
+    const hyphen = t.split(" - ");
+    if (hyphen.length === 2) return hyphen.every((v) => COMPARATOR.test(v.trim()));
+    return t.split(/\s+/).every((c) => COMPARATOR.test(c));
+  });
+}
+
+/** A dependency spec: a range, a protocol with no whitespace, or a dist-tag. */
+function isSpec(v: unknown): boolean {
+  if (!isStr(v)) return false;
+  if (isRange(v) || DIST_TAG.test(v)) return true;
+  if (v.startsWith("npm:")) {
+    const rest = v.slice(4);
+    const at = rest.lastIndexOf("@");
+    return at > 0 ? isName(rest.slice(0, at)) && isSpec(rest.slice(at + 1)) : isName(rest);
   }
+  if (/^catalog:[a-z0-9._-]*$/.test(v)) return true;
+  return /^(workspace:|github:|git\+https:\/\/|https:\/\/|file:|link:)\S+$/.test(v) || v === "workspace:*";
+}
+
+/** `<name>@<spec>`, the name possibly scoped. */
+function isResolution(v: unknown): boolean {
+  if (!isStr(v)) return false;
+  const at = v.lastIndexOf("@");
+  return at > 0 && isName(v.slice(0, at)) && isSpec(v.slice(at + 1));
+}
+
+const isDeps = (v: unknown) => isObj(v) && Object.entries(v).every(([k, x]) => isName(k) && isSpec(x));
+const isNames = (v: unknown) => Array.isArray(v) && v.every(isName);
+const isBin = (v: unknown) => (isStr(v) && BIN_PATH.test(v)) || (isObj(v) && Object.entries(v).every(([k, x]) => isStr(k) && /^[A-Za-z0-9._-]{1,214}$/.test(k) && isStr(x) && BIN_PATH.test(x)));
+const isPlatform = (v: unknown) => (isStr(v) && PLATFORM.test(v)) || (Array.isArray(v) && v.every((x) => isStr(x) && PLATFORM.test(x)));
+const DEP_KEYS = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"] as const;
+
+function isWorkspace(v: unknown): boolean {
+  if (!isObj(v) || !onlyKeys(v, ["name", "version", ...DEP_KEYS, "optionalPeers", "bin"])) return false;
+  if (v.name !== undefined && !isName(v.name)) return false;
+  if (v.version !== undefined && !(isStr(v.version) && VERSION.test(v.version))) return false;
+  if (DEP_KEYS.some((k) => v[k] !== undefined && !isDeps(v[k]))) return false;
+  if (v.optionalPeers !== undefined && !isNames(v.optionalPeers)) return false;
+  return v.bin === undefined || isBin(v.bin);
+}
+
+function isMeta(v: unknown): boolean {
+  if (!isObj(v) || !onlyKeys(v, [...DEP_KEYS, "optionalPeers", "bin", "binDir", "os", "cpu", "libc"])) return false;
+  if (DEP_KEYS.some((k) => v[k] !== undefined && !isDeps(v[k]))) return false;
+  if (v.optionalPeers !== undefined && !isNames(v.optionalPeers)) return false;
+  if (v.bin !== undefined && !isBin(v.bin)) return false;
+  if (v.binDir !== undefined && !(isStr(v.binDir) && BIN_PATH.test(v.binDir))) return false;
+  return ["os", "cpu", "libc"].every((k) => v[k] === undefined || isPlatform(v[k]));
+}
+
+/** One `packages` entry: npm `[resolution, registry, meta, integrity]`, workspace `[resolution]`, git `[resolution, meta, "<owner>-<repo>-<sha>"]`, file, link or tarball `[resolution, meta]`. */
+function isPackage(v: unknown): boolean {
+  if (!Array.isArray(v) || !isResolution(v[0])) return false;
+  if (v.length === 1) return true;
+  if (v.length === 2) return isMeta(v[1]);
+  if (v.length === 3) return isMeta(v[1]) && isStr(v[2]) && GIT_REF.test(v[2]);
+  if (v.length === 4) return isStr(v[1]) && (v[1] === "" || /^https:\/\/\S+$/.test(v[1])) && isMeta(v[2]) && isStr(v[3]) && INTEGRITY.test(v[3]);
+  return false;
+}
+
+/**
+ * Whether `text` is Bun's text lockfile, checked structurally: JSON with trailing commas but no comment; the top-level
+ * keys `lockfileVersion` (0 to 2), `workspaces` and `packages`, and optionally `configVersion` (0 or 1),
+ * `trustedDependencies`, `patchedDependencies`, `overrides`, `catalog` and `catalogs`; each value in the shape Bun
+ * writes; and every string a name, resolution, spec, registry, integrity, path or platform of at most 256 characters.
+ * Anything else is not a lockfile, so the file is unscreened and holds.
+ */
+export function isBunLock(text: string): boolean {
+  const v = lockJson(text);
+  if (!isObj(v) || !onlyKeys(v, ["lockfileVersion", "configVersion", "workspaces", "packages", "trustedDependencies", "patchedDependencies", "overrides", "catalog", "catalogs"])) return false;
+  if (!Number.isInteger(v.lockfileVersion) || (v.lockfileVersion as number) < 0 || (v.lockfileVersion as number) > 2) return false;
+  if (v.configVersion !== undefined && v.configVersion !== 0 && v.configVersion !== 1) return false;
+  if (!isObj(v.workspaces) || !Object.entries(v.workspaces).every(([k, w]) => (k === "" || (isStr(k) && WORKSPACE_PATH.test(k))) && isWorkspace(w))) return false;
+  if (!isObj(v.packages) || !Object.entries(v.packages).every(([k, p]) => isStr(k) && NESTED_NAME.test(k) && isPackage(p))) return false;
+  if (v.trustedDependencies !== undefined && !isNames(v.trustedDependencies)) return false;
+  if (v.patchedDependencies !== undefined && !(isObj(v.patchedDependencies) && Object.entries(v.patchedDependencies).every(([k, x]) => (isName(k) || isResolution(k)) && isStr(x) && BIN_PATH.test(x)))) return false;
+  if (v.overrides !== undefined && !isDeps(v.overrides)) return false;
+  if (v.catalog !== undefined && !isDeps(v.catalog)) return false;
+  return v.catalogs === undefined || (isObj(v.catalogs) && Object.entries(v.catalogs).every(([k, c]) => /^[a-z0-9._-]{1,64}$/.test(k) && isDeps(c)));
 }
 
 /** The lockfiles a `skip_paths` entry may name, by file name, and the check its content at the head must pass to be skipped. */

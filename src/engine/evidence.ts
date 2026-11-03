@@ -24,6 +24,7 @@ import { join } from "node:path";
 import Ajv2020 from "ajv/dist/2020";
 import type { Phases } from "../policy/types";
 import { redactSecretForms, sanitizeTerminal } from "../run/sanitize";
+import { codeSpan } from "./decisions";
 import type { WorkOrder } from "../workorder/validate";
 
 export { turnsOfRun } from "../run/spend";
@@ -146,8 +147,19 @@ const unxml = (s: string) =>
     e.startsWith("#x") ? String.fromCodePoint(parseInt(e.slice(2), 16)) : e.startsWith("#") ? String.fromCodePoint(Number(e.slice(1))) : (XML_ENTITIES[e] ?? m),
   );
 
-/** Why bun's junit report doesn't show every planner test file run and passed, none skipped; undefined when it does. */
-function junitProblem(xml: string | undefined, files: readonly string[]): string | undefined {
+/** A planner test file at the merge, and the tests it holds by a static count (`test(` and `it(` calls at a line's start; at least 1). */
+export interface PlannerTest {
+  file: string;
+  tests: number;
+}
+
+/**
+ * Why bun's junit report doesn't show the planner's tests run and passed; undefined when it does. Read per file: the
+ * report counts tests, none failed or skipped, lists as many test cases as it counts, and has, for each planner file,
+ * at least as many test cases as the file's static count (a lower bound: `test.each` and loops add more), so a
+ * planner test that silently didn't run shows.
+ */
+function junitProblem(xml: string | undefined, files: readonly PlannerTest[]): string | undefined {
   if (xml === undefined) return "verify ran the acceptance tests but left no acceptance.junit.xml";
   const top = /<testsuites\b([^>]*)>/.exec(xml);
   const attr = (a: string, name: string) => new RegExp(`\\s${name}="([^"]*)"`).exec(a)?.[1];
@@ -158,9 +170,15 @@ function junitProblem(xml: string | undefined, files: readonly string[]): string
   if (/<skipped\b/.test(xml) || Number(attr(top[1]!, "skipped") ?? "0") > 0) return "the acceptance junit shows a skipped test";
   const cases = [...xml.matchAll(/<testcase\b([^>]*)>/g)].map((m) => m[1]!);
   if (cases.length !== tests) return `the acceptance junit counts ${tests} tests but lists ${cases.length}`;
-  const ran = new Set(cases.map((c) => unxml(attr(c, "file") ?? "")));
-  const missing = files.filter((f) => !ran.has(f));
+  const perFile = new Map<string, number>();
+  for (const c of cases) {
+    const f = unxml(attr(c, "file") ?? "");
+    perFile.set(f, (perFile.get(f) ?? 0) + 1);
+  }
+  const missing = files.filter((f) => !perFile.has(f.file));
   if (missing.length > 0) return `the acceptance junit has no result for ${missing.length} of the planner's ${files.length} test files`;
+  const short = files.filter((f) => (perFile.get(f.file) ?? 0) < f.tests);
+  if (short.length > 0) return `the acceptance junit has fewer results than the planner's tests in ${short.length} of its ${files.length} test files`;
   return undefined;
 }
 
@@ -169,7 +187,7 @@ function junitProblem(xml: string | undefined, files: readonly string[]): string
  * recorded container exit code, and the planner's acceptance test files at the merge (undefined: they couldn't be
  * listed).
  */
-export function verifyResult(outDir: string | undefined, wo: WorkOrder, phases: Phases, signals: { exitCode: number | undefined; acceptanceFiles: readonly string[] | undefined }): VerifyResult {
+export function verifyResult(outDir: string | undefined, wo: WorkOrder, phases: Phases, signals: { exitCode: number | undefined; acceptanceFiles: readonly PlannerTest[] | undefined }): VerifyResult {
   if (!phases.verify) return { state: "off" };
   if (outDir === undefined) return { state: "broken", why: "no verify run of this head" };
   const raw = text(join(outDir, PHASE_OUTPUTS.verify));
@@ -190,7 +208,7 @@ export function verifyResult(outDir: string | undefined, wo: WorkOrder, phases: 
   if (check !== "passed" || smoke === "failed" || acceptance === "failed") return ran;
   // verify.json reads all passed: the other three signals must agree.
   const status = archonStatus(outDir);
-  if (status !== "completed") return { state: "unconfirmed", why: `verify.json reads all passed, but Archon's status for the run is ${status === undefined ? "unknown" : JSON.stringify(sanitizeTerminal(status).slice(0, 40))}` };
+  if (status !== "completed") return { state: "unconfirmed", why: `verify.json reads all passed, but Archon's status for the run is ${status === undefined ? "unknown" : codeSpan(status, 40)}` };
   if (signals.exitCode !== 0) return { state: "unconfirmed", why: `verify.json reads all passed, but the verify container ${signals.exitCode === undefined ? "has no recorded exit code" : `exited ${signals.exitCode}`}` };
   if (signals.acceptanceFiles === undefined) return { state: "unconfirmed", why: "the planner's acceptance tests at the merge could not be listed" };
   if (acceptance === "none") {
@@ -238,12 +256,6 @@ export function reviewResult(outDir: string | undefined, phases: Phases): Review
   return { state: "ran", verdict: r.verdict, findings: r.findings, criteria: r.criteria };
 }
 
-/** A why from the run's own text: no terminal control, no `@ < > \``, at most 200 characters. */
-const runText = (s: string) => {
-  const safe = sanitizeTerminal(s.replace(/[\n\t]/g, " ")).replace(/[@<>`]/g, "");
-  return Array.from(safe).slice(0, 200).join("");
-};
-
 /** CodeRabbit's CLI result (see the module comment): the rules are the order they are checked in. */
 export function codeRabbitResult(outDir: string | undefined, phases: Phases): CodeRabbitResult {
   if (!phases.coderabbit) return { state: "off" };
@@ -264,7 +276,7 @@ export function codeRabbitResult(outDir: string | undefined, phases: Phases): Co
   const isExit = exactKeys(last, ["type", "exit"]) && Number.isInteger(last.exit);
   const isSkip = exactKeys(last, ["type", "skipped"]) && typeof last.skipped === "string";
   if (!isExit && !isSkip) return bad;
-  if (isSkip) return { state: "not-reviewed", why: `the CodeRabbit CLI step was skipped: ${runText(last.skipped as string)}` };
+  if (isSkip) return { state: "not-reviewed", why: `the CodeRabbit CLI step was skipped: ${codeSpan(last.skipped as string, 200)}` };
   if (last.exit !== 0 && last.exit !== 2) return { state: "not-reviewed", why: `the CodeRabbit CLI exited ${last.exit as number}` };
   const stream = rows.slice(0, -1);
   if (stream.some((r) => r.type !== "finding" && JSON.stringify(r).includes("review_skipped"))) return { state: "not-reviewed", why: "CodeRabbit skipped the review" };

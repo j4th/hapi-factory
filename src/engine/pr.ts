@@ -25,7 +25,8 @@ export interface PrInput {
   evidence: Evidence;
   /** The head the PR shows: the one pushed, or, when nothing was pushed, the PR's own (`s.prHead`); the unpushed head is named only in a reason. */
   head: string;
-  stat: { files: number; insertions: number; deletions: number };
+  /** The diff's size, `<merge>..<head>`; undefined when the host's scratch doesn't hold the head (a PR head the factory never pushed). */
+  stat: { files: number; insertions: number; deletions: number } | undefined;
   planningPr: number | undefined;
   position: { k: number; n: number; siblings: number[] };
   runs: { id: string; kind: RunKind; round: number; retry?: number }[];
@@ -39,6 +40,11 @@ export interface PrInput {
   ci?: "pending" | "passed" | "failed";
   /** Design §3.5's unfixed major findings in a fix round's own change (./harvest.ts), at the top of Unresolved. */
   unfixed?: string[];
+  /**
+   * The run's head, when it was not pushed (a moved branch, GitHub's refusal, or a ready PR's new head a draft): every
+   * head-specific Evidence row is scoped to it and says so, and no finding of it, nor an unfixed line, is shown.
+   */
+  unpushed?: string;
 }
 
 export const BEGIN = "<!-- hapi:begin -->";
@@ -76,7 +82,7 @@ function count(lines: string[]): number {
   return more ? lines.length - 1 + Number(more[1]) : lines.length;
 }
 
-/** One decision's Evidence row: `| decide: <name> v<version> | <h7> | <screened> | <result> |`. */
+/** One decision's Evidence row: `| decide: <name> v<version> | <h7> | <screened> | <result> |`; `head` is the cell's text. */
 function decisionRow(s: Screened, head: string): string {
   const via = (["jev", "haiku", "default"] as const).filter((k) => (s.via[k] ?? 0) > 0).map((k) => `${k} ${s.via[k]}`);
   const screened =
@@ -92,7 +98,7 @@ function decisionRow(s: Screened, head: string): string {
   else if (s.asked + s.reused === 0 && s.unscreened > 0) result = `${s.unscreened} not screened`;
   else if (s.holds.length + s.notes.length === 0) result = "pass";
   else result = `${count(s.holds)} hold, ${count(s.notes)} note`;
-  return `| decide: ${cell(s.decision)} v${cell(s.version)} | ${h7(head)} | ${cell(screened)} | ${cell(result)} |`;
+  return `| decide: ${cell(s.decision)} v${cell(s.version)} | ${head} | ${cell(screened)} | ${cell(result)} |`;
 }
 
 /** The verify rows' results. */
@@ -116,6 +122,8 @@ export function renderPr(i: PrInput): string {
   const e = i.evidence;
   const id = i.order.id;
   const head = h7(i.head);
+  /** The head the evidence is of: the PR's, or the run's head that was not pushed. */
+  const evidenceHead = i.unpushed === undefined ? head : `${h7(i.unpushed)} (not pushed)`;
   const ci = i.ci ?? "pending";
   const out: string[] = [BEGIN, "## Verdict", ""];
 
@@ -130,7 +138,7 @@ export function renderPr(i: PrInput): string {
   }
 
   // 2. Unresolved, then Check this yourself.
-  const unresolved = [...(i.unfixed ?? []), ...i.outcome.reasons];
+  const unresolved = [...(i.unpushed === undefined ? (i.unfixed ?? []) : []), ...i.outcome.reasons];
   if (ready && ci === "failed") unresolved.push(`\`ci / gates\` failed on ${head}`);
   if (e.cr.state === "not-reviewed") unresolved.push(`CodeRabbit's CLI did not review this head: ${e.cr.why}`);
   out.push("", "## Unresolved", "");
@@ -155,7 +163,11 @@ export function renderPr(i: PrInput): string {
 
   // 4. Asked and built.
   out.push("", "## Asked and built", "", fence(goalOf(i.order.taskMd) || "(task.md has no paragraph)"), "");
-  out.push(`${i.stat.files} files, +${i.stat.insertions} −${i.stat.deletions}. Rollback: revert this PR's merge commit.`);
+  out.push(
+    i.stat === undefined
+      ? `The diff's size isn't known: the host's copy of the repo doesn't hold the PR's head ${head}. Rollback: revert this PR's merge commit.`
+      : `${i.stat.files} files, +${i.stat.insertions} −${i.stat.deletions}. Rollback: revert this PR's merge commit.`,
+  );
 
   // 5. Evidence, restated after every round.
   const v = verifyCells(e);
@@ -171,22 +183,24 @@ export function renderPr(i: PrInput): string {
   const n = e.gates.files.length;
   const gates = e.gates.problems.length === 0 ? `passed (${n} ${n === 1 ? "file" : "files"})` : `refused (${e.gates.problems.length} problems)`;
   out.push("", "## Evidence", "", "| Gate | Head | Command | Result |", "|---|---|---|---|");
-  out.push(`| host gates | ${head} | the bundle, its trailers, protected paths, scope, the secret scan | ${cell(gates)} |`);
-  out.push(`| check | ${head} | \`mise run check\` | ${cell(v.check)} |`);
-  out.push(`| smoke | ${head} | \`mise run smoke\` | ${cell(v.smoke)} |`);
-  out.push(`| acceptance | ${head} | ${acceptanceCmd.startsWith("bun") ? `\`${acceptanceCmd}\`` : acceptanceCmd} | ${cell(v.acceptance)} |`);
-  out.push(`| the independent review | ${head} | factory-review, read-only | ${cell(review)} |`);
-  out.push(`| CodeRabbit's CLI | ${head} | \`cr review --agent --committed --gate major\` | ${cell(cr)} |`);
-  for (const s of e.screens) out.push(decisionRow(s, i.head));
+  out.push(`| host gates | ${evidenceHead} | the bundle, its trailers, protected paths, scope, the secret scan | ${cell(gates)} |`);
+  out.push(`| check | ${evidenceHead} | \`mise run check\` | ${cell(v.check)} |`);
+  out.push(`| smoke | ${evidenceHead} | \`mise run smoke\` | ${cell(v.smoke)} |`);
+  out.push(`| acceptance | ${evidenceHead} | ${acceptanceCmd.startsWith("bun") ? `\`${acceptanceCmd}\`` : acceptanceCmd} | ${cell(v.acceptance)} |`);
+  out.push(`| the independent review | ${evidenceHead} | factory-review, read-only | ${cell(review)} |`);
+  out.push(`| CodeRabbit's CLI | ${evidenceHead} | \`cr review --agent --committed --gate major\` | ${cell(cr)} |`);
+  for (const s of e.screens) out.push(decisionRow(s, evidenceHead));
   out.push(`| \`ci / gates\` | ${head} | GitHub Actions, on the pushed head | ${ci} |`);
-  if (r.state === "ran" && (r.findings.length > 0 || r.criteria.length > 0)) {
+  if (i.unpushed !== undefined) {
+    out.push("", `The rows above but \`ci / gates\` are of round ${i.round}'s head ${h7(i.unpushed)}, which was not pushed (see Unresolved); the PR's head is still ${head}, and its findings aren't shown.`);
+  } else if (r.state === "ran" && (r.findings.length > 0 || r.criteria.length > 0)) {
     const lines = [
       ...r.findings.map((f) => `[${f.severity}] ${f.path}: ${f.summary}`),
       ...r.criteria.map((c, n) => `criterion ${n + 1} (${c.mark}): ${c.criterion}\n  evidence: ${c.evidence}`),
     ];
     out.push("", "The independent review's findings and criteria, as it wrote them:", "", fence(lines.join("\n")));
   }
-  if (e.cr.state === "reviewed" && e.cr.findings.length > 0) {
+  if (i.unpushed === undefined && e.cr.state === "reviewed" && e.cr.findings.length > 0) {
     out.push("", "CodeRabbit's findings, as it wrote them:", "", fence(e.cr.findings.map((f) => `[${f.severity}] ${f.file}${f.line === undefined ? "" : `:${f.line}`}: ${f.title}\n${f.text}`).join("\n\n")));
   }
 

@@ -11,6 +11,7 @@ import { diffSubjects, ledgerPath, readLedger, type Screened } from "../../src/e
 import {
   diffStat,
   type Evidence,
+  fixHunks,
   GITLEAKS_VERSION,
   type GateResult,
   type HarvestDeps,
@@ -19,6 +20,7 @@ import {
   hostGates,
   outcome,
   push,
+  pushOutcome,
   runGates,
   scratchPath,
 } from "../../src/engine/harvest";
@@ -285,9 +287,12 @@ describe("with real git: a push never uses +, and a moved branch is never forced
     const remote = join(w.tmp, "remote.git");
     w.work("init", "-q", "--bare", remote);
     const calls: { cmd: string[]; env: Record<string, string> }[] = [];
+    // The push allows https alone (GIT_ALLOW_PROTOCOL); this test's remote is a local path, so the recording runner
+    // checks that and lifts it for the real git underneath. A separate assertion shows git refuses the path with it.
     const run: Runner = async (cmd, o) => {
       calls.push({ cmd, env: o.env });
-      return runCommand(cmd, o);
+      const { GIT_ALLOW_PROTOCOL: _https, ...env } = o.env;
+      return runCommand(cmd, { ...o, env });
     };
     const d = { run, env: { PATH: process.env.PATH ?? "/usr/bin:/bin" } };
     expect(await push(d, { scratch, remote, id: ORDER.id, head, token: "fake-push-token" })).toEqual({ pushed: true });
@@ -296,7 +301,8 @@ describe("with real git: a push never uses +, and a moved branch is never forced
     expect(argv.some((a) => a.startsWith("+") || a.startsWith("--force") || a === "-f")).toBe(false);
     expect(argv.join(" ")).not.toContain("fake-push-token");
     const { authedGit } = await import("../../src/forge/github/git");
-    expect(calls[0]!.env).toMatchObject({ ...authedGit("fake-push-token"), GIT_TERMINAL_PROMPT: "0" });
+    expect(calls[0]!.env).toMatchObject({ ...authedGit("fake-push-token"), GIT_TERMINAL_PROMPT: "0", GIT_ALLOW_PROTOCOL: "https" });
+    await expect(push(realGit(), { scratch, remote, id: ORDER.id, head, token: "fake-push-token" })).rejects.toThrow(/^git push to factory\/0001-skeleton failed \(exit \d+\)/);
     // Another commit lands on the remote branch; pushing a head that doesn't descend from it is refused, never forced.
     const later = w.commit({ "src/b.ts": "b\n" });
     w.work("push", "-q", remote, `${later}:refs/heads/factory/0001-skeleton`);
@@ -376,7 +382,7 @@ describe("harvest", () => {
   });
 
   test("a ready PR's head is never replaced by one that fails check, and a moved branch is never overwritten", async () => {
-    const { d, f, fw, s, h, base } = await world();
+    const { d, f, fw, s, h, base, head } = await world();
     fw.ff.addPr({ head: "factory/0001-skeleton" });
     fw.ff.push("factory/0001-skeleton", base);
     const verify = { ...h.verify!, round: 1 };
@@ -384,7 +390,7 @@ describe("harvest", () => {
     const held = await harvest(d, { ...s, pr: 1, prHead: base }, { ...h, verify });
     expect(fw.pushes).toEqual([]);
     expect(held.verdict).toBe("decision");
-    expect(held.reasons[0]).toBe(`round 1's head failed check, smoke or the acceptance tests in the verify container, so it was not pushed over the ready PR (run ${V})`);
+    expect(held.reasons[0]).toBe(`round 1's head ${head.slice(0, 7)} failed check in the verify container, so it was not pushed over the ready PR (run ${V})`);
     expect(held.prHead).toBe(base);
     expect(bodyOf(fw.ff, 0)).toContain("not screened (this head was not pushed)");
     const h9 = "9".repeat(40);
@@ -393,7 +399,7 @@ describe("harvest", () => {
     const moved = await harvest(d, { ...s, pr: 1, prHead: base }, h);
     expect(fw.pushes).toEqual([]);
     expect(moved.verdict).toBe("decision");
-    expect(moved.reasons[0]).toBe(`factory/0001-skeleton moved to 9999999 since the factory pushed ${base.slice(0, 7)}: not overwritten`);
+    expect(moved.reasons[0]).toBe(`factory/0001-skeleton moved to 9999999 since the factory pushed ${base.slice(0, 7)}: not overwritten; the run's head ${h.verify!.sha.slice(0, 7)} was not pushed`);
     expect(moved.prHead).toBe(base);
   });
 
@@ -504,8 +510,108 @@ describe("harvest", () => {
     const { d, fw, s, h } = await world();
     d.pushBranch = async () => ({ moved: "factory/0001-skeleton moved on GitHub (not a fast-forward): not overwritten" });
     const r = await harvest(d, s, h);
-    expect([r.pr, r.verdict, r.reasons[0]]).toEqual([undefined, "decision", "factory/0001-skeleton moved on GitHub (not a fast-forward): not overwritten"]);
+    expect([r.pr, r.verdict, r.reasons[0]]).toEqual([undefined, "decision", `factory/0001-skeleton moved on GitHub (not a fast-forward): not overwritten; the run's head ${h.verify!.sha.slice(0, 7)} was not pushed`]);
     expect(writes(fw.ff)).toEqual([]);
     expect(existsSync(join(scratchPath(d.engineDir, ORDER.repo, ORDER.id), "HEAD"))).toBe(true);
+  });
+});
+
+describe("fix round 1", () => {
+  test("after a moved push, nothing marks the draft PR ready, and the body's evidence is the unpushed head's, said so", async () => {
+    const { d, fw, s, h, base, head } = await world();
+    fw.ff.addPr({ head: "factory/0001-skeleton", draft: true });
+    fw.ff.push("factory/0001-skeleton", base);
+    d.pushBranch = async () => ({ moved: "factory/0001-skeleton moved on GitHub (not a fast-forward): not overwritten" });
+    const r = await harvest(d, { ...s, pr: 1, prHead: base }, h);
+    expect(writes(fw.ff)).not.toContain("POST /graphql");
+    expect(writes(fw.ff)).toEqual(["PATCH /pulls/1", "POST /issues/1/labels"]);
+    expect(fw.ff.prs.get(1)!.draft).toBe(true);
+    expect([r.prHead, r.verdict, r.reasons[0]]).toEqual([base, "decision", `factory/0001-skeleton moved on GitHub (not a fast-forward): not overwritten; the run's head ${head.slice(0, 7)} was not pushed`]);
+    const body = bodyOf(fw.ff, 0);
+    expect(body).toContain(`| host gates | ${head.slice(0, 7)} (not pushed) |`);
+    expect(body).toContain(`| check | ${head.slice(0, 7)} (not pushed) |`);
+    expect(body).toMatch(new RegExp(`\\| decide: diff-screen v[0-9a-f]{12} \\| ${head.slice(0, 7)} \\(not pushed\\) \\| not asked \\| not screened \\(this head was not pushed\\) \\|`));
+    expect(body).toContain(`| \`ci / gates\` | ${base.slice(0, 7)} |`);
+    expect(body).toContain(`"head":"${base}"`);
+  });
+
+  test("a PR head the scratch doesn't hold gives a body without a diff stat, never a throw", async () => {
+    const { d, fw, s, h } = await world();
+    fw.ff.addPr({ head: "factory/0001-skeleton", draft: true });
+    fw.ff.push("factory/0001-skeleton", "8".repeat(40));
+    d.pushBranch = async () => ({ moved: "factory/0001-skeleton moved on GitHub (not a fast-forward): not overwritten" });
+    await harvest(d, { ...s, pr: 1 }, h);
+    expect(bodyOf(fw.ff, 0)).toContain("The diff's size isn't known: the host's copy of the repo doesn't hold the PR's head 8888888.");
+  });
+
+  test("only git's own non-fast-forward is a move; GitHub's refusal carries its own reason; anything else throws", () => {
+    const line = (summary: string) => `To https://github.com/x/y.git\n!\tabc:refs/heads/factory/0001-skeleton\t${summary}\nDone\n`;
+    expect(pushOutcome(0, "", ORDER.id)).toEqual({ pushed: true });
+    for (const why of ["[rejected] (non-fast-forward)", "[rejected] (fetch first)"]) expect(pushOutcome(1, line(why), ORDER.id)).toEqual({ moved: "factory/0001-skeleton moved on GitHub (not a fast-forward): not overwritten" });
+    expect(pushOutcome(1, line("[remote rejected] (push declined due to repository rule violations @x)"), ORDER.id)).toEqual({
+      refused: "GitHub refused the push to factory/0001-skeleton: `push declined due to repository rule violations x`",
+    });
+    expect(pushOutcome(1, line("[rejected] (stale info)"), ORDER.id)).toBeUndefined();
+    expect(pushOutcome(128, "", ORDER.id)).toBeUndefined();
+  });
+
+  test("a refused push opens no PR and holds the work order, with GitHub's reason", async () => {
+    const { d, fw, s, h, head } = await world();
+    d.pushBranch = async () => ({ refused: "GitHub refused the push to factory/0001-skeleton: `push declined`" });
+    const r = await harvest(d, s, h);
+    expect([r.pr, r.verdict, r.reasons[0]]).toEqual([undefined, "decision", `GitHub refused the push to factory/0001-skeleton: \`push declined\`; the run's head ${head.slice(0, 7)} was not pushed`]);
+    expect(writes(fw.ff)).toEqual([]);
+  });
+
+  test("the not-pushed reason gives the draft's real cause", async () => {
+    const { d, f, fw, s, h, base, head } = await world();
+    fw.ff.addPr({ head: "factory/0001-skeleton" });
+    fw.ff.push("factory/0001-skeleton", base);
+    writeOut(f, V, "verify.json", "not json");
+    const r = await harvest(d, { ...s, pr: 1, prHead: base }, h);
+    expect(r.reasons[0]).toBe(`round 0's head ${head.slice(0, 7)} has no readable verify result (verify: verify.json is malformed), so it was not pushed over the ready PR (run ${V})`);
+  });
+
+  test("m20: the review's verdict and marks go on the review run's record at harvest, never overwritten", async () => {
+    const { d, f, s, h } = await world();
+    await harvest(d, s, h);
+    expect((await readRecord(f.deps.stateDir, R))!.review).toEqual({ verdict: "ready", marks: ["met"] });
+    expect((await readRecord(f.deps.stateDir, W))!.review).toBeUndefined();
+    writeReview(f, R, { verdict: "needs-work", findings: [], criteria: [{ criterion: "c", mark: "unmet", evidence: "e" }] });
+    await harvest(d, s, h);
+    expect((await readRecord(f.deps.stateDir, R))!.review).toEqual({ verdict: "ready", marks: ["met"] });
+  });
+
+  test("with real git: names git quotes, and an added line that looks like a header, are read per file, as content", async () => {
+    const w = gitWorld();
+    w.commit({ "src/tést.ts": 'test.skip("x", () => {});\n', 'src/a"b.ts': 'it.skip("y", () => {});\n', "src/c.ts": "++ b/src/zz.ts\nprocess.exit(0);\n" });
+    const g = await gatesOn(w);
+    expect(g.signals).toEqual([
+      '`src/a"b.ts`: an added line skips a test (.skip, .todo or .only)',
+      "`src/c.ts`: an added line calls process.exit",
+      "`src/tést.ts`: an added line skips a test (.skip, .todo or .only)",
+    ]);
+    expect(g.signals.some((l) => l.includes("zz.ts"))).toBe(false);
+  });
+
+  test("with real git: a fix's own ranges are per file, for a quoted name and a deleted file too", async () => {
+    const w = gitWorld();
+    const first = w.commit({ "src/tést.ts": "a\nb\nc\n", "src/old.ts": "1\n2\n3\n", "src/x.ts": "x\n" });
+    const fix = w.commit({ "src/tést.ts": "a\nB\nc\n", "src/old.ts": null, "src/x.ts": "x\n++ b/src/x.ts\n" });
+    const hunks = await fixHunks(realGit(), w.scratch(), first, fix);
+    expect(Object.fromEntries(hunks)).toEqual({ "src/old.ts": [], "src/tést.ts": [[2, 2]], "src/x.ts": [[2, 2]] });
+  });
+
+  test("with real git: a secret's commits leave the scratch, and only a clean scratch is made readable by all", async () => {
+    const key = fakeSecret("ANTHROPIC_API_KEY");
+    const w = gitWorld();
+    w.commit({ "src/b.ts": `export const k = "${key}";\n` });
+    const blob = w.work("rev-parse", "HEAD:src/b.ts");
+    const g = await gatesOn(w, { secrets: { ANTHROPIC_API_KEY: key } });
+    expect(g.problems.map((p) => p.gate)).toEqual(["secret"]);
+    const scratch = scratchPath(w.engineDir, ORDER.repo, ORDER.id);
+    const has = (args: string[]) => Bun.spawnSync(["git", "--git-dir", scratch, ...args], { env: { PATH: process.env.PATH!, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } }).exitCode === 0;
+    expect(has(["rev-parse", "--verify", "--quiet", `refs/hapi/runs/${W}`])).toBe(false);
+    expect(has(["cat-file", "-e", blob])).toBe(false);
   });
 });

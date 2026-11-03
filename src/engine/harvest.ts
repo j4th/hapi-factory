@@ -13,8 +13,8 @@
  *   tampering, placeholders, loosened tests) are "check this yourself" lines only, never a verdict.
  * - **The outcome** (`outcome`, pure): design §3.6's rows, the operator's acceptance-test rules, then the screens'
  *   holds last. Screens never change `push` or `draft`.
- * - **The push** (`push`): `git push` without `+` or `--force`, the token in the process's environment only; a
- *   rejected push is a moved branch, never overwritten.
+ * - **The push** (`push`): `git push` without `+` or `--force`, over https alone, the token in the process's
+ *   environment only; a non-fast-forward is a moved branch, never overwritten, and GitHub's refusal carries its reason.
  * - **`harvest`**: the gates, the evidence, the PR lookup (a closed PR ends it; a moved branch or a ready PR whose
  *   new head failed check means no push), the screens of a head it will push (each answer saved before the push),
  *   the push, the PR body (./pr.ts) and its labels, then `harvestedAt` on each record it read (H-206). It mints no
@@ -23,7 +23,7 @@
 import { lstat, mkdir, mkdtemp, readdir, rm, stat, chmod, writeFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { KEY_PATTERNS } from "../../policy/decisions/write-gate";
 import type { ask } from "../decide/record";
 import type { Forge, PrInfo } from "../forge";
@@ -41,6 +41,7 @@ import type { RunDeps } from "../run/spec";
 import { isWorkOrderId, type WorkOrder } from "../workorder/validate";
 import {
   callsOf,
+  codeSpan,
   type DiffInput,
   decisionSpend,
   emptyScreens,
@@ -55,7 +56,7 @@ import {
   type Subject,
 } from "./decisions";
 import type { Discovered } from "./discover";
-import { type CodeRabbitResult, codeRabbitResult, type ReviewResult, reviewResult, turnsOfRun, type VerifyResult, verifyResult, type WorkerResult, workerResult } from "./evidence";
+import { type CodeRabbitResult, codeRabbitResult, type PlannerTest, type ReviewResult, reviewResult, turnsOfRun, type VerifyResult, verifyResult, type WorkerResult, workerResult } from "./evidence";
 import { mirrorPath } from "./mirror";
 import { type PrInput, renderPr, rerenderPr } from "./pr";
 import type { Verdict, WorkOrderState } from "./state";
@@ -156,26 +157,52 @@ const SIGNALS: readonly { what: string; re: RegExp }[] = [
 ];
 const BUNFIG = "it changes bunfig.toml, which can preload code into bun test";
 
-/** "Check this yourself" lines from the final diff's added lines, one per file and signal, in path order; at most 50. */
-function signalsOf(patch: string, secrets: Record<string, string>): string[] {
-  const found = new Map<string, Set<string>>();
-  const add = (file: string, what: string) => (found.get(file) ?? found.set(file, new Set()).get(file)!).add(what);
-  let file: string | undefined;
-  for (const line of patch.split("\n")) {
-    if (line.startsWith("diff --git ")) file = undefined;
-    const m = /^\+\+\+ b\/(.*)$/.exec(line);
-    if (m) {
-      file = m[1]!;
-      if (/(^|\/)bunfig\.toml$/.test(file)) add(file, BUNFIG);
-      continue;
+/** One file's change, from its own `diff -U0`: its added lines (every `+` line after the first `@@`) and its new-side line ranges. */
+export interface FileChange {
+  added: string[];
+  ranges: [number, number][];
+}
+
+/**
+ * Each of `files`' changes, `base..head`, from one `--literal-pathspecs diff -U0 --text` per file of a `-z` list, so a
+ * file is never named by parsing a header (a quoted or escaped name, or an added line that looks like `+++ b/…`, can't
+ * misattribute a line), and `--text` sees through a `-diff` attribute. Only `@@` lines give ranges; every `+` line
+ * after the first is content. undefined when git fails.
+ */
+export async function fileChanges(d: Pick<RunDeps, "run" | "env">, scratch: string, base: string, head: string, files: readonly string[]): Promise<Map<string, FileChange> | undefined> {
+  const out = new Map<string, FileChange>();
+  for (const f of files) {
+    const r = await scratchGit(d, scratch, ["diff", "-U0", "--text", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", base, head, "--", f], ["--literal-pathspecs"]);
+    if (r.code !== 0) return undefined;
+    const change: FileChange = { added: [], ranges: [] };
+    let body = false;
+    for (const line of r.stdout.split("\n")) {
+      const h = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(line);
+      if (h) {
+        body = true;
+        const start = Number(h[1]);
+        const n = h[2] === undefined ? 1 : Number(h[2]);
+        if (n > 0) change.ranges.push([start, start + n - 1]);
+        continue;
+      }
+      if (body && line.startsWith("+")) change.added.push(line.slice(1));
     }
-    if (file === undefined || !line.startsWith("+")) continue;
-    for (const sig of SIGNALS) if (sig.re.test(line)) add(file, sig.what);
+    out.set(f, change);
   }
+  return out;
+}
+
+/** "Check this yourself" lines from each changed file's added lines, one per file and signal, in path order; at most 50. */
+function signalsOf(changes: Map<string, FileChange>, secrets: Record<string, string>): string[] {
   const order = [BUNFIG, ...SIGNALS.map((x) => x.what)];
-  const lines = [...found]
+  const lines = [...changes]
     .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
-    .flatMap(([path, whats]) => order.filter((w) => whats.has(w)).map((w) => `${shownPath(redactSecretForms(path, secrets))}: ${w}`));
+    .flatMap(([path, c]) => {
+      const whats = new Set<string>();
+      if (basename(path) === "bunfig.toml") whats.add(BUNFIG);
+      for (const line of c.added) for (const sig of SIGNALS) if (sig.re.test(line)) whats.add(sig.what);
+      return order.filter((w) => whats.has(w)).map((w) => `${shownPath(redactSecretForms(path, secrets))}: ${w}`);
+    });
   return lines.length <= 50 ? lines : [...lines.slice(0, 50), `… and ${lines.length - 50} more`];
 }
 
@@ -325,12 +352,18 @@ export async function hostGates(
     if (!globs.some((g) => globMatches(g, f, { caseSensitive: true }))) scope.push(`${shown(f, o.secrets)} is outside every piece's files`);
   }
   problems.push(...capGate("protected", prot), ...capGate("scope", scope));
-  // 6. Readable by all, as the mirror is: a run container's uid reads the scratch.
-  await readableByAll(o.scratch);
-  // 7. The secret scan, and the added-line signals.
-  problems.push(...capGate("secret", await secretScan(d, { scratch: o.scratch, base: o.base, head, secrets: o.secrets })));
-  const patch = await git(["diff", "-U0", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", o.base, head]);
-  const signals = patch.code === 0 ? signalsOf(patch.stdout, o.secrets) : ["the added-line signals could not be read: check the diff yourself"];
+  // 6. The secret scan, and the added-line signals.
+  const leaks = await secretScan(d, { scratch: o.scratch, base: o.base, head, secrets: o.secrets });
+  problems.push(...capGate("secret", leaks));
+  const changes = await fileChanges(d, o.scratch, o.base, head, files);
+  const signals = changes !== undefined ? signalsOf(changes, o.secrets) : ["the added-line signals could not be read: check the diff yourself"];
+  // 7. A secret's commits leave the scratch at once; a clean scratch is made readable by all, as the mirror is (a
+  // run container's uid reads it).
+  if (leaks.length > 0) {
+    for (const args of [["update-ref", "-d", ref], ["reflog", "expire", "--expire=now", "--all"], ["repack", "-a", "-d", "-q"], ["prune", "--expire=now"]]) {
+      await must(args, "drop the run's commits after a secret was found");
+    }
+  } else await readableByAll(o.scratch);
   return { head, files, problems, signals };
 }
 
@@ -411,25 +444,45 @@ export interface PushOptions {
   head: string;
   token: string;
 }
-export type PushResult = { pushed: true } | { moved: string };
+/** moved: git's non-fast-forward; refused: GitHub's own refusal (push protection, a ruleset). Neither is ever forced. */
+export type PushResult = { pushed: true } | { moved: string } | { refused: string };
 
 /**
  * Push `head` to `factory/<id>`, never forced (no `+`, no `--force`): git itself, not `hardenedGit` (whose `env -i`
- * would need the token on its argv), with the token in the environment only (`authedGit`) and no prompt. A rejected
- * push (not a fast-forward) is `moved`; any other failure throws, the token and its header redacted.
+ * would need the token on its argv), with the token in the environment only (`authedGit`), no prompt and https alone
+ * (`GIT_ALLOW_PROTOCOL`). git's non-fast-forward is `moved`, GitHub's own refusal `refused` (`pushOutcome`); any other
+ * failure throws, the token and its header redacted.
  */
 export async function push(d: Pick<RunDeps, "run" | "env">, o: PushOptions): Promise<PushResult> {
   if (!isWorkOrderId(o.id)) throw new Error(`not a work-order id: ${JSON.stringify(o.id)}`);
   if (!COMMIT.test(o.head)) throw new Error("not a commit id to push");
-  const env = { PATH: d.env.PATH ?? "/usr/bin:/bin", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0", ...authedGit(o.token) };
+  const env = { PATH: d.env.PATH ?? "/usr/bin:/bin", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0", GIT_ALLOW_PROTOCOL: "https", ...authedGit(o.token) };
   const r = await d.run(
     ["git", "--git-dir", o.scratch, "-c", `safe.directory=${o.scratch}`, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "push", "--porcelain", o.remote, `${o.head}:refs/heads/factory/${o.id}`],
     { env, inherit: false },
   );
-  if (r.code === 0) return { pushed: true };
-  if (r.stdout.split("\n").some((l) => l.startsWith("!") && l.includes("rejected"))) return { moved: `factory/${o.id} moved on GitHub (not a fast-forward): not overwritten` };
   const header = authedGit(o.token).GIT_CONFIG_VALUE_0!;
-  throw new Error(`git push to factory/${o.id} failed (exit ${r.code}): ${firstLine(redactSecrets(redactSecretForms(r.stderr ?? "", { TOKEN: o.token }), { HEADER: header }))}`);
+  const clean = (t: string) => redactSecrets(redactSecretForms(t, { TOKEN: o.token }), { HEADER: header });
+  const outcome = pushOutcome(r.code, clean(r.stdout), o.id);
+  if (outcome !== undefined) return outcome;
+  throw new Error(`git push to factory/${o.id} failed (exit ${r.code}): ${firstLine(clean(r.stderr ?? ""))}`);
+}
+
+/**
+ * What a `git push --porcelain` said: pushed (exit 0); `moved` only for a rejection that is git's own non-fast-forward
+ * (`[rejected]` with `(non-fast-forward)` or `(fetch first)`); `refused` for GitHub's own refusal (`[remote rejected]`:
+ * push protection, a ruleset), with its reason in a code span; undefined for any other failure (the caller throws).
+ */
+export function pushOutcome(code: number, porcelain: string, id: string): PushResult | undefined {
+  if (code === 0) return { pushed: true };
+  for (const line of porcelain.split("\n")) {
+    if (!line.startsWith("!")) continue;
+    const summary = line.split("\t")[2] ?? "";
+    if (/^\[rejected\] \((non-fast-forward|fetch first)\)/.test(summary)) return { moved: `factory/${id} moved on GitHub (not a fast-forward): not overwritten` };
+    const remote = /^\[remote rejected\] \((.*)\)\s*$/.exec(summary);
+    if (remote) return { refused: `GitHub refused the push to factory/${id}: ${codeSpan(remote[1]!, 120)}` };
+  }
+  return undefined;
 }
 
 /** The PR's diff stat: `diff --numstat -z --no-renames <base> <head>` in the scratch, hardened as the gates' calls are; a binary file counts no line. */
@@ -515,35 +568,36 @@ export interface HarvestInput {
   position: { k: number; n: number; siblings: number[] };
 }
 
-/** The planner's acceptance test files at the merge (`.factory/work/<id>/acceptance/`), or undefined when they can't be listed. */
-async function acceptanceFiles(d: Pick<RunDeps, "run" | "env">, scratch: string, mergeSha: string, id: string): Promise<string[] | undefined> {
+/** A test call at a line's start: `test(`, `it(`, and their modifiers but `.each` (which adds tests a static count can't see). */
+const TEST_CALL = /^\s*(?:test|it)(?:\.(?:only|skip|todo|failing|serial|concurrent|if\([^)\n]*\)))?\s*\(/gm;
+
+/**
+ * The planner's acceptance test files at the merge (`.factory/work/<id>/acceptance/`), each with its static test
+ * count (at least 1), read as blobs; undefined when they can't be listed or read.
+ */
+async function acceptanceFiles(d: Pick<RunDeps, "run" | "env">, scratch: string, mergeSha: string, id: string): Promise<PlannerTest[] | undefined> {
   if (!(await exists(join(scratch, "HEAD")))) return undefined;
-  const r = await scratchGit(d, scratch, ["ls-tree", "-r", "-z", "--name-only", mergeSha, "--", `.factory/work/${id}/acceptance`], ["--literal-pathspecs"]);
+  const r = await scratchGit(d, scratch, ["ls-tree", "-r", "-z", mergeSha, "--", `.factory/work/${id}/acceptance`], ["--literal-pathspecs"]);
   if (r.code !== 0) return undefined;
-  return r.stdout.split("\0").filter((f) => /(\.|_)(test|spec)\.[cm]?[jt]sx?$/.test(f));
+  const out: PlannerTest[] = [];
+  for (const entry of r.stdout.split("\0").filter((e) => e !== "")) {
+    const tab = entry.indexOf("\t");
+    const [, type, oid] = entry.slice(0, tab).split(" ");
+    const file = entry.slice(tab + 1);
+    if (type !== "blob" || !/(\.|_)(test|spec)\.[cm]?[jt]sx?$/.test(file)) continue;
+    const blob = await scratchGit(d, scratch, ["cat-file", "blob", oid!]);
+    if (blob.code !== 0) return undefined;
+    out.push({ file, tests: Math.max(1, blob.stdout.match(TEST_CALL)?.length ?? 0) });
+  }
+  return out;
 }
 
-/** The new-side line ranges of each file a fix run changed (`<fix sha>..<head>`, -U0). */
-async function fixHunks(d: Pick<RunDeps, "run" | "env">, scratch: string, base: string, head: string): Promise<Map<string, [number, number][]>> {
-  const r = await scratchGit(d, scratch, ["diff", "-U0", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", base, head]);
-  const hunks = new Map<string, [number, number][]>();
-  if (r.code !== 0) return hunks;
-  let file: string | undefined;
-  for (const line of r.stdout.split("\n")) {
-    const f = /^\+\+\+ b\/(.*)$/.exec(line);
-    if (f) {
-      file = f[1]!;
-      hunks.set(file, []);
-      continue;
-    }
-    const h = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(line);
-    if (h && file !== undefined) {
-      const start = Number(h[1]);
-      const n = h[2] === undefined ? 1 : Number(h[2]);
-      hunks.get(file)!.push([start, start + Math.max(n, 1) - 1]);
-    }
-  }
-  return hunks;
+/** The new-side line ranges of each file a fix run changed (`<fix sha>..<head>`), per file of a `-z` list (`fileChanges`); a deleted file has none. */
+export async function fixHunks(d: Pick<RunDeps, "run" | "env">, scratch: string, base: string, head: string): Promise<Map<string, [number, number][]>> {
+  const names = await scratchGit(d, scratch, ["diff", "--name-only", "-z", "--no-renames", base, head]);
+  if (names.code !== 0) return new Map();
+  const changes = await fileChanges(d, scratch, base, head, names.stdout.split("\0").filter((f) => f !== ""));
+  return new Map([...(changes ?? new Map<string, FileChange>())].map(([f, c]) => [f, c.ranges]));
 }
 
 /**
@@ -569,6 +623,17 @@ function unfixedFindings(e: Evidence, hunks: Map<string, [number, number][]>, ro
   return [...new Set(lines)];
 }
 
+/** Why the outcome is a draft, as the not-pushed reason says it: what failed in the verify container, or why it can't be read. */
+function draftCause(e: Evidence): string {
+  const v = e.verify;
+  if (v.state === "broken") return `has no readable verify result (verify: ${v.why})`;
+  if (v.state === "ran") {
+    const failed = [v.check === "failed" ? "check" : undefined, v.smoke === "failed" ? "smoke" : undefined, v.acceptance === "failed" ? "the acceptance tests" : undefined].filter((x): x is string => x !== undefined);
+    if (failed.length > 0) return `failed ${failed.length === 1 ? failed[0] : `${failed.slice(0, -1).join(", ")} and ${failed.at(-1)}`} in the verify container`;
+  }
+  return "is a draft's (the verify container's results)";
+}
+
 /** The PR's title: `<id>: <task.md's first "# " heading>`, sanitized, no `@ < >`, at most 72 characters. */
 function titleOf(order: Discovered): string {
   const heading = /^# (.+)$/m.exec(order.taskMd)?.[1]?.trim() ?? "";
@@ -577,14 +642,24 @@ function titleOf(order: Discovered): string {
   return chars.length > 72 ? `${chars.slice(0, 71).join("")}…` : t;
 }
 
-/** Set `harvestedAt` (and, with decision models off, `decisions: "off"` in the same write) on a record, never overwriting it, under its run lock. */
-async function markHarvested(d: HarvestDeps, runId: string, at: string, off: boolean): Promise<void> {
+/**
+ * Set `harvestedAt` (and, with decision models off, `decisions: "off"` in the same write) on a record, and on the
+ * review run's its `review` (m20), never overwriting either, under its run lock.
+ */
+async function markHarvested(d: HarvestDeps, runId: string, at: string, off: boolean, review?: RunRecord["review"]): Promise<void> {
   for (let attempt = 1; ; attempt++) {
     try {
       await withRunLock(d.run, runId, async () => {
         const r = await readRecord(d.run.stateDir, runId);
-        if (r === undefined || r.harvestedAt !== undefined) return;
-        await writeRecord(d.run.stateDir, { ...r, harvestedAt: at, ...(off ? { decisions: "off" as const } : {}) });
+        if (r === undefined) return;
+        const first = r.harvestedAt === undefined;
+        const addReview = review !== undefined && r.review === undefined;
+        if (!first && !addReview) return;
+        await writeRecord(d.run.stateDir, {
+          ...r,
+          ...(first ? { harvestedAt: at, ...(off ? { decisions: "off" as const } : {}) } : {}),
+          ...(addReview ? { review } : {}),
+        });
       });
       return;
     } catch (e) {
@@ -618,7 +693,9 @@ export async function harvest(d: HarvestDeps, s: WorkOrderState, h: HarvestInput
   const reviewRec = ofHead(h.review);
   const read = [...new Map([h.run, h.verify, h.review, ...h.runs].filter((r): r is RunRecord => r !== undefined).map((r) => [r.runId, r])).values()];
   const done = async (state: WorkOrderState): Promise<WorkOrderState> => {
-    for (const r of read) await markHarvested(d, r.runId, now, off);
+    // m20: the review's verdict and the criteria's marks go on the review run's record, with harvestedAt.
+    const review = e.review.state === "ran" && reviewRec !== undefined ? { runId: reviewRec.runId, review: { verdict: e.review.verdict, marks: e.review.criteria.map((c) => c.mark) } } : undefined;
+    for (const r of read) await markHarvested(d, r.runId, now, off, review?.runId === r.runId ? review.review : undefined);
     return state;
   };
   const e: Evidence = {
@@ -643,21 +720,19 @@ export async function harvest(d: HarvestDeps, s: WorkOrderState, h: HarvestInput
   // A closed factory PR is this work order's own: it leaves with its PR set, and Task 13 settles it closed.
   if (pr?.state === "closed") return done({ ...s, pr: pr.number, reasons: ["the PR was closed"], updatedAt: now });
 
-  let noPush: string | undefined;
-  if (pr !== undefined && s.prHead !== undefined && pr.headSha !== s.prHead) noPush = `${ref} moved to ${short(pr.headSha)} since the factory pushed ${short(s.prHead)}: not overwritten`;
-  else if (pr !== undefined && !pr.draft && first.draft) {
+  // Not pushed: a branch moved since the factory's push, or a ready PR whose new head is a draft's (m49(5): the PR
+  // keeps its head, and the unpushed head is named only in the reason and its Evidence rows).
+  let notPushed: string | undefined;
+  if (pr !== undefined && s.prHead !== undefined && pr.headSha !== s.prHead) {
+    notPushed = `${ref} moved to ${short(pr.headSha)} since the factory pushed ${short(s.prHead)}: not overwritten; the run's head ${short(head)} was not pushed`;
+  } else if (pr !== undefined && !pr.draft && first.draft) {
     const failed = h.verify ?? h.run;
-    noPush = `round ${failed.round ?? h.run.round ?? 0}'s head failed check, smoke or the acceptance tests in the verify container, so it was not pushed over the ready PR (run ${failed.runId})`;
+    notPushed = `round ${failed.round ?? h.run.round ?? 0}'s head ${short(head)} ${draftCause(e)}, so it was not pushed over the ready PR (run ${failed.runId})`;
   }
 
   let result: Outcome = first;
-  let shownHead = head;
   let prHead = s.prHead;
-  if (noPush !== undefined) {
-    e.screens = emptyScreens(policy, false);
-    result = { ...first, verdict: "decision", reasons: [noPush, ...first.reasons] };
-    shownHead = s.prHead ?? pr!.headSha;
-  } else {
+  if (notPushed === undefined) {
     // Only a head it will push is screened; every answer is saved before the push.
     const subjects: Subject[] = [];
     if (!off) {
@@ -670,25 +745,30 @@ export async function harvest(d: HarvestDeps, s: WorkOrderState, h: HarvestInput
     e.screens = await screenHarvest(d, { s, run: h.run, head, subjects, policy, ask: true });
     result = outcome(e, phases);
     const pushed = await d.pushBranch({ scratch, remote: `https://github.com/${d.repo}.git`, id, head, token: await d.token("push") });
-    if ("moved" in pushed) {
-      result = { ...result, verdict: "decision", reasons: [pushed.moved, ...result.reasons] };
-      // A branch the factory didn't push is never shown as its head, nor opened as its PR.
-      if (pr === undefined) return done({ ...s, verdict: result.verdict, reasons: result.reasons, updatedAt: now });
-      shownHead = s.prHead ?? pr.headSha;
-    } else prHead = head;
+    if ("pushed" in pushed) prHead = head;
+    else notPushed = `${"moved" in pushed ? pushed.moved : pushed.refused}; the run's head ${short(head)} was not pushed`;
   }
+  if (notPushed !== undefined) {
+    e.screens = emptyScreens(policy, false);
+    result = { ...first, verdict: "decision", reasons: [notPushed, ...first.reasons] };
+    // A branch the factory didn't push is never shown as its head, nor opened as its PR.
+    if (pr === undefined) return done({ ...s, verdict: result.verdict, reasons: result.reasons, updatedAt: now });
+  }
+  const shownHead = notPushed === undefined ? head : (s.prHead ?? pr!.headSha);
 
   // The body, its labels, then harvestedAt.
   const ledger = await readLedger(ledgerPath(d.engineDir, d.repo, id));
   const spends = h.runs.map((r) => spendOfRun(outOf(r)!, r.budgetUsd ?? h.order.workOrder.budget.usd));
   const turns = (await Promise.all(h.runs.map((r) => turnsOfRun(outOf(r)!)))).reduce<number>((n, t) => n + (t ?? 0), 0);
-  const fix = h.run.kind === "fix" ? unfixedFindings(e, await fixHunks(d.run, scratch, h.run.sha, head), h.run.round ?? 1) : [];
+  const fix = notPushed === undefined && h.run.kind === "fix" ? unfixedFindings(e, await fixHunks(d.run, scratch, h.run.sha, head), h.run.round ?? 1) : [];
+  // The stat only of a head the scratch holds: the one pushed, or the factory's last (else the body has none).
+  const known = (await scratchGit(d.run, scratch, ["cat-file", "-e", `${shownHead}^{commit}`])).code === 0;
   const input: PrInput = {
     order: h.order,
     outcome: result,
     evidence: e,
     head: shownHead,
-    stat: await d.stat({ scratch, base: h.order.mergeSha, head: shownHead }),
+    stat: known ? await d.stat({ scratch, base: h.order.mergeSha, head: shownHead }) : undefined,
     planningPr: s.planningPr,
     position: h.position,
     runs: h.runs.map((r) => ({ id: r.runId, kind: r.kind ?? "worker", round: r.round ?? 0, ...(r.retry === undefined ? {} : { retry: r.retry }) })),
@@ -703,13 +783,15 @@ export async function harvest(d: HarvestDeps, s: WorkOrderState, h: HarvestInput
     phase: "pr",
     round: h.run.round ?? 0,
     ci: "pending",
+    ...(notPushed === undefined ? {} : { unpushed: head }),
     ...(fix.length > 0 ? { unfixed: fix } : {}),
   };
   let number: number;
   if (pr !== undefined) {
     number = pr.number;
     await forge.editPrBody(number, rerenderPr(pr.body, input));
-    if (noPush === undefined && pr.draft && !result.draft) await forge.markReady(number);
+    // In a not-pushed case the body is the one state-changing write: nothing marks a head nobody vetted ready.
+    if (notPushed === undefined && pr.draft && !result.draft) await forge.markReady(number);
   } else {
     number = (await forge.openPr({ head: ref, base: "main", title: titleOf(h.order), body: renderPr(input), draft: result.draft })).number;
   }

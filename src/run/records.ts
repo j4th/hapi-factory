@@ -108,6 +108,11 @@ export interface RunRecord {
    * run: written with `harvestedAt`, in the same write (Plan 03 Task 12), so it is never silent. No other value.
    */
   decisions?: "off";
+  /**
+   * A review run's verdict and its acceptance criteria's marks, in order, as the harvester read them (m20; Plan 03
+   * Task 12): written with or after `harvestedAt`, never overwritten. What an eval compares (design §3.8).
+   */
+  review?: { verdict: "ready" | "needs-work" | "blocked"; marks: ("met" | "partly" | "unmet")[] };
 }
 
 /** The files a run's dir holds beside record.json and run.json, each bound read-only into the container: see the module comment. */
@@ -150,11 +155,19 @@ const amount = (v: unknown) => v === undefined || (typeof v === "number" && Numb
 /** An optional count: absent, or a whole number of at least 0. */
 const count = (v: unknown) => v === undefined || (typeof v === "number" && Number.isInteger(v) && v >= 0);
 
+/** A record's `review`: exactly `{ verdict, marks }`, a verdict of the review's three and marks of its three. */
+function reviewOk(v: unknown): boolean {
+  if (v === null || typeof v !== "object" || Array.isArray(v)) return false;
+  const r = v as Record<string, unknown>;
+  if (Object.keys(r).sort().join(",") !== "marks,verdict") return false;
+  return ["ready", "needs-work", "blocked"].includes(r.verdict as string) && Array.isArray(r.marks) && r.marks.every((m) => m === "met" || m === "partly" || m === "unmet");
+}
+
 /**
  * `x` as a record of run `runId`, or undefined if it isn't one: a kind that is no run kind, a budget or spend that
  * isn't a finite number of at least 0, a round, turns or retry that isn't a whole number of at least 0, a
- * forgeRepo that isn't a GitHub repository's owner/name, an exit code that isn't an integer, or a `decisions` that
- * isn't "off", isn't.
+ * forgeRepo that isn't a GitHub repository's owner/name, an exit code that isn't an integer, a `decisions` that
+ * isn't "off", or a `review` that isn't a verdict and marks, isn't.
  */
 function asRecord(x: unknown, runId: string): RunRecord | undefined {
   const r = x as Partial<RunRecord> | null;
@@ -164,6 +177,7 @@ function asRecord(x: unknown, runId: string): RunRecord | undefined {
   if (r.forgeRepo !== undefined && (typeof r.forgeRepo !== "string" || parseOwnerRepo(r.forgeRepo) === undefined)) return undefined;
   if (r.exitCode !== undefined && !Number.isInteger(r.exitCode)) return undefined;
   if (r.decisions !== undefined && r.decisions !== "off") return undefined;
+  if (r.review !== undefined && !reviewOk(r.review)) return undefined;
   const text = [r.key, r.project, r.repo, r.sha, r.workOrder, r.workflow, r.container, r.network, r.startedAt, r.deadline, r.volumes?.work, r.volumes?.out];
   return text.every((t) => typeof t === "string") ? (r as RunRecord) : undefined;
 }

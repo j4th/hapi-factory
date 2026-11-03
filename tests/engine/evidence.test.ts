@@ -25,7 +25,8 @@ afterEach(cleanup);
 const PHASES: Phases = SHIPPED.runs.phases;
 const ON: Phases = { ...PHASES, coderabbit: true };
 const WO = ORDER.workOrder;
-const SIGNALS = { exitCode: 0, acceptanceFiles: [ACCEPTANCE] };
+const PLANNER = [{ file: ACCEPTANCE, tests: 1 }];
+const SIGNALS = { exitCode: 0, acceptanceFiles: PLANNER };
 
 const outDir = (f: ReturnType<typeof fakeRun>, id: string) => join(f.deps.stateDir, id, "out");
 
@@ -46,7 +47,7 @@ describe("verify: verify.json and the four signals", () => {
   test("a check that failed before smoke and the acceptance tests ran is check failed, not broken (ruling m26)", () => {
     const f = fakeRun();
     writeVerify(f, "a00000000001", { check: { exit: 1, tail: "mise install failed" }, smoke: null, acceptance: null }, { status: "failed", junit: null });
-    expect(verifyResult(outDir(f, "a00000000001"), WO, PHASES, { exitCode: 1, acceptanceFiles: [ACCEPTANCE] })).toEqual({ state: "ran", check: "failed", smoke: "not-run", acceptance: "not-run" });
+    expect(verifyResult(outDir(f, "a00000000001"), WO, PHASES, { exitCode: 1, acceptanceFiles: PLANNER })).toEqual({ state: "ran", check: "failed", smoke: "not-run", acceptance: "not-run" });
   });
 
   test("a missing or malformed verify.json, or no smoke the work order needs, is a broken verify", () => {
@@ -75,8 +76,8 @@ describe("verify: verify.json and the four signals", () => {
 
   test("verify passes only when Archon's status, the exit code, verify.json and the acceptance junit agree", () => {
     const f = fakeRun();
-    const cases: [string, Parameters<typeof writeVerify>[3], { exitCode: number | undefined; acceptanceFiles: string[] | undefined }, unknown, string][] = [
-      ["d00000000001", { status: "failed" }, SIGNALS, PASSING, `verify.json reads all passed, but Archon's status for the run is "failed"`],
+    const cases: [string, Parameters<typeof writeVerify>[3], { exitCode: number | undefined; acceptanceFiles: { file: string; tests: number }[] | undefined }, unknown, string][] = [
+      ["d00000000001", { status: "failed" }, SIGNALS, PASSING, "verify.json reads all passed, but Archon's status for the run is `failed`"],
       ["d00000000002", {}, { ...SIGNALS, exitCode: 1 }, PASSING, "verify.json reads all passed, but the verify container exited 1"],
       ["d00000000003", {}, { ...SIGNALS, exitCode: undefined }, PASSING, "verify.json reads all passed, but the verify container has no recorded exit code"],
       ["d00000000004", { junit: null }, SIGNALS, PASSING, "verify ran the acceptance tests but left no acceptance.junit.xml"],
@@ -84,7 +85,8 @@ describe("verify: verify.json and the four signals", () => {
       ["d00000000006", { junit: junitFor(["tests/other.test.ts"]) }, SIGNALS, PASSING, "the acceptance junit has no result for 1 of the planner's 1 test files"],
       ["d00000000007", {}, { ...SIGNALS, acceptanceFiles: undefined }, PASSING, "the planner's acceptance tests at the merge could not be listed"],
       ["d00000000008", {}, SIGNALS, { ...PASSING, acceptance: null }, "verify.json shows no acceptance run, but the merge holds 1 acceptance test files"],
-      ["d00000000009", { junit: junitFor([]).replace('tests="0"', 'tests="0"') }, SIGNALS, PASSING, "the acceptance junit counts no test"],
+      ["d00000000009", { junit: junitFor([]) }, SIGNALS, PASSING, "the acceptance junit counts no test"],
+      ["d00000000010", {}, { ...SIGNALS, acceptanceFiles: [{ file: ACCEPTANCE, tests: 3 }] }, PASSING, "the acceptance junit has fewer results than the planner's tests in 1 of its 1 test files"],
     ];
     for (const [id, o, signals, json, why] of cases) {
       writeVerify(f, id, json, o);
@@ -167,7 +169,7 @@ describe("CodeRabbit's CLI", () => {
 
   test(`the closing hapi line is read: a skipped step, or a CLI exit other than 0 or 2, is "not reviewed"`, () => {
     const f = fakeRun();
-    expect(cr(f, "f20000000001", ['{"type":"hapi","skipped":"coderabbit is off in run.json"}'])).toEqual({ state: "not-reviewed", why: "the CodeRabbit CLI step was skipped: coderabbit is off in run.json" });
+    expect(cr(f, "f20000000001", ['{"type":"hapi","skipped":"coderabbit is off in run.json"}'])).toEqual({ state: "not-reviewed", why: "the CodeRabbit CLI step was skipped: `coderabbit is off in run.json`" });
     expect(cr(f, "f20000000002", [...STREAM, '{"type":"hapi","exit":1}'])).toEqual({ state: "not-reviewed", why: "the CodeRabbit CLI exited 1" });
     expect(cr(f, "f20000000003", [...STREAM, '{"type":"hapi","exit":124}'])).toEqual({ state: "not-reviewed", why: "the CodeRabbit CLI exited 124" });
     expect(cr(f, "f20000000004", [...STREAM, '{"type":"hapi","exit":0}'])).toMatchObject({ state: "reviewed" });
@@ -184,7 +186,11 @@ describe("CodeRabbit's CLI", () => {
     const why = (r as { why: string }).why.slice("the CodeRabbit CLI step was skipped: ".length);
     expect(why).not.toContain("\x1b");
     expect(why).not.toMatch(/[@<>]/);
-    expect(Array.from(why).length).toBeLessThanOrEqual(200);
+    // In a code span, so a link, an image, an autolink or an issue reference in the run's text can't render.
+    expect(why).toMatch(/^`[^`]*`$/);
+    expect(Array.from(why).length).toBeLessThanOrEqual(202);
+    const md = cr(f, "f40000000002", [JSON.stringify({ type: "hapi", skipped: "see [x](https://example.invalid) ![](https://example.invalid/i.png) #1 `code`" })]);
+    expect(md).toEqual({ state: "not-reviewed", why: "the CodeRabbit CLI step was skipped: `see [x](https://example.invalid) ![](https://example.invalid/i.png) #1 code`" });
     expect(codeRabbitResult(outDir(f, "f50000000001"), ON)).toEqual({ state: "not-reviewed", why: "the review run left no coderabbit.ndjson" });
   });
 });
