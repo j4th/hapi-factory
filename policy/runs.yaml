@@ -2,19 +2,23 @@
 #
 # Run limits (Plans 02 and 03). The run launcher, the poller and the harvester
 # read them; a repo overlay may lower them, never raise them, and may switch a
-# phase on but never off. poll_interval_s is central only.
+# phase on but never off. poll_interval_s, max_retries, inputs_mb and
+# work_order_kb are central only.
 max_live: 1             # live runs at once; the launcher refuses the next, and the poller waits for a free slot
-retention_days: 14      # a run's files are removed this many days after its harvestedAt; Plan 02 sets none, so nothing is removed yet (H-206)
+retention_days: 14      # a run's files are removed this many days after its harvestedAt, and never before the UTC month it started in has ended (the poller's monthly cap reads them)
 output_limits_mb:       # the most each output file may be; a larger one is not copied out and the run is recorded failed
   bundle: 256           # the result bundle
   transcript: 64        # the run transcript
   decisions: 16         # the decisions log
   result: 4             # the result summary
 disk:                   # the most disk one run's volumes may use (the run engine's disk check)
-  gb: 20                # the cap, in GB
+  gb: 20                # the cap, in GiB
   enforcement: hard     # hard stops the run when it is crossed; soft flags it and lets it finish
 poll_interval_s: 120    # seconds between the poller's passes over the registered repos (30-3600; central only)
 max_auto_rounds: 3      # automatic runs per work order with no human action between them; the poller counts them; always hard: the poller's check, never softened by budgets.enforcement.poller
+max_retries: 2          # times the operator may queue a failed work order again (hapi retry); the command refuses one more; always hard: never softened by budgets.enforcement.poller; central only; 0 turns hapi retry off
+inputs_mb: 16           # the most a review or fix run's inputs copy may be (diff.patch, verify.json and findings.md together), in MiB; a larger one is refused, never truncated; central only
+work_order_kb: 1024     # the most discovery reads of each work-order file (order.yaml, task.md, .factory/config.yaml), in KiB; a larger one is a problem the work order can't run with, never truncated; central only
 phases:                 # what a run does; an overlay may switch one on, never off
   verify: true          # the verify container runs the repo's gates
   review: true          # the review container reviews the diff

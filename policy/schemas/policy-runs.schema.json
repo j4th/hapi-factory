@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "policy-runs.schema.json",
   "title": "policy/runs.yaml",
-  "description": "The run engine's limits (Plans 02 and 03): how many runs may be live, how long finished runs are kept, how large each run output and each run's disk may be, how often the poller polls, and which phases and fix rounds a run has. Every key is required: the loader fills no defaults.",
+  "description": "The run engine's limits (Plans 02 and 03): how many runs may be live, how long finished runs are kept, how large each run output and each run's disk may be, how often the poller polls, which phases and fix rounds a run has, how many times the operator may queue a failed work order again, and how large a review or fix run's inputs and each work-order file may be. Every key is required: the loader fills no defaults.",
   "type": "object",
   "properties": {
     "max_live": {
@@ -10,7 +10,7 @@
       "$ref": "policy-defs.schema.json#/$defs/count"
     },
     "retention_days": {
-      "description": "Days after a run's harvestedAt (set by Plan 03's harvester) that the launcher removes its files; a run with no harvestedAt is never removed, so Plan 02 removes nothing yet (H-206).",
+      "description": "Days after a run's harvestedAt (set by Plan 03's harvester) that the launcher removes its files, and never before the UTC month it started in has ended (the poller's monthly cap reads them); a run with no harvestedAt is never removed.",
       "$ref": "policy-defs.schema.json#/$defs/count"
     },
     "output_limits_mb": {
@@ -71,6 +71,18 @@
       "description": "Automatic runs per work order with no human action between them. The poller counts it; always hard: the poller's check, never softened by budgets.enforcement.poller.",
       "$ref": "policy-defs.schema.json#/$defs/count"
     },
+    "max_retries": {
+      "description": "Times the operator may queue a failed work order again (hapi retry); the command refuses one more. Always hard: never softened by budgets.enforcement.poller. Central only; 0 turns hapi retry off.",
+      "$ref": "policy-defs.schema.json#/$defs/rounds"
+    },
+    "inputs_mb": {
+      "description": "The most, in MiB, a review or fix run's inputs copy may be (diff.patch, verify.json and findings.md together): the engine and the launcher refuse a larger one, never truncate it. Central only.",
+      "$ref": "policy-defs.schema.json#/$defs/count"
+    },
+    "work_order_kb": {
+      "description": "The most, in KiB, discovery reads of each work-order file (order.yaml, task.md, .factory/config.yaml): a larger one is a problem the work order can't run with, never truncated. Central only.",
+      "$ref": "policy-defs.schema.json#/$defs/count"
+    },
     "phases": {
       "description": "What a run does, and how many fix rounds it may make. An overlay may switch a phase on, never off, and lower the numbers.",
       "type": "object",
@@ -128,6 +140,9 @@
     "disk",
     "poll_interval_s",
     "max_auto_rounds",
+    "max_retries",
+    "inputs_mb",
+    "work_order_kb",
     "phases"
   ],
   "additionalProperties": false

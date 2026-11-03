@@ -485,6 +485,25 @@ describe("retention (reapRuns)", () => {
     expect(err).toEqual([`hapi run: removed run aaaaaaaaaaaa: harvested ${when}, more than runs.retention_days (14) ago`]);
   });
 
+  test("retention keeps a harvested run until its startedAt's UTC month has ended, so the poller's monthly cap still counts it", async () => {
+    const { err } = capture();
+    const f = fakeRun();
+    const at = async (id: string, startedAt: string, harvestedAt: string) => {
+      const rec = await seedRun(f, { id, status: "succeeded", startedAt, objects: false });
+      await writeRecord(f.deps.stateDir, { ...rec, harvestedAt });
+      writeOut(f.deps.stateDir, id, "result.json", "{}");
+    };
+    // NOW is 2026-10-29T12:00Z: each was harvested 28 days ago, past retention_days (14).
+    await at("aaaaaaaaaaaa", "2026-10-01T00:30:00.000Z", "2026-10-01T01:00:00.000Z");
+    await at("bbbbbbbbbbbb", "2026-09-30T23:30:00.000Z", "2026-10-01T01:00:00.000Z");
+    await at("cccccccccccc", "not a time", "2026-10-01T01:00:00.000Z");
+    await reapRuns(f.deps);
+    expect(existsSync(recordDir(f.deps.stateDir, "aaaaaaaaaaaa"))).toBe(true);
+    expect(existsSync(recordDir(f.deps.stateDir, "bbbbbbbbbbbb"))).toBe(false);
+    expect(existsSync(recordDir(f.deps.stateDir, "cccccccccccc"))).toBe(true);
+    expect(err).toEqual(["hapi run: removed run bbbbbbbbbbbb: harvested 2026-10-01T01:00:00.000Z, more than runs.retention_days (14) ago"]);
+  });
+
   test("a live run is never deleted, harvested or not", async () => {
     capture();
     const f = fakeRun();

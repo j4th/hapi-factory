@@ -16,6 +16,7 @@
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { recordDir, type RunRecord } from "./records";
 
 /** `file`'s text, or undefined when it is missing or can't be read. */
 function text(file: string): string | undefined {
@@ -63,6 +64,14 @@ export function spendOfRun(outDir: string, budgetUsd: number): { usd: number; kn
   const archon = doc?.run?.metadata?.total_cost_usd;
   const seen = [...totals.slice(-1), ...(spendOk(archon) ? [archon] : [])];
   return seen.length === 0 ? { usd: budgetUsd, known: false } : { usd: Math.max(...seen), known: true };
+}
+
+/**
+ * A run's spend from its record's out dir, at its own budget when unknown (`rec.budgetUsd`, or `runUsd` for a record
+ * with none): the one expression the caps, the harvester and the status rows share (ruling m50(7)).
+ */
+export function runSpend(stateDir: string, rec: Pick<RunRecord, "runId" | "budgetUsd">, runUsd: number): { usd: number; known: boolean } {
+  return spendOfRun(join(recordDir(stateDir, rec.runId), "out"), rec.budgetUsd ?? runUsd);
 }
 
 /**

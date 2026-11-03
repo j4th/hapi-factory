@@ -55,7 +55,9 @@
  * 12. the inputs dir (`StartOptions.inputsDir`): a review and a fix need one, a
  *     worker and a verify take none, and it holds only regular files, its kind's
  *     inputs (./kinds.ts `inputFiles`; ./records.ts `inputsProblem`): a fix's
- *     findings.md, a review's diff.patch and verify.json; never a bundle;
+ *     findings.md, a review's diff.patch and verify.json; never a bundle; and
+ *     together at most `runs.inputs_mb` (refused, never truncated, here and
+ *     again as the copy reads them);
  * 12a. the kind's extra binds (./kinds.ts `extraBinds`: a review's Claude Code
  *     managed settings), each a file of the build: docker would bind an empty
  *     dir in a missing one's place, and the review would run without them;
@@ -148,7 +150,11 @@
  * Then retention, fail-closed: it deletes
  * a finished run's dir only once record.json's `harvestedAt` (Plan 03's
  * harvester sets it) is more than `runs.retention_days` ago, so an output no
- * harvester has read is never lost.
+ * harvester has read is never lost, and only once the UTC month its
+ * `startedAt` falls in has ended: the poller's monthly cap reads every run of
+ * the month from its record (src/engine/caps.ts), so a run removed earlier
+ * would let a repo spend past `budgets.repo_monthly_usd`. A `startedAt` that
+ * doesn't parse keeps the run.
  *
  * Everything that comes out of a run is untrusted data: stored and checked,
  * never executed, never read by git with its own config, never printed raw.
@@ -595,7 +601,7 @@ export async function startRun(d: RunDeps, o: StartOptions): Promise<StartedRun>
   const base = o.kind === "worker" ? o.sha : (await parentOf(d, o)).sha;
   if (profile.inputs && o.inputsDir === undefined) throw new Error(`a ${o.kind} run needs an inputs dir (StartOptions.inputsDir): ${INPUTS_FOR[o.kind]}`);
   if (!profile.inputs && o.inputsDir !== undefined) throw new Error(`a ${o.kind} run takes no inputs dir${NO_INPUTS[o.kind] ?? ""}`);
-  const inputs = o.inputsDir === undefined ? undefined : await inputsProblem(o.inputsDir, profile);
+  const inputs = o.inputsDir === undefined ? undefined : await inputsProblem(o.inputsDir, profile, d.runs.inputs_mb);
   if (inputs !== undefined) throw new Error(inputs);
   for (const [src, dst] of profile.extraBinds(d)) {
     const st = await lstat(src).catch(() => undefined);
@@ -650,7 +656,7 @@ export async function startRun(d: RunDeps, o: StartOptions): Promise<StartedRun>
       keyProblem(records, { key: rec.key, workOrder: order.id, sha: o.sha, ...(o.retryOf === undefined ? {} : { retryOf: o.retryOf }) }) ??
       capacityProblem(await liveRuns(d), records, { repo, ...(forgeRepo === undefined ? {} : { forgeRepo }) }, d);
     if (refused !== undefined) throw new Error(refused);
-    await createRun(d.stateDir, rec, runFile, files, o.inputsDir);
+    await createRun(d.stateDir, rec, runFile, files, o.inputsDir, d.runs.inputs_mb);
     try {
       let sidecar: { spec: Sidecar; dir: string } | undefined;
       if (sc !== undefined && sidecarSpec !== undefined) {
@@ -1080,7 +1086,8 @@ async function sweepRunDisk(d: RunDeps, live: Set<string>): Promise<string[]> {
  * run `hapi run stop` is about to stop is never stopped at its deadline here, since the operator's stop outranks
  * the deadline (it is still finalized once its container has exited). A run another process is finalizing, or one
  * `down` holds the run disk's lock over, is left to it. Then the run disk's sweep (`sweepRunDisk`) and retention
- * (see the module comment): a finished run harvested more than `runs.retention_days` ago loses its dir. Throws
+ * (see the module comment): a finished run harvested more than `runs.retention_days` ago, and started before the
+ * current UTC month, loses its dir. Throws
  * after trying every run, naming those it couldn't finish.
  */
 export async function reapRuns(deps: RunDeps, o: { stopping?: string } = {}): Promise<void> {
@@ -1101,10 +1108,15 @@ export async function reapRuns(deps: RunDeps, o: { stopping?: string } = {}): Pr
     const records = await listRecords(deps.stateDir);
     failures.push(...(await sweepRunDisk(deps, new Set(records.filter((r) => r.status === "live").map((r) => r.runId)))));
     const keep = deps.runs.retention_days * 86_400_000;
+    const now = deps.now();
+    // The poller's monthly cap reads every run of the current UTC month from its record: none goes before it ends.
+    const monthStart = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);
     for (const rec of records) {
       // Only a time hapi's harvester wrote: anything else, or none, keeps the run.
       const harvested = typeof rec.harvestedAt === "string" ? Date.parse(rec.harvestedAt) : Number.NaN;
-      if (rec.status === "live" || !Number.isFinite(harvested) || deps.now().getTime() - harvested <= keep) continue;
+      const started = typeof rec.startedAt === "string" ? Date.parse(rec.startedAt) : Number.NaN;
+      if (rec.status === "live" || !Number.isFinite(harvested) || now.getTime() - harvested <= keep) continue;
+      if (!Number.isFinite(started) || started >= monthStart) continue;
       try {
         await removeRunDir(deps.stateDir, rec.runId);
         console.error(`hapi run: removed run ${rec.runId}: harvested ${rec.harvestedAt}, more than runs.retention_days (${deps.runs.retention_days}) ago`);

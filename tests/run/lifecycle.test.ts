@@ -966,6 +966,14 @@ describe("startRun", () => {
           (k) => k.base({ kind: "fix", parent: P, inputsDir: join(k.f.tmp, "order.yaml") }),
           (k) => `the inputs dir ${join(k.f.tmp, "order.yaml")} is not a directory`,
         ],
+        [
+          "inputs over runs.inputs_mb",
+          (k) => {
+            k.f.deps.runs = { ...k.f.deps.runs, inputs_mb: 1 };
+            return k.base({ kind: "fix", parent: P, inputsDir: holding(k, (d) => writeFileSync(join(d, "findings.md"), "x".repeat(1024 * 1024 + 1))) });
+          },
+          (_, o) => `the inputs dir ${o.inputsDir} holds 1.0 MiB, over runs.inputs_mb (1 MiB): an inputs copy is refused, never truncated`,
+        ],
       ];
       for (const [what, over, text] of cases) {
         const k = await kinded();

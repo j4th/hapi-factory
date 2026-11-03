@@ -135,7 +135,7 @@ export interface Sidecar {
 export interface Runs {
   /** Runs live at once. */
   max_live: number;
-  /** Days after a run's harvestedAt that its files are kept (H-206). */
+  /** Days after a run's harvestedAt that its files are kept (H-206), and never less than until the UTC month it started in has ended. */
   retention_days: number;
   /** The largest, in MB, each file a run writes may be. */
   output_limits_mb: { bundle: number; transcript: number; decisions: number; result: number };
@@ -145,6 +145,12 @@ export interface Runs {
   poll_interval_s: number;
   /** Automatic runs per work order with no human action between them. */
   max_auto_rounds: number;
+  /** Times the operator may queue a failed work order again (`hapi retry`). Always hard; central only. */
+  max_retries: number;
+  /** The most, in MiB, a review or fix run's inputs copy may be: refused, never truncated. Central only. */
+  inputs_mb: number;
+  /** The most, in KiB, discovery reads of each work-order file: refused, never truncated. Central only. */
+  work_order_kb: number;
   phases: Phases;
 }
 
@@ -362,7 +368,7 @@ export interface RepoOverlay {
     enforcement?: Partial<Budgets["enforcement"]>;
   };
   /** Run limits to lower; each must be at most the base value. */
-  runs?: Partial<Omit<Runs, "output_limits_mb" | "poll_interval_s" | "disk" | "phases">> & {
+  runs?: Partial<Omit<Runs, "output_limits_mb" | "poll_interval_s" | "max_retries" | "inputs_mb" | "work_order_kb" | "disk" | "phases">> & {
     output_limits_mb?: Partial<Runs["output_limits_mb"]>;
     disk?: Partial<Runs["disk"]>;
     phases?: Partial<Phases>;

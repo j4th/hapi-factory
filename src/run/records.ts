@@ -41,7 +41,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { chmod, lstat, mkdir, open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { parseOwnerRepo } from "../forge/github/app-token";
 import type { RunFile } from "../generate/archon";
 import { withStoreLock } from "../secrets/store-files";
@@ -203,12 +203,21 @@ export async function readRecord(stateDir: string, runId: string): Promise<RunRe
   return rec;
 }
 
+/** Write `text` to `file` whole: a new temp file beside it (`mode`, never an existing one), renamed into place. */
+export async function writeWhole(file: string, text: string, mode = 0o600): Promise<void> {
+  const tmp = join(dirname(file), `.${basename(file)}.${randomUUID()}`);
+  await writeFile(tmp, text, { mode, flag: "wx" });
+  try {
+    await rename(tmp, file);
+  } catch (e) {
+    await rm(tmp, { force: true });
+    throw e;
+  }
+}
+
 /** Write `rec` whole (a temp file renamed into place), 0600. */
 export async function writeRecord(stateDir: string, rec: RunRecord): Promise<void> {
-  const dir = recordDir(stateDir, rec.runId);
-  const tmp = join(dir, `.${RECORD}.${randomUUID()}`);
-  await writeFile(tmp, `${JSON.stringify(rec, null, 2)}\n`, { mode: 0o600, flag: "wx" });
-  await rename(tmp, join(dir, RECORD));
+  await writeWhole(join(recordDir(stateDir, rec.runId), RECORD), `${JSON.stringify(rec, null, 2)}\n`);
 }
 
 /** Every run's record, oldest id first. A dir without record.json (a start that died before writing it) is skipped. */
@@ -231,13 +240,17 @@ export async function listRecords(stateDir: string): Promise<RunRecord[]> {
 /** A name in an inputs dir that may be shown: plain, and short. */
 const PLAIN_NAME = /^[A-Za-z0-9._-]{1,64}$/;
 
+const MIB = 1024 * 1024;
+/** The refusal of an inputs copy over `runs.inputs_mb`: refused, never truncated. */
+const inputsOver = (dir: string, bytes: number, capMb: number) => `the inputs dir ${dir} holds ${(bytes / MIB).toFixed(1)} MiB, over runs.inputs_mb (${capMb} MiB): an inputs copy is refused, never truncated`;
+
 /**
  * Why `dir` can't be the inputs dir of a run of `profile`'s kind, or undefined: it must be a directory (not a
  * symlink to one) holding only regular files, each one of its kind's inputs (`inputFiles.allowed`, ./kinds.ts), and
- * each it requires (`inputFiles.required`): a fix's findings.md, a review's diff.patch. A name that isn't plain is
- * never shown.
+ * each it requires (`inputFiles.required`): a fix's findings.md, a review's diff.patch; together at most `capMb` MiB
+ * (`runs.inputs_mb`), when given. A name that isn't plain is never shown.
  */
-export async function inputsProblem(dir: string, profile: Pick<KindProfile, "kind" | "inputFiles">): Promise<string | undefined> {
+export async function inputsProblem(dir: string, profile: Pick<KindProfile, "kind" | "inputFiles">, capMb?: number): Promise<string | undefined> {
   const { allowed, required } = profile.inputFiles;
   const at = await lstat(dir).catch(() => undefined);
   if (at === undefined || !at.isDirectory()) return `the inputs dir ${dir} is not a directory`;
@@ -247,6 +260,7 @@ export async function inputsProblem(dir: string, profile: Pick<KindProfile, "kin
   } catch (e) {
     return `the inputs dir ${dir} can't be read (${(e as NodeJS.ErrnoException).code ?? "error"})`;
   }
+  let bytes = 0;
   for (const name of names) {
     if (!PLAIN_NAME.test(name)) return "the inputs dir holds a name that isn't plain ([A-Za-z0-9._-], at most 64 characters): not shown";
     const entry = await lstat(join(dir, name)).catch(() => undefined);
@@ -255,20 +269,25 @@ export async function inputsProblem(dir: string, profile: Pick<KindProfile, "kin
       const bundle = /\.bundle$/.test(name) ? ": an inputs dir never holds a bundle" : "";
       return `${dir}/${name} is not one of a ${profile.kind} run's inputs (${allowed.join(", ") || "none"})${bundle}`;
     }
+    bytes += entry.size;
   }
   for (const name of required) if (!names.includes(name)) return `${dir} has no ${name}: a ${profile.kind} run's inputs dir must hold it`;
+  if (capMb !== undefined && bytes > capMb * MIB) return inputsOver(dir, bytes, capMb);
   return undefined;
 }
 
 /**
  * Copy the inputs dir `from` into `<dir>/inputs` (0755, each file 0644: the container reads them as another host
  * uid). Each file is opened without following a link and must be a regular file named for one of `allowed`, its
- * kind's inputs, as `inputsProblem` checked before the launcher's lock; anything else now throws.
+ * kind's inputs, as `inputsProblem` checked before the launcher's lock, and all of them together at most `capMb`
+ * MiB, counted as they are read (a file that grew since the check is refused, never truncated); anything else now
+ * throws.
  */
-async function copyInputs(from: string, dir: string, allowed: readonly string[]): Promise<void> {
+async function copyInputs(from: string, dir: string, allowed: readonly string[], capMb: number | undefined): Promise<void> {
   const to = join(dir, INPUTS_DIR);
   await mkdir(to, { mode: 0o755 });
   await chmod(to, 0o755);
+  let total = 0;
   for (const name of (await readdir(from)).sort()) {
     if (!allowed.includes(name)) throw new Error(`the inputs dir ${from} changed after it was checked: it holds a name that is not one of its kind's inputs`);
     const fh = await open(join(from, name), constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -279,6 +298,8 @@ async function copyInputs(from: string, dir: string, allowed: readonly string[])
     } finally {
       await fh.close();
     }
+    total += bytes.length;
+    if (capMb !== undefined && total > capMb * MIB) throw new Error(inputsOver(from, total, capMb));
     const file = join(to, name);
     await writeFile(file, bytes, { flag: "wx" });
     await chmod(file, 0o644);
@@ -287,7 +308,8 @@ async function copyInputs(from: string, dir: string, allowed: readonly string[])
 
 /**
  * Make the run's dir (it must not exist), with its record, its run file and each of `PER_RUN_FILES`, and, for a
- * review or a fix, its copy of the inputs dir `inputsFrom` (`copyInputs`); a write that fails removes the dir again.
+ * review or a fix, its copy of the inputs dir `inputsFrom` (`copyInputs`, at most `inputsCapMb` MiB); a write that
+ * fails removes the dir again.
  */
 export async function createRun(
   stateDir: string,
@@ -295,6 +317,7 @@ export async function createRun(
   runFile: RunFile,
   files: Record<(typeof PER_RUN_FILES)[number], string>,
   inputsFrom?: string,
+  inputsCapMb?: number,
 ): Promise<void> {
   await mkdir(stateDir, { recursive: true, mode: 0o700 });
   const dir = recordDir(stateDir, rec.runId);
@@ -308,7 +331,7 @@ export async function createRun(
       // The container reads it as uid 1001, another host uid under rootless Docker: readable by all, whatever the umask.
       await chmod(file, 0o644);
     }
-    if (inputsFrom !== undefined) await copyInputs(inputsFrom, dir, kindProfile(rec.kind ?? "worker").inputFiles.allowed);
+    if (inputsFrom !== undefined) await copyInputs(inputsFrom, dir, kindProfile(rec.kind ?? "worker").inputFiles.allowed, inputsCapMb);
   } catch (e) {
     await rm(dir, { recursive: true, force: true });
     throw e;

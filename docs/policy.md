@@ -19,7 +19,7 @@
 | `commands.yaml` | `policy-commands` | Hermes's command allowlist, as argv-exact rules; the Pi built-in tools workers get | The Hermes `hapi-cmd-allow` hook (default-deny, fail-closed; Plan 04); Archon `allowed_tools` per node |
 | `trusted_sources.yaml` | `policy-trusted-sources` | Source tiers T0–T3, and the hosts each egress zone may reach | The egress proxy allowlists (the real boundary); Hermes's web backend pins and blocklist; Anthropic `allowed_domains` |
 | `budgets.yaml` | `policy-budgets` | Workspace and key caps, the per-run target, the per-repo and per-day caps, Hermes's turn limit | Hermes `max_turns`; Archon `budget` on per-task children; hapi-guard limits; the poller's repo and day checks; provider key limits (documented, applied by hand or API) |
-| `runs.yaml` | `policy-runs` | The run engine's limits: live runs, retention, output sizes, the disk cap, the poll interval, the automatic-round cap and the phase and round knobs | The run launcher (Plan 02 Task 7); the poller, the harvester and hapi-guard (Plan 03) |
+| `runs.yaml` | `policy-runs` | The run engine's limits: live runs, retention, output sizes, the disk cap, the poll interval, the automatic-round cap, the retries, the inputs and work-order file caps, and the phase and round knobs | The run launcher (Plan 02 Task 7); the poller, the harvester and hapi-guard (Plan 03) |
 | `repos.yaml` | `policy-repos` | The repo registry: the GitHub App installation ids and the repos the poller acts on | The poller; `hapi new-repo` adds a repo to it |
 | `sidecars.yaml` | `policy-sidecars` | The central list of sidecars (a pinned image, a command and a port each) that a repo's overlay may name | The run engine, which starts the sidecar a repo names |
 | `github/rulesets/*.json` | none (GitHub's ruleset API body) | The four GitHub rulesets, one file each | `loadPolicy` doesn't load them. `hapi new-repo` posts them, the README and the runbook apply them with `gh api --input`, and `tests/docs/rulesets.test.ts` holds them to their rules |
@@ -230,7 +230,7 @@ All amounts are in USD.
 | `repo_monthly_usd` | 25.00 | Most one registered repo's runs may spend per UTC calendar month. The poller reads it. An overlay may lower it. |
 | `daily_usd` | 10.00 | Most all registered repos together may spend per UTC calendar day. The poller reads it. Central only: an overlay naming it is an unknown key. |
 | `enforcement.archon` | `hard` | The same for Archon's `factory-task` budget (Plan 03). Archon bounds nodes, never dollars: `factory-task`'s `max_work_units` is pinned to its node count whatever this says (ruling m7), so it is **hard-only** for `factory-task`, and `tests/run/workflows.test.ts` holds it `hard`. `soft` isn't applied there yet (H-257). |
-| `enforcement.poller` | `hard` | What the poller does when a run would cross `repo_monthly_usd` or `daily_usd`: `hard` refuses the run, `soft` starts it and flags it (`hapi:flagged`). It applies to those two spend caps only; the round counts in `runs.yaml` are always hard. |
+| `enforcement.poller` | `hard` | What the poller does when a run would cross `repo_monthly_usd` or `daily_usd`: `hard` refuses the run, `soft` starts it and flags it (`hapi:flagged` on its PR, once there is one). It applies to those two spend caps only; the round counts and `max_retries` in `runs.yaml` are always hard. |
 
 `enforcement` is a setting per enforcement point: `hard` stops the run at `run_usd`; `soft` lets it finish and flags it (`hapi:flagged`, spec §13.3). All three ship as `hard` and are required: the loader fills no defaults, so the fail-closed value lives in the YAML. An overlay may harden a mode but never soften it (soft < hard). An overlay may also lower `repo_monthly_usd`, never raise it.
 
@@ -238,20 +238,23 @@ The monthly caps are enforced at the provider. The operator sets them on the Con
 
 ### `runs.yaml`
 
-The run engine's limits (Plan 02 Task 7 and Plan 03; [the runs runbook](runbooks/runs.md) covers the launcher, the outputs and retention). Every key is required. An overlay may lower any number, never raise one, except `poll_interval_s`, which is central only (an overlay naming it is an unknown key). An overlay may switch a `phases` flag on, never off.
+The run engine's limits (Plan 02 Task 7 and Plan 03; [the runs runbook](runbooks/runs.md) covers the launcher, the outputs and retention, and [the engine runbook](runbooks/engine.md#the-pipeline) the pipeline). Every key is required. An overlay may lower any number, never raise one, except `poll_interval_s`, `max_retries`, `inputs_mb` and `work_order_kb`, which are central only (an overlay naming one is an unknown key). An overlay may switch a `phases` flag on, never off.
 
 | Key | Value | Meaning |
 |---|---|---|
 | `max_live` | 1 | Live runs at once; the launcher refuses the next, and the poller waits for a free slot |
-| `retention_days` | 14 | A run's files are removed this many days after its `harvestedAt`. Plan 02 sets none, so nothing is removed yet (H-206) |
+| `retention_days` | 14 | A run's files are removed this many days after its `harvestedAt`, and never before the UTC month it started in has ended: the poller's monthly cap reads each run of the month from its record. A run with no `harvestedAt` is never removed (H-244) |
 | `output_limits_mb.bundle` | 256 | The most the result bundle may be, in MB |
 | `output_limits_mb.transcript` | 64 | The most the run transcript may be |
 | `output_limits_mb.decisions` | 16 | The most the decisions log may be |
 | `output_limits_mb.result` | 4 | The most the result summary may be |
-| `disk.gb` | 20 | The most disk one run's volumes may use, in GB (the run engine's disk check) |
+| `disk.gb` | 20 | The most disk one run's volumes may use, in GiB (the run engine's disk check) |
 | `disk.enforcement` | `hard` | `hard` stops the run when the cap is crossed; `soft` flags it and lets it finish. An overlay may harden it, never soften it. |
 | `poll_interval_s` | 120 | Seconds between the poller's passes over the registered repos, 30 to 3600. Central only. |
 | `max_auto_rounds` | 3 | Automatic runs per work order with no human action between them. The poller counts it; always hard: the poller's check, never softened by `budgets.enforcement.poller`. |
+| `max_retries` | 2 | Times the operator may queue a failed work order again (`hapi retry`); the command refuses one more. Always hard: never softened by `budgets.enforcement.poller`. Central only; 0 turns `hapi retry` off. |
+| `inputs_mb` | 16 | The most a review or fix run's inputs copy may be, in MiB (`diff.patch`, `verify.json` and `findings.md` together): the engine refuses to build a larger one and the launcher to copy it, never truncating it. Central only. |
+| `work_order_kb` | 1024 | The most discovery reads of each work-order file (`order.yaml`, `task.md`, `.factory/config.yaml`), in KiB, by its size in git before the read: a larger one is a problem the work order can't run with ("Can't run"), never truncated. Central only. |
 | `phases.verify` | true | The verify container runs the repo's gates |
 | `phases.review` | true | The review container reviews the diff |
 | `phases.coderabbit` | false | The CodeRabbit CLI in the review container. Off until an unattended key exists (H-167) |
@@ -555,14 +558,14 @@ In a JSON Pointer, a `/` inside a key is written `~1` and a `~` is written `~0`.
 
 A target repo can adjust the central policy with an overlay in its `.factory/config.yaml` (spec §7). **An overlay may only tighten policy.** The one exception is `egress_extra`: it may add hosts, and the overlay file is itself protected (`.factory/**`), so adding one goes through a reviewed planning PR.
 
-An overlay has the seven keys below. **Any other key is rejected**, `repos`, `sidecars`, `gates`, `budgets.daily_usd` and `runs.poll_interval_s` included. Four of them change policy, and those may only tighten it, except for `egress_extra`. The other three, `default_risk`, `workflow` and `sidecar`, are repo settings (spec §7). They don't loosen any policy, so the tighten-only rule doesn't apply to them.
+An overlay has the seven keys below. **Any other key is rejected**, `repos`, `sidecars`, `gates`, `budgets.daily_usd`, `runs.poll_interval_s`, `runs.max_retries`, `runs.inputs_mb` and `runs.work_order_kb` included. Four of them change policy, and those may only tighten it, except for `egress_extra`. The other three, `default_risk`, `workflow` and `sidecar`, are repo settings (spec §7). They don't loosen any policy, so the tighten-only rule doesn't apply to them.
 
 | Key | What it may do |
 |---|---|
 | `protected_paths` | **Add** a glob, or **raise** a listed glob's modes (allow < ask < deny). An entry may name only some of the three modes. For a glob the base policy lists, the others keep their base value. A **new** glob may name only `ask` or `deny`; naming `allow` is rejected, because under [strictest-wins](#how-globs-combine) it can't change anything and so reads as a loosening attempt. Its unnamed modes are stored as `allow`, which adds no rule. A new glob that overlaps a protected one can tighten files under it but never loosen them. `null` asks to remove the glob, and that is **always rejected**. |
 | `egress_extra` | **Add** hosts to the `archon` zone's allowlist. The rules are the same as for any host. A [**forge host**](#trusted_sourcesyaml) (`github.com`, `githubusercontent.com`, `githubassets.com`, `ghcr.io`, `gitlab.com`, `bitbucket.org`, or a subdomain of one) is rejected, because the Archon zone must never reach the forge (spec §4.3). |
 | `budgets` | **Lower** any budget in `budgets.yaml` except `daily_usd`, which is central only (`repo_monthly_usd` included). Each value must be at most the base value. `enforcement` modes (`hapi_guard`, `archon`, `poller`) may be **hardened** (soft to hard), never softened. |
-| `runs` | **Lower** any limit in `runs.yaml` (`max_live`, `retention_days`, `max_auto_rounds`, `output_limits_mb.*`, `disk.gb`, and `phases.fix_rounds_before_pr`, `fix_rounds_on_pr`, `round_turns` and `round_usd`), never raise one. `disk.enforcement` may be **hardened**. A `phases` flag (`verify`, `review`, `coderabbit`, `require_acceptance`) may be switched **on**, never off. `poll_interval_s` is central only. After the merge the result must still satisfy `phases.round_usd <= budgets.run_usd`. |
+| `runs` | **Lower** any limit in `runs.yaml` (`max_live`, `retention_days`, `max_auto_rounds`, `output_limits_mb.*`, `disk.gb`, and `phases.fix_rounds_before_pr`, `fix_rounds_on_pr`, `round_turns` and `round_usd`), never raise one. `disk.enforcement` may be **hardened**. A `phases` flag (`verify`, `review`, `coderabbit`, `require_acceptance`) may be switched **on**, never off. `poll_interval_s`, `max_retries`, `inputs_mb` and `work_order_kb` are central only. After the merge the result must still satisfy `phases.round_usd <= budgets.run_usd`. |
 | `default_risk` | The risk new work orders for this repo start from: `low`, `medium` or `high`. A repo setting, not policy: any value is accepted, `low` included. |
 | `workflow` | The Archon workflow this repo's work orders use by default. A lowercase slug, the same rule as a work order's `workflow` (so `factory-task`, not `Factory_Task` or `factory-`). A repo setting, not policy. `hapi run start` runs only a workflow of hapi's pack (`archon/workflows/hapi/`), never one of Archon's bundled ones. |
 | `sidecar` | `{ name, data_dir }`: the sidecar this repo's runs start and the repo directory mounted into it. `name` must be one `sidecars.yaml` lists (otherwise a `PolicyError` at `/sidecar/name`); `data_dir` is a repo-relative directory with no `*` or `?`. `applyOverlay` adds `<data_dir>/**` as denied to workers (merged with any overlay `protected_paths` entry for it, strictest wins), because the directory holds the code the sidecar runs. A repo setting, not policy. |

@@ -36,7 +36,7 @@ import { hardenedGit } from "../run/git";
 import { bundleProblem } from "../run/lifecycle";
 import { lockHeld, readRecord, recordDir, type RunRecord, withRunLock, writeRecord } from "../run/records";
 import { redactSecretForms, redactSecrets, sanitizeTerminal, secretHits } from "../run/sanitize";
-import { spendOfRun } from "../run/spend";
+import { runSpend } from "../run/spend";
 import type { RunDeps } from "../run/spec";
 import { isWorkOrderId, type WorkOrder } from "../workorder/validate";
 import {
@@ -59,7 +59,7 @@ import type { Discovered } from "./discover";
 import { type CodeRabbitResult, codeRabbitResult, type PlannerTest, type ReviewResult, reviewResult, turnsOfRun, type VerifyResult, verifyResult, type WorkerResult, workerResult } from "./evidence";
 import { mirrorPath } from "./mirror";
 import { type PrInput, renderPr, rerenderPr } from "./pr";
-import type { Verdict, WorkOrderState } from "./state";
+import type { Phase, Verdict, WorkOrderState } from "./state";
 
 /** The gitleaks the host's secret scan runs: mise.toml's pin (a test holds them equal). */
 export const GITLEAKS_VERSION = "8.30.1";
@@ -594,6 +594,18 @@ export interface HarvestDeps {
   decideKeys(): Promise<{ jev: string | undefined; anthropic: string | undefined }>;
 }
 
+/** Each diff-based registry decision's subjects for `head` (`<mergeSha>..<head>` in the scratch); none with decision models off. */
+async function subjectsFor(d: Pick<HarvestDeps, "subjects">, policy: Policy, order: Discovered, scratch: string, head: string, secrets: Record<string, string>): Promise<Subject[]> {
+  const subjects: Subject[] = [];
+  if (policy.decisions.mode === "off") return subjects;
+  for (const [name, entry] of Object.entries(ENGINE_DECISIONS)) {
+    const knob = policy.decisions.by_name[name];
+    if (entry.subjects !== "diff" || knob === undefined || knob.mode === "off") continue;
+    subjects.push(...(await d.subjects({ decision: name, scratch, base: order.mergeSha, head, goal: goalOf(order.taskMd), skip: knob.skip_paths ?? [], maxChars: policy.gates.max_state_chars, secrets })));
+  }
+  return subjects;
+}
+
 /** The work order's policy: the central one, with its overlay applied when it has one. */
 export const policyOf = (central: Policy, order: Discovered): Policy => (order.overlay === undefined ? central : applyOverlay(central, order.overlay));
 
@@ -813,14 +825,7 @@ export async function harvest(d: HarvestDeps, s: WorkOrderState, h: HarvestInput
   let prHead = s.prHead;
   if (notPushed === undefined) {
     // Only a head it will push is screened; every answer is saved before the push.
-    const subjects: Subject[] = [];
-    if (!off) {
-      for (const [name, entry] of Object.entries(ENGINE_DECISIONS)) {
-        const knob = policy.decisions.by_name[name];
-        if (entry.subjects !== "diff" || knob === undefined || knob.mode === "off") continue;
-        subjects.push(...(await d.subjects({ decision: name, scratch, base: h.order.mergeSha, head, goal: goalOf(h.order.taskMd), skip: knob.skip_paths ?? [], maxChars: policy.gates.max_state_chars, secrets })));
-      }
-    }
+    const subjects = await subjectsFor(d, policy, h.order, scratch, head, secrets);
     e.screens = await screenHarvest(d, { s, run: h.run, head, subjects, policy, ask: true });
     result = outcome(e, phases);
     const pushed = await d.pushBranch({ scratch, remote: `https://github.com/${d.repo}.git`, id, head, token: await d.token("push") });
@@ -844,7 +849,7 @@ export async function harvest(d: HarvestDeps, s: WorkOrderState, h: HarvestInput
 
   // The body, its labels, then harvestedAt.
   const ledger = await readLedger(ledgerPath(d.engineDir, d.repo, id));
-  const spends = h.runs.map((r) => spendOfRun(outOf(r)!, r.budgetUsd ?? h.order.workOrder.budget.usd));
+  const spends = h.runs.map((r) => runSpend(d.run.stateDir, r, h.order.workOrder.budget.usd));
   const turns = (await Promise.all(h.runs.map((r) => turnsOfRun(outOf(r)!)))).reduce<number>((n, t) => n + (t ?? 0), 0);
   const fix = notPushed === undefined && h.run.kind === "fix" ? unfixedFindings(e, await fixHunks(d.run, scratch, h.run.sha, head), h.run.round ?? 1) : [];
   // The stat only of a head the scratch holds: the one pushed, or the factory's last (else the body has none).
@@ -891,4 +896,75 @@ export async function harvest(d: HarvestDeps, s: WorkOrderState, h: HarvestInput
     await forge.addLabels(number, flagged ? ["lane:factory", "hapi:flagged"] : ["lane:factory"]);
   }
   return done({ ...s, pr: number, ...(prHead === undefined ? {} : { prHead }), verdict: result.verdict, reasons: result.reasons, updatedAt: now });
+}
+
+const RANK: Record<Verdict, number> = { ready: 0, decision: 1, "do-not-merge": 2 };
+/** The worse of two verdicts. */
+export const worse = (a: Verdict, b: Verdict): Verdict => (RANK[a] >= RANK[b] ? a : b);
+
+/**
+ * Re-render a factory PR's body for the head it shows, `s.prHead` (Plan 03 Task 13): when `ci / gates` completes on
+ * it (Ready to merge shows only once it is green, the Task 8 → 13 ruling), or when the state machine moves the PR to
+ * `waiting` with a reason (rulings m31, m50). `h.run` is the run whose head that is. The body is built as the
+ * harvest builds it, from the scratch and the ledger: that run's gates and evidence, the screens re-read from the
+ * ledger (`ask: false`, so it asks and spends nothing; with decision models off it builds no subjects), the whole
+ * ledger's cost, and the state's reasons beyond the outcome's under Unresolved, with a verdict no better than the
+ * state's. It pushes nothing, marks nothing ready and adds no label. Returns whether it wrote the body: false when
+ * the body is already that, or the run's gates don't give the PR's head.
+ */
+export async function rerender(d: HarvestDeps, s: WorkOrderState, h: HarvestInput, o: { forge: Forge; pr: PrInfo; ci: "pending" | "passed" | "failed"; phase: Phase }): Promise<boolean> {
+  const policy = policyOf(d.central, h.order);
+  const phases = policy.runs.phases;
+  const id = h.order.id;
+  const scratch = scratchPath(d.engineDir, d.repo, id);
+  const gates = await d.gates(h.order, h.run);
+  if (gates.head === undefined || gates.head !== s.prHead || gates.problems.length > 0) return false;
+  const head = gates.head;
+  const secrets = await d.secrets();
+  const outOf = (r: RunRecord | undefined) => (r === undefined ? undefined : join(recordDir(d.run.stateDir, r.runId), "out"));
+  const ofHead = (r: RunRecord | undefined) => (r !== undefined && r.sha === head ? r : undefined);
+  const verifyRec = ofHead(h.verify);
+  const reviewRec = ofHead(h.review);
+  const e: Evidence = {
+    gates,
+    verify: verifyResult(outOf(verifyRec), h.order.workOrder, phases, { exitCode: verifyRec?.exitCode, acceptanceFiles: await acceptanceFiles(d.run, scratch, h.order.mergeSha, id) }),
+    review: reviewResult(outOf(reviewRec), phases),
+    cr: codeRabbitResult(outOf(reviewRec), phases),
+    worker: await workerResult(outOf(h.run)!, secrets),
+    screens: [],
+  };
+  e.screens = await screenHarvest(d, { s, run: h.run, head, subjects: await subjectsFor(d, policy, h.order, scratch, head, secrets), policy, ask: false });
+  const result = outcome(e, phases);
+  const extra = s.reasons.filter((r) => !result.reasons.includes(r));
+  const verdict = worse(worse(result.verdict, s.verdict ?? "ready"), extra.length > 0 ? "decision" : "ready");
+  const ledger = await readLedger(ledgerPath(d.engineDir, d.repo, id));
+  const spends = h.runs.map((r) => runSpend(d.run.stateDir, r, h.order.workOrder.budget.usd));
+  const turns = (await Promise.all(h.runs.map((r) => turnsOfRun(outOf(r)!)))).reduce<number>((n, t) => n + (t ?? 0), 0);
+  const fix = h.run.kind === "fix" ? unfixedFindings(e, await fixHunks(d.run, scratch, h.run.sha, head), h.run.round ?? 1) : [];
+  const input: PrInput = {
+    order: h.order,
+    outcome: { ...result, verdict, reasons: [...result.reasons, ...extra] },
+    evidence: e,
+    head,
+    stat: await d.stat({ scratch, base: h.order.mergeSha, head }),
+    planningPr: s.planningPr,
+    position: h.position,
+    runs: h.runs.map((r) => ({ id: r.runId, kind: r.kind ?? "worker", round: r.round ?? 0, ...(r.retry === undefined ? {} : { retry: r.retry }) })),
+    rounds: h.rounds,
+    roundCap: phases.fix_rounds_before_pr + phases.fix_rounds_on_pr,
+    cost: {
+      usd: spends.reduce((n, x) => n + x.usd, 0),
+      unknown: spends.filter((x) => !x.known).length,
+      turns,
+      decisions: { usd: await decisionSpend(d.engineDir, { repo: d.repo, ids: [id], from: new Date(0), to: d.run.now(), unknownUsd: policy.gates.classifiers.jev.unknown_call_usd }), calls: callsOf(ledger) },
+    },
+    phase: o.phase,
+    round: roundOfBody(o.pr.body, head) ?? h.run.round ?? 0,
+    ci: o.ci,
+    ...(fix.length > 0 ? { unfixed: fix } : {}),
+  };
+  const body = rerenderPr(o.pr.body, input);
+  if (body === o.pr.body) return false;
+  await o.forge.editPrBody(o.pr.number, body);
+  return true;
 }

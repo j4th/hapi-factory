@@ -14,8 +14,11 @@
  *   gc would prune it. A merge the mirror no longer holds is `readWorkOrder`'s "<sha12> is not in the mirror".
  * - **Problems, not work orders.** A bad one (a directory name that isn't a work-order id, YAML that doesn't parse,
  *   an order that fails validation, an id unlike its directory's name, no task.md, a file that isn't a regular
- *   file, an overlay that fails its schema or loosens the central policy) is pushed onto the caller's `problems`, for the tick report and the status
- *   comment's "Can't run" table, and is never returned.
+ *   file, a file over `runs.work_order_kb`, an overlay that fails its schema or loosens the central policy) is
+ *   pushed onto the caller's `problems`, for the tick report and the status comment's "Can't run" table, and is
+ *   never returned.
+ * - **Capped before it is read.** Each of the three files' size comes from `ls-tree -l`, and one over
+ *   `runs.work_order_kb` (central only) is refused, never truncated, before its blob is read (H-247).
  * - **Read as data.** Files are read with `cat-file blob`, never `git show`, so no textconv, attribute or pager
  *   applies; pathspecs are literal (`--literal-pathspecs`), so a directory name is never a glob; and a work-order
  *   id and a commit id are checked before either reaches git, so nothing is ever read as an option.
@@ -154,15 +157,17 @@ export async function readWorkOrder(d: DiscoverDeps, repo: string, id: string, m
   const orderPath = `.factory/work/${id}/order.yaml`;
   const taskPath = `.factory/work/${id}/task.md`;
   const wanted = [orderPath, taskPath, OVERLAY];
-  const listed = await git(d, repo, ["ls-tree", "-r", "-z", sha, "--", ...wanted], `list ${orderPath} at ${at}`);
+  // -l gives each blob's size, so a file over runs.work_order_kb is refused before it is read (H-247).
+  const listed = await git(d, repo, ["ls-tree", "-r", "-z", "-l", sha, "--", ...wanted], `list ${orderPath} at ${at}`);
   const entries = listed
     .split("\0")
     .filter((e) => e !== "")
     .map((e) => {
       const tab = e.indexOf("\t");
-      const [mode, type, oid] = e.slice(0, tab).split(" ");
-      return { mode, type, oid, path: e.slice(tab + 1) };
+      const [mode, type, oid, size] = e.slice(0, tab).split(/ +/);
+      return { mode, type, oid, size: Number(size), path: e.slice(tab + 1) };
     });
+  const capKb = d.central.runs.work_order_kb;
   const blobs = new Map<string, string>();
   for (const path of wanted) {
     const entry = entries.find((e) => e.path === path);
@@ -171,6 +176,11 @@ export async function readWorkOrder(d: DiscoverDeps, repo: string, id: string, m
     if (entry === undefined && !nested) continue;
     if (entry === undefined || entry.type !== "blob" || (entry.mode !== "100644" && entry.mode !== "100755") || !/^[0-9a-f]{40,64}$/.test(entry.oid ?? "")) {
       throw new Error(`${path} at ${at} is not a regular file`);
+    }
+    // Refused, never truncated: a size git didn't give is refused too.
+    if (!Number.isSafeInteger(entry.size) || entry.size > capKb * 1024) {
+      const shownSize = Number.isSafeInteger(entry.size) ? `${(entry.size / 1024).toFixed(1)} KiB` : "of a size git didn't give";
+      throw new Error(`${path} at ${at} is ${shownSize}, over runs.work_order_kb (${capKb} KiB): discovery reads no larger work-order file`);
     }
     blobs.set(path, entry.oid!);
   }

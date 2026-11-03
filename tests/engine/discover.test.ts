@@ -192,6 +192,30 @@ describe("discovery", () => {
     expect(await discover(d)).toEqual({ found: [], problems: [{ path: ".factory/work/0006-link/order.yaml", reason: `.factory/work/0006-link/task.md at ${merge.slice(0, 12)} is not a regular file` }] });
   });
 
+  test("with real git: a work-order file over runs.work_order_kb is a problem, refused before it is read, never truncated (H-247)", async () => {
+    const { git, d, mirror } = await world();
+    const small = structuredClone(central);
+    small.runs.work_order_kb = 1;
+    const merge = plan(git, "plan/big", 8, () => {
+      addOrder(git, "0007-big");
+      writeFileSync(join(git.dir, ".factory", "work", "0007-big", "task.md"), `# 0007-big\n\n${"x".repeat(2048)}\n`);
+      git("add", "--", ".factory/work/0007-big/task.md");
+      addOrder(git, "0008-fine");
+    });
+    toMirror(git, mirror);
+    const reads: string[][] = [];
+    const counting: DiscoverDeps = { ...d, central: small, run: (cmd, o) => (reads.push(cmd), d.run(cmd, o)) };
+    const problems: DiscoverProblem[] = [];
+    const found = await discoverWorkOrders(counting, REPO, new Set(), problems);
+    expect(found.map((o) => o.id)).toEqual(["0008-fine"]);
+    expect(problems).toEqual([{ path: ".factory/work/0007-big/order.yaml", reason: `.factory/work/0007-big/task.md at ${merge.slice(0, 12)} is 2.0 KiB, over runs.work_order_kb (1 KiB): discovery reads no larger work-order file` }]);
+    // Refused from ls-tree -l's size: no blob of 0007-big was read (its order.yaml is read only after every size is checked).
+    const blobReads = reads.filter((c) => c.includes("cat-file") && c.includes("blob")).length;
+    expect(blobReads).toBe(2);
+    // At the shipped 1024 KiB it is read.
+    expect((await discover(d)).found.map((o) => o.id)).toEqual(["0007-big", "0008-fine"]);
+  });
+
   test("with real git: the overlay comes from the merge commit, not main's head", async () => {
     const { git, d, mirror } = await world();
     plan(git, "plan/one", 7, () => {

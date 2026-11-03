@@ -5,7 +5,7 @@
  * ~/.gitconfig or ~/.config, and nothing touches the network: a mirror fetches from the work dir's path.
  */
 import { expect } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import YAML from "yaml";
@@ -13,16 +13,20 @@ import type { Answers, DecideOptions, DecideResult, DecisionFile, State } from "
 import type { ask } from "../../src/decide/record";
 import type { Discovered } from "../../src/engine/discover";
 import type { ReviewFinding } from "../../src/engine/evidence";
-import type { Evidence, PushOptions, PushResult } from "../../src/engine/harvest";
+import type { Evidence, GateProblem, HarvestDeps, PushOptions, PushResult } from "../../src/engine/harvest";
 import { mirrorPath } from "../../src/engine/mirror";
+import type { PipelineDeps } from "../../src/engine/pipeline";
+import type { StatusEvent, WorkOrderState } from "../../src/engine/state";
 import { githubForge } from "../../src/forge";
 import { loadPolicy } from "../../src/policy/load";
 import type { DecisionModels, EngineDecision, Policy } from "../../src/policy/types";
+import type { StartOptions } from "../../src/run/lifecycle";
+import { keyPart, readRecord, runKey, type RunRecord, writeRecord } from "../../src/run/records";
 import type { RunDeps } from "../../src/run/spec";
 import { runCommand } from "../../src/stack/up";
 import { validateWorkOrder } from "../../src/workorder/validate";
-import { fakeForge } from "../forge/helpers";
-import { writeOrder } from "../run/helpers";
+import { fakeForge, OPERATOR } from "../forge/helpers";
+import { fakeRun, NOW, seedRun, writeOrder } from "../run/helpers";
 import { tempDir } from "../secrets/helpers";
 
 /** git in one work dir, which returns stdout, trimmed; `dir` is that work dir. A non-zero exit fails the test, naming the command. */
@@ -352,3 +356,182 @@ export const CLEAN: Evidence = {
   worker: { result: "done", endsOnQuestion: false, account: "## Account\nChose X over Y.", hasFinal: true },
   screens: [],
 };
+
+// ---------------------------------------------------------------------------------------------------------------
+// Plan 03 Task 13: the state machine's helpers.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** The users beyond Task 3's: a stranger (the round's off switch), CodeRabbit's login on a user account, and a triage maintainer. */
+export const SOMEONE = { id: 4242, login: "someone", type: "User" };
+export const IMPOSTOR = { id: 999, login: "coderabbitai", type: "User" };
+export const MAINT = { id: 5, login: "maint", type: "User" };
+
+/** The merge the pipeline tests key ORDER at. */
+export const MERGE = "f".repeat(40);
+
+/** The fake gates' head of a run of `round` in pass `retry`: 40 hex digits (the fake heads are no commits). */
+export const headAt = (round: number, retry = 0): string => `${"e".repeat(36)}${String(retry).padStart(2, "0")}${String(round).padStart(2, "0")}`;
+
+/** What the fake engine git prints for a review's diff. */
+export const FAKE_PATCH = "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -0,0 +1 @@\n+export const a = 1;\n";
+
+/** One `start` call: its options, and the inputs dir's files as they were when it was called. */
+export interface Started {
+  o: StartOptions;
+  inputs: Record<string, string> | undefined;
+  rec: RunRecord;
+}
+
+/**
+ * The state machine's world (Task 13): `fakeRun()`'s deps with a clock the test moves (`clock.now`) and the engine's
+ * own git calls answered (a review's diff, `cat-file -e`, `update-ref`), a temp engineDir, the shipped policy, Task 12's
+ * forge world with a `pr` and a `checks` client of one fake GitHub, fake gates (clean unless `refuse` names the run;
+ * the head `headAt(round, retry)`), a fake `start` that writes a live record as startRun would and records each call,
+ * `finish` to end one, and `emit` collecting events. Every run starts at `clock.now`, and the clock moves a minute on.
+ */
+export function pipelineDeps(o: { central?: Policy; decide?: HarvestDeps["decide"]; subjects?: HarvestDeps["subjects"]; decision?: string } = {}) {
+  const f = fakeRun();
+  const engineDir = join(f.tmp, "engine");
+  const clock = { now: new Date(NOW) };
+  /** The engine's git calls the fake answered, each as its argv after `git`'s own options. */
+  const gitCalls: string[][] = [];
+  const answer = (code: number, stdout = "") => ({ code, stdout, stderr: "" });
+  const runner: RunDeps["run"] = async (cmd, opts) => {
+    const g = cmd.indexOf("git");
+    if (cmd[0] === "env" && cmd[1] === "-i" && g > 0) {
+      const rest = cmd.slice(g + 1);
+      let i = 0;
+      while (rest[i] === "-c" || rest[i] === "--git-dir" || rest[i] === "--literal-pathspecs") i += rest[i] === "--literal-pathspecs" ? 1 : 2;
+      const args = rest.slice(i);
+      if (args[0] === "diff" || args[0] === "update-ref" || (args[0] === "cat-file" && args[1] === "-e")) {
+        gitCalls.push(args);
+        if (args[0] !== "diff") return answer(0);
+        if (args.includes("--name-only")) return answer(0, "src/a.ts\0");
+        return answer(0, FAKE_PATCH);
+      }
+    }
+    return f.deps.run(cmd, opts);
+  };
+  const run: RunDeps = { ...f.deps, run: runner, now: () => clock.now };
+  const fw = forgeWorld();
+  const ff = fw.ff;
+  ff.collaborators.set("maint", "triage");
+  ff.collaborators.set("example-owner", "admin");
+  const forges = {
+    pr: githubForge({ repo: ff.repo, token: "fake-pr-token", fetch: ff.fetch }),
+    checks: githubForge({ repo: ff.repo, token: "fake-checks-token", fetch: ff.fetch }),
+  };
+  const starts: Started[] = [];
+  const events: StatusEvent[] = [];
+  /** Run ids whose fake gates refuse, with the problem each gives. */
+  const refuse = new Map<string, GateProblem[]>();
+  let next = 0;
+  const order = orderAt(MERGE);
+  const tick = () => {
+    clock.now = new Date(clock.now.getTime() + 60_000);
+  };
+  const decide = o.decide ?? fakeDecide();
+  const d: PipelineDeps = {
+    run,
+    engineDir,
+    repo: ORDER.repo,
+    central: o.central ?? SHIPPED,
+    forge: async (p) => forges[p],
+    token: async () => "fake-push-token",
+    secrets: async () => ({}),
+    gates: async (_order, rec) => ({ head: headAt(rec.round ?? 0, rec.retry ?? 0), files: ["src/a.ts"], problems: refuse.get(rec.runId) ?? [], signals: [] }),
+    pushBranch: fw.pushBranch,
+    public: true,
+    subjects:
+      o.subjects ??
+      (async (x) => [{ decision: o.decision ?? x.decision, subject: "src/a.ts", part: "whole", state: { goal: x.goal, path: "src/a.ts", part: "whole", diff: "diff --git a/src/a.ts b/src/a.ts" } }]),
+    stat: async () => ({ files: 1, insertions: 1, deletions: 0 }),
+    decide,
+    decideKeys: async () => ({ jev: "fake-jev-key", anthropic: "fake-anthropic-key" }),
+    start: async (so) => {
+      const id = (++next).toString(16).padStart(12, "0");
+      const inputs = so.inputsDir === undefined ? undefined : Object.fromEntries(readdirSync(so.inputsDir).sort().map((n) => [n, readFileSync(join(so.inputsDir!, n), "utf8")]));
+      const rec = await seedRun(f, {
+        id,
+        workOrder: so.workOrder.id,
+        sha: so.sha,
+        repo: so.repoGitDir,
+        key: runKey(so.workOrder.id, so.sha, keyPart(so.kind, so.round ?? 0, so.retry)),
+        status: "live",
+        objects: false,
+        startedAt: clock.now.toISOString(),
+        kind: so.kind,
+        round: so.round ?? 0,
+        ...(so.retry === undefined ? {} : { retry: so.retry }),
+        ...(so.parent === undefined ? {} : { parent: so.parent }),
+        ...(so.budgetUsd === undefined ? {} : { budgetUsd: so.budgetUsd }),
+        ...(so.forgeRepo === undefined ? {} : { forgeRepo: so.forgeRepo.toLowerCase() }),
+      });
+      starts.push({ o: so, inputs, rec });
+      tick();
+      return rec;
+    },
+    emit: async (e) => void events.push(e),
+    operator: OPERATOR.login,
+  };
+
+  /** End run `id` with `status`, writing its kind's outputs: a done worker or fix spending `usd`, a passing verify, a ready review, unless told. */
+  const finish = async (id: string, status: RunRecord["status"], x: { reason?: string; usd?: number; verify?: unknown; review?: unknown; exitCode?: number } = {}) => {
+    const rec = await readRecord(f.deps.stateDir, id);
+    if (rec === undefined) throw new Error(`no run ${id}`);
+    const kind = rec.kind ?? "worker";
+    if (kind === "worker" || kind === "fix") {
+      writeOut(f, id, "decisions.jsonl", decisionsOf("done", x.usd ?? 0.5));
+      writeOut(f, id, "transcript.jsonl", transcriptOf(["## Account\nDid it.\n", "RESULT: done"], kind === "fix" ? "fix" : "implement"));
+    }
+    if (kind === "verify") writeVerify(f, id, x.verify ?? PASSING_VERIFY, { status: status === "succeeded" ? "completed" : "failed" });
+    if (kind === "review") writeReview(f, id, x.review ?? READY_REVIEW);
+    await writeRecord(f.deps.stateDir, { ...rec, status, ...(x.reason === undefined ? {} : { reason: x.reason }), ...(kind === "verify" ? { exitCode: x.exitCode ?? 0 } : {}) });
+  };
+
+  /** A run of ORDER seeded as the engine's fake start would make it (the key from its kind, round, retry and sha), finished unless `status` is live. */
+  const seed = async (kind: RunRecord["kind"] & string, x: { id: string; sha?: string; round?: number; retry?: number; parent?: string; status?: RunRecord["status"]; startedAt?: string; budgetUsd?: number; usd?: number; reason?: string; review?: unknown; verify?: unknown; harvestedAt?: string; forgeRepo?: string | null }) => {
+    const round = x.round ?? 0;
+    const retry = x.retry ?? 0;
+    // A fix starts on the head before it (the review's); a verify or review on its round's head.
+    const sha = x.sha ?? (kind === "worker" ? MERGE : kind === "fix" ? headAt(Math.max(0, round - 1), retry) : headAt(round, retry));
+    const budgetUsd = x.budgetUsd ?? (kind === "worker" ? 3 : kind === "verify" ? 0 : 1);
+    const rec = await seedRun(f, {
+      id: x.id,
+      workOrder: ORDER.id,
+      sha,
+      key: runKey(ORDER.id, sha, keyPart(kind, round, retry)),
+      status: "live",
+      objects: false,
+      startedAt: x.startedAt ?? clock.now.toISOString(),
+      kind,
+      round,
+      retry,
+      budgetUsd,
+      ...(x.forgeRepo === null ? {} : { forgeRepo: x.forgeRepo ?? ORDER.repo }),
+      ...(x.parent === undefined ? {} : { parent: x.parent }),
+      ...(x.harvestedAt === undefined ? {} : { harvestedAt: x.harvestedAt }),
+    });
+    if (x.startedAt === undefined) tick();
+    if ((x.status ?? "succeeded") !== "live") await finish(x.id, x.status ?? "succeeded", x);
+    return rec;
+  };
+
+  /** ORDER's state at `phase`, keyed at MERGE, planning PR 7, retry 0, unless `over` says otherwise. */
+  const state = (over: Partial<WorkOrderState> = {}): WorkOrderState => ({
+    repo: ORDER.repo,
+    id: ORDER.id,
+    mergeSha: MERGE,
+    planningPr: 7,
+    phase: "queued",
+    runs: [],
+    autoRounds: 0,
+    reworkRounds: 0,
+    retry: 0,
+    reasons: [],
+    updatedAt: clock.now.toISOString(),
+    ...over,
+  });
+
+  return { f, d, ff, fw, forges, order, clock, starts, events, refuse, finish, seed, state, gitCalls, decide, engineDir };
+}

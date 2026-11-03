@@ -56,8 +56,8 @@ export const END = "<!-- hapi:end -->";
 /** The most of the worker's account a PR shows. */
 const ACCOUNT_CHARS = 6000;
 
-/** A host line, as a last net: one line, no terminal control, no `@`, `<` or `>`. */
-const plain = (s: string) => sanitizeTerminal(s.replace(/[\r\n]+/g, " ")).replace(/[@<>]/g, "");
+/** A host line, as a last net: one line, no terminal control, no `@`, `<` or `>`. The state machine reads a reason's Unresolved line by it. */
+export const plain = (s: string) => sanitizeTerminal(s.replace(/[\r\n]+/g, " ")).replace(/[@<>]/g, "");
 
 /** Text a run or a model wrote, in a fence it can't leave (see the module comment). */
 export function fence(text: string, cap?: number): string {
