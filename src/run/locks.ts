@@ -30,7 +30,7 @@ export const RUN_DISK = "/var/lib/hapi/rundisk";
 
 /** Run `fn` holding the run disk's lock (see the module comment). It fails at once if another live process holds it. */
 export function withStackLock<T>(d: { diskDir: string; env: Record<string, string | undefined> }, what: "stack-down" | "run-copyout", fn: () => Promise<T>): Promise<T> {
-  return withStoreLock(d.diskDir, what, fn, { env: d.env });
+  return withStoreLock(d.diskDir, what, fn, { env: d.env, label: what === "stack-down" ? "hapi stack down" : "hapi run" });
 }
 
 /** Whether `e` is `withStoreLock` refusing a lock another live process holds. */

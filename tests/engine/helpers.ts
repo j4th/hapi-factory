@@ -555,13 +555,14 @@ export function registered(base: Policy = SHIPPED, repos: string[] = [SANDBOX, S
 
 /**
  * A checkout root for the CLI's tests (`RunDeps.root`): a temp dir holding a copy of policy/ whose repos.yaml
- * registers SANDBOX and SECOND, and whose gates.yaml sets `decisions.mode` to `models` when given.
+ * registers `repos` (SANDBOX and SECOND by default), and whose gates.yaml sets `decisions.mode` to `models` when given.
  */
-export function policyRoot(o: { models?: DecisionModels } = {}): string {
+export function policyRoot(o: { models?: DecisionModels; repos?: string[] } = {}): string {
   const root = tempDir("hapi-engine-root-");
   const dir = join(root, "policy");
   Bun.spawnSync(["cp", "-R", join(import.meta.dir, "..", "..", "policy"), dir]);
-  const repos = readFileSync(join(dir, "repos.yaml"), "utf8").replace(/^repos: \{\}.*$/m, `repos:\n  ${SANDBOX}: { registered: "2026-11-01" }\n  ${SECOND}: { registered: "2026-11-01" }`);
+  const listed = (o.repos ?? [SANDBOX, SECOND]).map((r) => `  ${r}: { registered: "2026-11-01" }`).join("\n");
+  const repos = readFileSync(join(dir, "repos.yaml"), "utf8").replace(/^repos: \{\}.*$/m, `repos:\n${listed}`);
   writeFileSync(join(dir, "repos.yaml"), repos);
   if (o.models !== undefined) {
     const gates = readFileSync(join(dir, "gates.yaml"), "utf8").replace(/^(  mode: )enforce(\s)/m, `$1${o.models}$2`);

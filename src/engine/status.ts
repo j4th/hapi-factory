@@ -8,18 +8,23 @@
  *   orders that can't run, the plan's spend against the caps, and the decision-models line when `gates.decisions.mode`
  *   isn't `enforce` (so decision models off is never silent). The poller creates it once and edits it in place, only
  *   when its body changes (`upsertStatusComment`, its mark `<engineDir>/status/<owner>/<name>/<planning-pr>.json`).
- *   Once every work order has settled and no problem is open, it posts one final comment; a work order that leaves the
- *   settled phases (`hapi retry`) reopens the plan, and the next settling posts another.
+ *   Once every work order has settled and no problem is open, it posts one final comment, and the poller then leaves
+ *   the plan's comments as they are (./poll.ts); a work order that leaves the settled phases (`hapi retry`) reopens the
+ *   plan, and the next settling posts another.
+ * - **Recoverable.** A mark that is missing (a crash, or a write that failed, after the comment was posted) is found
+ *   again on the PR: the newest comment of the factory's App that starts with the hidden marker is adopted, never a
+ *   second one posted; a comment someone deleted (its edit a 404) is found again the same way, or posted anew.
  * - **Markdown-safe.** Every cell is one line, its `|` escaped. Text a run, a worker, a planner or GitHub controls
  *   (reasons, problems' paths and reasons) is in a code span (`codeSpan`: no `@ < > \``, no control character), so no
  *   mention, link, image, HTML or emphasis renders; the rest is host-built (ids the schema checked, run ids, numbers).
  * - **`hapi status`** prints the same table from local state only (./cli.ts `statusCommand`).
  */
 import { createHash } from "node:crypto";
-import { appendFile, chmod, mkdir, readFile } from "node:fs/promises";
+import { appendFile, chmod, mkdir, readFile, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import type { Forge } from "../forge";
-import { parseOwnerRepo } from "../forge/github/app-token";
+import type { Forge, IssueComment } from "../forge";
+import { APPS, parseOwnerRepo } from "../forge/github/app-token";
+import { ForgeError } from "../forge/github/rest";
 import type { DecisionModels } from "../policy/types";
 import { readRecord, writeWhole } from "../run/records";
 import { runSpend } from "../run/spend";
@@ -46,6 +51,8 @@ export interface StatusMark {
 
 const MARKER = "<!-- hapi:status v1 -->";
 const FINAL_MARKER = "<!-- hapi:status-final v1 -->";
+/** The factory App's bot: the only author whose status comment is adopted. */
+const FACTORY_BOT = `${APPS.factory.name}[bot]`;
 const SETTLED: readonly Phase[] = ["merged", "closed", "failed"];
 const usd2 = (n: number) => `$${n.toFixed(2)}`;
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -156,7 +163,7 @@ export function renderFinal(rows: StatusRow[]): string {
 export const settledRows = (rows: StatusRow[]): boolean => rows.length > 0 && rows.every((r) => SETTLED.includes(r.state.phase));
 
 /** The mark at `file`, or undefined when there is none. Anything else there throws: a lost id would post a second comment. */
-async function readMark(file: string): Promise<StatusMark | undefined> {
+export async function readMark(file: string): Promise<StatusMark | undefined> {
   let text: string;
   try {
     text = await readFile(file, "utf8");
@@ -192,28 +199,64 @@ async function writeMark(file: string, m: StatusMark): Promise<void> {
   await writeWhole(file, `${JSON.stringify(m)}\n`);
 }
 
+/** A comment the factory's App posted. */
+const ours = (c: IssueComment) => c.viaApp && c.userType === "Bot" && c.userLogin === FACTORY_BOT;
+
 /**
- * The planning PR's status comment: created once (`created`), edited in place only when `body` changes (`edited`).
- * `settled` is "there is a row, and every row is settled"; `finalBody` is the final comment, undefined while a problem
- * is open. Settled with a final body and no final comment yet posts it (`final`); not settled with one posted marks
- * the plan open again (`reopened`, no forge call), so the next settling posts another. Settled with a problem open
- * leaves the mark as it is. `forge` is called only for a write, so a tick with nothing to change mints no token.
- * Returns the actions taken, in order. The mark is written after each write, so a crash between them can at most post
- * one comment again.
+ * The PR's status comment found again, or posted (`created`): the newest the factory's App posted that starts with the
+ * marker is adopted (`adopted`), and edited to `body` when it differs (`edited`); `final` is whether the App has posted
+ * a final comment there. The mark is written at once.
+ */
+async function adoptOrCreate(f: Forge, planningPr: number, body: string, file: string, actions: string[]): Promise<StatusMark> {
+  const mine = (await f.issueComments(planningPr)).filter(ours);
+  const found = mine.filter((c) => c.body.startsWith(MARKER)).sort((a, b) => b.id - a.id)[0];
+  const final = mine.some((c) => c.body.startsWith(FINAL_MARKER));
+  if (found === undefined) {
+    const mark = { commentId: await f.createComment(planningPr, body), sha256: sha256(body), final };
+    await writeMark(file, mark);
+    actions.push("created");
+    return mark;
+  }
+  let mark: StatusMark = { commentId: found.id, sha256: sha256(found.body), final };
+  await writeMark(file, mark);
+  actions.push("adopted");
+  if (mark.sha256 !== sha256(body)) {
+    await f.editComment(found.id, body);
+    mark = { ...mark, sha256: sha256(body) };
+    await writeMark(file, mark);
+    actions.push("edited");
+  }
+  return mark;
+}
+
+/**
+ * The planning PR's status comment: created once (`created`), or found again when the mark is missing (`adopted`),
+ * then edited in place only when `body` changes (`edited`); a comment someone deleted (its edit a 404) is found again
+ * or posted anew. `settled` is "there is a row, and every row is settled"; `finalBody` is the final comment, undefined
+ * while a problem is open. Settled with a final body and no final comment yet posts it (`final`); not settled with one
+ * posted marks the plan open again (`reopened`, no forge call), so the next settling posts another. Settled with a
+ * problem open leaves the mark as it is. `forge` is called only when it must read or write, so a tick with nothing to
+ * change mints no token. Returns the actions taken, in order. The mark is written after each write.
  */
 export async function upsertStatusComment(forge: () => Promise<Forge>, planningPr: number, body: string, finalBody: string | undefined, file: string, settled: boolean): Promise<string[]> {
   const actions: string[] = [];
   let mark = await readMark(file);
   const sha = sha256(body);
   if (mark === undefined) {
-    mark = { commentId: await (await forge()).createComment(planningPr, body), sha256: sha, final: false };
-    await writeMark(file, mark);
-    actions.push("created");
+    mark = await adoptOrCreate(await forge(), planningPr, body, file, actions);
   } else if (mark.sha256 !== sha) {
-    await (await forge()).editComment(mark.commentId, body);
-    mark = { ...mark, sha256: sha };
-    await writeMark(file, mark);
-    actions.push("edited");
+    const f = await forge();
+    try {
+      await f.editComment(mark.commentId, body);
+      mark = { ...mark, sha256: sha };
+      await writeMark(file, mark);
+      actions.push("edited");
+    } catch (e) {
+      if (!(e instanceof ForgeError && e.status === 404)) throw e;
+      // Deleted on GitHub: the mark names nothing. Find the comment again, or post it anew.
+      await rm(file, { force: true });
+      mark = await adoptOrCreate(f, planningPr, body, file, actions);
+    }
   }
   if (settled && finalBody !== undefined && !mark.final) {
     await (await forge()).createComment(planningPr, finalBody);

@@ -7,7 +7,9 @@
  *   when a repo's tick failed closed, so the service's status says so; a skipped tick (another holds the poll lock)
  *   exits 0.
  * - **`hapi status [<owner>/<name>]`**: each planning PR's work orders, as its status comment shows them, from local
- *   state alone: no git, no forge, no Docker.
+ *   state alone: hapi's state files, and the repo's overlay at the plan's merge read from its mirror with hardened
+ *   host git (read-only; skipped when there is no mirror), so a run's unknown spend counts at the same `run_usd` as
+ *   in the comment. No forge, no Docker, no fetch.
  * - **`hapi retry <owner>/<name> <work-order-id>`** (the operator's call of 2026-11-01, m19): from the operator's
  *   own terminal, a `failed` work order with no PR goes back to the end of its repo's queue for a fresh pass, under
  *   the poll lock, at most `runs.max_retries` times; a later tick starts its worker. It reads hapi's local state and
@@ -16,6 +18,7 @@
  *
  * `pollDeps` and `pipelineDepsOf` are the production wiring of the poller's and the state machine's deps.
  */
+import { stat } from "node:fs/promises";
 import { join } from "node:path";
 import { ask } from "../decide/record";
 import { githubForge, forgeToken } from "../forge";
@@ -29,9 +32,9 @@ import type { RunDeps } from "../run/spec";
 import { diffSubjects } from "./decisions";
 import { discoverWorkOrders, type DiscoverDeps, firstAddedBy, pinWorkOrder, planningPrOf, readWorkOrder } from "./discover";
 import { diffStat, push, runGates } from "./harvest";
-import { engineDirOf, ensureMirror, fetchMirror, type MirrorDeps } from "./mirror";
+import { engineDirOf, ensureMirror, fetchMirror, type MirrorDeps, mirrorPath } from "./mirror";
 import { advance, type PipelineDeps } from "./pipeline";
-import { ACTIVE, formatTick, type PollDeps, pollTick, QUEUE, type Tick, withPollLock } from "./poll";
+import { ACTIVE, budgetsOf, formatTick, type PollDeps, pollTick, QUEUE, type Tick, withPollLock } from "./poll";
 import { appendEvent, modelsLine, rowsOf, statusTable, totalOf } from "./status";
 import { listStates, readState, retryProblem, retryState, type WorkOrderState, writeState } from "./state";
 import { isWorkOrderId } from "../workorder/validate";
@@ -160,7 +163,15 @@ async function statusBlocks(d: RunDeps, central: Policy, engineDir: string, stat
   for (const key of keys) {
     const mine = groups.get(key)!.sort((a, b) => (a.id < b.id ? -1 : 1));
     const first = mine[0]!;
-    const rows = await rowsOf(d.stateDir, mine, central.budgets.run_usd, engineDir, central.gates.classifiers.jev.unknown_call_usd, d.now());
+    // The comment's basis: the plan's overlay at its merge, read from the mirror (none there: the central policy's).
+    const dd: DiscoverDeps = { run: d.run, env: d.env, engineDir, central };
+    const mirrored = await stat(join(mirrorPath(engineDir, first.repo), "HEAD")).then(
+      () => true,
+      () => false,
+    );
+    const readOrder = (id: string, mergeSha: string) => (mirrored ? readWorkOrder(dd, first.repo, id, mergeSha) : Promise.reject(new Error("no mirror")));
+    const budgets = await budgetsOf(central, first, readOrder);
+    const rows = await rowsOf(d.stateDir, mine, budgets.run_usd, engineDir, central.gates.classifiers.jev.unknown_call_usd, d.now());
     const lines = [first.planningPr === undefined ? `${first.repo} (no planning PR)` : `${first.repo} planning PR #${first.planningPr}`, statusTable(rows), `Total: $${totalOf(rows).toFixed(2)}`];
     const m = modelsLine(central.decisions.mode);
     if (m !== undefined) lines.push(m);
@@ -201,7 +212,7 @@ export async function retryCommand(args: string[], deps: { run?: Partial<RunDeps
     const central = centralOf(d);
     registeredIn(central, repo!);
     const engineDir = deps.engineDir ?? engineDirOf(d.env);
-    const line = await withPollLock(engineDir, d.env, async () => {
+    const queue = async (): Promise<string> => {
       const s = await readState(engineDir, repo!, id!);
       if (s === undefined) throw new Error(`${repo} has no work order ${id}: \`hapi status ${repo}\` lists them`);
       const why = retryProblem(s, central.runs.max_retries);
@@ -211,7 +222,8 @@ export async function retryCommand(args: string[], deps: { run?: Partial<RunDeps
       await appendEvent(engineDir, event);
       const ahead = (await listStates(engineDir, repo)).filter((x) => x.id !== id && x.pr === undefined && (ACTIVE.includes(x.phase) || QUEUE.includes(x.phase))).length;
       return `hapi retry: ${repo} ${id} is queued again (retry ${state.retry}), with ${ahead} of the repo's work orders ahead of it: a poll tick starts its worker at ${state.mergeSha.slice(0, 12)} once none is ahead and the caps allow`;
-    }).catch((e: unknown) => {
+    };
+    const line = await withPollLock(engineDir, d.env, queue, "hapi retry").catch((e: unknown) => {
       if (lockHeld(e)) throw new Error(`${(e as Error).message}: run hapi retry again when the tick ends`);
       throw e;
     });

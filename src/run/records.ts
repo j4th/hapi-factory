@@ -410,10 +410,10 @@ export function capacityProblem(live: string[], records: RunRecord[], want: { re
  * interleave. A held lock fails at once, naming its holder.
  */
 export function withStartLock<T>(d: Pick<RunDeps, "stateDir" | "env">, fn: () => Promise<T>): Promise<T> {
-  return withStoreLock(d.stateDir, "run-start", fn, { env: definedEnv(d.env) });
+  return withStoreLock(d.stateDir, "run-start", fn, { env: definedEnv(d.env), label: "hapi run" });
 }
 
 /** Run `fn` holding run `runId`'s own lock, keyed by its dir: one finalize at a time, and a stop request between them. */
 export function withRunLock<T>(d: Pick<RunDeps, "stateDir" | "env">, runId: string, fn: () => Promise<T>): Promise<T> {
-  return withStoreLock(recordDir(d.stateDir, runId), "run-finalize", fn, { env: definedEnv(d.env) });
+  return withStoreLock(recordDir(d.stateDir, runId), "run-finalize", fn, { env: definedEnv(d.env), label: "hapi run" });
 }

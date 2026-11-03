@@ -237,7 +237,12 @@ describe("pollTick", () => {
       });
       return r!;
     })();
-    expect(held.repos.find((x) => x.repo === SANDBOX)!.error).toBeUndefined();
+    const sandboxHeld = held.repos.find((x) => x.repo === SANDBOX)!;
+    expect(sandboxHeld.error).toBeUndefined();
+    // Said in the report, naming the holder.
+    expect(sandboxHeld.waiting).toHaveLength(1);
+    expect(sandboxHeld.waiting[0]).toMatch(new RegExp(`^${W1} waiting: another command, hapi poll \\(pid \\d+, started .+\\), is using .+hapi never takes the lock`));
+    expect(formatTick(held)[0]).toStartWith(`${SANDBOX}: ${W1} waiting: another command, hapi poll (pid`);
     expect(seen(w)).toEqual([]);
     expect(bytes(statePath(w.engineDir, SANDBOX, W1))).toEqual(before);
     // A PolicyLoosenError (a tightened central policy, m15): that work order can't run; the repo's tick goes on.
@@ -301,6 +306,58 @@ describe("pollTick", () => {
     w.advanced.length = 0;
     await pollTick(w.d);
     expect(seen(w)).toEqual([W1]);
+  });
+
+  test("a settled plan's final comment is left as it is: no row is read, nothing is rendered, and a retry reopens it", async () => {
+    const w = tickWorld();
+    const reads: string[] = [];
+    const readOrder = w.d.readOrder;
+    w.d.readOrder = async (repo, id, sha) => (reads.push(id), readOrder(repo, id, sha));
+    await writeState(w.engineDir, w.state({ id: W1, phase: "merged", pr: 12, runs: ["0a0a0a0a0a0a"] }));
+    await writeState(w.engineDir, w.state({ id: W2, phase: "failed", reasons: ["worker run 0b0b0b0b0b0b ended failed: x"] }));
+    // A final mark whose sha256 is no longer the body a tick would render (retention removed its runs, say).
+    const file = markPath(w.engineDir, SANDBOX, 3);
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, `${JSON.stringify({ commentId: 1000, sha256: "0".repeat(64), final: true })}\n`);
+    const mark = bytes(file);
+    w.worlds[SANDBOX]!.comment(3, { id: 3, login: "hapi-factory[bot]", type: "Bot" }, "<!-- hapi:status v1 -->\nold", true);
+    const r = await pollTick(w.d);
+    expect(w.worlds[SANDBOX]!.calls).toEqual([]);
+    expect(reads).toEqual([]);
+    expect(bytes(file)).toEqual(mark);
+    expect(r.repos.find((x) => x.repo === SANDBOX)!.comments).toEqual([]);
+    // hapi retry leaves W2 queued: the plan reopens, its comment edited, no second final comment.
+    const failed = (await readState(w.engineDir, SANDBOX, W2))!;
+    await writeState(w.engineDir, retryState(failed, T2).state);
+    const again = await pollTick(w.d);
+    expect(again.repos.find((x) => x.repo === SANDBOX)!.comments).toEqual(["#3 edited", "#3 reopened"]);
+    expect(JSON.parse(readFileSync(file, "utf8")).final).toBe(false);
+    // A problem on a settled plan isn't frozen out: it still shows (the mark stays final).
+    const p = tickWorld({ problems: { [SANDBOX]: [{ path: ".factory/work/0004-bad/order.yaml", reason: "invalid YAML" }] } });
+    await writeState(p.engineDir, p.state({ id: W1, phase: "merged", pr: 12 }));
+    const pfile = markPath(p.engineDir, SANDBOX, 3);
+    mkdirSync(dirname(pfile), { recursive: true });
+    writeFileSync(pfile, `${JSON.stringify({ commentId: 1000, sha256: "0".repeat(64), final: true })}\n`);
+    p.worlds[SANDBOX]!.comment(3, { id: 3, login: "hapi-factory[bot]", type: "Bot" }, "<!-- hapi:status v1 -->\nold", true);
+    expect((await pollTick(p.d)).repos.find((x) => x.repo === SANDBOX)!.comments).toEqual(["#3 edited"]);
+    expect(JSON.parse(readFileSync(pfile, "utf8")).final).toBe(true);
+  });
+
+  test("a heads cache that can't be removed is a warning, after the state and its events are written", async () => {
+    const w = tickWorld();
+    await writeState(w.engineDir, w.state({ id: W1, phase: "waiting", pr: 12 }));
+    const heads = headsFile(w.engineDir, SANDBOX, W1);
+    // A directory where the file should be: rm without recursive refuses it.
+    mkdirSync(join(heads, "x"), { recursive: true });
+    const event = { at: T2, repo: SANDBOX, workOrder: W1, phase: "closed" as const, pr: 12 };
+    w.d.advance = async (s) => ({ state: { ...s, phase: "closed", updatedAt: T2 }, events: [event] });
+    const r = await pollTick(w.d);
+    const sandbox = r.repos.find((x) => x.repo === SANDBOX)!;
+    expect(sandbox.error).toBeUndefined();
+    expect((await readState(w.engineDir, SANDBOX, W1))!.phase).toBe("closed");
+    expect(w.events()).toEqual([event]);
+    expect(sandbox.warnings).toHaveLength(1);
+    expect(sandbox.warnings[0]).toStartWith(`${W1}: its heads cache wasn't removed: `);
   });
 
   test("a state that retires (merged or closed) loses its heads cache", async () => {

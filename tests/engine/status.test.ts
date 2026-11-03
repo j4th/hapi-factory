@@ -5,7 +5,7 @@
  * through the real adapter. No Docker, no model, no network.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { statusCommand } from "../../src/engine/cli";
@@ -13,9 +13,15 @@ import { appendLedger, ledgerPath } from "../../src/engine/decisions";
 import { markPath, renderFinal, renderStatus, rowsOf, type StatusRow, statusTable, upsertStatusComment, VERDICT_TEXT } from "../../src/engine/status";
 import { type WorkOrderState, writeState } from "../../src/engine/state";
 import { githubForge } from "../../src/forge";
+import { FACTORY_BOT, STRANGER } from "../forge/helpers";
 import { fakeRun, NOW, seedRun } from "../run/helpers";
 import { capture, cleanup } from "../secrets/helpers";
-import { decisionsOf, MERGE, planningWorld, policyRoot, SANDBOX, writeOut, writes } from "./helpers";
+import YAML from "yaml";
+import { readWorkOrder } from "../../src/engine/discover";
+import { budgetsOf } from "../../src/engine/poll";
+import { loadPolicy } from "../../src/policy/load";
+import { runCommand } from "../../src/stack/up";
+import { decisionsOf, gitWorld, MERGE, ORDER, planningWorld, policyRoot, SANDBOX, writeOut, writes } from "./helpers";
 
 afterEach(cleanup);
 
@@ -200,6 +206,56 @@ describe("upsertStatusComment", () => {
     expect(writes(w.ff).filter((x) => x.startsWith("POST"))).toHaveLength(2);
   });
 
+  /** A status body: the hidden marker first, as renderStatus writes it. */
+  const B = (t: string) => `<!-- hapi:status v1 -->\n${t}`;
+
+  test("a mark lost after the POST (its write failed) is found again on the PR: the next tick makes no second POST", async () => {
+    const w = world();
+    // The mark's dir can't be written: the comment is posted, then writing its mark fails.
+    mkdirSync(dirname(w.file), { recursive: true, mode: 0o700 });
+    chmodSync(dirname(w.file), 0o500);
+    await expect(upsertStatusComment(w.lazy, 3, B("one"), undefined, w.file, false)).rejects.toThrow();
+    chmodSync(dirname(w.file), 0o700);
+    expect(writes(w.ff)).toEqual(["POST /issues/3/comments"]);
+    // Someone else's comment holding the marker, newer, is never adopted: only the factory App's.
+    w.ff.comment(3, STRANGER, B("not ours"));
+    w.ff.comment(3, { ...FACTORY_BOT }, B("posted by a user's own hand"), false);
+    expect(await upsertStatusComment(w.lazy, 3, B("one"), undefined, w.file, false)).toEqual(["adopted"]);
+    expect(writes(w.ff)).toEqual(["POST /issues/3/comments"]);
+    expect(mark(w.file)).toEqual({ commentId: 1000, sha256: sha256(B("one")), final: false });
+    // Found again with a new body: adopted, then edited in place.
+    const v = world();
+    await upsertStatusComment(v.lazy, 3, B("one"), undefined, v.file, false);
+    rmSync(v.file);
+    expect(await upsertStatusComment(v.lazy, 3, B("two"), undefined, v.file, false)).toEqual(["adopted", "edited"]);
+    expect(writes(v.ff)).toEqual(["POST /issues/3/comments", "PATCH /issues/comments/1000"]);
+  });
+
+  test("a lost mark on a plan whose final comment is posted is found again as final: no second final comment", async () => {
+    const w = world();
+    await upsertStatusComment(w.lazy, 3, B("settled"), "<!-- hapi:status-final v1 -->\nFINAL", w.file, true);
+    rmSync(w.file);
+    expect(await upsertStatusComment(w.lazy, 3, B("settled"), "<!-- hapi:status-final v1 -->\nFINAL", w.file, true)).toEqual(["adopted"]);
+    expect(mark(w.file)).toEqual({ commentId: 1000, sha256: sha256(B("settled")), final: true });
+    expect(writes(w.ff)).toEqual(["POST /issues/3/comments", "POST /issues/3/comments"]);
+  });
+
+  test("a status comment someone deleted is posted again, not edited forever", async () => {
+    const w = world();
+    await upsertStatusComment(w.lazy, 3, B("one"), undefined, w.file, false);
+    w.ff.removeComment(1000);
+    expect(await upsertStatusComment(w.lazy, 3, B("two"), undefined, w.file, false)).toEqual(["created"]);
+    expect(writes(w.ff)).toEqual(["POST /issues/3/comments", "PATCH /issues/comments/1000", "POST /issues/3/comments"]);
+    expect(mark(w.file)).toEqual({ commentId: 1001, sha256: sha256(B("two")), final: false });
+    // And the next edit goes to the new one.
+    expect(await upsertStatusComment(w.lazy, 3, B("three"), undefined, w.file, false)).toEqual(["edited"]);
+    expect(writes(w.ff).at(-1)).toBe("PATCH /issues/comments/1001");
+    // Any other forge error still fails closed, mark kept.
+    w.ff.failNext("PATCH", `/repos/${SANDBOX}/issues/comments/1001`, 502);
+    await expect(upsertStatusComment(w.lazy, 3, B("four"), undefined, w.file, false)).rejects.toThrow("HTTP 502");
+    expect(mark(w.file).commentId).toBe(1001);
+  });
+
   test("a mark that isn't one fails closed, naming the file, and posts nothing", async () => {
     const w = world();
     await upsertStatusComment(w.lazy, 3, "one", undefined, w.file, false);
@@ -265,6 +321,36 @@ describe("hapi status", () => {
       expect(out).toHaveLength(2);
       for (const block of out) expect(block.split("\n").at(-1)).toBe(line);
     }
+  });
+
+  test("hapi status counts an unknown spend at the plan's overlay's run_usd, as the comment does", async () => {
+    const { out } = capture();
+    // A real mirror whose main holds the work order and an overlay lowering run_usd, read with hardened host git.
+    const gw = gitWorld();
+    const merge = gw.onMain({
+      [`.factory/work/${ORDER.id}/order.yaml`]: YAML.stringify(ORDER.workOrder),
+      [`.factory/work/${ORDER.id}/task.md`]: ORDER.taskMd,
+      ".factory/config.yaml": "budgets:\n  run_usd: 1\n",
+    });
+    const f = fakeRun();
+    // A run retention removed: no record, so it counts at run_usd, unknown.
+    const s = stateOf({ repo: ORDER.repo, id: ORDER.id, mergeSha: merge, runs: ["0a0a0a0a0a0a"] });
+    await writeState(gw.engineDir, s);
+    const run = { ...f.deps, run: runCommand, root: policyRoot({ repos: [ORDER.repo] }) };
+    expect(await statusCommand([ORDER.repo], { run, engineDir: gw.engineDir })).toBe(0);
+    expect(out[0]).toContain(`| \`${ORDER.id}\` | queued | \`0a0a0a0a0a0a\` | — | 0 automatic, 0 rework | $1.00 (budget: spend unknown) |`);
+    // The comment's basis is the same: budgetsOf over the work order's overlay.
+    const central = loadPolicy(join(run.root, "policy"));
+    const budgets = await budgetsOf(central, s, (id, sha) => readWorkOrder({ run: runCommand, env: f.deps.env, engineDir: gw.engineDir, central }, ORDER.repo, id, sha));
+    expect(budgets.run_usd).toBe(1);
+    // With no mirror, the central policy's: $3.00.
+    out.length = 0;
+    const bare = fakeRun();
+    const engineDir = join(bare.tmp, "engine");
+    await writeState(engineDir, s);
+    expect(await statusCommand([ORDER.repo], { run: { ...bare.deps, root: run.root }, engineDir })).toBe(0);
+    expect(out[0]).toContain("| $3.00 (budget: spend unknown) |");
+    expect(bare.calls).toEqual([]);
   });
 
   test("with no state, it says so", async () => {

@@ -23,8 +23,10 @@ const SERVICE = [
   "Type=oneshot",
   "WorkingDirectory=%h/hapi-factory",
   "Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin",
-  "ExecStart=%h/.local/bin/mise run hapi -- poll --once",
+  "Environment=XDG_RUNTIME_DIR=%t",
+  "ExecStart=%h/.local/bin/mise exec -- bun run src/cli.ts poll --once",
   "TimeoutStartSec=1800",
+  "TimeoutStopSec=15",
   "KillMode=process",
   "",
 ];
@@ -58,13 +60,24 @@ describe("emitSystemd", () => {
     }
   });
 
-  test("KillMode=process says why, just above it: the detached supervisors live in the service's cgroup", () => {
+  test("KillMode=process says why, just above it: the detached supervisors live in the service's cgroup, and bun is the main PID", () => {
     const lines = emitSystemd(p)["hapi-poll.service"]!.split("\n");
     const at = lines.indexOf("KillMode=process");
     const comment = lines.slice(0, at).reverse();
-    const why = comment.slice(0, comment.findIndex((l) => !l.startsWith("#"))).reverse().join(" ");
-    expect(why).toContain("hapi run supervise");
-    expect(why).toContain("control-group");
+    const why = comment.slice(0, comment.findIndex((l) => !l.startsWith("#"))).reverse();
+    expect(why).toEqual([
+      "# startRun's detached `hapi run supervise` processes live in this cgroup: control-group would kill them when the",
+      "# oneshot exits, and mixed would SIGKILL them at a stop's timeout. process signals the tick (bun, the main PID) alone.",
+    ]);
+  });
+
+  test("the tick is the main process: mise exec runs bun in its place, never mise run's task shell, and a stop waits 15 s at most", () => {
+    const service = emitSystemd(p)["hapi-poll.service"]!;
+    expect(service).toContain("ExecStart=%h/.local/bin/mise exec -- bun run src/cli.ts poll --once\n");
+    expect(body(service).some((l) => l.includes("mise run"))).toBe(false);
+    expect(service).toContain("TimeoutStopSec=15\n");
+    // %t is the user manager's runtime dir: the locks and the zone env files are under it.
+    expect(service).toContain("Environment=XDG_RUNTIME_DIR=%t\n");
   });
 
   test("poll_interval_s: 300 gives 300 in all three places", () => {
@@ -78,7 +91,7 @@ describe("emitSystemd", () => {
   test("the paths are up.ts's: hapi's checkout and its mise, under %h", () => {
     const service = emitSystemd(p)["hapi-poll.service"]!;
     expect(service).toContain(`WorkingDirectory=%h/${HAPI_CHECKOUT}\n`);
-    expect(service).toContain(`ExecStart=%h/${HAPI_MISE} run hapi -- poll --once\n`);
+    expect(service).toContain(`ExecStart=%h/${HAPI_MISE} exec -- bun run src/cli.ts poll --once\n`);
     expect(service).toContain(`Documentation=file:%h/${HAPI_CHECKOUT}/docs/runbooks/stack.md\n`);
   });
 

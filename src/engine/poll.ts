@@ -21,7 +21,11 @@
  *       writes nothing (Review Focus 4). A held lock leaves that work order for the next tick. A work order that can't
  *       be read, or whose overlay the central policy now refuses (m15), is a problem and waits;
  *    5. each planning PR its states or problems name gets its status comment (./status.ts), with the caps of its
- *       first work order's overlay; the forge is asked for only when the comment must change.
+ *       first work order's overlay; the forge is asked for only when the comment must change. A plan whose final
+ *       comment is posted, every work order still settled and no problem open, is left as it is: no row is read and
+ *       nothing is rendered (the controller's ruling, fix round 1), so a settled plan's comment never drifts (spend a
+ *       retention removed, caps after its merge is gone) and the tick's cost doesn't grow with history. A work order
+ *       that leaves the settled phases (`hapi retry`) reopens it.
  *    A throw anywhere in a repo's tick (a forge error, a git failure, a rate limit: GitHub's secondary one is a 403
  *    with retry-after) fails that repo closed with its first lines, the tick's tokens redacted; the next tick
  *    retries. Every token the repo's tick minted is revoked in its `finally`, and each is minted for one tick alone.
@@ -42,7 +46,7 @@ import { withStoreLock } from "../secrets/store-files";
 import { definedEnv, type Env } from "../stack/up";
 import { type DiscoverProblem, type Discovered, overlapProblem } from "./discover";
 import { headsFile } from "./pipeline";
-import { appendEvent, markPath, renderFinal, renderStatus, rowsOf, settledRows, upsertStatusComment } from "./status";
+import { appendEvent, markPath, readMark, renderFinal, renderStatus, rowsOf, settledRows, upsertStatusComment } from "./status";
 import { listStates, newState, type Phase, type StatusEvent, withOrderLock, type WorkOrderState, writeState } from "./state";
 
 /** A repo's tick's credentials and forges, each made when first asked for and kept for the tick alone. */
@@ -103,6 +107,8 @@ export interface RepoTick {
   comments: string[];
   /** `<path>: <reason>`, each work order that can't run. */
   problems: string[];
+  /** `<id> waiting: <why>`, each work order left for the next tick because a lock it needs is held. */
+  waiting: string[];
   warnings: string[];
   /** Why the repo's tick failed closed. */
   error?: string;
@@ -121,9 +127,12 @@ export interface Minted {
   revoke(): Promise<void>;
 }
 
-/** Run `fn` holding the poll lock (keyed by the engine dir): a tick, or `hapi retry`. Fails at once while another holds it. */
-export function withPollLock<T>(engineDir: string, env: Env, fn: () => Promise<T>): Promise<T> {
-  return withStoreLock(engineDir, "poll", fn, { env: definedEnv(env) });
+/**
+ * Run `fn` holding the poll lock (keyed by the engine dir): a tick, or `hapi retry`, which `label` names in the lock's
+ * line, so a refusal or a signal's line says which (`hapi poll`, by default). Fails at once while another holds it.
+ */
+export function withPollLock<T>(engineDir: string, env: Env, fn: () => Promise<T>, label = "hapi poll"): Promise<T> {
+  return withStoreLock(engineDir, "poll", fn, { env: definedEnv(env), label });
 }
 
 /** A repo's `Tick`: each token minted once, when first asked for, and pushed onto `minted` for the tick's revoke. */
@@ -209,7 +218,7 @@ export async function pollTick(d: PollDeps): Promise<TickReport> {
 
 /** One repo's tick: see the module comment, step 3. */
 async function tickRepo(d: PollDeps, repo: string): Promise<RepoTick> {
-  const r: RepoTick = { repo, created: [], moved: [], comments: [], problems: [], warnings: [] };
+  const r: RepoTick = { repo, created: [], moved: [], comments: [], problems: [], waiting: [], warnings: [] };
   const minted: Minted[] = [];
   const tick = makeTick(d, repo, minted);
   try {
@@ -269,8 +278,9 @@ async function work(d: PollDeps, repo: string, tick: Tick, r: RepoTick): Promise
       await appendEvent(d.engineDir, { at: now, repo, workOrder: s.id, phase: s.phase, ...(s.phase === "held" ? { verdict: s.verdict, reason: s.reasons[0] } : {}) });
       return true;
     }).catch((e: unknown) => {
-      if (lockHeld(e)) return false; // its state is made on the next tick
-      throw e;
+      if (!lockHeld(e)) throw e;
+      r.waiting.push(`${o.id} waiting: ${shown(e, [])}`); // its state is made on the next tick
+      return false;
     });
     if (!made) continue;
     orders.set(`${o.id}@${o.mergeSha}`, Promise.resolve(o));
@@ -291,14 +301,20 @@ async function work(d: PollDeps, repo: string, tick: Tick, r: RepoTick): Promise
       await withOrderLock(d.engineDir, s, d.run.env, async () => {
         const a = await d.advance(s, order, tick);
         if (JSON.stringify(a.state) !== JSON.stringify(s)) await writeState(d.engineDir, a.state);
-        // Retired: its heads cache is never read again (advance has unpinned it).
-        if ((a.state.phase === "merged" || a.state.phase === "closed") && a.state.phase !== s.phase) await rm(headsFile(d.engineDir, repo, s.id), { force: true });
         for (const e of a.events) await appendEvent(d.engineDir, e);
         if (a.state.phase !== s.phase) r.moved.push(`${s.id} ${s.phase} -> ${a.state.phase}`);
         for (const w of a.warnings ?? []) r.warnings.push(sanitizeTerminal(w.replace(/[\r\n]+/g, " ")));
+        // Retired: its heads cache is never read again (advance has unpinned it). A cache only, so a removal that fails
+        // is a warning, after the state and its events are written.
+        if ((a.state.phase === "merged" || a.state.phase === "closed") && a.state.phase !== s.phase) {
+          await rm(headsFile(d.engineDir, repo, s.id), { force: true }).catch((e: unknown) => r.warnings.push(`${s.id}: its heads cache wasn't removed: ${shown(e, [])}`));
+        }
       });
     } catch (e) {
-      if (lockHeld(e)) continue; // another holder: the next tick
+      if (lockHeld(e)) {
+        r.waiting.push(`${s.id} waiting: ${shown(e, [])}`); // another holder: the next tick
+        continue;
+      }
       if (e instanceof PolicyLoosenError || e instanceof PolicyError) {
         problem({ path, reason: shown(e, []), pr: s.planningPr });
         continue;
@@ -312,13 +328,16 @@ async function work(d: PollDeps, repo: string, tick: Tick, r: RepoTick): Promise
   const prs = new Set([...states.map((s) => s.planningPr), ...problems.map((p) => p.pr)].filter((n): n is number => n !== undefined));
   for (const pr of [...prs].sort((a, b) => a - b)) {
     const mine = states.filter((s) => s.planningPr === pr).sort(byId);
+    const open = problems.filter((p) => p.pr === pr).map(({ path, reason }) => ({ path, reason }));
+    const file = markPath(d.engineDir, repo, pr);
+    // Frozen: the final comment is posted and the plan is still settled, with no problem open.
+    if (open.length === 0 && mine.length > 0 && mine.every((s) => SETTLED.includes(s.phase)) && (await readMark(file))?.final === true) continue;
     const budgets = await budgetsOf(d.policy, mine[0], readOrder);
     const rows = await rowsOf(d.run.stateDir, mine, budgets.run_usd, d.engineDir, d.policy.gates.classifiers.jev.unknown_call_usd, d.run.now());
-    const open = problems.filter((p) => p.pr === pr).map(({ path, reason }) => ({ path, reason }));
     const body = renderStatus(rows, { monthlyUsd: budgets.repo_monthly_usd, dailyUsd: budgets.daily_usd }, open, d.policy.decisions.mode);
     const settled = settledRows(rows);
     const final = settled && open.length === 0 ? renderFinal(rows) : undefined;
-    for (const a of await upsertStatusComment(() => tick.forge("pr"), pr, body, final, markPath(d.engineDir, repo, pr), settled)) r.comments.push(`#${pr} ${a}`);
+    for (const a of await upsertStatusComment(() => tick.forge("pr"), pr, body, final, file, settled)) r.comments.push(`#${pr} ${a}`);
   }
 }
 
@@ -326,7 +345,7 @@ async function work(d: PollDeps, repo: string, tick: Tick, r: RepoTick): Promise
  * A planning PR's budgets: its first work order's overlay over the central policy (one planning PR's work orders share
  * its merge, and so its `.factory/config.yaml`), or the central policy's with none, or when it can't be read or applied.
  */
-async function budgetsOf(central: Policy, first: WorkOrderState | undefined, readOrder: (id: string, mergeSha: string) => Promise<Discovered>): Promise<Policy["budgets"]> {
+export async function budgetsOf(central: Policy, first: WorkOrderState | undefined, readOrder: (id: string, mergeSha: string) => Promise<Discovered>): Promise<Policy["budgets"]> {
   if (first === undefined) return central.budgets;
   try {
     const o = await readOrder(first.id, first.mergeSha);
@@ -342,7 +361,7 @@ export function formatTick(r: TickReport): string[] {
   if (r.skipped !== undefined) lines.push(`poll: ${r.skipped}`);
   if (r.reap !== undefined) lines.push(`poll: ${r.reap}`);
   for (const x of r.repos) {
-    const entries = [...x.created, ...x.moved, ...x.comments];
+    const entries = [...x.created, ...x.moved, ...x.waiting, ...x.comments];
     if (entries.length > 0) lines.push(`${x.repo}: ${entries.join("; ")}`);
     else if (x.error === undefined) lines.push(`${x.repo}: nothing to do`);
     for (const p of x.problems) lines.push(`${x.repo}: can't run ${p}`);

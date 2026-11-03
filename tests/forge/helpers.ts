@@ -303,6 +303,11 @@ export function fakeForge(o: { repo?: string; private?: boolean; pageSize?: numb
     },
     addPr,
     comment,
+    /** Delete comment `id`, as a maintainer can: a later edit of it is a 404. */
+    removeComment(id: number): void {
+      const i = comments.findIndex((c) => c.id === id);
+      if (i >= 0) comments.splice(i, 1);
+    },
     label(n: number, name: string, actor: Actor, a: { viaApp?: boolean; action?: "labeled" | "unlabeled"; at?: string } = {}): void {
       const action = a.action ?? "labeled";
       const pr = prs.get(n);

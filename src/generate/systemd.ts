@@ -1,9 +1,11 @@
 /**
  * The poller's systemd user units (design §3.4; Plan 03 Task 14; spike 09's T20 rulings), into `build/systemd/`:
  *
- * - `hapi-poll.service`: one tick, `mise run hapi -- poll --once` in hapi's checkout, `Type=oneshot`, with its own
- *   `PATH` (the user manager's env carries whatever the session had; T20). `mise run` puts the checkout's pinned tools
- *   on the task's PATH, gitleaks among them, which the harvester's secret scan needs at mise.toml's version.
+ * - `hapi-poll.service`: one tick, `mise exec -- bun run src/cli.ts poll --once` in hapi's checkout, `Type=oneshot`,
+ *   with its own `PATH` and `XDG_RUNTIME_DIR` (the user manager's env carries whatever the session had; T20). `mise
+ *   exec` puts the checkout's pinned tools on PATH, gitleaks among them, which the harvester's secret scan needs at
+ *   mise.toml's version, then execs bun, so the tick is the unit's main process: a stop's SIGTERM reaches the tick
+ *   itself, and `TimeoutStopSec` bounds it (kill switch 3; Task 14 fix round 1).
  * - `hapi-poll.timer`: the first tick `runs.poll_interval_s` after the timer starts (`OnActiveSec`: without it the
  *   timer never fires, T20), then one `runs.poll_interval_s` after each tick started (`OnUnitActiveSec`).
  *
@@ -21,6 +23,8 @@ const CHECKOUT = "hapi-factory";
 const MISE = ".local/bin/mise";
 /** A tick's bound: past FINALIZE_WAIT_S (a reap's finalize) and a harvest, so systemd never kills a tick mid-write. */
 const TICK_TIMEOUT_S = 1800;
+/** How long a stop waits for the tick after its SIGTERM before the SIGKILL: what kill switch 3 waits for at worst. */
+const STOP_TIMEOUT_S = 15;
 
 /** `{ "hapi-poll.service", "hapi-poll.timer" }`, each with the generated-file notice first. */
 export function emitSystemd(p: Policy): Record<string, string> {
@@ -35,10 +39,12 @@ export function emitSystemd(p: Policy): Record<string, string> {
     "Type=oneshot",
     `WorkingDirectory=%h/${CHECKOUT}`,
     "Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin",
-    `ExecStart=%h/${MISE} run hapi -- poll --once`,
+    "Environment=XDG_RUNTIME_DIR=%t",
+    `ExecStart=%h/${MISE} exec -- bun run src/cli.ts poll --once`,
     `TimeoutStartSec=${TICK_TIMEOUT_S}`,
-    "# A tick's startRun spawns a detached `hapi run supervise` per run, and those processes live in this service's",
-    "# cgroup. The default, KillMode=control-group, would kill them when the oneshot exits; process kills the tick alone.",
+    `TimeoutStopSec=${STOP_TIMEOUT_S}`,
+    "# startRun's detached `hapi run supervise` processes live in this cgroup: control-group would kill them when the",
+    "# oneshot exits, and mixed would SIGKILL them at a stop's timeout. process signals the tick (bun, the main PID) alone.",
     "KillMode=process",
     "",
   ].join("\n");

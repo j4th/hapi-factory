@@ -208,7 +208,7 @@ export async function listStates(engineDir: string, repo?: string): Promise<Work
 
 /** Run `fn` holding work order `s`'s own lock (the secrets commands' lock, keyed by its state file): one writer at a time. */
 export function withOrderLock<T>(engineDir: string, s: Pick<WorkOrderState, "repo" | "id">, env: Env, fn: () => Promise<T>): Promise<T> {
-  return withStoreLock(statePath(engineDir, s.repo, s.id), "engine-order", fn, { env: definedEnv(env) });
+  return withStoreLock(statePath(engineDir, s.repo, s.id), "engine-order", fn, { env: definedEnv(env), label: "hapi poll" });
 }
 
 /** Move `s` to `to`: only its phase and `updatedAt` change. The event carries the state's PR, verdict and pass (from retry 1). */
