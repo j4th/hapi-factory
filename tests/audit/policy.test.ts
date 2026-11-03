@@ -9,10 +9,11 @@
  *   notes only. Read from policy/, so it needs nothing running.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { cpSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { runAudit } from "../../src/audit/index";
-import { cleanup, cleanWorld, hostEnv, NAME, only, OWNER, REPO, registeredPolicy, SIDECAR_IMAGE, tempDir } from "./helpers";
+import { envFileText } from "../../src/secrets/files";
+import { APP_IDS, APP_KEY, appOf, cleanup, cleanWorld, hostEnv, NAME, only, OWNER, REPO, registeredPolicy, SIDECAR_IMAGE, tempDir } from "./helpers";
 
 afterEach(cleanup);
 
@@ -66,8 +67,11 @@ describe("policy.repos", () => {
     const w = await registered();
     const r = only(await runAudit(w.ctx), "policy.repos");
     expect([r.status, r.detail]).toEqual(["pass", "policy/repos.yaml: 1 repo, each covered by the recorded hapi-planner and hapi-factory installations (CodeRabbit's isn't checked: hapi holds no key for it)"]);
-    const asked = w.requests.filter((c) => c.url === `https://api.github.com/repos/${OWNER}/${NAME}/installation`);
-    expect(asked.length).toBeGreaterThanOrEqual(2);
+    // Exactly one GET of the repo's installation per App, each with that App's own JWT, and nothing else: no mint.
+    expect(w.requests.map((c) => [c.method, c.url, appOf(c)])).toEqual([
+      ["GET", `https://api.github.com/repos/${OWNER}/${NAME}/installation`, "planner"],
+      ["GET", `https://api.github.com/repos/${OWNER}/${NAME}/installation`, "factory"],
+    ]);
   });
 
   test("a recorded installation GitHub doesn't have fails, naming the repo, the App and both ids", async () => {
@@ -87,6 +91,19 @@ describe("policy.repos", () => {
     expect(r.status).toBe("fail");
     expect(r.detail).toContain(`${OWNER}/${NAME}: hapi-planner: the App is not installed on ${OWNER}/${NAME} (GitHub 404)`);
     expect(r.detail).toContain(`${OWNER}/${NAME}: hapi-factory: the App is not installed`);
+  });
+
+  test("with one App's key missing and the other's installation matching, it skips, naming the App it couldn't ask", async () => {
+    const w = await registered({ keys: false });
+    const dir = join(w.ctx.env.XDG_RUNTIME_DIR!, "hapi", "env");
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    chmodSync(join(w.ctx.env.XDG_RUNTIME_DIR!, "hapi"), 0o700);
+    writeFileSync(join(dir, "host.env"), envFileText("host", { HAPI_PLANNER_APP_ID: String(APP_IDS.planner), HAPI_PLANNER_APP_PRIVATE_KEY: APP_KEY }), { mode: 0o600 });
+    const r = only(await runAudit(w.ctx), "policy.repos");
+    expect(r.status).toBe("skip");
+    expect(r.detail).toStartWith(`${OWNER}/${NAME}: hapi-planner's installations match, but no GitHub credentials for hapi-factory: `);
+    expect(r.detail).toContain("has no HAPI_FACTORY_APP_ID");
+    expect(w.requests.map((c) => appOf(c))).toEqual(["planner"]);
   });
 
   test("with no host.env (no App keys) it skips, naming the repo", async () => {

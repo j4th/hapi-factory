@@ -50,7 +50,7 @@ Every command below that runs as hapi is run on the host, from your own terminal
 
 ```bash
 sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
-  export XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"; \
+  export XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus" PATH="$HOME/.local/bin:$PATH"; \
   systemctl --user list-timers hapi-poll.timer --no-pager; \
   journalctl --user -u hapi-poll.service -n 50 --no-pager'
 ```
@@ -160,7 +160,8 @@ sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
 
 `hapi retry` reads hapi's local state and the central policy alone: no git, no token, no GitHub or Docker call. It refuses, naming why:
 
-- a repo `policy/repos.yaml` doesn't register, or a work order with no state there: ``<repo> has no work order <id>: `hapi status <repo>` lists them``;
+- a repo `policy/repos.yaml` doesn't register: `<repo> isn't registered in policy/repos.yaml`;
+- a registered repo with no state for that work order: ``<repo> has no work order <id>: `hapi status <repo>` lists them``;
 - a work order that isn't failed: `work order <id> is <phase>, not failed: only a failed work order is retried (docs/runbooks/engine.md, Troubleshooting)`;
 - one with a PR: `work order <id> has PR #<n>: a PR is reworked with the hapi:rework label, not retried`;
 - one already retried `runs.max_retries` times (2; central only, always hard, and 0 turns `hapi retry` off): `work order <id> has been retried <n> times, and runs.max_retries is <n>: plan the work again under a new work order id`;
@@ -293,25 +294,28 @@ The harvester asks one decision, `diff-screen` (`policy/decisions/diff-screen.ts
 - **The knobs** are `policy/gates.yaml`'s `decisions` block, central and protected, so each change is a PR you merge: `decisions.mode` (`enforce`; `notes`: asked and recorded, but no answer holds a PR; `off`: nothing is asked); one decision moved to `shadow` (asked and recorded, with no effect but its Evidence row) or `off`; its `on_unscreened`, and `max_calls_per_head`; and adding a decision (a decision file, a registry line, a `by_name` entry and its schema line). Running with none at all: [docs/policy.md, "Running without decision models"](../policy.md#running-without-decision-models).
 - **The ledger**, `~hapi/.local/state/hapi/engine/decisions/<owner>/<name>/<id>.jsonl` (0600, append-only, one per work order, kept with its state): an `asking` line before each call, and an `answer` line after it (or for a subject that wasn't asked). A line holds names and numbers: the decision and its version, the run, head, subject and part, the typed answers, the classifier, the verdict, its effect and the cost. It never holds the state's text or a key.
 
-**Reading a repo's ledger**, as hapi. It needs `jq` on the host; since each line is names and numbers only, `cat` does too:
+**Reading a repo's ledger**, as hapi. It needs `jq` on the host (nothing installs it); since each line is names and numbers only, `cat` of the file does too:
 
 ```bash
 OWNER="$(gh api user --jq .login)"
-sudo -u hapi -H -- sh -c 'cd "$HOME/.local/state/hapi/engine/decisions/$1" && \
+sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
+  export XDG_RUNTIME_DIR PATH="$HOME/.local/bin:$PATH"; \
+  command -v jq > /dev/null || { echo "no jq on this host: cat the ledger files instead (each line is names and numbers)"; exit 1; }; \
+  cd "$HOME/.local/state/hapi/engine/decisions/$1" && \
   jq -c "select(.kind == \"answer\") | {workOrder, retry, run: .run[0:12], head: .head[0:7], decision, version, subject, part, public, models, via, verdict, effect, cost_usd}" *.jsonl' \
   hapi-decisions "$OWNER/<name>"
 ```
 
-**Replaying one decision** offline (calibration, H-262): rebuild the line's state from the mirror by its `run`, `head`, `subject` and `part`, check it against the line's `key` ([`hapi decide`](../policy.md#hapi-decide-name---state-file-file---public---mock)), and save it as `~hapi/replay.json`. Then, as hapi, add `--public` only when the line's `public` is `true`, never for a private repo's line:
+**Replaying one decision** is Plan 06's calibration (H-262), and a real replay waits for it: `hapi decide` reads the classifier keys from its own environment alone (`HAPI_JEV_OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`), and hapi's shell holds neither, so as hapi it prints only the file's fallback (`via: default`). Its shape, for when it can: rebuild the line's state from the mirror by its `run`, `head`, `subject` and `part`, check it against the line's `key` ([`hapi decide`](../policy.md#hapi-decide-name---state-file-file---public---mock)), and save it as `~hapi/replay.json`; then, as hapi, with `--public` as the second argument only when the line's `public` is `true` (never for a private repo's line):
 
 ```bash
 sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
   export XDG_RUNTIME_DIR PATH="$HOME/.local/bin:$PATH"; \
-  cd "$HOME/hapi-factory" && exec mise run hapi -- decide diff-screen --state-file "$HOME/$1"' \
+  cd "$HOME/hapi-factory" && exec mise run hapi -- decide diff-screen --state-file "$HOME/$1" ${2:+"$2"}' \
   hapi-decide replay.json
 ```
 
-It reads the classifier keys from its own environment alone (`HAPI_JEV_OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`); with neither set, it prints the file's fallback with `via: default`.
+For a public repo's line, end it `hapi-decide replay.json --public`.
 
 - **Spend.** Each call is written to the ledger before it is made, and counts at its reported cost, or at `classifiers.jev.unknown_call_usd` ($0.001) when nothing answered, never $0. At most `decisions.max_calls_per_head` (24) calls are made for one pushed head, over every harvest of it. Decision spend counts toward the repo's month and the day ([the caps](#the-caps)), the status comment's row and the PR's "Cost and turns" line.
 - **Time.** When the providers fail, a harvest's calls (made together) take up to about 2 minutes: Jev's 30 s, then Haiku's 30 s with its two retries. A re-render makes no call.
@@ -372,7 +376,7 @@ Every cap is a fail-closed default in policy (anti-goal 1: no unbounded spend, n
 
   ```bash
   sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
-    export XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"; \
+    export XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus" PATH="$HOME/.local/bin:$PATH"; \
     systemctl --user stop hapi-poll.timer'
   ```
 
@@ -393,7 +397,7 @@ Every cap is a fail-closed default in policy (anti-goal 1: no unbounded spend, n
 | Stuck in `queued` | Another work order of the repo is active before its PR, a `cap-stopped` one is ahead of it, or `runs.max_live` is reached (another live run, a hand run included). `hapi status` and `hapi run list` show which. |
 | `Needs your decision` with `the work order has no acceptance tests (runs.phases.require_acceptance)` | Its planning PR carried none under `.factory/work/<id>/acceptance/`. Check it yourself and merge, or plan it again with tests. |
 | A verify run can't install (check's tail shows `bun ci` failing), and the PR is a draft | The bundle's `bun.lock` is out of date with its `package.json`, or a registry isn't on `egress-archon`'s allowlist (`policy/trusted_sources.yaml`). Send it back with `hapi:rework`, or add the host by a reviewed change. |
-| A status comment someone deleted | It comes back the next time its content changes. To get it back now, remove its mark, as hapi: `sudo -u hapi -H -- sh -c 'rm -- "$HOME/.local/state/hapi/engine/status/$1/$2.json"' hapi-mark "$OWNER/<name>" <planning-pr>`; on a settled plan, that posts the final comment again too. |
+| A status comment someone deleted | It comes back the next time its content changes. To get it back now, remove its mark, as hapi, with the repo's `<owner>/<name>` and the planning PR's number: `sudo -u hapi -H -- sh -c 'rm -- "$HOME/.local/state/hapi/engine/status/$1/$2.json"' hapi-mark "$(gh api user --jq .login)/<name>" <planning-pr>`; on a settled plan, that posts the final comment again too. |
 | No timer after a reboot (`runtime.poller-timer` fails, `list-timers` shows none) | The timer's links are runtime ones, which a reboot clears: run `mise run up`. |
 | A work order is `failed` | Read the reason in `hapi status`. If the cause was outside the work order (a rate limit, a timeout, a container `mise run down` removed, a flaky preflight, your own `hapi run stop`), fix it, then [`hapi retry`](#a-failed-work-order). A failure from the work order's own content, or `has been retried <n> times, and runs.max_retries is <n>`, needs a new id in a new planning PR; so does a closed `factory/<id>` PR, which shows as `closed`. A `hapi run start` by hand is never picked up by the poller. |
 | `failed` with `a <kind> run's inputs (…) are <n> MiB, over runs.inputs_mb (16 MiB): refused, never truncated` | Before a PR the inputs are the same every pass, so `hapi retry` fails the same way: plan the work again, smaller. |

@@ -12,7 +12,9 @@
  * and Archon's database), so a forged low line must not lower it: an honest ledger is cumulative and never falls, so
  * a ledger whose totals fall from one line to a later one makes the spend unknown, and so does no total at all. An
  * unknown spend counts at the run's whole budget, so a cap never counts a run it can't read as cheaper than it may
- * have been. A worker that rewrites both sources consistently can still under-report (H-250).
+ * have been. It still under-reports a worker that rewrites the ledger alone, its totals never falling: the spend is
+ * then Archon's total when that is lower than the truth, and anything the ledger says when Archon reports none; and
+ * one that rewrites both sources, to any value (H-250).
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";

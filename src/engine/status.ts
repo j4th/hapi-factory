@@ -151,8 +151,9 @@ export function renderStatus(rows: StatusRow[], caps: { monthlyUsd: number; dail
 
 /**
  * The final comment, once every work order of the plan has settled and no problem is open. It carries no
- * decision-models line: the status comment, which every tick still renders and edits after the plan settles, does,
- * and so does each factory PR's body.
+ * decision-models line: the status comment, as last rendered before it, does, and so does each factory PR's body.
+ * Once it is posted the poller leaves the plan's comments as they are (./poll.ts), until a work order leaves the
+ * settled phases (`hapi retry`).
  */
 export function renderFinal(rows: StatusRow[]): string {
   const n = (p: Phase) => rows.filter((r) => r.state.phase === p).length;

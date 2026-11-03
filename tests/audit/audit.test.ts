@@ -82,10 +82,11 @@ test("audit passes a clean fixture", async () => {
   ]) {
     expect([id, only(results, id).status]).toEqual([id, "pass"]);
   }
-  // policy.repos asks GitHub with the App keys in host.env, which the clean world doesn't write: a registry with no repo
-  // passes, and one with a repo skips.
-  const registered = Object.keys(loadPolicy(join(REPO, "policy")).repos.repos).length;
-  expect(only(results, "policy.repos").status).toBe(registered === 0 ? "pass" : "skip");
+  // policy.repos on the shipped registry, which registers no repo (`repos: {}`): a pass that says so. A protected change
+  // that registers one (the sandbox's, Plan 03 Task 16) updates this pin with tests/policy/load.test.ts's, and then the
+  // clean world, which writes no host.env, skips it.
+  expect(Object.keys(loadPolicy(join(REPO, "policy")).repos.repos)).toEqual([]);
+  expect([only(results, "policy.repos").status, only(results, "policy.repos").detail]).toEqual(["pass", "policy/repos.yaml registers no repo: the poller acts on none"]);
   // The live MCP comparison waits for Plan 04 (H-101), so it is a skip until then (H-026).
   expect(only(results, "mcp.tool-hashes").status).toBe("skip");
   for (const id of ["github.rulesets", "github.app-perms", "github.repo-settings", "github.labels", "repo.ai-workflows"]) {
