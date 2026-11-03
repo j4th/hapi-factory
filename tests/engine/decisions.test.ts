@@ -18,6 +18,7 @@ import {
   diffSubjects,
   ENGINE_DECISIONS,
   goalOf,
+  isBunLock,
   type LedgerLine,
   ledgerPath,
   readLedger,
@@ -265,6 +266,17 @@ describe("with real git", () => {
       }
       // Sixteen dist-tags is the cap, and a lockfile at it is still one.
       expect(await subjectsOf({ "bun.lock": t(Object.fromEntries(words.slice(0, 16).map((w, i) => [`d${i}`, w]))) })).toEqual([]);
+    });
+
+    test("a lockfile nested deeper than 16 is not one: unscreened, never a throw, at depth 17 and at depth 100,000", async () => {
+      const notLock = "skip_paths names it as a lockfile, but it doesn't parse as bun.lock";
+      const deep = (n: number) => `{"lockfileVersion": 2, "workspaces": {"": {}}, "packages": {}, "configVersion": ${"[".repeat(n)}${"]".repeat(n)}}`;
+      expect(isBunLock(deep(100_000))).toBe(false);
+      expect(isBunLock(deep(17))).toBe(false);
+      for (const n of [17, 100_000]) {
+        const subjects = await subjectsOf({ "bun.lock": deep(n) });
+        expect([n, subjects.map((x) => [x.subject, x.state, x.unscreened])]).toEqual([n, [["bun.lock", undefined, notLock]]]);
+      }
     });
 
     test("Bun's own lockfiles are skipped: the template's, rendered, and hapi-factory's root bun.lock (|| and ~ ranges, optionalPeers, bin)", async () => {

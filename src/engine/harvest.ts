@@ -346,15 +346,16 @@ export async function hostGates(
     failure = e;
     throw e;
   } finally {
-    if (!clean) {
-      try {
-        await purgeRun(d, o.scratch, o.runId);
-      } catch (e) {
-        throw new Error(`cannot drop run ${o.runId}'s commits from the scratch ${o.scratch}: ${e instanceof Error ? e.message : String(e)}`, { cause: failure ?? e });
-      }
-    }
-    // 7. Readable by all, as the mirror is, once what it holds was scanned clean or the unscanned commits are gone.
-    await readableByAll(o.scratch);
+    // 7. Unscanned commits dropped, or (after a clean scan) every object no ref reaches (a bundle's pack can carry
+    // one HEAD doesn't reach, never scanned); then readable by all, as the mirror is.
+    await settleScratch({
+      clean,
+      failure,
+      purge: () => purgeRun(d, o.scratch, o.runId),
+      compact: () => compactScratch(d, o.scratch),
+      open: () => readableByAll(o.scratch),
+      what: `run ${o.runId}'s scratch ${o.scratch}`,
+    });
   }
 
   async function scanned(): Promise<GateResult> {
@@ -395,16 +396,42 @@ export async function hostGates(
   }
 }
 
-/**
- * Drop run `runId`'s commits from the scratch: its ref, the reflogs, and every object no ref reaches (`repack -a -d`,
- * `prune --expire=now`). After a secret, an exit before the scan, or GitHub's refusal of the push (its push
- * protection may have found what the host's scan didn't). A missing ref is no error. Throws when git fails.
- */
-export async function purgeRun(d: Pick<RunDeps, "run" | "env">, scratch: string, runId: string): Promise<void> {
-  for (const args of [["update-ref", "-d", `refs/hapi/runs/${runId}`], ["reflog", "expire", "--expire=now", "--all"], ["repack", "-a", "-d", "-q"], ["prune", "--expire=now"]]) {
+/** Every object no ref reaches leaves the scratch: the reflogs expired, `repack -a -d`, `prune --expire=now`. Throws when git fails. */
+export async function compactScratch(d: Pick<RunDeps, "run" | "env">, scratch: string): Promise<void> {
+  for (const args of [["reflog", "expire", "--expire=now", "--all"], ["repack", "-a", "-d", "-q"], ["prune", "--expire=now"]]) {
     const r = await scratchGit(d, scratch, args);
     if (r.code !== 0) throw new Error(`git ${args[0]} exited ${r.code}: ${firstLine(r.stderr)}`);
   }
+}
+
+/**
+ * Drop run `runId`'s commits from the scratch: its ref, then every object no ref reaches (`compactScratch`). After a
+ * secret, an exit before the scan, or GitHub's refusal of the push (its push protection may have found what the
+ * host's scan didn't). A missing ref is no error. Throws when git fails.
+ */
+export async function purgeRun(d: Pick<RunDeps, "run" | "env">, scratch: string, runId: string): Promise<void> {
+  const r = await scratchGit(d, scratch, ["update-ref", "-d", `refs/hapi/runs/${runId}`]);
+  if (r.code !== 0) throw new Error(`git update-ref exited ${r.code}: ${firstLine(r.stderr)}`);
+  await compactScratch(d, scratch);
+}
+
+/**
+ * How the host gates leave the scratch, on every exit from the bundle's fetch on: purged unless the scan was clean,
+ * else compacted; then opened (readable by all). A step that fails throws its own error carrying the original one
+ * (the gates' own throw, if any) as its cause, so neither is lost, and the scratch stays private: nothing after a
+ * failed step runs.
+ */
+export async function settleScratch(o: { clean: boolean; failure: unknown; purge: () => Promise<void>; compact: () => Promise<void>; open: () => Promise<void>; what: string }): Promise<void> {
+  const step = async (run: () => Promise<void>, doing: string) => {
+    try {
+      await run();
+    } catch (e) {
+      throw new Error(`cannot ${doing} ${o.what}: ${e instanceof Error ? e.message : String(e)}`, { cause: o.failure ?? e });
+    }
+  };
+  if (o.clean) await step(o.compact, "compact");
+  else await step(o.purge, "drop the unscanned commits from");
+  await step(o.open, "make readable by all");
 }
 
 export interface Evidence {
@@ -808,7 +835,8 @@ export async function harvest(d: HarvestDeps, s: WorkOrderState, h: HarvestInput
   }
   if (notPushed !== undefined) {
     if (e.screens.length === 0 || e.screens.every((x) => x.pushed)) e.screens = emptyScreens(policy, false);
-    result = { ...first, verdict: "decision", reasons: [notPushed, ...first.reasons] };
+    // The other reasons are of the head that wasn't pushed: each says so, since the PR shows another.
+    result = { ...first, verdict: "decision", reasons: [notPushed, ...first.reasons.map((r) => `${short(head)} (not pushed): ${r}`)] };
     // A branch the factory didn't push is never shown as its head, nor opened as its PR.
     if (pr === undefined) return done({ ...s, verdict: result.verdict, reasons: result.reasons, updatedAt: now });
   }
@@ -840,8 +868,8 @@ export async function harvest(d: HarvestDeps, s: WorkOrderState, h: HarvestInput
     },
     phase: "pr",
     // The hidden block's round is its head's: the pushed run's, or, when nothing was pushed, the round the PR's own
-    // block names for that head (else the harvested run's, the closest the host has).
-    round: notPushed !== undefined && pr !== undefined ? (roundOfBody(pr.body, shownHead) ?? h.run.round ?? 0) : (h.run.round ?? 0),
+    // block names for that head; with no such block the round isn't known, and the block carries none.
+    round: notPushed === undefined ? (h.run.round ?? 0) : pr === undefined ? undefined : roundOfBody(pr.body, shownHead),
     ci: "pending",
     ...(notPushed === undefined ? {} : { unpushed: head }),
     ...(fix.length > 0 ? { unfixed: fix } : {}),

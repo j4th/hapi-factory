@@ -4,7 +4,7 @@
  * No model is called: fakeDecide, or the real ask() over a recording fetch with fake keys.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ask } from "../../src/decide/record";
 import { diffSubjects, ledgerPath, readLedger, type Screened } from "../../src/engine/decisions";
@@ -24,6 +24,7 @@ import {
   pushOutcome,
   runGates,
   scratchPath,
+  settleScratch,
 } from "../../src/engine/harvest";
 import type { WorkOrderState } from "../../src/engine/state";
 import { applyOverlay } from "../../src/policy/overlay";
@@ -32,6 +33,7 @@ import { readRecord, type RunRecord } from "../../src/run/records";
 import { runCommand, type Runner } from "../../src/stack/up";
 import { FAKE_ANTHROPIC_KEY, FAKE_JEV_KEY, recordingFetch } from "../decide/helpers";
 import { fakeRun, fakeSecret, NOW, seedRun } from "../run/helpers";
+import { caught } from "../forge/helpers";
 import { cleanup } from "../secrets/helpers";
 import {
   ACCEPTANCE,
@@ -703,5 +705,74 @@ describe("fix round 2", () => {
     expect(changes!.get("src/f")).toEqual({ added: [], ranges: [] });
     expect(changes!.get("src/f/x.ts")).toEqual({ added: ["process.kill(1)"], ranges: [[1, 1]] });
     expect(Object.fromEntries(await fixHunks(realGit(), scratch, first, head))).toEqual({ "src/f": [], "src/f/x.ts": [[1, 1]] });
+  });
+});
+
+describe("fix round 3", () => {
+  const genv = { PATH: process.env.PATH!, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" };
+  const sgit = (scratch: string, ...args: string[]) => Bun.spawnSync(["git", "--git-dir", scratch, ...args], { env: genv }).exitCode === 0;
+
+  test("with real git: a bundle's object no ref reaches leaves the scratch after a clean scan too", async () => {
+    const key = fakeSecret("ANTHROPIC_API_KEY");
+    const w = gitWorld();
+    const head = w.commit({ "src/a.ts": "a\n" });
+    const hiddenFile = join(w.tmp, "hidden.txt");
+    writeFileSync(hiddenFile, `the key: ${key}\n`);
+    const hidden = w.work("hash-object", "-w", hiddenFile);
+    // A crafted bundle: the run's objects, plus a blob HEAD doesn't reach, which no scan reads.
+    const objs = Bun.spawnSync(["git", "-C", w.work.dir, "rev-list", "--objects", `${w.base}..HEAD`], { env: genv }).stdout.toString().split("\n").filter(Boolean).map((l) => l.split(" ")[0]);
+    const pack = Bun.spawnSync(["git", "-C", w.work.dir, "pack-objects", "--stdout", "-q"], { env: genv, stdin: new TextEncoder().encode(`${[...objs, hidden].join("\n")}\n`) }).stdout;
+    const bundle = join(w.tmp, "crafted.bundle");
+    writeFileSync(bundle, Buffer.concat([Buffer.from(`# v2 git bundle\n-${w.base} base\n${head} HEAD\n\n`), Buffer.from(pack)]));
+    const g = await gatesOn(w, { bundle, secrets: { ANTHROPIC_API_KEY: key } });
+    expect(g.problems).toEqual([]);
+    const scratch = scratchPath(w.engineDir, ORDER.repo, ORDER.id);
+    expect(sgit(scratch, "cat-file", "-e", head)).toBe(true);
+    expect(sgit(scratch, "cat-file", "-e", hidden)).toBe(false);
+    expect(lstatSync(scratch).mode & 0o555).toBe(0o555);
+  });
+
+  test("a cleanup step that fails throws its own error carrying the original as its cause, and nothing after it runs", async () => {
+    const calls: string[] = [];
+    const ok = (name: string) => async () => void calls.push(name);
+    const boom = (name: string) => async () => {
+      calls.push(name);
+      throw new Error(`${name} failed`);
+    };
+    const original = new Error("the gates' own failure");
+    const opened = await caught(settleScratch({ clean: true, failure: original, purge: ok("purge"), compact: ok("compact"), open: boom("open"), what: "the scratch" }));
+    expect([opened.message, (opened.cause as Error).message, calls]).toEqual(["cannot make readable by all the scratch: open failed", "the gates' own failure", ["compact", "open"]]);
+    calls.length = 0;
+    const purged = await caught(settleScratch({ clean: false, failure: original, purge: boom("purge"), compact: ok("compact"), open: ok("open"), what: "the scratch" }));
+    expect([purged.message, (purged.cause as Error).message, calls]).toEqual(["cannot drop the unscanned commits from the scratch: purge failed", "the gates' own failure", ["purge"]]);
+    calls.length = 0;
+    const alone = await caught(settleScratch({ clean: true, failure: undefined, purge: ok("purge"), compact: boom("compact"), open: ok("open"), what: "the scratch" }));
+    expect([alone.message, (alone.cause as Error).message, calls]).toEqual(["cannot compact the scratch: compact failed", "compact failed", ["compact"]]);
+  });
+
+  test("with real git: a purge that fails leaves the scratch private, and says why with the original cause", async () => {
+    const key = fakeSecret("ANTHROPIC_API_KEY");
+    const w = gitWorld();
+    const head = w.commit({ "src/a.ts": `export const k = "${key}";\n` });
+    const bundle = w.bundle();
+    const main = w.onMain({ "README.md": "# moved\n" });
+    w.work("checkout", "-q", "--detach", head);
+    const run: Runner = async (cmd, o) => (cmd.includes("update-ref") ? { code: 1, stdout: "", stderr: "fatal: cannot lock ref" } : runCommand(cmd, o));
+    const scratch = scratchPath(w.engineDir, ORDER.repo, ORDER.id);
+    const e = await caught(hostGates({ run, env: { PATH: process.env.PATH! } }, { mirror: w.mirror, scratch, bundle, runId: W, base: main, workOrder: ORDER.workOrder, policy: SHIPPED, secrets: { ANTHROPIC_API_KEY: key } }));
+    expect(e.message).toBe(`cannot drop the unscanned commits from run ${W}'s scratch ${scratch}: git update-ref exited 1: fatal: cannot lock ref`);
+    expect(lstatSync(scratch).mode & 0o777).toBe(0o700);
+  });
+
+  test("an unpushed head's reasons say so, its account's claim line is gone, and the block carries no round it can't pair", async () => {
+    const { d, f, fw, s, h, base, head } = await world();
+    fw.ff.addPr({ head: "factory/0001-skeleton", body: "an operator's body, with no hidden block" });
+    fw.ff.push("factory/0001-skeleton", base);
+    writeVerify(f, V, { ...PASSING_VERIFY, check: { exit: 1, tail: "x" } }, { status: "failed" });
+    const r = await harvest(d, { ...s, pr: 1, prHead: base }, h);
+    expect(r.reasons.slice(1)).toEqual([`${head.slice(0, 7)} (not pushed): check failed in the verify container`]);
+    const body = bodyOf(fw.ff, 0);
+    expect(body).not.toContain("The worker's account below is its own claim");
+    expect(body).toContain(`<!-- hapi:pr v1 {"workOrder":"0001-skeleton","status":"pr","head":"${base}","verdict":"decision"} -->`);
   });
 });

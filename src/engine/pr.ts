@@ -35,8 +35,11 @@ export interface PrInput {
   /** decisions: the work order's whole ledger. */
   cost: { usd: number; unknown: number; turns: number; decisions: { usd: number; calls: number } };
   phase: Phase;
-  /** The round of `head`: the pushed run's, or, when nothing was pushed, the PR's own head's (the hidden block's). */
-  round: number;
+  /**
+   * The round of `head`: the pushed run's, or, when nothing was pushed, the PR's own head's as its hidden block named
+   * it; undefined when that isn't known, and the hidden block then carries no round.
+   */
+  round: number | undefined;
   /** `ci / gates` on the head: undefined is pending. Ready to merge is shown only once it passed. */
   ci?: "pending" | "passed" | "failed";
   /** Design §3.5's unfixed major findings in a fix round's own change (./harvest.ts), at the top of Unresolved. */
@@ -93,7 +96,7 @@ function decisionRow(s: Screened, head: string): string {
       : `${s.subjects} ${s.subjects === 1 ? "file" : "files"} screened (${s.asked} asked, ${s.reused} reused${via.length > 0 ? `; ${via.join(", ")}` : ""})`;
   let result: string;
   if (s.models === "off") result = "off: decision models are off (gates.decisions.mode)";
-  else if (!s.pushed) result = asked ? "asked; this head was not pushed" : "not screened (this head was not pushed)";
+  else if (!s.pushed) result = s.asked + s.reused > 0 ? "asked; this head was not pushed" : s.unscreened > 0 ? "unscreened; this head was not pushed" : "not screened (this head was not pushed)";
   else if (s.mode === "off") result = `off (gates.decisions.by_name.${s.decision}.mode)`;
   else if (s.mode === "shadow") result = `shadow: would hold ${count(s.holds)}`;
   else if (s.models === "notes") result = `notes only (gates.decisions.mode): ${count(s.notes)} note`;
@@ -148,7 +151,7 @@ export function renderPr(i: PrInput): string {
   if (unresolved.length === 0) out.push("Nothing unresolved.");
   else for (const r of unresolved) out.push(`- ${plain(r)}`);
   const check = [
-    "The worker's account below is its own claim; the host did not check it.",
+    ...(i.unpushed === undefined ? ["The worker's account below is its own claim; the host did not check it."] : []),
     "CI's `ci / gates` check on the head is GitHub's own run, on a fresh runner: read its result on this PR.",
     ...(i.unpushed === undefined ? e.gates.signals : []),
     ...(i.unpushed === undefined ? e.screens.filter((s) => s.mode === "enforce" && s.models !== "off").flatMap((s) => s.notes) : []),
@@ -227,7 +230,7 @@ export function renderPr(i: PrInput): string {
   else out.push("_The worker's own claim; the host did not check it._", "", fence(account, ACCOUNT_CHARS));
 
   // 9. The hidden state block.
-  const state = { workOrder: id, status: i.phase, round: i.round, head: i.head, verdict: i.outcome.verdict };
+  const state = { workOrder: id, status: i.phase, ...(i.round === undefined ? {} : { round: i.round }), head: i.head, verdict: i.outcome.verdict };
   out.push("", `<!-- hapi:pr v1 ${JSON.stringify(state).replace(/-->/g, "")} -->`, END);
   return out.join("\n");
 }

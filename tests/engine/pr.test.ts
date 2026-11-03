@@ -165,6 +165,8 @@ describe("Evidence names each decision with its version, and Cost and turns coun
     expect(row(screen({ pushed: false, subjects: 0, asked: 0, via: {} }))).toContain("| not asked | not screened (this head was not pushed) |");
     expect(row(screen())).toContain("| pass |");
     expect(row(screen({ asked: 0, unscreened: 3, via: { default: 3 }, holds: ["a", "b", "c"] }))).toContain("| 3 not screened |");
+    expect(row(screen({ pushed: false }))).toContain("| asked; this head was not pushed |");
+    expect(row(screen({ pushed: false, asked: 0, unscreened: 2, via: { default: 2 } }))).toContain("| unscreened; this head was not pushed |");
   });
 
   test("Cost and turns ends with the decisions' spend", () => {

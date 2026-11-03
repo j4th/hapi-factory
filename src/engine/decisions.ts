@@ -396,28 +396,57 @@ function windows(state: (part: string, diff: string) => State, header: string[],
 
 const NOT_SHOWN = "content not shown in the diff";
 
-/** The strings and keys a JSON value holds, counted recursively: what a lockfile's string tokens must equal. */
-function stringsIn(v: unknown): number {
-  if (typeof v === "string") return 1;
-  if (Array.isArray(v)) return v.reduce<number>((n, x) => n + stringsIn(x), 0);
-  if (v !== null && typeof v === "object") return Object.entries(v).reduce<number>((n, [, x]) => n + 1 + stringsIn(x), 0);
-  return 0;
+/** The strings and keys a JSON value holds, counted with a stack (no recursion): what a lockfile's string tokens must equal. */
+function stringsIn(root: unknown): number {
+  let n = 0;
+  const stack: unknown[] = [root];
+  while (stack.length > 0) {
+    const v = stack.pop();
+    if (typeof v === "string") n++;
+    else if (Array.isArray(v)) for (const x of v) stack.push(x);
+    else if (v !== null && typeof v === "object") {
+      for (const [, x] of Object.entries(v)) {
+        n++;
+        stack.push(x);
+      }
+    }
+  }
+  return n;
 }
+
+/** The deepest a Bun lockfile nests (it writes about 5 levels): anything deeper isn't one, and is never parsed. */
+const MAX_LOCK_DEPTH = 16;
 
 /**
  * Bun's text lockfile as JSON: trailing commas are dropped, and any comment (`//` or `/*` outside a string) makes it
  * not a lockfile at all, since text in a comment is text the screen would never see. Every character must be printable
  * ASCII or JSON's whitespace. A duplicate key (`JSON.parse` keeps the last, so the first could hold anything, escaped
  * or not) is caught by counting: the string tokens the scanner met must equal the keys and strings the parsed value
- * holds. undefined when it isn't such a JSON value.
+ * holds. Nesting deeper than MAX_LOCK_DEPTH is refused while scanning, before anything recurses. undefined when it
+ * isn't such a JSON value, and on any error.
  */
 function lockJson(text: string): unknown {
+  try {
+    return lockJsonUnsafe(text);
+  } catch {
+    return undefined;
+  }
+}
+
+function lockJsonUnsafe(text: string): unknown {
   if (/[^\x09\x0a\x0d\x20-\x7e]/.test(text)) return undefined;
   let out = "";
   let tokens = 0;
+  let depth = 0;
   for (let i = 0; i < text.length; i++) {
     const c = text[i]!;
-    if (c === '"') {
+    if (c === "{" || c === "[") {
+      if (++depth > MAX_LOCK_DEPTH) return undefined;
+      out += c;
+    } else if (c === "}" || c === "]") {
+      depth--;
+      out += c;
+    } else if (c === '"') {
       let j = i + 1;
       while (j < text.length && text[j] !== '"') j += text[j] === "\\" ? 2 : 1;
       out += text.slice(i, j + 1);
@@ -539,10 +568,18 @@ function isPackage(v: unknown): boolean {
  * keys `lockfileVersion` (0 to 2), `workspaces` and `packages`, and optionally `configVersion` (0 or 1),
  * `trustedDependencies`, `patchedDependencies`, `overrides`, `catalog` and `catalogs`; each value in the shape Bun
  * writes; every string a name, resolution, spec, registry, integrity, path or platform, printable ASCII, of at most
- * 256 characters; no duplicate key; and at most 16 dist-tag specs. Anything else is not a lockfile, so the file is
- * unscreened and holds.
+ * 256 characters; no duplicate key; no nesting deeper than 16; and at most 16 dist-tag specs. Anything else, and any
+ * error while checking, is not a lockfile, so the file is unscreened and holds.
  */
 export function isBunLock(text: string): boolean {
+  try {
+    return isBunLockUnsafe(text);
+  } catch {
+    return false;
+  }
+}
+
+function isBunLockUnsafe(text: string): boolean {
   distTags = 0;
   const v = lockJson(text);
   if (!isObj(v) || !onlyKeys(v, ["lockfileVersion", "configVersion", "workspaces", "packages", "trustedDependencies", "patchedDependencies", "overrides", "catalog", "catalogs"])) return false;
