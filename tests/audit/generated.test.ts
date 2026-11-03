@@ -13,7 +13,8 @@ import { runAudit } from "../../src/audit/index";
 import { buildAll } from "../../src/generate/index";
 import { loadPolicy } from "../../src/policy/load";
 import { buildDigest } from "../../src/stack/up";
-import { cleanup, cleanWorld, files, helperContainer, only, REPO, runContainer, sidecarContainer, tempDir } from "./helpers";
+import { runPart } from "../../src/audit/checks/runtime";
+import { cleanup, cleanWorld, type Container, files, helperContainer, only, REPO, runContainer, sidecarContainer, tempDir } from "./helpers";
 
 afterEach(cleanup);
 
@@ -51,6 +52,35 @@ describe("generated.drift", () => {
     delete stray.Config.Labels["org.hapi.helper"];
     v.containers.push(stray);
     expect((await drift(v)).detail).toContain("quirky_name has no org.hapi.build-sha256 label");
+  });
+
+  test("D47 (controller): a sidecar or helper of another project, or carrying a Compose project, is not skipped: it fails as a stray would", async () => {
+    // Listed through the stack's Compose label, so each is in the audit's view.
+    const dress = (c: Container, project: string) => (Object.assign(c.Config.Labels, { "com.docker.compose.project": "hapi", "org.hapi.project": project }), c);
+    for (const [what, make] of [
+      ["a helper with a Compose project", () => dress(helperContainer("copyout"), "hapi")],
+      ["a helper of another project", () => dress(helperContainer("chown", "dddddddddddd"), "elsewhere")],
+      ["a sidecar with a Compose project", () => dress(sidecarContainer("aaaaaaaaaaaa"), "hapi")],
+      ["a sidecar of another project", () => dress(sidecarContainer("aaaaaaaaaaaa"), "elsewhere")],
+    ] as const) {
+      const w = await cleanWorld();
+      const c = make();
+      if (what.includes("sidecar")) w.containers.push(runContainer(w, "aaaaaaaaaaaa", { sidecar: "bun-http" }));
+      w.containers.push(c);
+      const r = await drift(w);
+      expect([what, r.status]).toEqual([what, "fail"]);
+      expect(r.detail).toContain(`${c.Name.replace(/^\//, "")} has no org.hapi.build-sha256 label`);
+    }
+  });
+
+  test("runPart: a sidecar or helper only of hapi's project and no Compose service", () => {
+    const helper = helperContainer("clean");
+    expect(runPart(helper as never)).toBe("helper");
+    expect(runPart(sidecarContainer("aaaaaaaaaaaa") as never)).toBe("sidecar");
+    expect(runPart({ ...helper, Config: { ...helper.Config, Labels: { ...helper.Config.Labels, "org.hapi.project": "elsewhere" } } } as never)).toBeUndefined();
+    expect(runPart({ ...helper, Config: { ...helper.Config, Labels: { ...helper.Config.Labels, "com.docker.compose.project": "hapi" } } } as never)).toBeUndefined();
+    // A blank Compose label, as the launcher leaves one, is no Compose service.
+    expect(runPart({ ...helper, Config: { ...helper.Config, Labels: { ...helper.Config.Labels, "com.docker.compose.project": "" } } } as never)).toBe("helper");
   });
 
   test("a deployed build equal to a fresh one, and every container started from it, passes", async () => {

@@ -35,7 +35,7 @@ import { loadPolicy } from "../../policy/load";
 import type { RosterName } from "../../policy/types";
 import { buildDigest, currentUserOverride, HAPI_CHECKOUT, HAPI_USER } from "../../stack/up";
 import { type AuditRun, type CheckResult, result } from "../types";
-import { classify, containerName, isRunning, liveContainers } from "./runtime";
+import { containerName, isRunning, liveContainers, runPart } from "./runtime";
 
 export type Deployed = { dir: string } | { skip: string };
 
@@ -232,13 +232,8 @@ export async function generatedDrift(run: AuditRun): Promise<CheckResult[]> {
   else {
     // A run's smoke sidecar, and a one-shot helper caught mid-flight (D47), mount nothing of build/, so they carry no
     // build label: runtime.run-container holds them to policy/sidecars.yaml and the helpers' invariants instead. Only
-    // a container classify calls a sidecar or a helper is skipped.
-    const skipped = (c: (typeof stack.containers)[number]) => {
-      if (c.Config?.Labels?.["org.hapi.run"] === undefined) return false;
-      const what = classify(c);
-      return "sidecar" in what || "helper" in what;
-    };
-    const up = stack.containers.filter((c) => isRunning(c) && !skipped(c));
+    // a sidecar or helper of hapi's own project that is no Compose service (`runPart`) is skipped.
+    const up = stack.containers.filter((c) => isRunning(c) && runPart(c) === undefined);
     for (const c of up) {
       const digest = c.Config?.Labels?.["org.hapi.build-sha256"] ?? "";
       if (digest === "") labelProblems.push(`${containerName(c)} has no org.hapi.build-sha256 label (not started through \`hapi stack up\`)`);

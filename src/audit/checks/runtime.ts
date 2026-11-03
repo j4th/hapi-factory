@@ -556,6 +556,21 @@ export function classify(c: Container): { run: true } | { sidecar: true } | { he
 }
 
 /**
+ * Whether a running container is one a stack-wide check may pass over as a run's own part, and which (the final
+ * review's D47 and D46): a sidecar or a helper by `classify`, and only one of hapi's own project
+ * (`org.hapi.project=hapi`) that is no Compose service (no `com.docker.compose.project`, or a blank one, as the
+ * launcher leaves it). Anything else, a stray dressed as a helper or a stack service carrying a helper's labels
+ * included, is undefined: it is held to every check. generated.drift passes over both kinds; runtime.dev-override
+ * only helpers, since a sidecar carries the launcher's started-by labels (m24).
+ */
+export function runPart(c: Container): "sidecar" | "helper" | undefined {
+  const l = c.Config?.Labels ?? {};
+  if (l["org.hapi.run"] === undefined || l["org.hapi.project"] !== PROJECT || (l["com.docker.compose.project"] ?? "") !== "") return undefined;
+  const what = classify(c);
+  return "sidecar" in what ? "sidecar" : "helper" in what ? "helper" : undefined;
+}
+
+/**
  * The sidecar runtime.run-container compares a live one against: policy's sidecar `s`, for run `v`. Its data's path is
  * a sample: the check compares /data's mount, not its source.
  */
@@ -906,13 +921,9 @@ export async function devOverride(run: AuditRun): Promise<CheckResult[]> {
   }
   const stack = await liveContainers(run);
   // A helper caught mid-flight carries no stack labels: runtime.run-container holds it to the helpers' invariants.
-  // Only a helper of hapi's own project, and no Compose service (D46): a stack container that carries a helper's
-  // labels, or a helper of another project, is held to the stack labels like any container.
-  const helper = (c: Container) => {
-    const l = c.Config?.Labels ?? {};
-    return l["org.hapi.run"] !== undefined && l["org.hapi.project"] === PROJECT && (l["com.docker.compose.project"] ?? "") === "" && "helper" in classify(c);
-  };
-  const containers = "containers" in stack ? stack.containers.filter((c) => isRunning(c) && !helper(c)) : [];
+  // Only a helper of hapi's own project that is no Compose service (`runPart`, D46): a stack container carrying a
+  // helper's labels, or a helper of another project, is held to the stack labels like any container.
+  const containers = "containers" in stack ? stack.containers.filter((c) => isRunning(c) && runPart(c) !== "helper") : [];
   for (const c of containers) {
     const v = label(c, "org.hapi.dev-override") ?? "";
     const by = label(c, "org.hapi.started-by") ?? "";
