@@ -12,12 +12,16 @@ import YAML from "yaml";
 import type { Answers, DecideOptions, DecideResult, DecisionFile, State } from "../../src/decide/index";
 import type { ask } from "../../src/decide/record";
 import type { Discovered } from "../../src/engine/discover";
+import type { ReviewFinding } from "../../src/engine/evidence";
+import type { Evidence, PushOptions, PushResult } from "../../src/engine/harvest";
 import { mirrorPath } from "../../src/engine/mirror";
+import { githubForge } from "../../src/forge";
 import { loadPolicy } from "../../src/policy/load";
 import type { DecisionModels, EngineDecision, Policy } from "../../src/policy/types";
 import type { RunDeps } from "../../src/run/spec";
 import { runCommand } from "../../src/stack/up";
 import { validateWorkOrder } from "../../src/workorder/validate";
+import { fakeForge } from "../forge/helpers";
 import { writeOrder } from "../run/helpers";
 import { tempDir } from "../secrets/helpers";
 
@@ -254,3 +258,97 @@ export function policyWith(o: { models?: DecisionModels; max?: number; diff?: Pa
 
 /** `loadPolicy("policy")`, once. */
 export const SHIPPED: Policy = loadPolicy("policy");
+
+/** Write `text` to `<stateDir>/<runId>/out/<name>` (the outputs copy-out brought back); returns its path. */
+export function writeOut(f: { deps: { stateDir: string } }, runId: string, name: string, text: string | Uint8Array): string {
+  const dir = join(f.deps.stateDir, runId, "out");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  writeFileSync(join(dir, name), text);
+  return join(dir, name);
+}
+
+/** A review run's outputs as T19 recorded them: result.json with the review node completed, and the StructuredOutput row in the transcript. */
+export function writeReview(f: { deps: { stateDir: string } }, runId: string, output: unknown, o: { nodeState?: string; coderabbit?: string } = {}): void {
+  writeOut(f, runId, "result.json", JSON.stringify({ run: { status: "completed", nodes: [{ nodeId: "review", state: o.nodeState ?? "completed" }, { nodeId: "coderabbit", state: "completed" }] } }));
+  const row = { type: "provider_event", step: "review", attemptId: "r1", seq: 3, event: { type: "tool_call", toolCallId: "toolu_so", name: "StructuredOutput", rawInput: output } };
+  writeOut(f, runId, "transcript.jsonl", `${JSON.stringify({ type: "workflow_start" })}\n${JSON.stringify(row)}\n`);
+  writeOut(f, runId, "coderabbit.ndjson", o.coderabbit ?? '{"type":"hapi","skipped":"runs.phases.coderabbit is off for this run"}\n');
+}
+
+/** bun's junit report for `files`, each with one passing test. */
+export const junitFor = (files: string[]) =>
+  `<?xml version="1.0" encoding="UTF-8"?>\n<testsuites name="bun test" tests="${files.length}" assertions="${files.length}" failures="0" skipped="0" time="0.01">\n${files
+    .map((f) => `  <testsuite name="${f}" file="${f}" tests="1" assertions="1" failures="0" skipped="0" time="0">\n    <testcase name="works" classname="" time="0" file="${f}" line="1" assertions="1" />\n  </testsuite>`)
+    .join("\n")}\n</testsuites>\n`;
+
+/** The planner's acceptance test the harvest tests merge on main. */
+export const ACCEPTANCE = `.factory/work/${"0001-skeleton"}/acceptance/a.test.ts`;
+
+/** A verify run's outputs: verify.json (`json`), result.json (`status`, completed by default) and, unless `junit` is null, the acceptance junit. */
+export function writeVerify(f: { deps: { stateDir: string } }, runId: string, json: unknown, o: { status?: string; junit?: string | null } = {}): void {
+  writeOut(f, runId, "verify.json", typeof json === "string" ? json : JSON.stringify(json));
+  writeOut(f, runId, "result.json", JSON.stringify({ run: { status: o.status ?? "completed", nodes: [{ nodeId: "verify", state: "completed" }] } }));
+  if (o.junit !== null) writeOut(f, runId, "acceptance.junit.xml", o.junit ?? junitFor([ACCEPTANCE]));
+}
+
+export const PASSING_VERIFY = { check: { exit: 0, tail: "ok" }, smoke: { exit: 0, tail: "" }, acceptance: { exit: 0, tail: "1 pass" } };
+export const READY_REVIEW: { verdict: "ready"; findings: ReviewFinding[]; criteria: { criterion: string; mark: "met"; evidence: string }[] } = {
+  verdict: "ready",
+  findings: [],
+  criteria: [{ criterion: "the health tool answers", mark: "met", evidence: "tests/health.test.ts" }],
+};
+
+/** A worker's transcript: provider_event rows of `step`, attempt a1, chunked as Pi streams them. */
+export function transcriptOf(chunks: (string | { tool: string })[], step = "implement", attempt = "a1"): string {
+  return (
+    chunks
+      .map((c, i) =>
+        JSON.stringify({
+          type: "provider_event",
+          step,
+          attemptId: attempt,
+          seq: i,
+          event: typeof c === "string" ? { type: "agent_message_chunk", text: c } : { type: "tool_call", toolCallId: `t${i}`, name: c.tool, rawInput: {} },
+        }),
+      )
+      .join("\n") + "\n"
+  );
+}
+
+/** A worker's decisions.jsonl: a spend record of `usd` and `turns`, then its result record. */
+export const decisionsOf = (result: string, usd = 0.5, turns = 3) =>
+  `${JSON.stringify({ event: "budget", decision: "allow", rule: "spend", cost_usd: usd, turns })}\n${JSON.stringify({ event: "result", decision: result, rule: "result", reason: "" })}\n`;
+
+/** Task 3's fake forge for ORDER.repo, the real adapter over it, and a fake pushBranch that moves the fake's branch. */
+export function forgeWorld() {
+  const ff = fakeForge({ repo: ORDER.repo });
+  const forge = githubForge({ repo: ff.repo, token: "fake-pr-token", fetch: ff.fetch });
+  const pushes: PushOptions[] = [];
+  const pushBranch = async (o: PushOptions): Promise<PushResult> => {
+    pushes.push(o);
+    ff.push(`factory/${o.id}`, o.head);
+    return { pushed: true };
+  };
+  return { ff, forge, pushes, pushBranch };
+}
+
+/** Each of the fake forge's calls that isn't a GET, as `<METHOD> <path>`, the repo's API prefix cut off. */
+export function writes(ff: ReturnType<typeof fakeForge>): string[] {
+  return ff.calls
+    .filter((c) => c.method !== "GET")
+    .map((c) => {
+      const path = new URL(c.url).pathname;
+      const repo = `/repos/${ff.repo}`;
+      return `${c.method} ${path.startsWith(repo) ? path.slice(repo.length) : path}`;
+    });
+}
+
+/** design §3.6's clean evidence: gates clean, verify all passed, the review ready with one met criterion, CodeRabbit reviewed with no finding, the worker done. */
+export const CLEAN: Evidence = {
+  gates: { head: "c".repeat(40), files: ["src/a.ts"], problems: [], signals: [] },
+  verify: { state: "ran", check: "passed", smoke: "passed", acceptance: "passed" },
+  review: { state: "ran", verdict: "ready", findings: [], criteria: [{ criterion: "the health tool answers", mark: "met", evidence: "tests/health.test.ts" }] },
+  cr: { state: "reviewed", findings: [] },
+  worker: { result: "done", endsOnQuestion: false, account: "## Account\nChose X over Y.", hasFinal: true },
+  screens: [],
+};

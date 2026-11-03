@@ -101,6 +101,15 @@ describe("readRecord", () => {
     const good = { ...base, budgetUsd: 0, spendUsd: 0.42, round: 1, turns: 0 };
     expect(await readRecord(written(good), "aaaaaaaaaaaa")).toEqual(good as RunRecord);
   });
+
+  test(`a record whose decisions isn't "off" is not one hapi wrote`, async () => {
+    for (const decisions of ["on", "enforce", true, ""]) {
+      const e = await caught(readRecord(written({ ...base, decisions }), "aaaaaaaaaaaa"));
+      expect([decisions, e.message]).toEqual([decisions, expect.stringContaining("is not a run record hapi wrote")]);
+    }
+    expect((await readRecord(written({ ...base, decisions: "off" }), "aaaaaaaaaaaa"))!.decisions).toBe("off");
+    expect("decisions" in (await readRecord(written(base), "aaaaaaaaaaaa"))!).toBe(false);
+  });
 });
 
 describe("forgeRepo (m23)", () => {

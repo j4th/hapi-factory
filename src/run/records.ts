@@ -103,6 +103,11 @@ export interface RunRecord {
    * the run's status (a paused run exits 0): one more source Task 12 cross-checks a verify run's results against.
    */
   exitCode?: number;
+  /**
+   * `"off"` when decision models were off (policy/gates.yaml's `decisions.mode`) for the harvest that first read the
+   * run: written with `harvestedAt`, in the same write (Plan 03 Task 12), so it is never silent. No other value.
+   */
+  decisions?: "off";
 }
 
 /** The files a run's dir holds beside record.json and run.json, each bound read-only into the container: see the module comment. */
@@ -148,7 +153,8 @@ const count = (v: unknown) => v === undefined || (typeof v === "number" && Numbe
 /**
  * `x` as a record of run `runId`, or undefined if it isn't one: a kind that is no run kind, a budget or spend that
  * isn't a finite number of at least 0, a round, turns or retry that isn't a whole number of at least 0, a
- * forgeRepo that isn't a GitHub repository's owner/name, or an exit code that isn't an integer, isn't.
+ * forgeRepo that isn't a GitHub repository's owner/name, an exit code that isn't an integer, or a `decisions` that
+ * isn't "off", isn't.
  */
 function asRecord(x: unknown, runId: string): RunRecord | undefined {
   const r = x as Partial<RunRecord> | null;
@@ -157,6 +163,7 @@ function asRecord(x: unknown, runId: string): RunRecord | undefined {
   if (![r.budgetUsd, r.spendUsd].every(amount) || ![r.round, r.turns, r.retry].every(count)) return undefined;
   if (r.forgeRepo !== undefined && (typeof r.forgeRepo !== "string" || parseOwnerRepo(r.forgeRepo) === undefined)) return undefined;
   if (r.exitCode !== undefined && !Number.isInteger(r.exitCode)) return undefined;
+  if (r.decisions !== undefined && r.decisions !== "off") return undefined;
   const text = [r.key, r.project, r.repo, r.sha, r.workOrder, r.workflow, r.container, r.network, r.startedAt, r.deadline, r.volumes?.work, r.volumes?.out];
   return text.every((t) => typeof t === "string") ? (r as RunRecord) : undefined;
 }

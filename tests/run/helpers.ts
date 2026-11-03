@@ -460,7 +460,7 @@ export async function seedRun(
 ): Promise<RunRecord> {
   const { deps, world } = f;
   const name = `${deps.project}-run-${o.id}`;
-  const optional = ["kind", "parent", "round", "budgetUsd", "spendUsd", "roster", "policyHash", "retry", "turns", "model", "forgeRepo"] as const;
+  const optional = ["kind", "parent", "round", "budgetUsd", "spendUsd", "roster", "policyHash", "retry", "turns", "model", "forgeRepo", "exitCode"] as const;
   const rec: RunRecord = {
     runId: o.id,
     key: o.key ?? "k".repeat(64),
