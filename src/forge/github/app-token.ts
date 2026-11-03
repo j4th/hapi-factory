@@ -50,7 +50,7 @@ export const APPS = {
     envPrefix: "HAPI_PLANNER",
     permissions: { contents: "write", pull_requests: "write", issues: "read", metadata: "read" },
   },
-  /** The harvester: pushes factory/* branches, opens delivery PRs, labels them, and reads CodeRabbit's check run. */
+  /** The harvester: pushes factory/* branches, opens delivery PRs, labels them, and reads the check runs on their heads (`ci / gates`, and CodeRabbit's). */
   factory: {
     name: "hapi-factory",
     envPrefix: "HAPI_FACTORY",

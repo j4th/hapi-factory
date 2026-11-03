@@ -35,7 +35,7 @@ Set these permissions **exactly**. Everything not listed is **No access**, inclu
 |---|---|---|---|
 | Contents | Read and write | Read and write | Push the App's own branches |
 | Pull requests | Read and write | Read and write | Open PRs, and label them: GitHub accepts Pull requests write for labels on a PR |
-| Checks | No access | Read-only | The poller reads CodeRabbit's check run on a factory PR's head (design §3.6) |
+| Checks | No access | Read-only | The poller reads `ci / gates` on every factory PR's head (Ready to merge shows only once it is green), and CodeRabbit's check run when its round is on (design §3.6) |
 | Issues | Read-only | No access | The planner reads issues for context. Neither App writes them. |
 | Metadata | Read-only | Read-only | Mandatory for every App |
 | Administration | **No access** | **No access** | Neither App may change settings or rulesets |
@@ -43,7 +43,7 @@ Set these permissions **exactly**. Everything not listed is **No access**, inclu
 
 | | `hapi-planner` | `hapi-factory` |
 |---|---|---|
-| Used by | Hermes. A host helper mints a 1-hour token per session, outside the container (spec §9.1, `hapi-gh-token`). | The harvester, a host script run by the `hapi` user (spec §9.4), and the run engine: `forgeToken` mints this App's tokens for the mirror (fetch), the push, PR writes and reads, and the poller's read of CodeRabbit's check run |
+| Used by | Hermes. A host helper mints a 1-hour token per session, outside the container (spec §9.1, `hapi-gh-token`). | The harvester, a host script run by the `hapi` user (spec §9.4), and the run engine: `forgeToken` mints this App's tokens for the mirror (fetch), the push, PR writes and reads, and the poller's reads of the check runs on a factory PR's head (`ci / gates`, and CodeRabbit's) |
 | Branches | `plan/*` | `factory/*` |
 | Private key | In your secrets store, as `hapi-host-planner-app-private-key` | In your secrets store, as `hapi-host-factory-app-private-key` |
 | App ID | In your secrets store, as `hapi-host-planner-app-id` | In your secrets store, as `hapi-host-factory-app-id` |
@@ -61,7 +61,7 @@ The run engine (`src/forge/github/token.ts`) does not use `hapi token mint`'s fi
 | `mirror` | Contents: read | The mirror's `git fetch` |
 | `push` | Contents: write | The harvester's push of `factory/*` |
 | `pr` | Pull requests: write | Opening and editing PRs, comments, labels, and the reads: PR, issue comments, label events, reviews, review comments, collaborator permission |
-| `checks` | Checks: read | CodeRabbit's check run on the PR head |
+| `checks` | Checks: read | The check runs on a factory PR's head: `ci / gates` on every converge, and CodeRabbit's |
 
 CodeRabbit's round uses two of them: its reviews and review comments are read with the `pr` token, its check run with the `checks` token.
 
@@ -88,7 +88,7 @@ When a release adds a permission to an App (Plan 03 adds **Checks: Read-only** t
 
    Paste back the `github.app-perms` line (expected `pass`), the summary line, and the permissions line from the installation's page ("Read access to checks and metadata", "Read and write access to code and pull requests").
 
-**The window:** until step 2 is done, the installation lacks Checks. `hapi token mint --app factory` and a `checks` `forgeToken` ask for a permission the installation does not have, GitHub refuses them (HTTP 422), and `github.app-perms` fails.
+**The window:** until step 2 is done, the installation lacks Checks. `hapi token mint --app factory` and a `checks` `forgeToken` ask for a permission the installation does not have, GitHub refuses them (HTTP 422), and `github.app-perms` fails, naming it (`hapi-factory's installation on <repo> lacks checks: read: accept the App's new permissions on the installation (…)`), as it does for an App that lacks a permission of the table or has it at a lower level. Checks is needed whether or not CodeRabbit is on: every converge of a factory PR reads `ci / gates` with the `checks` token, so a repo's every tick fails until it is accepted.
 
 ## Creating each App
 

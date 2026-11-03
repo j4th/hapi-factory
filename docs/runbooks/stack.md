@@ -131,7 +131,7 @@ The helper always copies the three files together. `secrets:check` refuses a rec
 
 ```bash
 mise run up                          # from any account: it runs as hapi
-mise run up -- --roster budget       # Haiku 5.5 on every Archon tier (spec §12)
+mise run up -- --roster budget       # Haiku 5.5 on every Archon tier but the review's, Sonnet 5.5 (spec §12)
 mise run up -- --config <file>       # a secrets config other than ~/.config/hapi/secrets.yaml
 mise run down
 ```
@@ -163,7 +163,7 @@ sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
   systemctl --user status hapi-poll.service --no-pager -n 5'
 ```
 
-Expected: `hapi-poll.timer` activates `hapi-poll.service`, with NEXT within `runs.poll_interval_s`; after a tick, the service's last run shows `status=0/SUCCESS`, or `status=1/FAILURE` when a repo's tick failed closed (the journal, `journalctl --user -u hapi-poll.service`, has each repo's line, `<repo>: failed closed: <error>; the next tick retries`). The service runs with `KillMode=process`, because each run's detached `hapi run supervise` lives in its cgroup and must outlive the tick; systemd may log the leftover supervisors at the next tick's start, which is expected. A stop (`up`, `down`, kill switch 3) sends SIGTERM to the tick alone (bun, the unit's main process): it releases its locks and exits, and after `TimeoutStopSec=15` systemd kills it, so a stop takes seconds, 15 s at worst ([the units](../generated-configs.md#buildsystemd)). **Never run `systemctl --user kill hapi-poll.service`** except as part of `mise run down`: its default (`--kill-whom=all`) signals every process in the service's cgroup, every live run's supervisor included, and those runs are then reaped at their deadline instead of finalized when they end.
+Expected: `hapi-poll.timer` activates `hapi-poll.service`, with NEXT within `runs.poll_interval_s`; after a tick, the service's last run shows `status=0/SUCCESS`, or `status=1/FAILURE` when a repo's tick failed closed or the tick's reap failed (the journal, `journalctl --user -u hapi-poll.service`, has each repo's line, `<repo>: failed closed: <error>; the next tick retries`). The service runs with `KillMode=process`, because each run's detached `hapi run supervise` lives in its cgroup and must outlive the tick; systemd may log the leftover supervisors at the next tick's start, which is expected. A stop (`up`, `down`, kill switch 3) sends SIGTERM to the tick alone (bun, the unit's main process): it releases its locks and exits, and after `TimeoutStopSec=15` systemd kills it, so a stop takes seconds, 15 s at worst ([the units](../generated-configs.md#buildsystemd)). **Never run `systemctl --user kill hapi-poll.service`** except as part of `mise run down`: its default (`--kill-whom=all`) signals every process in the service's cgroup, every live run's supervisor included, and those runs are then reaped at their deadline instead of finalized when they end.
 
 **The live check of the stop** (Task 16 runs it, as hapi; none of it has run on the real host yet): it starts one tick by hand, waits until its main process is bun, times a stop, and counts the ticks and supervisors left. Run it while a run is live, and the supervisor count is the same before and after the stop:
 
@@ -374,7 +374,7 @@ It does start a second Hermes, with fake keys, so allow for its memory (up to 4 
 | Other integration tests | What they prove |
 |---|---|
 | `tests/secrets/sops.int.test.ts` | The whole key lifecycle on the real sops and age, and now also these: <br>- the store stays mode `0600` after each real `sops rotate` (add-machine, revoke, recover); <br>- decoy gpg-agent sockets in each machine's `HOME` and `XDG_RUNTIME_DIR` are never dialled; <br>- sops 3.13.3 reads its default key file as well as `SOPS_AGE_KEY_FILE` (the control: it fails without it), which is why `checkSopsKeys` checks that file; <br>- sops leaves `""` unencrypted, which `sopsFileProblem` allows. |
-| `tests/generate/policy-build.int.test.ts` | `mise run policy:build -- --roster budget --out <dir>` passes its flags through mise: it writes the twenty files with the budget roster. An unknown roster exits non-zero and writes nothing. |
+| `tests/generate/policy-build.int.test.ts` | `mise run policy:build -- --roster budget --out <dir>` passes its flags through mise: it writes the twenty-two files with the budget roster. An unknown roster exits non-zero and writes nothing. |
 
 #### How the read-only checks work
 

@@ -14,8 +14,9 @@ import { appCredentials, findInstallationId, mintInstallationToken, parseOwnerRe
 export type TokenPurpose = "mirror" | "push" | "pr" | "checks";
 
 /**
- * The permissions each purpose asks for. CodeRabbit's round needs two: its reviews and review comments
- * through a "pr" forge, its check run through a "checks" forge.
+ * The permissions each purpose asks for. "checks" reads the check runs on a factory PR's head: `ci / gates` on every
+ * converge (Ready to merge shows only once it is green), and CodeRabbit's; CodeRabbit's round also reads its reviews
+ * and review comments through a "pr" forge.
  */
 export const PURPOSE_PERMISSIONS: Readonly<Record<TokenPurpose, Readonly<Permissions>>> = Object.freeze({
   mirror: Object.freeze({ contents: "read" }),

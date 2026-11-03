@@ -4022,6 +4022,8 @@ Along the way, the run exercises CodeRabbit's round, one rework and the status c
   - **Task 1:** the CodeRabbit answer (H-167).
 - Produces: the live record that Plan 04 and H-168 read.
 
+**To stop during this run:** stopping the poller's timer or its service (`systemctl --user stop hapi-poll.timer`, or `hapi-poll.service`) only stops ticks, and leaves live runs going: each run's supervisor lives in the service's cgroup and survives by design (H-280). To end live runs and their spend, use `hapi run stop <id>` for each run, kill switch 3 (`mise run down`), or the provider's limit ([engine.md, Stopping everything](../../runbooks/engine.md#stopping-everything)).
+
 - [ ] **Step 1: Write the section.** Every command is complete and split into short lines with `\`. As-hapi commands use runs.md's form. Every command that names the owner starts from `OWNER="$(gh api user --jq .login)"`, so no login is written down. The section holds:
   - **Before:** Steps 2–4 below.
   - **Planning PR 1's files, in full:**
@@ -4068,7 +4070,7 @@ Along the way, the run exercises CodeRabbit's round, one rework and the status c
   - **Record tables:**
     - a run table: work order, run id, kind, round, status, spend, verdict, CodeRabbit;
     - the pass criteria, each with its result and evidence: design §4's nine points, then "every factory PR marked `Ready to merge` had its acceptance tests pass in the verify container", whose evidence is each such PR's verify run id and its `verify.json`'s `acceptance.exit`;
-    - a "Decisions" table: factory PR, harvest (run id, head), decision and version, subjects, via (jev, haiku, default), holds and notes (by file), spend, and the operator's call on each hold **and each note**: *agreed* (reworked or closed on it, or it pointed at something the operator commented on) or *disagreed* (merged unchanged).
+    - a "Decisions" table: factory PR, harvest (run id, head), decision and version, subjects, via (jev, haiku, default), holds and notes (by file), each hold's cause (coverage, a subject no classifier answered, or finding, what an answer found), the calls for the head (of `max_calls_per_head`), spend, and the operator's call on each hold **and each note**: *agreed* (reworked or closed on it, or it pointed at something the operator commented on) or *disagreed* (merged unchanged).
   - **A stop-and-report check:** if any harvest's decisions are all `via: "default"`, stop and report to the controller before the next step, because keys or egress are wrong.
 
   Then check Task 11's `factory-verify` against the sandbox. The verify container holds no key, joins `egress-archon`, and installs from the bundle's `bun.lock` with `bun ci --frozen-lockfile --ignore-scripts`; it never reuses the worker's `node_modules`. 0001 adds `@modelcontextprotocol/sdk`, so the `skeleton` piece's `bun.lock` must hold it, and the registry it comes from must be on `egress-archon`'s allowlist. If either is missing, stop and report it to the controller before Step 5.
