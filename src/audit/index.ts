@@ -24,6 +24,7 @@ import { rm } from "node:fs/promises";
 import { userInfo } from "node:os";
 import { join, resolve } from "node:path";
 import { parseOwnerRepo } from "../forge/github/app-token";
+import { sanitizeTerminal } from "../run/sanitize";
 import { generatedDrift } from "./checks/generated";
 import { githubAppPerms, githubLabels, githubRepoSettings, githubRulesets, repoAiWorkflows } from "./checks/github";
 import { mcpToolHashes } from "./checks/mcp";
@@ -171,7 +172,8 @@ export async function auditCommand(args: string[], deps: Partial<AuditContext> =
   };
   const results = await runAudit(ctx);
   const width = Math.max(...CHECK_IDS.map((id) => id.length));
-  for (const r of results) console.log(`${r.status.padEnd(4)}  ${r.id.padEnd(width)}  ${r.detail}`);
+  // A detail can carry text from GitHub, Docker or a tool: no terminal control reaches the terminal (M16).
+  for (const r of results) console.log(`${r.status.padEnd(4)}  ${r.id.padEnd(width)}  ${sanitizeTerminal(r.detail)}`);
   const count = (s: CheckResult["status"]) => results.filter((r) => r.status === s).length;
   console.log(`hapi audit: ${count("pass")} pass, ${count("fail")} fail, ${count("skip")} skip`);
   return count("fail") > 0 ? 1 : 0;

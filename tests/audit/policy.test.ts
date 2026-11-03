@@ -197,6 +197,22 @@ describe("policy.decision-models", () => {
     expect([r.status, r.detail]).toEqual(["pass", 'note: the engine\'s decisions give notes only (gates.decisions.mode: notes): none holds a PR (docs/policy.md, "Running without decision models")']);
   });
 
+  test("M12: a decision in shadow passes, with a note that it holds nothing", async () => {
+    const r = await models(({ gates, flags }) => ({ gates: once(gates, /^( {6}mode:) enforce/m, "$1 shadow"), flags }));
+    expect([r.status, r.detail]).toEqual([
+      "pass",
+      'note: the engine\'s diff-screen is in shadow (gates.decisions.by_name.diff-screen.mode: shadow): asked and recorded, it holds nothing (docs/policy.md, "Running without decision models")',
+    ]);
+  });
+
+  test("M12: a decision with on_unscreened: note passes, with a note that an unanswered subject never holds", async () => {
+    const r = await models(({ gates, flags }) => ({ gates: once(gates, /^( {6}on_unscreened:) hold/m, "$1 note"), flags }));
+    expect([r.status, r.detail]).toEqual([
+      "pass",
+      'note: the engine\'s diff-screen gives a note, not a hold, for a subject no classifier answered (gates.decisions.by_name.diff-screen.on_unscreened: note) (docs/policy.md, "Running without decision models")',
+    ]);
+  });
+
   test("both at once: one gate off and notes only, in one note", async () => {
     const r = await models(({ gates, flags }) => ({ gates: once(once(gates, /^( {2}mode:) enforce/m, "$1 notes"), /^(bash_gate:\n {2}enabled:) true/m, "$1 false"), flags }));
     expect([r.status, r.detail]).toEqual([

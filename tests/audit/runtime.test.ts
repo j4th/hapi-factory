@@ -477,7 +477,7 @@ describe("runtime.run-container", () => {
       const { withSidecar } = await sidecarWorld();
       for (const kind of ["worker", "verify", "fix"] as const) {
         const r = await withSidecar(kind);
-        expect([kind, r.status, r.detail]).toEqual([kind, "pass", expect.stringContaining("1 live run containers are as their kind's definition says")]);
+        expect([kind, r.status, r.detail]).toEqual([kind, "pass", expect.stringContaining("1 live run container is as its kind's definition says")]);
         expect([kind, r.detail.includes("and 1 smoke sidecars as policy/sidecars.yaml says (its image, read-only, /data read-only, no key, on its run's network alone)")]).toEqual([kind, true]);
       }
       // A stopped sidecar (one that crashed) isn't checked, and has no endpoint on the run's network, so none is expected.
@@ -669,7 +669,7 @@ describe("runtime.run-container", () => {
       const w = await cleanWorld();
       w.containers.push(runContainer(w, "cccccccccccc"), helperContainer("copyout", "cccccccccccc", "nifty_copy"), helperContainer("chown", "dddddddddddd", "nifty_chown"), helperContainer("clean", "eeeeeeeeeeee", "nifty_clean"));
       const r = await check(w, "runtime.run-container");
-      expect([r.status, r.detail]).toEqual(["pass", expect.stringContaining("1 live run containers are as their kind's definition says")]);
+      expect([r.status, r.detail]).toEqual(["pass", expect.stringContaining("1 live run container is as its kind's definition says")]);
       expect(r.detail).toContain("and 3 helpers as the helpers are made");
       // Each alone passes too: the chown helper's CAP_CHOWN is the one capability a helper may add.
       for (const kind of ["copyout", "chown", "clean"] as const) {
@@ -750,6 +750,69 @@ describe("runtime.run-container", () => {
         expect([what, r.status, r.detail.includes(`quirky_name: ${part}`)]).toEqual([what, "fail", true]);
         expect([what, r.detail.includes(VALUE)]).toEqual([what, false]);
       }
+    });
+
+    test("D50, D49: a helper's user, mounts, no-new-privileges and privilege are as its kind makes it", async () => {
+      const cases: [what: string, make: () => Container, part: string][] = [
+        ["a copy-out helper as root", () => edited(helperContainer("copyout"), (c) => void (c.Config.User = "0:0")), "it runs as 0:0, not 1001:1001, as a copyout helper does"],
+        ["a chown helper as 1001", () => edited(helperContainer("chown"), (c) => void (c.Config.User = "1001:1001")), "it runs as 1001:1001, not 0:0, as a chown helper does"],
+        ["a cleanup helper with no user", () => edited(helperContainer("clean"), (c) => void (c.Config.User = "")), "it runs as (the image's user), not 1001:1001, as a clean helper does"],
+        ["a copy-out helper writing /out", () => edited(helperContainer("copyout"), (c) => void (c.Mounts![0]!.RW = true)), "its mounts are not exactly a run's out volume (hapi-run-<id>-out) at /out, read-only"],
+        ["a copy-out helper with a second mount", () => edited(helperContainer("copyout"), (c) => void c.Mounts!.push({ Type: "bind", Source: "/home/hapi", Destination: "/h", RW: false })), "its mounts are not exactly a run's out volume (hapi-run-<id>-out) at /out, read-only"],
+        ["a chown helper on another run's volume", () => edited(helperContainer("chown"), (c) => void (c.Mounts![0]!.Name = "hapi-run-ffffffffffff-work")), "its mounts are not exactly its run's volumes hapi-run-ab12cd34ef56-work at /w and hapi-run-ab12cd34ef56-out at /o"],
+        ["a cleanup helper outside the run disk", () => edited(helperContainer("clean"), (c) => void (c.Mounts![0]!.Source = "/home/hapi/.ssh")), "its mounts are not only its run's dirs on the run disk (/var/lib/hapi/rundisk/hapi-run-ab12cd34ef56-work at /w, -out at /o)"],
+        ["no no-new-privileges", () => edited(helperContainer("chown"), (c) => void (c.HostConfig!.SecurityOpt = [])), "no-new-privileges:true is not set"],
+        ["a privileged helper", () => edited(helperContainer("copyout"), (c) => void (c.HostConfig!.Privileged = true)), "it is privileged (--privileged)"],
+      ];
+      for (const [what, make, part] of cases) {
+        const w = await cleanWorld();
+        w.containers.push(make());
+        const r = await check(w, "runtime.run-container");
+        expect([what, r.status, r.detail]).toEqual([what, "fail", expect.stringContaining(`quirky_name: ${part}`)]);
+      }
+    });
+
+    test("M11, D49: a run container that is privileged, or adds a capability, fails", async () => {
+      for (const [what, edit, part] of [
+        ["privileged", (c: Container) => void (c.HostConfig!.Privileged = true), "it is privileged (--privileged)"],
+        ["an added capability", (c: Container) => void (c.HostConfig!.CapAdd = ["CAP_SYS_ADMIN"]), "it adds SYS_ADMIN, where a run container adds none"],
+      ] as const) {
+        const w = await cleanWorld();
+        w.containers.push(edited(runContainer(w, "aaaaaaaaaaaa"), edit));
+        const r = await check(w, "runtime.run-container");
+        expect([what, r.status, r.detail]).toEqual([what, "fail", expect.stringContaining(`hapi-run-aaaaaaaaaaaa: ${part}`)]);
+      }
+    });
+
+    test("D51: a run container with no Id fails: its endpoint can't be matched by id", async () => {
+      const w = await cleanWorld();
+      w.containers.push(runContainer(w, "aaaaaaaaaaaa"));
+      // docker ps lists it, but its inspect carries no Id.
+      const real = w.ctx.exec;
+      w.ctx.exec = async (cmd) => {
+        const r = await real(cmd);
+        if (cmd[0] !== "docker" || cmd[1] !== "inspect") return r;
+        const xs = JSON.parse(r.stdout) as Container[];
+        return { ...r, stdout: JSON.stringify(xs.map((x) => (x.Name === "/hapi-run-aaaaaaaaaaaa" ? (({ Id: _, ...rest }) => rest)(x) : x))) };
+      };
+      const r = await check(w, "runtime.run-container");
+      expect(r.status).toBe("fail");
+      expect(r.detail).toContain("hapi-run-aaaaaaaaaaaa: it has no container id, so its endpoint on hapi-run-aaaaaaaaaaaa can't be matched by id");
+    });
+
+    test("D44, D52: a stray's run name is never shown raw, a missing network mode says (none), and the live count reads right", async () => {
+      const w = await cleanWorld();
+      w.containers.push(edited(helperContainer("clean", "x$(id)y"), (c) => delete c.Config.Labels["org.hapi.helper"]));
+      const r = await check(w, "runtime.run-container");
+      expect(r.status).toBe("fail");
+      expect(r.detail).not.toContain("$(id)");
+      expect(r.detail).toContain("its run's container ((a value that is not shown))");
+      const n = await cleanWorld();
+      n.containers.push(edited(helperContainer("copyout"), (c) => delete c.HostConfig!.NetworkMode));
+      expect((await check(n, "runtime.run-container")).detail).toContain("a helper is on no network, but its network is (none) and");
+      const one = await cleanWorld();
+      one.containers.push(runContainer(one, "aaaaaaaaaaaa"));
+      expect((await check(one, "runtime.run-container")).detail).toContain("1 live run container is as its kind's definition says");
     });
 
     test("a container named hapi-run-<id> with a helper label still gets the whole run check", async () => {
@@ -964,6 +1027,28 @@ describe("runtime.dev-override", () => {
     expect(s.detail).toContain("quirky_name was not started through `hapi stack up`");
   });
 
+  test("D45, D46: a label value is never shown raw; a helper of another project isn't skipped", async () => {
+    const edited = (c: Container, f: (c: Container) => void) => (f(c), c);
+    const w = await cleanWorld();
+    w.containers[0]!.Config.Labels["org.hapi.dev-override"] = "x\u001b[2Jy";
+    const r = await check(w, "runtime.dev-override");
+    expect(r.status).toBe("fail");
+    expect(r.detail).not.toContain("\u001b");
+    expect(r.detail).toContain("org.hapi.dev-override=(a value that is not shown)");
+    const by = await cleanWorld();
+    Object.assign(by.containers[0]!.Config.Labels, { "org.hapi.dev-override": "1", "org.hapi.started-by": "a`b" });
+    expect((await check(by, "runtime.dev-override")).detail).toContain("by (a value that is not shown)");
+    // A stack service that carries a helper's labels, of hapi's project or another, is held to the stack labels.
+    for (const project of ["hapi", "elsewhere"]) {
+      const other = await cleanWorld();
+      const archon = svc(other, "hermes");
+      Object.assign(archon.Config.Labels, { "org.hapi.run": "", "org.hapi.project": project, "org.hapi.helper": "copyout", "org.hapi.dev-override": "1", "org.hapi.started-by": "operator" });
+      const o = await check(other, "runtime.dev-override");
+      expect([project, o.status]).toEqual([project, "fail"]);
+      expect(o.detail).toContain(`${archon.Name.replace(/^\//, "")} was started with HAPI_ALLOW_CURRENT_USER=1 by operator`);
+    }
+  });
+
   test("a run container started as hapi with no bypass is counted among the containers that pass", async () => {
     const w = await cleanWorld();
     w.containers.push(runContainer(w));
@@ -1117,6 +1202,14 @@ describe("runtime.poller-timer", () => {
     down.dockerDown = true;
     const d = await check(down, "runtime.poller-timer");
     expect([d.status, d.detail.toLowerCase()]).toEqual(["skip", expect.stringContaining("docker")]);
+    expect(showCalls(w)).toEqual([]);
+  });
+
+  test("M15: a stack whose containers are all stopped is not up: it skips, asking nothing", async () => {
+    const w = await cleanWorld();
+    for (const c of w.containers) c.State = { Running: false };
+    const r = await check(w, "runtime.poller-timer");
+    expect([r.status, r.detail]).toEqual(["skip", "the stack is not running (no container of the Compose project hapi): `mise run up` starts it"]);
     expect(showCalls(w)).toEqual([]);
   });
 

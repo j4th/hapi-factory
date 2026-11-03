@@ -288,6 +288,13 @@ test("an error that holds the token is printed with it redacted", async () => {
   expect(failLine(w)).toBe(`step 5 (settings) failed: PATCH /repos/${FULL}: HTTP 500: boom [redacted] and [redacted]`);
 });
 
+test("M16: GitHub's text is printed with no terminal control in it", async () => {
+  const w = newRepoWorld({ routes: { [`PATCH ${R}`]: { status: 500, body: { message: "boom\u001b]0;owned\u0007 \u001b[2Jthere" } } } });
+  expect(await go(w)).toBe(1);
+  expect(failLine(w)).toBe(`step 5 (settings) failed: PATCH /repos/${FULL}: HTTP 500: boom there`);
+  for (const l of w.out) expect(l).not.toContain("\u001b");
+});
+
 test("an App install GitHub refuses becomes a web step the command waits on (design §3.2)", async () => {
   const w = newRepoWorld({ routes: { [`PUT ${API}/user/installations/12/repositories/${REPO_ID}`]: { status: 403, body: { message: "Resource not accessible by integration" } } } });
   w.setOnConfirm(() => w.installed.get(12)!.add(REPO_ID));

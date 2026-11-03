@@ -307,6 +307,18 @@ describe("github.app-perms", () => {
     });
   }
 
+  test("I5: an App lacking a permission the engine needs (factory without checks: read), or with it at a lower level, fails, naming the runbook's step", async () => {
+    const good = { planner: { contents: "write", pull_requests: "write", issues: "read", metadata: "read" }, factory: { contents: "write", pull_requests: "write", checks: "read", metadata: "read" } };
+    const lacking = await run(await withToken({ appPermissions: { ...good, factory: { contents: "write", pull_requests: "write", metadata: "read" } } }));
+    expect(lacking.perms.status).toBe("fail");
+    expect(lacking.perms.detail).toContain("hapi-factory lacks checks: read");
+    expect(lacking.perms.detail).toContain("hapi-factory's installation on");
+    expect(lacking.perms.detail).toContain("docs/runbooks/github-apps.md#adding-a-permission-to-an-existing-app");
+    const lower = await run(await withToken({ appPermissions: { ...good, planner: { contents: "read", pull_requests: "write", issues: "read", metadata: "read" } } }));
+    expect(lower.perms.status).toBe("fail");
+    expect(lower.perms.detail).toContain("hapi-planner has contents: read, below the runbook's contents: write");
+  });
+
   test("a response with no permissions object, or no App id, fails closed: there is nothing to clear", async () => {
     const cases: [string, (body: Record<string, unknown>) => void, string][] = [
       [`GET ${API}/app`, (b) => delete b.permissions, "GET /app returned no permissions object"],
@@ -554,6 +566,26 @@ describe("github.rulesets and the contract's check", () => {
       expect([registered, contexts, r.rulesets.status]).toEqual([registered, contexts, status]);
       expect(r.rulesets.detail).toContain(says);
     }
+  });
+});
+
+describe("M14: main-review's require_last_push_approval", () => {
+  const withLastPush = (v: unknown) => mutate((r) => (named(r, "main-protect").rules[2].parameters.required_status_checks = [{ context: "ci / gates", integration_id: 15368 }], named(r, "main-review").rules[0].parameters.require_last_push_approval = v));
+
+  test("a registered repo fails without it, naming it; hapi-factory's own repo (not registered) is left alone", async () => {
+    for (const v of [false, undefined]) {
+      const w = await withToken({ rulesets: withLastPush(v) });
+      w.ctx.policyDir = registeredPolicy();
+      const r = await run(w);
+      expect([v, r.rulesets.status]).toEqual([v, "fail"]);
+      expect(r.rulesets.detail).toContain("main-review's pull_request rule doesn't set require_last_push_approval");
+    }
+    const ok = await withToken({ rulesets: withLastPush(true) });
+    ok.ctx.policyDir = registeredPolicy();
+    expect((await run(ok)).rulesets.status).toBe("pass");
+    // Not registered (hapi-factory's own repo keeps false until its operator step): no problem of it.
+    const own = await run(await withToken({ rulesets: mutate((r) => (named(r, "main-review").rules[0].parameters.require_last_push_approval = false)) }));
+    expect(own.rulesets.status).toBe("pass");
   });
 });
 

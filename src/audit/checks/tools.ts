@@ -38,8 +38,7 @@ import { HERMES_HOME, proxyEnv, serviceEnvironment } from "../../stack/env";
 import { type AuditRun, type CheckResult, result } from "../types";
 import { deployedBuild } from "./generated";
 import { dockerfileImages, dockerfileOf } from "./pins";
-
-const firstLine = (s: string) => (s.trim().split("\n")[0] ?? "").slice(0, 300);
+import { firstLine } from "./util";
 
 /** The image to run for `service`: the one Compose built, else its Dockerfile's last FROM, if either is here. Never pulled. */
 async function localImage(run: AuditRun, service: string): Promise<{ image: string; user?: string } | { skip: string }> {

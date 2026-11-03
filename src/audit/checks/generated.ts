@@ -230,9 +230,15 @@ export async function generatedDrift(run: AuditRun): Promise<CheckResult[]> {
   let labels: string;
   if ("unavailable" in stack) labels = `${stack.unavailable}, so no container's build label was checked`;
   else {
-    // A run's smoke sidecar mounts nothing of build/, so it carries no build label: runtime.run-container holds it to
-    // policy/sidecars.yaml instead. Only a container classify calls a sidecar is skipped.
-    const up = stack.containers.filter((c) => isRunning(c) && !(c.Config?.Labels?.["org.hapi.run"] !== undefined && "sidecar" in classify(c)));
+    // A run's smoke sidecar, and a one-shot helper caught mid-flight (D47), mount nothing of build/, so they carry no
+    // build label: runtime.run-container holds them to policy/sidecars.yaml and the helpers' invariants instead. Only
+    // a container classify calls a sidecar or a helper is skipped.
+    const skipped = (c: (typeof stack.containers)[number]) => {
+      if (c.Config?.Labels?.["org.hapi.run"] === undefined) return false;
+      const what = classify(c);
+      return "sidecar" in what || "helper" in what;
+    };
+    const up = stack.containers.filter((c) => isRunning(c) && !skipped(c));
     for (const c of up) {
       const digest = c.Config?.Labels?.["org.hapi.build-sha256"] ?? "";
       if (digest === "") labelProblems.push(`${containerName(c)} has no org.hapi.build-sha256 label (not started through \`hapi stack up\`)`);

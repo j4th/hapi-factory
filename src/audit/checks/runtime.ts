@@ -77,6 +77,7 @@ import { currentUserOverride, HAPI_USER, networkProblem, POLL_UNITS, PROJECT, ru
 import type { WorkOrder } from "../../workorder/validate";
 import { type AuditContext, type AuditRun, type CheckResult, result } from "../types";
 import { freshBuilds } from "./generated";
+import { firstLine as firstLineOf } from "./util";
 
 /** A container as `docker inspect` prints it (the fields the audit reads). */
 export interface Container {
@@ -97,7 +98,8 @@ export interface Container {
     Image?: string | null;
     WorkingDir?: string | null;
   };
-  Mounts?: { Type?: string; Source?: string; Destination?: string; RW?: boolean }[] | null;
+  /** Name: a volume's name (a bind has none). */
+  Mounts?: { Type?: string; Name?: string; Source?: string; Destination?: string; RW?: boolean }[] | null;
   /** The networks the container is on, by name, each with the aliases `--network-alias` gave it there. */
   NetworkSettings?: { Networks?: Record<string, { Aliases?: string[] | null } | null> | null } | null;
   HostConfig?: {
@@ -123,7 +125,7 @@ export interface Container {
 
 export type Stack = { containers: Container[] } | { unavailable: string };
 
-const firstLine = (s: string) => (s.trim().split("\n")[0] ?? "").slice(0, 200);
+const firstLine = (s: string) => firstLineOf(s, 200);
 
 /** The containers `docker ps -a` finds with these filters, inspected (the listing of a run is the argv after `docker ps -a -q --no-trunc`). */
 async function inspected(run: AuditRun, filters: string[]): Promise<Stack> {
@@ -308,7 +310,7 @@ export async function runNetworkProblems(run: AuditRun, c: Container, profile: K
   const name = containerName(c);
   const problems: string[] = [];
   const mode = c.HostConfig?.NetworkMode;
-  if (mode !== name) problems.push(`its network is ${shown(mode ?? "(none)")}, not its own network ${name}`);
+  if (mode !== name) problems.push(`its network is ${mode === undefined ? "(none)" : shown(mode)}, not its own network ${name}`);
   const on = Object.keys(c.NetworkSettings?.Networks ?? {}).sort();
   if (on.length !== 1 || on[0] !== name) problems.push(`it is on ${on.length === 0 ? "no network" : on.map(shown).join(", ")}, not on its own network ${name} alone`);
   if (!on.includes(name)) return problems;
@@ -383,6 +385,9 @@ export interface RunShape {
   entrypoint: string | undefined;
   args: string[];
   capDrop: string[];
+  /** `--cap-add` and `--privileged` (M11): no run container has either. */
+  capAdd: string[];
+  privileged: boolean;
   readOnly: boolean;
   securityOpt: string[];
   user: string | undefined;
@@ -426,6 +431,8 @@ export function shapeOf(argv: string[]): RunShape {
     entrypoint: after("--entrypoint")[0],
     args: argv.includes("--entrypoint") ? argv.slice(argv.indexOf("--entrypoint") + 3) : [],
     capDrop: after("--cap-drop"),
+    capAdd: after("--cap-add"),
+    privileged: argv.some((a) => a === "--privileged" || (a.startsWith("--privileged=") && a !== "--privileged=false")),
     readOnly: argv.includes("--read-only"),
     securityOpt: after("--security-opt"),
     user: after("--user")[0],
@@ -474,6 +481,8 @@ function definitionProblems(want: RunShape, packDir: string, profile: KindProfil
   if (want.memory === undefined) problems.push("it has no memory limit");
   if (want.stopTimeout !== STOP_GRACE_S) problems.push(`its stop timeout is ${want.stopTimeout ?? "Docker's default"}, not ${STOP_GRACE_S}`);
   if (want.init !== false) problems.push("it doesn't set --init=false: its prelude must be PID 1 whatever the daemon's default");
+  if (want.capAdd.length > 0) problems.push(`it adds ${want.capAdd.map(cap).sort().join(", ")}, where a run container adds none`);
+  if (want.privileged) problems.push("it is privileged (--privileged), where a run container holds no privilege");
   return problems;
 }
 
@@ -484,7 +493,7 @@ function definitionProblems(want: RunShape, packDir: string, profile: KindProfil
  * no-new-privileges, the user, the pids and memory limits), the stop timeout (in `Config.StopTimeout`) and no init
  * process at PID 1 (`HostConfig.Init`).
  */
-export function liveProblems(c: Container, want: RunShape, packDir: string): string[] {
+export function liveProblems(c: Container, want: RunShape, packDir: string, what = "a run container"): string[] {
   const problems: string[] = [];
   const have = c.HostConfig?.Tmpfs ?? {};
   for (const [path, options] of want.tmpfs) {
@@ -503,7 +512,11 @@ export function liveProblems(c: Container, want: RunShape, packDir: string): str
   problems.push(...envProblems(envOf(c), want.env));
   if (Object.keys(c.HostConfig?.PortBindings ?? {}).length > 0) problems.push("it publishes a port (a run listens nowhere)");
   const h = c.HostConfig ?? {};
-  for (const cap of want.capDrop) if (!(h.CapDrop ?? []).includes(cap)) problems.push(`it does not drop ${cap} capabilities`);
+  for (const c2 of want.capDrop) if (!(h.CapDrop ?? []).includes(c2)) problems.push(`it does not drop ${c2} capabilities`);
+  // No capability added beyond the definition's, and no privilege (M11, D49).
+  const added = (h.CapAdd ?? []).map(cap).filter((x) => !want.capAdd.map(cap).includes(x)).sort();
+  if (added.length > 0) problems.push(`it adds ${added.join(", ")}, where ${what} adds none`);
+  if (h.Privileged === true && !want.privileged) problems.push(`it is privileged (--privileged), where ${what} holds no privilege`);
   if (want.readOnly && h.ReadonlyRootfs !== true) problems.push("its root filesystem is not read-only");
   for (const opt of want.securityOpt) if (!(h.SecurityOpt ?? []).includes(opt)) problems.push(`${opt} is not set`);
   if (want.user !== undefined && c.Config?.User !== want.user) problems.push(`it runs as ${c.Config?.User || "(the image's user)"}, not ${want.user}`);
@@ -538,7 +551,7 @@ export function classify(c: Container): { run: true } | { sidecar: true } | { he
   if (v !== "" && kind === SIDECAR_KIND && containerName(c) === sidecarName(runName(PROJECT, v))) return { sidecar: true };
   const helper = labels[HELPER_LABEL];
   if (kind !== SIDECAR_KIND && helper !== undefined && (HELPER_KINDS as readonly string[]).includes(helper)) return { helper: helper as HelperKind };
-  const whose = v === "" ? "its run's container (a run's name), its run's sidecar" : `its run's container (${runName(PROJECT, v)}), its run's sidecar (${sidecarName(runName(PROJECT, v))})`;
+  const whose = v === "" ? "its run's container (a run's name), its run's sidecar" : `its run's container (${shown(runName(PROJECT, v))}), its run's sidecar (${shown(sidecarName(runName(PROJECT, v)))})`;
   return { stray: `carries org.hapi.run=${v === "" ? "(empty)" : shown(v)} but is neither ${whose} nor a hapi helper` };
 }
 
@@ -610,20 +623,17 @@ export function sidecarProblems(
   // With no policy sidecar to hold it to, it has failed already; with one, it is that sidecar, flag for flag.
   if (s === undefined) return problems;
   if (image !== s.image && problems.every((p) => !p.startsWith(`runs ${shownImage},`))) problems.push(`runs ${shownImage}, not policy's ${declared} image ${s.image}`);
-  problems.push(...liveProblems(c, sidecarShape(s, v, ctx), ""));
+  problems.push(...liveProblems(c, sidecarShape(s, v, ctx), "", "a sidecar"));
   const have = [c.Path ?? "", ...(c.Args ?? [])];
   if (have.length !== s.command.length || have.some((w, i) => w !== s.command[i])) problems.push(`it runs ${have.map(shown).join(" ")}, not ${s.command.join(" ")}`);
   if (c.Config?.WorkingDir !== "/data") problems.push(`its working dir is ${shown(c.Config?.WorkingDir || "(the image's)")}, not /data`);
-  const added = (c.HostConfig?.CapAdd ?? []).map(cap).sort();
-  if (added.length > 0) problems.push(`it adds ${added.join(", ")}, where a sidecar adds none`);
-  if (c.HostConfig?.Privileged === true) problems.push("it is privileged (--privileged), where a sidecar holds no privilege");
   const labels = c.Config?.Labels ?? {};
   for (const [k, value] of Object.entries(labels)) {
     if (k.startsWith("com.docker.compose.") && value !== "") problems.push(`it carries ${shown(k)}=${shown(value)}: a sidecar is no service of the Compose project`);
   }
   if (labels[HELPER_LABEL] !== undefined) problems.push(`it carries ${HELPER_LABEL}=${shown(labels[HELPER_LABEL])}: a sidecar is no helper`);
   const mode = c.HostConfig?.NetworkMode;
-  if (mode !== run) problems.push(`its network is ${shown(mode ?? "(none)")}, not its run's network ${run}`);
+  if (mode !== run) problems.push(`its network is ${mode === undefined ? "(none)" : shown(mode)}, not its run's network ${run}`);
   const nets = c.NetworkSettings?.Networks ?? {};
   const on = Object.keys(nets).sort();
   if (on.length !== 1 || on[0] !== run) problems.push(`it is on ${on.length === 0 ? "no network" : on.map(shown).join(", ")}, not on its run's network ${run} alone`);
@@ -644,7 +654,7 @@ export function helperProblems(c: Container, kind: HelperKind, zoneKeys: Record<
   const h = c.HostConfig ?? {};
   const nets = Object.keys(c.NetworkSettings?.Networks ?? {});
   if (h.NetworkMode !== "none" || nets.length !== 1 || nets[0] !== "none") {
-    problems.push(`a helper is on no network, but its network is ${shown(h.NetworkMode ?? "(none)")} and it is on ${nets.length === 0 ? "no network" : nets.map(shown).join(", ")}`);
+    problems.push(`a helper is on no network, but its network is ${h.NetworkMode === undefined ? "(none)" : shown(h.NetworkMode)} and it is on ${nets.length === 0 ? "no network" : nets.map(shown).join(", ")}`);
   }
   const any = new Set(Object.values(zoneKeys).flat());
   for (const name of [...envOf(c).keys()].filter((n) => any.has(n)).sort()) problems.push(`${name} is set: a helper holds no key`);
@@ -654,7 +664,41 @@ export function helperProblems(c: Container, kind: HelperKind, zoneKeys: Record<
   const added = (h.CapAdd ?? []).map(cap).sort();
   const allowed = kind === "chown" ? ["CHOWN"] : [];
   if (added.some((a) => !allowed.includes(a))) problems.push(`it adds ${added.join(", ")}, where a ${kind} helper may add ${allowed.length === 0 ? "none" : allowed.join(", ")}`);
+  // D49, D50: no privilege, no new privileges, its kind's user, and only its kind's mounts.
+  if (h.Privileged === true) problems.push("it is privileged (--privileged), where a helper holds no privilege");
+  if (!(h.SecurityOpt ?? []).includes(NO_NEW_PRIVILEGES)) problems.push(`${NO_NEW_PRIVILEGES} is not set`);
+  const user = kind === "chown" ? "0:0" : APP_USER;
+  if (c.Config?.User !== user) problems.push(`it runs as ${c.Config?.User ? shown(c.Config.User) : "(the image's user)"}, not ${user}, as a ${kind} helper does`);
+  problems.push(...helperMountProblems(c, kind));
   return problems;
+}
+
+/**
+ * How a helper's mounts fall short of its kind's (D50): the copy-out has only a run's out volume
+ * (`hapi-run-<id>-out`) at /out, read-only; the chown only its run's two volumes, `-work` at /w and `-out` at /o; the
+ * cleanup only its run's dirs on the run disk (`RUN_DISK`), `-work` at /w and `-out` at /o, at least one of them.
+ */
+function helperMountProblems(c: Container, kind: HelperKind): string[] {
+  const mounts = c.Mounts ?? [];
+  const v = c.Config?.Labels?.["org.hapi.run"] ?? "";
+  const run = runName(PROJECT, v);
+  if (kind === "copyout") {
+    const m = mounts[0];
+    const out = new RegExp(`^${runName(PROJECT, "[0-9a-f]{12}")}-out$`);
+    const ok = mounts.length === 1 && m?.Type === "volume" && out.test(m.Name ?? "") && m.Destination === "/out" && m.RW === false;
+    return ok ? [] : [`its mounts are not exactly a run's out volume (${runName(PROJECT, "<id>")}-out) at /out, read-only`];
+  }
+  const want = new Map([["/w", `${run}-work`], ["/o", `${run}-out`]]);
+  if (kind === "chown") {
+    const ok = mounts.length === 2 && [...want].every(([at, name]) => mounts.some((m) => m.Type === "volume" && m.Name === name && m.Destination === at && m.RW !== false));
+    return ok ? [] : [`its mounts are not exactly its run's volumes ${shown(`${run}-work`)} at /w and ${shown(`${run}-out`)} at /o`];
+  }
+  const ats = mounts.map((m) => m.Destination);
+  const ok =
+    mounts.length >= 1 &&
+    new Set(ats).size === ats.length &&
+    mounts.every((m) => m.Type === "bind" && m.Destination !== undefined && want.has(m.Destination) && m.Source === `${RUN_DISK}/${want.get(m.Destination)}`);
+  return ok ? [] : [`its mounts are not only its run's dirs on the run disk (${RUN_DISK}/${shown(`${run}-work`)} at /w, -out at /o)`];
 }
 
 /** runtime.run-container */
@@ -755,7 +799,7 @@ export async function runContainer(run: AuditRun): Promise<CheckResult[]> {
       ? `no live run container was checked (${runs.unavailable})`
       : live.length === 0 && helpers === 0 && sidecarsLive === 0
         ? "no live run container was checked (none is running)"
-        : `${live.length} live run containers are as their kind's definition says, each holding only its kind's zone's keys, on its own internal network with only its kind's proxy (and its sidecar, when it has one)${helpers === 0 ? "" : `, and ${helpers} helpers as the helpers are made (no network, no key, --rm, read-only, no capability but chown's CHOWN)`}${sidecarsLive === 0 ? "" : `, and ${sidecarsLive} smoke sidecars as policy/sidecars.yaml says (its image, read-only, /data read-only, no key, on its run's network alone)`}`;
+        : `${live.length === 1 ? "1 live run container is as its kind's definition says, holding" : `${live.length} live run containers are as their kind's definition says, each holding`} only its kind's zone's keys, on its own internal network with only its kind's proxy (and its sidecar, when it has one)${helpers === 0 ? "" : `, and ${helpers} helpers as the helpers are made (no network, no key, --rm, read-only, no capability but chown's CHOWN)`}${sidecarsLive === 0 ? "" : `, and ${sidecarsLive} smoke sidecars as policy/sidecars.yaml says (its image, read-only, /data read-only, no key, on its run's network alone)`}`;
   const nonProxy = Object.entries(serviceEnvironment("archon")).filter(([k]) => !/proxy/i.test(k)).length;
   const binds = RUN_KINDS.map((k) => `${k} ${readOnlyDestinations(kindProfile(k), buildDir).length}`).join(", ");
   return [
@@ -862,13 +906,20 @@ export async function devOverride(run: AuditRun): Promise<CheckResult[]> {
   }
   const stack = await liveContainers(run);
   // A helper caught mid-flight carries no stack labels: runtime.run-container holds it to the helpers' invariants.
-  const containers = "containers" in stack ? stack.containers.filter((c) => isRunning(c) && !(c.Config?.Labels?.["org.hapi.run"] !== undefined && "helper" in classify(c))) : [];
+  // Only a helper of hapi's own project, and no Compose service (D46): a stack container that carries a helper's
+  // labels, or a helper of another project, is held to the stack labels like any container.
+  const helper = (c: Container) => {
+    const l = c.Config?.Labels ?? {};
+    return l["org.hapi.run"] !== undefined && l["org.hapi.project"] === PROJECT && (l["com.docker.compose.project"] ?? "") === "" && "helper" in classify(c);
+  };
+  const containers = "containers" in stack ? stack.containers.filter((c) => isRunning(c) && !helper(c)) : [];
   for (const c of containers) {
     const v = label(c, "org.hapi.dev-override") ?? "";
     const by = label(c, "org.hapi.started-by") ?? "";
-    if (v === "1") problems.push(`${containerName(c)} was started with HAPI_ALLOW_CURRENT_USER=1 by ${by || "(no org.hapi.started-by)"}`);
-    else if (v !== "0") problems.push(`${containerName(c)} was not started through \`hapi stack up\` (org.hapi.dev-override=${v === "" ? "(empty)" : v})`);
-    else if (by !== HAPI_USER) problems.push(`${containerName(c)} says it was started by ${by || "(nobody)"} with no bypass, which \`hapi stack up\` never labels`);
+    // A label's value is shown only when it is plain (D45).
+    if (v === "1") problems.push(`${containerName(c)} was started with HAPI_ALLOW_CURRENT_USER=1 by ${by === "" ? "(no org.hapi.started-by)" : shown(by)}`);
+    else if (v !== "0") problems.push(`${containerName(c)} was not started through \`hapi stack up\` (org.hapi.dev-override=${v === "" ? "(empty)" : shown(v)})`);
+    else if (by !== HAPI_USER) problems.push(`${containerName(c)} says it was started by ${by === "" ? "(nobody)" : shown(by)} with no bypass, which \`hapi stack up\` never labels`);
   }
   if (problems.length > 0) {
     if (ctx.dev) return [result(id, "skip", `--dev: the dev bypass is reported, not failed: ${problems.join("; ")}`)];
@@ -895,7 +946,8 @@ export async function pollerTimer(run: AuditRun): Promise<CheckResult[]> {
   if (!who.isHapi) return [result(id, "skip", `run the audit as ${HAPI_USER}: ${timer} is in ${HAPI_USER}'s user manager (systemctl --user)`)];
   const stack = await stackContainers(run);
   if ("unavailable" in stack) return [result(id, "skip", stack.unavailable)];
-  if (stack.containers.length === 0) return [result(id, "skip", NOT_RUNNING)];
+  // A stack whose containers are all stopped is not up (M15).
+  if (!stack.containers.some(isRunning)) return [result(id, "skip", NOT_RUNNING)];
   const env = systemctlEnv(ctx.env);
   const show = ["systemctl", "--user", "show", timer, "--property=ActiveState"];
   const cannot = `cannot ask ${HAPI_USER}'s user manager`;

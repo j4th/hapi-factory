@@ -13,7 +13,7 @@ import { runAudit } from "../../src/audit/index";
 import { buildAll } from "../../src/generate/index";
 import { loadPolicy } from "../../src/policy/load";
 import { buildDigest } from "../../src/stack/up";
-import { cleanup, cleanWorld, files, only, REPO, runContainer, sidecarContainer, tempDir } from "./helpers";
+import { cleanup, cleanWorld, files, helperContainer, only, REPO, runContainer, sidecarContainer, tempDir } from "./helpers";
 
 afterEach(cleanup);
 
@@ -38,6 +38,19 @@ describe("generated.drift", () => {
     fake.Name = "/nifty_name";
     v.containers.push(fake);
     expect((await drift(v)).detail).toContain("nifty_name has no org.hapi.build-sha256 label");
+  });
+
+  test("D47: a helper caught mid-flight carries no build label: it isn't counted, and doesn't fail the check", async () => {
+    const w = await cleanWorld();
+    w.containers.push(helperContainer("copyout"), helperContainer("chown", "dddddddddddd", "nifty_chown"), helperContainer("clean", "eeeeeeeeeeee", "nifty_clean"));
+    const r = await drift(w);
+    expect([r.status, r.detail]).toEqual(["pass", expect.stringContaining("5 running containers")]);
+    // One that only says it is a helper is a stray: counted, and its missing label fails.
+    const v = await cleanWorld();
+    const stray = helperContainer("clean");
+    delete stray.Config.Labels["org.hapi.helper"];
+    v.containers.push(stray);
+    expect((await drift(v)).detail).toContain("quirky_name has no org.hapi.build-sha256 label");
   });
 
   test("a deployed build equal to a fresh one, and every container started from it, passes", async () => {

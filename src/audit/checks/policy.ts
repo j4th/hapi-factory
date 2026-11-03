@@ -14,14 +14,14 @@
  * - policy.decision-models (design §3.6, "Decisions"): always a pass. Running without decision models is the
  *   operator's explicit choice, and `loadPolicy` already refuses a gate or an engine decision that is on with no
  *   classifier, so this only says, in a note, what is off (`gates.decisions.mode: off`, else each decision that is
- *   off; then each of the guard's gates that is off) and whether the engine's decisions give notes only, so a policy
- *   without them is never silent. Read from policy/, so it needs nothing running.
+ *   off; then each of the guard's gates that is off), whether the engine's decisions give notes only, and each
+ *   decision in shadow or with `on_unscreened: note` (M12), so a policy that holds less is never silent. Read from
+ *   policy/, so it needs nothing running.
  */
 import { APPS, appCredentials, findInstallationId, parseOwnerRepo } from "../../forge/github/app-token";
 import { loadPolicy } from "../../policy/load";
 import { type AuditRun, type CheckResult, result } from "../types";
-
-const firstLine = (s: string) => (s.trim().split("\n")[0] ?? "").slice(0, 300);
+import { firstLine } from "./util";
 
 /** policy.budget-enforcement */
 export async function budgetEnforcement(run: AuditRun): Promise<CheckResult[]> {
@@ -111,7 +111,16 @@ export async function policyDecisionModels(run: AuditRun): Promise<CheckResult[]
   if (!p.gates.bash_gate.enabled) off.push("the bash gate (gates.bash_gate.enabled: false)");
   if (!p.gates.result_screen.enabled) off.push("the result screen (gates.result_screen.enabled: false)");
   const notes = p.decisions.mode === "notes";
-  if (off.length === 0 && !notes) {
+  // M12: a decision that is on but holds less than enforce does: in shadow it holds nothing; with on_unscreened:
+  // note, a subject no classifier answered never holds.
+  const softer: string[] = [];
+  if (p.decisions.mode !== "off") {
+    for (const [name, d] of Object.entries(p.decisions.by_name)) {
+      if (d.mode === "shadow") softer.push(`the engine's ${name} is in shadow (gates.decisions.by_name.${name}.mode: shadow): asked and recorded, it holds nothing`);
+      else if (d.mode === "enforce" && d.on_unscreened === "note") softer.push(`the engine's ${name} gives a note, not a hold, for a subject no classifier answered (gates.decisions.by_name.${name}.on_unscreened: note)`);
+    }
+  }
+  if (off.length === 0 && !notes && softer.length === 0) {
     return [result(id, "pass", `decision models are on: the engine's decisions (gates.decisions.mode: ${p.decisions.mode}), the bash gate and the result screen`)];
   }
   const parts: string[] = [];
@@ -121,5 +130,6 @@ export async function policyDecisionModels(run: AuditRun): Promise<CheckResult[]
     parts.push(`decision models are off for ${list}: nothing screens ${them} with a classifier, by the operator's choice`);
   }
   if (notes) parts.push("the engine's decisions give notes only (gates.decisions.mode: notes): none holds a PR");
+  parts.push(...softer);
   return [result(id, "pass", `note: ${parts.join("; ")} ${RECIPE}`)];
 }

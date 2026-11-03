@@ -112,6 +112,16 @@ describe("hapi audit", () => {
     expect(out.at(-1)).toMatch(/, 1 fail,/);
   });
 
+  test("M16: a detail is printed with no terminal control in it", async () => {
+    const w = await cleanWorld();
+    w.archonValidate = { code: 1, out: { errors: ["bad\u001b]0;owned\u0007 \u001b[2Jnode"], parseWarnings: [] } };
+    const { out } = capture();
+    expect(await auditCommand([], w.ctx)).toBe(1);
+    const line = out.find((l) => /^fail +tools\.archon-validate /.test(l))!;
+    expect(line).toContain("bad node");
+    for (const l of out) expect(l).not.toContain("\u001b");
+  });
+
   test("--strict turns every skip into a fail, saying why it was a skip", async () => {
     const w = await cleanWorld();
     const { out } = capture();

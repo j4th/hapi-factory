@@ -338,6 +338,9 @@ export async function githubRulesets(run: AuditRun): Promise<CheckResult[]> {
       if (!rr.some((r) => r.type === "update")) problems.push("main-review has no update (Restrict updates) rule, so an App could merge");
       const pr = rr.find((r) => r.type === "pull_request")?.parameters;
       if (pr?.require_code_owner_review !== true) problems.push("main-review's pull_request rule doesn't set require_code_owner_review");
+      // A registered repo's main-review is new-repo's (policy/github/rulesets/main-review.json): the last push to a PR
+      // needs someone else's approval (design §3.2 step 5). hapi-factory's own keeps false until its operator step (M14).
+      if (registered && pr?.require_last_push_approval !== true) problems.push("main-review's pull_request rule doesn't set require_last_push_approval (policy/github/rulesets/main-review.json sets it for a registered repo)");
       // Fail closed, as main's check above does: a missing or non-numeric count is NaN, and NaN < 1 is false.
       if (!(Number(pr?.required_approving_review_count) >= 1)) problems.push("main-review's required_approving_review_count is missing or below 1");
       if (data.bypassVisible && JSON.stringify((review.bypass_actors ?? []).map(({ actor_id, actor_type, bypass_mode }) => ({ actor_id, actor_type, bypass_mode }))) !== JSON.stringify(ADMIN_PR_ONLY)) {
@@ -374,7 +377,7 @@ export async function githubRulesets(run: AuditRun): Promise<CheckResult[]> {
         result(
           id,
           "pass",
-          `${name}: main requires only the ${gate} check, from GitHub Actions, with no bypass, blocks force-pushes and deletion, and main-review requires 1 code-owner approval with Restrict updates and only the Admin PR-only bypass; agent-branch-scope and tags-admin-only are active, scoped as the runbook sets them, with only the Admin role's bypass; no ruleset without bypass actors restricts updates, and no App is a bypass actor (read with ${data.via})`,
+          `${name}: main requires only the ${gate} check, from GitHub Actions, with no bypass, blocks force-pushes and deletion, and main-review requires 1 code-owner approval${registered ? " and the last push's approval" : ""} with Restrict updates and only the Admin PR-only bypass; agent-branch-scope and tags-admin-only are active, scoped as the runbook sets them, with only the Admin role's bypass; no ruleset without bypass actors restricts updates, and no App is a bypass actor (read with ${data.via})`,
         ),
       );
     }
@@ -383,6 +386,18 @@ export async function githubRulesets(run: AuditRun): Promise<CheckResult[]> {
 }
 
 const LEVELS: Record<string, number> = { read: 1, write: 2, admin: 3 };
+
+/** What of `app`'s runbook permissions `granted` lacks, or grants at a lower level (final review I5): the engine needs each, e.g. factory's checks: read on every converge. */
+function short(app: AppName, granted: Record<string, unknown>): string[] {
+  const out: string[] = [];
+  for (const [k, want] of Object.entries(APPS[app].permissions as Record<string, string>)) {
+    const v = granted[k];
+    if (v === undefined) out.push(`lacks ${k}: ${want}`);
+    else if ((LEVELS[String(v)] ?? 0) < LEVELS[want]!) out.push(`has ${k}: ${String(v)}, below the runbook's ${k}: ${want}`);
+  }
+  return out;
+}
+const ADD_PERMISSION = "docs/runbooks/github-apps.md#adding-a-permission-to-an-existing-app";
 
 /** What in `granted` goes beyond `app`'s runbook permissions (administration and workflows always do). */
 function beyond(app: AppName, granted: Record<string, unknown>): string[] {
@@ -422,9 +437,16 @@ export async function githubAppPerms(run: AuditRun): Promise<CheckResult[]> {
         const selfPerms = asRecord(self?.permissions);
         const instPerms = asRecord(inst?.permissions);
         if (selfPerms === undefined) problems.push(`${appName}: GET /app returned no permissions object, so the App's permissions can't be checked`);
-        else for (const p of beyond(app, selfPerms)) problems.push(`${appName} has ${p}, beyond docs/runbooks/github-apps.md's table`);
+        else {
+          for (const p of beyond(app, selfPerms)) problems.push(`${appName} has ${p}, beyond docs/runbooks/github-apps.md's table`);
+          for (const p of short(app, selfPerms)) problems.push(`${appName} ${p} (${ADD_PERMISSION})`);
+        }
         if (instPerms === undefined) problems.push(`${appName}: GET ${repoPath(repo)}/installation returned no permissions object, so its installation's permissions can't be checked`);
-        else for (const p of beyond(app, instPerms)) problems.push(`${appName}'s installation on ${name} has ${p}`);
+        else {
+          for (const p of beyond(app, instPerms)) problems.push(`${appName}'s installation on ${name} has ${p}`);
+          // An installation keeps the permissions it last accepted: one the App gained since is pending there.
+          for (const p of short(app, instPerms)) problems.push(`${appName}'s installation on ${name} ${p}: accept the App's new permissions on the installation (${ADD_PERMISSION})`);
+        }
         if (inst?.repository_selection !== "selected") problems.push(`${appName}'s installation covers all repositories, not selected ones`);
         if (typeof self?.id === "number") checked.push({ app, id: self.id });
         else problems.push(`${appName}: GET /app returned no App id, so whether the App is a ruleset bypass actor can't be checked`);
@@ -450,8 +472,8 @@ export async function githubAppPerms(run: AuditRun): Promise<CheckResult[]> {
     }
     const apps = checked.map((c) => APPS[c.app].name).join(" and ");
     if (problems.length > 0) out.push(result(id, "fail", `${name}: ${problems.join("; ")}. Set each App's permissions exactly as docs/runbooks/github-apps.md, and never make an App a bypass actor`));
-    else if (gaps.length > 0) out.push(result(id, "skip", `${name}: ${apps} have only the runbook's permissions, but ${gaps.join("; ")}`));
-    else out.push(result(id, "pass", `${name}: ${apps} have only the runbook's permissions (no administration, no workflows), are installed on selected repositories, and neither is a ruleset bypass actor`));
+    else if (gaps.length > 0) out.push(result(id, "skip", `${name}: ${apps} have exactly the runbook's permissions, but ${gaps.join("; ")}`));
+    else out.push(result(id, "pass", `${name}: ${apps} have exactly the runbook's permissions (each one the engine needs, and no administration or workflows), are installed on selected repositories, and neither is a ruleset bypass actor`));
   }
   return out;
 }

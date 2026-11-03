@@ -93,7 +93,7 @@ export interface Container {
   Path: string;
   Args: string[];
   Config: { Labels: Record<string, string>; Env: string[]; Cmd: string[] | null; Entrypoint: string[] | null; User?: string; StopTimeout?: number; Image?: string; WorkingDir?: string };
-  Mounts: { Type: string; Source: string; Destination: string; RW: boolean }[];
+  Mounts: { Type: string; Name?: string; Source: string; Destination: string; RW: boolean }[];
   NetworkSettings?: { Networks: Record<string, unknown> };
   HostConfig?: {
     NetworkMode?: string;
@@ -642,7 +642,7 @@ export function sidecarContainer(id = "ab12cd34ef56"): Container {
  * `--network none`, a read-only root, every capability dropped, and no key.
  */
 export function helperContainer(kind: "copyout" | "chown" | "clean", runId = "ab12cd34ef56", name = "quirky_name"): Container {
-  const vol = (v: string, dest: string, rw: boolean) => ({ Type: "volume", Source: `/var/lib/docker/volumes/hapi-run-${runId}-${v}/_data`, Destination: dest, RW: rw });
+  const vol = (v: string, dest: string, rw: boolean) => ({ Type: "volume", Name: `hapi-run-${runId}-${v}`, Source: `/var/lib/docker/volumes/hapi-run-${runId}-${v}/_data`, Destination: dest, RW: rw });
   return {
     Id: `id-helper-${kind}-${runId}`,
     Name: `/${name}`,

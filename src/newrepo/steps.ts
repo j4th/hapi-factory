@@ -40,6 +40,7 @@ import { asRecord, ghMessage, oneLine, paginate, rest } from "../forge/github/re
 import { CONTRACT_CHECK, contractSettings, LABELS } from "../forge/index";
 import { loadPolicy } from "../policy/load";
 import { authedHostGit } from "../run/git";
+import { sanitizeTerminal } from "../run/sanitize";
 import { definedEnv, type Env, type Runner } from "../stack/up";
 import { contractProblems, renderTemplate, TEMPLATE_DIR } from "./render";
 
@@ -463,7 +464,9 @@ function redact(text: string, token: string): string {
  * `[k/11] <step>: <what>` for each; on a failure, the step and why, what was done and what to undo (newest
  * first). Resolves to 0 when every step passed, 1 when one failed.
  */
-export async function newRepo(d: NewRepoDeps, token: string, o: NewRepoOptions): Promise<number> {
+export async function newRepo(deps: NewRepoDeps, token: string, o: NewRepoOptions): Promise<number> {
+  // Every line it prints can carry GitHub's text: no terminal control reaches the terminal (M16).
+  const d: NewRepoDeps = { ...deps, out: (line) => deps.out(sanitizeTerminal(line)) };
   const c: Ctx = { d, token, o, owner: "", userId: 0, full: "", gatesSha: "", files: new Map(), repoId: 0, apps: [], undo: [] };
   const acted: string[] = [];
   for (const [k, step] of STEPS.entries()) {
