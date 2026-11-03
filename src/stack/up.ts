@@ -78,15 +78,17 @@
  * seconds.
  * It does load the whole CLI (`bun run src/cli.ts`), so it needs a checkout
  * that loads (src/ parses, node_modules installed) and a working mise;
- * without them, use kill switch 3b (docs/runbooks/kill-switches.md). Volumes
- * are kept. With HAPI_ALLOW_CURRENT_USER=1 it stops the dev-bypass stack on
+ * without them, use kill switch 3b (docs/runbooks/kill-switches.md). The
+ * stack's own volumes (Compose's named volumes) are kept, since `compose down`
+ * runs without `-v`; the runs' volumes go with their runs, as above, unless
+ * the run disk's lock was held. With HAPI_ALLOW_CURRENT_USER=1 it stops the dev-bypass stack on
  * the Docker the caller's CLI reaches instead (normally the caller's own), and
  * warns how to stop hapi's.
  */
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { userInfo } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { CLIENT_RANGES } from "../generate/egress";
 import { buildAll, ROSTERS } from "../generate/index";
 import { loadPolicy } from "../policy/load";
@@ -408,7 +410,10 @@ export async function stackUp(args: string[], deps: StackDeps = {}): Promise<num
   const env = deps.env ?? process.env;
   const run = deps.run ?? runCommand;
   const who = currentUserOverride(env, deps.user);
-  if (!who.isHapi && !who.override) return reexec("up", args, run, env, who.user);
+  // The re-exec runs in hapi's checkout (`reexecScript`), so a relative --config is made absolute first, from the
+  // caller's working dir, as runStart does --repo (D94, H-222(c)); an absolute one goes verbatim.
+  const forwarded = args.map((a, i) => (args[i - 1] === "--config" && !isAbsolute(a) ? resolve(a) : a));
+  if (!who.isHapi && !who.override) return reexec("up", forwarded, run, env, who.user);
   if (who.override) {
     console.error(
       `hapi stack up: warning: HAPI_ALLOW_CURRENT_USER=1: running the stack as ${who.user}, not ${HAPI_USER}: a dev-only downgrade (no dedicated user, and your own Docker, not hapi's rootless one). The containers are labelled org.hapi.dev-override=1, and hapi audit reports it.`,

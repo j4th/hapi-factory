@@ -56,7 +56,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import defs from "../../policy/schemas/policy-defs.schema.json";
-import { mountable } from "../audit/checks/tools";
+import { mountable } from "./mount";
 import { RUN_PATHS } from "../generate/archon";
 import { ROSTERS } from "../generate/index";
 import type { RosterName, Runs } from "../policy/types";
@@ -184,8 +184,11 @@ export function runName(project: string, runId: string): string {
 export const HELPER_LABEL = "org.hapi.helper";
 export const HELPER_KINDS = ["copyout", "chown", "clean"] as const;
 export type HelperKind = (typeof HELPER_KINDS)[number];
-/** `--label org.hapi.helper=<kind>`. */
-export const helperLabels = (kind: HelperKind): string[] => ["--label", `${HELPER_LABEL}=${kind}`];
+/**
+ * `--label org.hapi.helper=<kind>`, and the image's Compose labels blank (D48), as a run's and a sidecar's are: a
+ * helper is never the archon service of the Compose project `hapi`.
+ */
+export const helperLabels = (kind: HelperKind): string[] => ["--label", `${HELPER_LABEL}=${kind}`, ...COMPOSE_LABELS.flatMap((k) => ["--label", `${k}=`])];
 
 /** The labels on every object of a run: its id and project, and `org.hapi.int` for a test project (tests/stack/helpers.ts cleans those up). */
 export function runLabels(project: string, runId: string): string[] {
@@ -234,7 +237,7 @@ const LABEL_VALUES: Record<string, (d: Started) => string> = {
  * `hapi` to `docker ps --filter label=com.docker.compose.project=hapi`, `compose ps` or the audit's stack
  * checks; the audit finds runs by `org.hapi.run` and `org.hapi.project`.
  */
-const COMPOSE_LABELS = ["com.docker.compose.project", "com.docker.compose.service", "com.docker.compose.version"];
+export const COMPOSE_LABELS = ["com.docker.compose.project", "com.docker.compose.service", "com.docker.compose.version"];
 
 const isMap = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
 const strings = (v: unknown, key: string): string[] => {

@@ -119,7 +119,7 @@ describe("the cleanup helper", () => {
   const helperArgv = (mounts: string[]) =>
     bounded([
       "docker", "run", "--rm", "--pull", "never", "--network", "none", "--read-only", "--user", "1001:1001", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
-      ...runLabels("hapi", ID), "--label", "org.hapi.helper=clean", ...mounts, "--entrypoint", "sh", "hapi-factory/archon:0.12.1", "-c", CLEAN_SCRIPT,
+      ...runLabels("hapi", ID), "--label", "org.hapi.helper=clean", "--label", "com.docker.compose.project=", "--label", "com.docker.compose.service=", "--label", "com.docker.compose.version=", ...mounts, "--entrypoint", "sh", "hapi-factory/archon:0.12.1", "-c", CLEAN_SCRIPT,
     ]);
 
   test("the cleanup helper empties only the run's existing dirs as 1001:1001, then they are removed", async () => {
@@ -178,7 +178,7 @@ describe("the cleanup helper", () => {
   test("a helper that never returns is stopped at the host's bound, and the dirs are kept", async () => {
     const f = fakeRun({ hangs: (c) => c.at(-1) === CLEAN_SCRIPT });
     const d = dirs(f, { work: true });
-    expect((await caught(removeVolumeDirs(f.deps, ID))).message).toBe(`emptying run ${ID}'s dirs on the run disk timed out after 150 s (helper exit 137)`);
+    expect((await caught(removeVolumeDirs(f.deps, ID))).message).toBe(`emptying run ${ID}'s dirs on the run disk timed out after 150 s or was killed (helper exit 137)`);
     expect(unbounded(f.calls[0]!.cmd).at(-1)).toBe(CLEAN_SCRIPT);
     expect(existsSync(d.work)).toBe(true);
   });

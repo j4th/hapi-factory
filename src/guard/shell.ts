@@ -822,13 +822,15 @@ const hasDotDot = (w: string): boolean => w.split("/").includes("..");
 const ASSIGNERS = new Set(["export", "declare", "typeset", "readonly", "local", "read", "mapfile", "readarray", "getopts", "let", "eval", "for", "select"]);
 const CD_VARS = /^(CDPATH|OLDPWD)(\[[^\]]*\])?\+?=/;
 const CD_NAMES = /CDPATH|OLDPWD/;
+/** The commands whose targets a later copy in the same command can't see into (D57): each can put a link there. */
+const PLACERS = new Set(["cp", "ln", "mv", "install"]);
 
 /**
  * Whether a simple command may set CDPATH or OLDPWD, from its parsed words (quotes removed, so `CD''PATH` is read as
  * CDPATH): an assignment to either before the command word, or an assigning builtin's word assigning or naming one
  * (`export CDPATH=…`, `read OLDPWD`, `printf -v CDPATH`). checkShell also blocks on either name anywhere in the
- * command's text (the forms these words don't show: `${CDPATH:=…}`, `declare -n r=CDPATH`); a name built from
- * pieces (`v=CD; export ${v}PATH=…`) is H-256's.
+ * command's text, or in any de-quoted word (the forms these words don't show: `${CDPATH:=…}`, `declare -n
+ * r=CD''PATH`, `printf -vCD''PATH`: D56); a name built from a variable (`v=CD; export ${v}PATH=…`) is H-256's.
  */
 function setsCdVars(words: string[]): boolean {
   const at = headOf(words).at;
@@ -845,6 +847,11 @@ export function checkShell(command: string, c: ShellContext): ShellBlock | undef
   let dirs = [c.cwd];
   /** Directories an earlier `mkdir` in the command makes, as resolved lexically. */
   const made = new Set<string>();
+  /**
+   * The targets of an earlier cp, ln, mv or install in the command, as resolved lexically (D57): the commands that can
+   * put a link, or a tree holding one, at a path. A plain file's writer (a redirect, tee, touch) can't, so it isn't here.
+   */
+  const placed = new Set<string>();
   const tilde = (w: string) => (w === "~" ? c.home : w.startsWith("~/") ? step(c.home, w.slice(2)) : w);
   /** A word as the kernel gets it: `~` expanded, relative to `base`, unnormalized. */
   const under = (base: string, w: string) => {
@@ -890,6 +897,14 @@ export function checkShell(command: string, c: ShellContext): ShellBlock | undef
    * followed, each real one once.
    */
   const copied = (src: string, root: string, word: string, deref: boolean): ShellBlock | undefined => {
+    // D57: what an earlier cp, ln or mv of this command put at the root, above it or in it (a link) isn't there yet to
+    // see, so a copy there blocks, walked or not.
+    const r = resolve(root);
+    for (const w of placed) {
+      if (w === r || r.startsWith(`${w}/`) || w.startsWith(`${r}/`)) {
+        return { rule: "shell-write", reason: `this command copies into ${word}, where an earlier part of it copies, links or moves, so where its files land can't be known`, path: root };
+      }
+    }
     if (!reachable(root) && !present(root)) return undefined;
     const tooBig = (what: string): ShellBlock => ({ rule: "shell-write", reason: `this command copies ${what} into ${word}, too many to check where they land`, path: root });
     const queue: [dir: string, rel: string][] = [[src, ""]];
@@ -959,12 +974,14 @@ export function checkShell(command: string, c: ShellContext): ShellBlock | undef
    * CDPATH or OLDPWD may send a `cd` somewhere this rule can't see (H-223): either name anywhere in the command's
    * text, a parsed word setting one (setsCdVars, the text read again included), or CDPATH in the env.
    */
-  let cdUnknown = c.cdpath === true || CD_NAMES.test(command) || queue.some((q) => setsCdVars(q.seg.words));
+  // Each de-quoted word too (D56): `declare -n r=CD''PATH` and `printf -vCD''PATH` name it only once the quotes go.
+  const namesCd = (words: string[]) => setsCdVars(words) || words.some((w) => CD_NAMES.test(w));
+  let cdUnknown = c.cdpath === true || CD_NAMES.test(command) || queue.some((q) => namesCd(q.seg.words));
   let nested = 0;
   const reread = (text: string, broad: boolean): ShellBlock | undefined => {
     if (++nested > MAX_NESTED) return { rule: "shell-write", reason: `this command nests eval, env -S or sh -c more than ${MAX_NESTED} deep, so what it runs can't be known` };
     const segs = parseShell(text);
-    if (segs.some((seg) => setsCdVars(seg.words))) cdUnknown = true;
+    if (segs.some((seg) => namesCd(seg.words))) cdUnknown = true;
     queue.unshift(...segs.map((seg) => ({ seg, broad })));
     return undefined;
   };
@@ -1005,6 +1022,9 @@ export function checkShell(command: string, c: ShellContext): ShellBlock | undef
           if (hit) return hit;
         }
       }
+    }
+    if (!h.broad && PLACERS.has(baseName(head)) && ind?.write) {
+      for (const d of here) for (const t of ind.targets) for (const p of paths(t.word, under(d, t.word))) placed.add(resolve(p));
     }
     if (!h.broad && baseName(head) === "mkdir") {
       // Each directory it makes, and with -p the ones above it, count as directories for the rest of the command.

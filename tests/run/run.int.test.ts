@@ -321,6 +321,14 @@ describe.skipIf(!INT || !ONLINE)("hapi run on a real Docker (a throwaway project
         await logsHold(live, "[sleep] Started");
       }, 300_000);
 
+      // The live run is stopped here too (D89, H-221(a)): a stop test that failed or was filtered out leaves no live
+      // run behind to fail the later tests on runs.max_live. A stopped run's stop is a no-op.
+      afterAll(async () => {
+        if (live === undefined) return;
+        const rec = await readRecord(state, live);
+        if (rec?.status === "live") await quietly(() => runStop([live], deps(PACK)));
+      }, 180_000);
+
       test("the run's network holds only the run and egress-archon", async () => {
         const name = runName(p.name, live);
         const [net] = JSON.parse(await must(["docker", "network", "inspect", name]));

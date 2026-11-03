@@ -291,7 +291,10 @@ const VECTORS: [string, boolean][] = [
   ["for OLDPWD in .github; do cd - && rm workflows/ci.yml; done", true],
   ["select CDPATH in .github; do cd workflows; rm ci.yml; done", true],
   ["declare -n r=CDPATH; r=.github; cd workflows; rm ci.yml", true],
-  ["for CD''PATH in .github; do cd workflows && rm ci.yml; done", true],
+  // D56: CDPATH or OLDPWD in any de-quoted word, pieces and printf's attached -v included.
+  ["declare -n r=CD''PATH; r=.github; cd workflows; rm ci.yml", true],
+  ["printf -vCD''PATH .github; cd workflows; rm ci.yml", true],
+  ["printf -vOLD\"\"PWD .github; cd -; rm workflows/ci.yml", true],
   ["export PATH=$PATH:/x && cd src && ls", false],
   ["source \"$HOME/.venv/bin/activate\" && cd src && ls", false],
   ["trap 'rm -f $t' EXIT; cd src && ls", false],
@@ -300,6 +303,11 @@ const VECTORS: [string, boolean][] = [
   // A copy into an existing tree outside the worktree is walked: a planted link there lands in it.
   ["cp -r /tmp/payload /tmp/dst", true],
   ["cp -r /tmp/payload /tmp/fresh", false],
+  // D57: a copy into what an earlier cp, ln or mv of the same command made: what it planted there is unseen.
+  ["ln -s WORK/.github /tmp/fresh && cp -r /tmp/payload /tmp/fresh", true],
+  ["cp -r /tmp/dst /tmp/fresh && cp -r /tmp/payload /tmp/fresh", true],
+  ["mkdir /tmp/fresh && ln -s WORK/AGENTS.md /tmp/fresh/AGENTS.md; cp -r /tmp/payload/. /tmp/fresh", true],
+  ["cp -r /tmp/payload /tmp/fresh && cp -r /tmp/stage/pkg /tmp/elsewhere", false],
   // An in-place edit's script is no target; a ".." after a missing dir, and a symlink loop, block (H-223(c)).
   ["sed -i 's/../X/' notes.md", false],
   ["perl -pi -e 's/../X/' notes.md", false],

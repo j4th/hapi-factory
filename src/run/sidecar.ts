@@ -30,14 +30,14 @@
  */
 import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { mountable } from "../audit/checks/tools";
 import type { Sidecar } from "../policy/types";
 import { SIDECAR_ALIAS } from "../stack/env";
 import { currentUserOverride, definedEnv } from "../stack/up";
 import { hardenedGit } from "./git";
 import { KIND_LABEL } from "./kinds";
+import { mountable } from "./mount";
 import type { RunRecord } from "./records";
-import { APP_USER, NO_NEW_PRIVILEGES, type RunDeps, runLabels } from "./spec";
+import { APP_USER, COMPOSE_LABELS, NO_NEW_PRIVILEGES, type RunDeps, runLabels } from "./spec";
 
 /** The subdir of a run's record dir that holds its sidecar's data, bound read-only at `/data`. */
 export const SIDECAR_DATA = "sidecar";
@@ -54,9 +54,6 @@ const DATA = "/data";
 /** Its one writable path, as small as the egress proxies' and the appuser's alone. */
 const TMPFS = "/tmp:size=64m,uid=1001,gid=1001,mode=0700";
 
-/** The Compose labels an image built by Compose carries, blanked as `runArgs` blanks a run's (./spec.ts). */
-const COMPOSE_LABELS = ["com.docker.compose.project", "com.docker.compose.service", "com.docker.compose.version"];
-
 /** The whole `docker run` argv of the sidecar `s` for run `rec`, its data at `dataDir` (see the module comment). Pure. */
 export function sidecarArgs(d: Pick<RunDeps, "project" | "user" | "env">, rec: Pick<RunRecord, "runId" | "container" | "network">, s: Sidecar, dataDir: string): string[] {
   const who = currentUserOverride(d.env, d.user);
@@ -66,6 +63,7 @@ export function sidecarArgs(d: Pick<RunDeps, "project" | "user" | "env">, rec: P
     ...runLabels(d.project, rec.runId),
     "--label", `${KIND_LABEL}=${SIDECAR_KIND}`,
     "--label", `org.hapi.started-by=${who.user}`, "--label", `org.hapi.dev-override=${who.override ? "1" : "0"}`,
+    // The Compose labels an image built by Compose carries, blanked as `runArgs` blanks a run's (./spec.ts).
     ...COMPOSE_LABELS.flatMap((k) => ["--label", `${k}=`]),
     "--network", rec.network, "--network-alias", SIDECAR_ALIAS,
     "--read-only", "--user", APP_USER, "--cap-drop", "ALL", "--security-opt", NO_NEW_PRIVILEGES,

@@ -340,9 +340,11 @@ export async function createRunObjects(
     const r = await d.run(cmd, { env, inherit: false });
     if (r.code !== 0) {
       let why = firstLine(r.stderr);
+      // A value under 4 characters is left: no real key is that short (src/guard/secrets.ts' MIN_SECRET_CHARS is
+      // longer still), and replacing one would garble every word it occurs in, so the message would say nothing.
       for (const v of Object.values(secrets)) if (v.length >= 4) why = why.replaceAll(v, "[a secret value]");
       // `cmd` starts with `timeout` only when it is a helper `bounded` put under the host's bound.
-      const how = cmd[0] === "timeout" && timedOut(r.code) ? `timed out after ${HELPER_HOST_TIMEOUT_S} s` : "failed";
+      const how = cmd[0] === "timeout" && timedOut(r.code) ? `timed out after ${HELPER_HOST_TIMEOUT_S} s or was killed` : "failed";
       throw new Error(`${what} ${how} (exit ${r.code}): ${why}`);
     }
     return r;
@@ -446,15 +448,17 @@ const modelName = (model: string) => model.slice(model.lastIndexOf("/") + 1);
 
 /**
  * Why a run of `kind` can't run the work order's roles on `roster` (`name`), or undefined (ruling m16):
- * - a worker runs implement in the workflows' Pi nodes, so `roles.implement` must name a pi tier;
+ * - a worker or a fix runs implement in the workflows' Pi nodes, so `roles.implement` must name a pi tier (a fix is
+ *   checked again, D41: the roster may have changed since its worker started);
  * - a review runs in Claude Code, so `roles.review` must name a claude tier, and one whose model isn't
- *   implement's (compared without the vendor): a model reviewing its own work is no second opinion;
- * - a verify runs no model, and a fix runs implement's, which its worker was checked for.
+ *   implement's (compared without the vendor): a model reviewing its own work is no second opinion; startRun also
+ *   refuses one on the model its parent worker recorded (D43);
+ * - a verify runs no model.
  * So no review runs on the portable roster (every tier is Pi): H-249. The budget roster's review tier is Sonnet, its
  * Pi tiers Haiku (Task 11).
  */
 export function rolesProblem(kind: RunKind, roles: WorkOrder["roles"], roster: Roster, name: RosterName): string | undefined {
-  if (kind === "worker") {
+  if (kind === "worker" || kind === "fix") {
     const has = roster[roles.implement].provider;
     return has === "pi" ? undefined : `the work order's roles.implement is ${roles.implement}, a ${has} tier in the ${name} roster: implement runs on Pi, so it must name a pi tier`;
   }
@@ -600,7 +604,15 @@ export async function startRun(d: RunDeps, o: StartOptions): Promise<StartedRun>
       );
     }
   }
-  const base = o.kind === "worker" ? o.sha : (await parentOf(d, o)).sha;
+  const parent = o.kind === "worker" ? undefined : await parentOf(d, o);
+  const base = parent?.sha ?? o.sha;
+  // D43: a review never runs on the model its parent worker ran on (its record's), whatever the roster says now.
+  if (o.kind === "review" && parent?.model !== undefined) {
+    const model = modelName(applied.rosters[roster][order.roles.review].model);
+    if (model === modelName(parent.model)) {
+      throw new Error(`a review run would run on ${model}, the model its parent worker run ${parent.runId} ran on: a review must run on another model than the work it reviews`);
+    }
+  }
   if (profile.inputs && o.inputsDir === undefined) throw new Error(`a ${o.kind} run needs an inputs dir (StartOptions.inputsDir): ${INPUTS_FOR[o.kind]}`);
   if (!profile.inputs && o.inputsDir !== undefined) throw new Error(`a ${o.kind} run takes no inputs dir${NO_INPUTS[o.kind] ?? ""}`);
   const inputs = o.inputsDir === undefined ? undefined : await inputsProblem(o.inputsDir, profile, d.runs.inputs_mb);
@@ -873,7 +885,7 @@ async function keepContainerLog(d: RunDeps, rec: RunRecord, out: string): Promis
   } catch (e) {
     return `the container's log could not be read: ${(e as Error).message}`;
   }
-  if (timedOut(r.code)) return `reading the container's log timed out after ${HELPER_HOST_TIMEOUT_S} s`;
+  if (timedOut(r.code)) return `reading the container's log timed out after ${HELPER_HOST_TIMEOUT_S} s or was killed`;
   if (r.code !== 0) return `the container's log could not be read (docker logs exited ${r.code})`;
   const text = redactSecrets(sanitizeTerminal(r.stdout), values);
   const file = join(out, "container.log");

@@ -166,6 +166,12 @@ describe("exportSidecarData, with real git", () => {
     expect(readdirSync(at.dest).length).toBe(4);
     const over = await repoWith(Object.fromEntries(Array.from({ length: 5 }, (_, i) => [`smoke/f${i}.txt`, `${i}\n`])));
     expect((await caught(exportSidecarData(d, over.bare, over.sha, "smoke", over.dest, { data_files: 4, data_mb: 1 }))).message).toBe("smoke holds more than 4 files or 1 MiB: the sidecar's data is at most that");
+    // D53: exactly data_mb MiB exports too, over two files and in one.
+    for (const files of [{ "smoke/a.bin": new Uint8Array(512 * 1024), "smoke/b.bin": new Uint8Array(512 * 1024) }, { "smoke/one.bin": new Uint8Array(1024 * 1024) }]) {
+      const mb = await repoWith(files);
+      await exportSidecarData(d, mb.bare, mb.sha, "smoke", mb.dest, { data_files: 4, data_mb: 1 });
+      expect(readdirSync(mb.dest).sort()).toEqual(Object.keys(files).map((f) => f.slice("smoke/".length)).sort());
+    }
   });
 
   test("with real git: the data dir is a literal path, never a pathspec, and git reads the source with no config of its own", async () => {

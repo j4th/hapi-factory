@@ -20,9 +20,9 @@ import type { Policy, RepoOverlay, Tier } from "../../src/policy/types";
 import { runDeps, START_USAGE } from "../../src/run/cli";
 import { COPY_SCRIPT, HELPER_HOST_TIMEOUT_S, HELPER_KILL_AFTER_S, HELPER_TIMEOUT_S, LIST_SCRIPT } from "../../src/run/copyout";
 import { CLEAN_SCRIPT, GIB, volumeDir } from "../../src/run/disk";
-import { MAX_OUTPUTS, type RunKind } from "../../src/run/kinds";
+import { kindProfile, MAX_OUTPUTS, type RunKind } from "../../src/run/kinds";
 import {
-  bundleProblem, EXIT_FORMAT, FINALIZE_WAIT_S, finalizeRun, guardProblems, LOGS_SCRIPT, reapRuns, rolesProblem, runStart, runStop, runSupervise, type StartOptions, startRun,
+  bundleProblem, createRunObjects, EXIT_FORMAT, FINALIZE_WAIT_S, finalizeRun, guardProblems, LOGS_SCRIPT, reapRuns, rolesProblem, runStart, runStop, runSupervise, type StartOptions, startRun,
 } from "../../src/run/lifecycle";
 import { lockHeld, withStackLock } from "../../src/run/locks";
 import { listRecords, PER_RUN_FILES, readRecord, RUN_ID, runKey, withRunLock, withStartLock } from "../../src/run/records";
@@ -304,7 +304,7 @@ describe("hapi run start: the order of steps", () => {
         "timeout", "-k", String(HELPER_KILL_AFTER_S), String(HELPER_HOST_TIMEOUT_S),
         "docker", "run", "--rm", "--pull", "never", "--network", "none", "--read-only", "--user", "0:0", "--cap-drop", "ALL", "--cap-add", "CHOWN", "--security-opt", "no-new-privileges:true",
         // Its run's labels, so `down` finds it, and org.hapi.helper=chown, so the audit holds it to the helpers' invariants.
-        ...labels, "--label", "org.hapi.helper=chown", "-v", `${N}-work:/w`, "-v", `${N}-out:/o`, "--entrypoint", "chown", "hapi-factory/archon:0.12.1", "1001:1001", "/w", "/o",
+        ...labels, "--label", "org.hapi.helper=chown", "--label", "com.docker.compose.project=", "--label", "com.docker.compose.service=", "--label", "com.docker.compose.version=", "-v", `${N}-work:/w`, "-v", `${N}-out:/o`, "--entrypoint", "chown", "hapi-factory/archon:0.12.1", "1001:1001", "/w", "/o",
       ],
     ]);
     expect(made[5]!.slice(0, 7)).toEqual(["docker", "run", "-d", "--pull", "never", "--name", N]);
@@ -429,7 +429,7 @@ describe("hapi run start: rollback", () => {
     const { err } = capture();
     const f = ready({ hangs: (c) => c.includes("chown") });
     expect(await runStart(["--repo", f.repo, "--work-order", f.order], f.deps)).toBe(1);
-    expect(err.at(-1)).toBe(`hapi run start: the volume chown helper timed out after ${HELPER_HOST_TIMEOUT_S} s (exit 137): (no error output). What start had created was removed.`);
+    expect(err.at(-1)).toBe(`hapi run start: the volume chown helper timed out after ${HELPER_HOST_TIMEOUT_S} s or was killed (exit 137): (no error output). What start had created was removed.`);
     expect([f.world.containers.size, f.world.networks.size, f.world.volumes.size, readdirSync(f.deps.stateDir), locksIn(f.xdg)]).toEqual([0, 0, 0, [], []]);
     expect(f.spawned).toEqual([]);
   });
@@ -555,6 +555,13 @@ describe("startRun", () => {
         "the work order's roles.review is medium, whose model in the budget roster, claude-sonnet-5-5, is roles.implement's (medium) too: a review must run on another model than the work it reviews",
         onRoster("budget"),
       ],
+      [
+        // D43: whatever the roster says now, a review never runs on the model its parent worker ran on.
+        "a review on the model its parent worker recorded",
+        (a) => ({ ...roles(a, "small", "medium"), kind: "review", parent: P }),
+        `a review run would run on claude-sonnet-5-5, the model its parent worker run ${P} ran on: a review must run on another model than the work it reviews`,
+        seeded({ model: "anthropic/claude-sonnet-5-5" }),
+      ],
       ["a round of -1", () => ({ round: -1 }), "the run's round -1 is not a whole number of at least 0"],
       ["a round of 0.5", () => ({ round: 0.5 }), "the run's round 0.5 is not a whole number of at least 0"],
       ["a kind that isn't one", () => ({ kind: "build" as RunKind }), '"build" is not a run kind (worker, verify, review or fix)'],
@@ -595,7 +602,7 @@ describe("startRun", () => {
     }
   });
 
-  test("rolesProblem, per kind (m16): a worker's implement on a pi tier; a review's on a claude tier whose model isn't implement's; no check for verify or fix", () => {
+  test("rolesProblem, per kind (m16): a worker's implement on a pi tier; a review's on a claude tier whose model isn't implement's; a fix's as a worker's; no check for verify", () => {
     const { anthropic, budget, portable } = POLICY.rosters;
     // A worker is checked for implement alone: review: small (a pi tier) passes, and so does every roster's pi tier.
     expect(rolesProblem("worker", { implement: "small", review: "small" }, anthropic, "anthropic")).toBeUndefined();
@@ -616,8 +623,13 @@ describe("startRun", () => {
     );
     // So no review runs on portable (no claude tier) yet (H-249).
     for (const review of ["small", "medium", "large"] as const) expect(rolesProblem("review", { implement: "large", review }, portable, "portable")).toContain("a pi tier in the portable roster");
-    // A verify runs no model, and a fix runs implement's, which its worker was checked for.
-    for (const kind of ["verify", "fix"] as const) expect([kind, rolesProblem(kind, { implement: "medium", review: "small" }, portable, "portable")]).toEqual([kind, undefined]);
+    // A verify runs no model: unchecked, even with implement on a claude tier (D41: on anthropic, where medium is one).
+    expect(rolesProblem("verify", { implement: "medium", review: "small" }, anthropic, "anthropic")).toBeUndefined();
+    // A fix runs implement on Pi as its worker does, so it is checked as a worker is: the roster may have changed since.
+    expect(rolesProblem("fix", { implement: "medium", review: "small" }, anthropic, "anthropic")).toBe(
+      "the work order's roles.implement is medium, a claude tier in the anthropic roster: implement runs on Pi, so it must name a pi tier",
+    );
+    expect(rolesProblem("fix", { implement: "large", review: "small" }, anthropic, "anthropic")).toBeUndefined();
   });
 
   test("a worker starts on the portable roster, whatever its review tier: only a review needs a claude tier", async () => {
@@ -1461,7 +1473,7 @@ describe("finalizeRun", () => {
     const done = await finalizeRun(await seedRun(f, { id: ID, running: false, outputs: completedOutputs() }), f.deps);
     expect([done.status, done.reason]).toEqual([
       "failed",
-      `copying transcript.jsonl out timed out (after ${HELPER_TIMEOUT_S} s in the helper, or ${HELPER_HOST_TIMEOUT_S} s in all): not copied; no transcript.jsonl was copied out, so the guard-ran check could not be made`,
+      `copying transcript.jsonl out timed out or was killed (a bound of ${HELPER_TIMEOUT_S} s in the helper, or ${HELPER_HOST_TIMEOUT_S} s in all): not copied; no transcript.jsonl was copied out, so the guard-ran check could not be made`,
     ]);
     expect(f.world.containers.size + f.world.networks.size + f.world.volumes.size).toBe(0);
     expect(locksIn(f.xdg)).toEqual([]);
@@ -1652,7 +1664,7 @@ describe("the container's log, when no result.json came out (final review C-1)",
     capture();
     const cases: [Parameters<typeof fakeRun>[0], string, boolean][] = [
       [{ failing: ["sh -c"] }, "the container's log could not be read (docker logs exited 1)", true],
-      [{ hangs: (c) => c[0] === "sh" }, "reading the container's log timed out after 150 s", true],
+      [{ hangs: (c) => c[0] === "sh" }, "reading the container's log timed out after 150 s or was killed", true],
       [{}, "the container's log was not kept, since nothing could redact it: ", false],
     ];
     for (const [o, note, envFile] of cases) {
@@ -1964,5 +1976,23 @@ describe("the hapi CLI", () => {
     expect(await main(["run", "stop"])).toBe(2);
     expect(await main(["run", "supervise", "x"])).toBe(2);
     expect(err).toEqual([START_USAGE, "usage: hapi run stop <run-id>", "usage: hapi run supervise <run-id>"]);
+  });
+});
+
+describe("D91: createRunObjects scrubs a secret from a failing docker CLI's error", () => {
+  test("a zone value the run container's docker CLI echoes on stderr is replaced; a value under 4 characters is left", async () => {
+    const f = fakeRun();
+    const rec = await seedRun(f, { id: "d1d1d1d1d1d1", status: "live", running: false, objects: false });
+    const key = fakeSecret("ANTHROPIC_API_KEY");
+    const run = f.deps.run;
+    const deps = {
+      ...f.deps,
+      run: async (cmd: string[], opts: Parameters<typeof run>[1]) =>
+        cmd[0] === "docker" && cmd[1] === "run" && cmd[2] === "-d" ? { code: 125, stdout: "", stderr: `docker: invalid env ANTHROPIC_API_KEY=${key} (and abc)\nmore` } : run(cmd, opts),
+    };
+    const argv = ["docker", "run", "-d", "--name", rec.container, "hapi-factory/archon:0.12.1"];
+    const e = await caught(createRunObjects(deps, rec, argv, { ANTHROPIC_API_KEY: key, SHORT: "abc" }, kindProfile("worker")));
+    expect(e.message).toBe(`docker run ${rec.container} failed (exit 125): docker: invalid env ANTHROPIC_API_KEY=[a secret value] (and abc)`);
+    expect(e.message).not.toContain(key);
   });
 });

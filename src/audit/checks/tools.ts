@@ -38,6 +38,7 @@ import { HERMES_HOME, proxyEnv, serviceEnvironment } from "../../stack/env";
 import { type AuditRun, type CheckResult, result } from "../types";
 import { deployedBuild } from "./generated";
 import { dockerfileImages, dockerfileOf } from "./pins";
+import { mountable } from "../../run/mount";
 import { firstLine } from "./util";
 
 /** The image to run for `service`: the one Compose built, else its Dockerfile's last FROM, if either is here. Never pulled. */
@@ -72,12 +73,6 @@ const exists = async (p: string) => {
     return false;
   }
 };
-
-/** A path a `-v src:dst` mount can hold, else throws naming `into` (the run launcher reuses it, src/run/spec.ts). */
-export function mountable(path: string, into = "the validation container"): string {
-  if (path.includes(":") || path.includes(",")) throw new Error(`cannot mount ${path} into ${into}: its path holds ":" or ","`);
-  return path;
-}
 
 /** The three read-only Archon commands the validation run makes, in order. */
 const ARCHON_COMMANDS = ["validate workflows --json", "ai alias list --json", "ai tier list --json"] as const;

@@ -19,7 +19,7 @@ afterEach(cleanup);
 const ID = "ab12cd34ef56";
 const VOL = `hapi-run-${ID}-out`;
 const LIMITS = { bundle: 256, transcript: 64, decisions: 16, result: 4 };
-const TIMED_OUT = `timed out (after ${HELPER_TIMEOUT_S} s in the helper, or ${HELPER_HOST_TIMEOUT_S} s in all)`;
+const TIMED_OUT = `timed out or was killed (a bound of ${HELPER_TIMEOUT_S} s in the helper, or ${HELPER_HOST_TIMEOUT_S} s in all)`;
 /** A worker's outputs: the four names a worker or fix run may leave. */
 const WORKER = kindProfile("worker").outputs;
 
@@ -184,7 +184,7 @@ describe("copyOut", () => {
         "timeout", "-k", String(HELPER_KILL_AFTER_S), String(HELPER_HOST_TIMEOUT_S),
         "docker", "run", "--rm", "--pull", "never", "--network", "none", "--read-only", "--user", "1001:1001", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
         // The run labels, so `down` finds it, and org.hapi.helper=copyout, so the audit holds it to the helpers' invariants.
-        "--label", RUN_LABEL, "--label", `${PROJECT_LABEL}=hapi`, "--label", "org.hapi.helper=copyout", "-v", `${VOL}:/out:ro`, "--entrypoint", "sh", "hapi-factory/archon:0.12.1", "-c", script,
+        "--label", RUN_LABEL, "--label", `${PROJECT_LABEL}=hapi`, "--label", "org.hapi.helper=copyout", "--label", "com.docker.compose.project=", "--label", "com.docker.compose.service=", "--label", "com.docker.compose.version=", "-v", `${VOL}:/out:ro`, "--entrypoint", "sh", "hapi-factory/archon:0.12.1", "-c", script,
       ]);
     }
     // The listing and every read are bounded in time inside the helper too, below the host's bound.

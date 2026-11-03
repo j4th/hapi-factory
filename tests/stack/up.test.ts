@@ -250,6 +250,17 @@ describe("hapi stack up", () => {
     expect(err.join("\n")).toContain("HAPI_ALLOW_CURRENT_USER=1");
   });
 
+  test("D94: a relative --config is made absolute, from the caller's working dir, before the re-exec into hapi's checkout", async () => {
+    capture();
+    const f = fakes({ user: "dev" });
+    expect(await stackUp(["--config", "conf/hapi.yaml", "--roster", "budget"], f.deps)).toBe(0);
+    expect(f.calls[0]!.cmd.slice(8)).toEqual(["hapi-stack", "--config", join(process.cwd(), "conf/hapi.yaml"), "--roster", "budget"]);
+    // As hapi, no re-exec: the path reaches the secrets step as given.
+    const h = fakes();
+    expect(await stackUp(["--config", "conf/hapi.yaml"], h.deps)).toBe(0);
+    expect(h.steps).toContain("resolve --config conf/hapi.yaml");
+  });
+
   test("the re-exec never hands sudo a login shell (-i) or a shell (-s), and its script holds none of the forwarded arguments (H-148)", async () => {
     capture();
     const scripts = new Set<string>();

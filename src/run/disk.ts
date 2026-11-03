@@ -24,7 +24,7 @@
 import { accessSync, constants, lstatSync, statfsSync, statSync } from "node:fs";
 import { rmdir } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
-import { mountable } from "../audit/checks/tools";
+import { mountable } from "./mount";
 import type { Runs } from "../policy/types";
 import { definedEnv } from "../stack/up";
 import { bounded, HELPER_HOST_TIMEOUT_S, timedOut } from "./copyout";
@@ -162,7 +162,7 @@ export async function removeVolumeDirs(d: Pick<RunDeps, "run" | "env" | "project
     ]),
     { env: definedEnv(d.env), inherit: false },
   );
-  if (r.code !== 0) throw new Error(`emptying run ${runId}'s dirs on the run disk ${timedOut(r.code) ? `timed out after ${HELPER_HOST_TIMEOUT_S} s` : "failed"} (helper exit ${r.code})`);
+  if (r.code !== 0) throw new Error(`emptying run ${runId}'s dirs on the run disk ${timedOut(r.code) ? `timed out after ${HELPER_HOST_TIMEOUT_S} s or was killed` : "failed"} (helper exit ${r.code})`);
   for (const { path } of full) {
     if (!(await removedIfEmpty(path))) throw new Error(`${path} on the run disk is not empty after the cleanup helper ran`);
   }

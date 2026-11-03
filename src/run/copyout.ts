@@ -54,11 +54,13 @@ export const bounded = (cmd: string[]): string[] => ["timeout", "-k", String(HEL
 
 /**
  * Whether a bounded helper's exit code says a bound stopped it: 124 is `timeout`'s own (inside the helper or on
- * the host), 137 its KILL, which a docker CLI waiting on a hung daemon needs.
+ * the host), 137 its KILL, which a docker CLI waiting on a hung daemon needs. 137 is any SIGKILL too (the OOM
+ * killer's), so the messages say "timed out ... or was killed" (H-222(b)).
  */
 export const timedOut = (code: number): boolean => code === 124 || code === 137;
 
-const TIMED_OUT = `timed out (after ${HELPER_TIMEOUT_S} s in the helper, or ${HELPER_HOST_TIMEOUT_S} s in all)`;
+// 137 is any SIGKILL, the OOM killer's too, not only the bound's (H-222(b)): so "or was killed".
+const TIMED_OUT = `timed out or was killed (a bound of ${HELPER_TIMEOUT_S} s in the helper, or ${HELPER_HOST_TIMEOUT_S} s in all)`;
 
 /**
  * Prints every name in /out (dot names too), NUL-separated, up to MAX_NAMES, under a `timeout` inside the helper
