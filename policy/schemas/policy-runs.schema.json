@@ -43,15 +43,15 @@
       "additionalProperties": false
     },
     "disk": {
-      "description": "The most disk one run's volumes may use.",
+      "description": "The run disk: the one filesystem every run's volumes share, checked before each start. Central only.",
       "type": "object",
       "properties": {
         "gb": {
-          "description": "The cap in GiB.",
+          "description": "The most the run disk may be, in GiB, so no run can grow past it: a bigger one, or one that isn't its own filesystem, fails the check.",
           "$ref": "policy-defs.schema.json#/$defs/count"
         },
         "enforcement": {
-          "description": "hard stops the run when the cap is crossed; soft flags it and lets it finish.",
+          "description": "hard: hapi run start refuses while the run disk's check fails; soft: it warns and starts anyway.",
           "$ref": "policy-defs.schema.json#/$defs/enforcement"
         }
       },
@@ -92,15 +92,15 @@
       "type": "object",
       "properties": {
         "verify": {
-          "description": "The verify container runs the repo's gates.",
+          "description": "The verify container runs the repo's gates. The poller (src/engine/pipeline.ts) starts it once a worker or fix run's host gates pass, and the harvester reads it.",
           "type": "boolean"
         },
         "review": {
-          "description": "The review container reviews the diff.",
+          "description": "The review container reviews the diff. The poller starts it after verify (or the gates, with verify off), and the harvester reads it.",
           "type": "boolean"
         },
         "coderabbit": {
-          "description": "The CodeRabbit CLI in the review container (flags.coderabbit is CodeRabbit's PR review, a different thing).",
+          "description": "The CodeRabbit CLI in the review container (flags.coderabbit is CodeRabbit's PR review, a different thing). startRun writes it into the review's run.json, and the poller and the harvester read its result.",
           "type": "boolean"
         },
         "require_acceptance": {

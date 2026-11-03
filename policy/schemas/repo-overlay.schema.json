@@ -56,31 +56,17 @@
       "additionalProperties": false
     },
     "runs": {
-      "description": "Run limits to lower and phases to switch on. Each number must be at most the base value; a phase may not go from on to off, and disk.enforcement may only harden. poll_interval_s is central only.",
+      "description": "Run limits to lower and phases to switch on. Each number must be at most the base value, and a phase may not go from on to off. The launcher's limits are central only, since it reads only policy/runs.yaml's: disk (one shared filesystem), max_live, retention_days and output_limits_mb's transcript, decisions and result, as are poll_interval_s, max_retries, max_rework_rounds, inputs_mb and work_order_kb. output_limits_mb.bundle may be lowered: the harvest enforces it.",
       "type": "object",
       "properties": {
-        "max_live": { "$ref": "policy-defs.schema.json#/$defs/count" },
-        "retention_days": { "$ref": "policy-defs.schema.json#/$defs/count" },
         "output_limits_mb": {
           "type": "object",
           "properties": {
-            "bundle": { "$ref": "policy-defs.schema.json#/$defs/count" },
-            "transcript": { "$ref": "policy-defs.schema.json#/$defs/count" },
-            "decisions": { "$ref": "policy-defs.schema.json#/$defs/count" },
-            "result": { "$ref": "policy-defs.schema.json#/$defs/count" }
+            "bundle": { "$ref": "policy-defs.schema.json#/$defs/count" }
           },
           "additionalProperties": false
         },
         "max_auto_rounds": { "$ref": "policy-defs.schema.json#/$defs/count" },
-        "disk": {
-          "description": "Lower gb; harden enforcement (soft may become hard).",
-          "type": "object",
-          "properties": {
-            "gb": { "$ref": "policy-defs.schema.json#/$defs/count" },
-            "enforcement": { "$ref": "policy-defs.schema.json#/$defs/enforcement" }
-          },
-          "additionalProperties": false
-        },
         "phases": {
           "description": "Switch a phase on (true; applyOverlay refuses false) and lower the round counts, turns and cap.",
           "type": "object",

@@ -1,9 +1,11 @@
 # yaml-language-server: $schema=schemas/policy-runs.schema.json
 #
 # Run limits (Plans 02 and 03). The run launcher, the poller and the harvester
-# read them; a repo overlay may lower them, never raise them, and may switch a
-# phase on but never off. poll_interval_s, max_retries, max_rework_rounds,
-# inputs_mb and work_order_kb are central only.
+# read them; a repo overlay may lower max_auto_rounds, output_limits_mb.bundle
+# and the phases' numbers, never raise them, and may switch a phase on but never
+# off. The rest are central only: the launcher's own (max_live, retention_days,
+# output_limits_mb but bundle, and disk, one filesystem every run shares), and
+# poll_interval_s, max_retries, max_rework_rounds, inputs_mb and work_order_kb.
 max_live: 1             # live runs at once; the launcher refuses the next, and the poller waits for a free slot
 retention_days: 14      # a run's files are removed this many days after its harvestedAt, and never before the UTC month it started in has ended (the poller's monthly cap reads them)
 output_limits_mb:       # the most each output file may be; a larger one is not copied out and the run is recorded failed
@@ -11,9 +13,9 @@ output_limits_mb:       # the most each output file may be; a larger one is not 
   transcript: 64        # the run transcript
   decisions: 16         # the decisions log
   result: 4             # the result summary
-disk:                   # the most disk one run's volumes may use (the run engine's disk check)
-  gb: 20                # the cap, in GiB
-  enforcement: hard     # hard stops the run when it is crossed; soft flags it and lets it finish
+disk:                   # the run disk: the one filesystem every run's volumes share, checked before each start (central only)
+  gb: 20                # the most it may be, in GiB, so no run can grow past it: a bigger one, or one that isn't its own filesystem, fails the check
+  enforcement: hard     # hard: hapi run start refuses while the check fails; soft: it warns and starts anyway
 poll_interval_s: 120    # seconds between the poller's passes over the registered repos (30-3600; central only)
 max_auto_rounds: 3      # automatic runs per work order with no human action between them; the poller counts them; always hard: the poller's check, never softened by budgets.enforcement.poller
 max_retries: 2          # times the operator may queue a failed work order again (hapi retry); the command refuses one more; always hard: never softened by budgets.enforcement.poller; central only; 0 turns hapi retry off
@@ -21,9 +23,9 @@ max_rework_rounds: 3    # rework runs a maintainer's hapi:rework label may start
 inputs_mb: 16           # the most a review or fix run's inputs copy may be (diff.patch, verify.json and findings.md together), in MiB; a larger one is refused, never truncated; central only
 work_order_kb: 1024     # the most discovery reads of each work-order file (order.yaml, task.md, .factory/config.yaml), in KiB; a larger one is a problem the work order can't run with, never truncated; central only
 phases:                 # what a run does; an overlay may switch one on, never off
-  verify: true          # the verify container runs the repo's gates
-  review: true          # the review container reviews the diff
-  coderabbit: false     # the CodeRabbit CLI in the review container; off until an unattended key exists (H-167)
+  verify: true          # the verify container runs the repo's gates; the poller (src/engine/pipeline.ts) starts it once a worker or fix run's host gates pass, and the harvester reads it
+  review: true          # the review container reviews the diff; the poller starts it after verify (or the gates, with verify off), and the harvester reads it
+  coderabbit: false     # the CodeRabbit CLI in the review container; startRun writes it into the review's run.json, and the poller and the harvester read its result; off until an unattended key exists (H-167)
   require_acceptance: true  # fail-closed: "Ready to merge" needs the work order's acceptance tests, .factory/work/<id>/acceptance/, to exist and pass in the verify container; with none, the best verdict is "Needs your decision". The harvester reads it; an overlay may only switch it on
   fix_rounds_before_pr: 1   # fix rounds a run makes before it opens its PR; the poller enforces the count; always hard: the poller's check, never softened by budgets.enforcement.poller
   fix_rounds_on_pr: 1       # fix rounds on an open PR after a review or CodeRabbit finding; the poller enforces the count; always hard: the poller's check, never softened by budgets.enforcement.poller

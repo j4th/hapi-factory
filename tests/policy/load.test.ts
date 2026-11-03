@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { cpSync, mkdtempSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { FORGE_DOMAINS, forgeDomain } from "../../src/policy/hosts";
 import { loadPolicy, PolicyError } from "../../src/policy/load";
 import rolesSchema from "../../policy/schemas/policy-roles.schema.json";
@@ -232,6 +232,12 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
     expect(e.issues.map((i) => i.path)).toContain("/installations/planner");
     e = bad(repos("{ planner: 1, factory: 2 }", good, "31-10-2026"));
     expect(e.issues.map((i) => i.path)).toContain("/repos/example-owner~1hapi-sandbox-fortune/registered");
+    // M22: two keys that differ only in case are one GitHub repo, registered twice.
+    e = bad(`installations: { planner: 1, factory: 2 }\nrepos:\n  ${good}: { registered: "2026-10-31" }\n  Example-Owner/Hapi-Sandbox-Fortune: { registered: "2026-11-01" }\n`);
+    expect(e.issues).toEqual([
+      { path: "/repos/Example-Owner~1Hapi-Sandbox-Fortune", message: `the same GitHub repo as ${good} (GitHub names ignore case): register each repo once` },
+    ]);
+    expect(e.file).toBe(join(dirname(e.file), "repos.yaml"));
   });
 
   test("sidecars.yaml pins each image by digest", () => {

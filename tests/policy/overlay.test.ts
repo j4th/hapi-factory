@@ -6,8 +6,22 @@ import { loadPolicy, PolicyError } from "../../src/policy/load";
 import { applyOverlay, loadOverlay, overlayFromText, PolicyLoosenError } from "../../src/policy/overlay";
 import { effectiveModes } from "../../src/policy/paths";
 import type { RepoOverlay } from "../../src/policy/types";
+import YAML from "yaml";
 
 const p = loadPolicy("policy");
+
+/** A `.factory/config.yaml` holding `yaml` in a temp dir, removed after each test. */
+const overlayTemps: string[] = [];
+afterEach(() => {
+  for (const d of overlayTemps.splice(0)) rmSync(d, { recursive: true, force: true });
+});
+function overlayFileAt(yaml: string): string {
+  const dir = mkdtempSync(join(tmpdir(), "hapi-overlay-"));
+  overlayTemps.push(dir);
+  const file = join(dir, "config.yaml");
+  writeFileSync(file, yaml);
+  return file;
+}
 
 function loosenError(fn: () => unknown): PolicyLoosenError {
   try {
@@ -206,15 +220,52 @@ describe("applyOverlay", () => {
     expect(q.message).toContain("softens budgets.enforcement.poller from hard to soft");
   });
 
-  test("an overlay may lower max_live and the output limits but not raise them", () => {
-    const r = applyOverlay(p, { runs: { retention_days: 7, output_limits_mb: { bundle: 128 } } });
-    expect(r.runs).toEqual({ ...p.runs, retention_days: 7, output_limits_mb: { bundle: 128, transcript: 64, decisions: 16, result: 4 } });
+  test("an overlay may lower output_limits_mb.bundle, which the harvest enforces, but not raise it", () => {
+    const r = applyOverlay(p, { runs: { output_limits_mb: { bundle: 128 } } });
+    expect(r.runs).toEqual({ ...p.runs, output_limits_mb: { bundle: 128, transcript: 64, decisions: 16, result: 4 } });
     expect(p.runs.output_limits_mb.bundle).toBe(256);
-    const e = loosenError(() => applyOverlay(p, { runs: { max_live: 2 } }));
-    expect(e.path).toBe("/runs/max_live");
-    expect(e.message).toContain("raises runs.max_live from 1 to 2");
-    expect(loosenError(() => applyOverlay(p, { runs: { output_limits_mb: { result: 5 } } })).path).toBe("/runs/output_limits_mb/result");
-    expect(loosenError(() => applyOverlay(p, { runs: { retention_days: 30 } })).path).toBe("/runs/retention_days");
+    const e = loosenError(() => applyOverlay(p, { runs: { output_limits_mb: { bundle: 512 } } }));
+    expect(e.path).toBe("/runs/output_limits_mb/bundle");
+    expect(e.message).toContain("raises runs.output_limits_mb.bundle from 256 to 512");
+  });
+
+  test("D20: overlayFromText refuses empty text, naming its label", () => {
+    let e: unknown;
+    try {
+      overlayFromText("", "abc1234:.factory/config.yaml");
+    } catch (x) {
+      e = x;
+    }
+    expect(e instanceof PolicyError).toBe(true);
+    expect((e as PolicyError).file).toBe("abc1234:.factory/config.yaml");
+  });
+
+  test("I6: the launcher's run limits are central only: an overlay that sets one fails loudly, naming it", () => {
+    for (const [runs, path, key] of [
+      [{ disk: { gb: 10 } }, "/runs/disk", "runs.disk"],
+      [{ disk: { enforcement: "hard" } }, "/runs/disk", "runs.disk"],
+      [{ max_live: 1 }, "/runs/max_live", "runs.max_live"],
+      [{ retention_days: 7 }, "/runs/retention_days", "runs.retention_days"],
+      [{ output_limits_mb: { transcript: 16 } }, "/runs/output_limits_mb/transcript", "runs.output_limits_mb.transcript"],
+      [{ output_limits_mb: { decisions: 8 } }, "/runs/output_limits_mb/decisions", "runs.output_limits_mb.decisions"],
+      [{ output_limits_mb: { result: 2 } }, "/runs/output_limits_mb/result", "runs.output_limits_mb.result"],
+    ] as const) {
+      for (const read of [
+        () => applyOverlay(p, { runs } as unknown as RepoOverlay),
+        () => loadOverlay(overlayFileAt(YAML.stringify({ runs }))),
+        () => overlayFromText(YAML.stringify({ runs }), "abc1234:.factory/config.yaml"),
+      ]) {
+        let e: unknown;
+        try {
+          read();
+        } catch (x) {
+          e = x;
+        }
+        expect([key, e instanceof PolicyError]).toEqual([key, true]);
+        expect([key, (e as PolicyError).path]).toEqual([key, path]);
+        expect((e as PolicyError).message).toContain(`${key} is central only`);
+      }
+    }
   });
 
   test("repo_monthly_usd may be lowered; daily_usd, poll_interval_s, max_retries and max_rework_rounds are central only", () => {
@@ -231,23 +282,11 @@ describe("applyOverlay", () => {
     expect(() => applyOverlay(p, { runs: { work_order_kb: 1 } } as unknown as RepoOverlay)).toThrow("/runs/work_order_kb: unknown key");
   });
 
-  test("the disk cap may be lowered and hardened, never raised or softened", () => {
-    const soft = structuredClone(p);
-    soft.runs.disk.enforcement = "soft";
-    expect(applyOverlay(soft, { runs: { disk: { gb: 10, enforcement: "hard" } } }).runs.disk).toEqual({ gb: 10, enforcement: "hard" });
-    const up = loosenError(() => applyOverlay(p, { runs: { disk: { gb: 40 } } }));
-    expect(up.path).toBe("/runs/disk/gb");
-    expect(up.message).toContain("raises runs.disk.gb from 20 to 40");
-    const down = loosenError(() => applyOverlay(p, { runs: { disk: { enforcement: "soft" } } }));
-    expect(down.path).toBe("/runs/disk/enforcement");
-    expect(down.message).toContain("softens runs.disk.enforcement from hard to soft");
-  });
-
   test("phases may be switched on and their rounds and caps lowered, never the reverse", () => {
     const r = applyOverlay(p, { runs: { max_auto_rounds: 2, phases: { coderabbit: true, fix_rounds_on_pr: 0, round_usd: 0.5 } } });
     expect(r.runs.phases).toEqual({ ...p.runs.phases, coderabbit: true, fix_rounds_on_pr: 0, round_usd: 0.5 });
     expect(r.runs.max_auto_rounds).toBe(2);
-    for (const k of ["verify", "require_acceptance"] as const) {
+    for (const k of ["verify", "review", "require_acceptance"] as const) {
       const e = loosenError(() => applyOverlay(p, { runs: { phases: { [k]: false } } }));
       expect(e.path).toBe(`/runs/phases/${k}`);
       expect(e.message).toContain(`switches runs.phases.${k} off`);
@@ -256,6 +295,9 @@ describe("applyOverlay", () => {
       "raises runs.phases.fix_rounds_before_pr from 1 to 2",
     );
     expect(loosenError(() => applyOverlay(p, { runs: { max_auto_rounds: 4 } })).message).toContain("raises runs.max_auto_rounds from 3 to 4");
+    // D20: the round's turns and dollars may only come down too.
+    expect(loosenError(() => applyOverlay(p, { runs: { phases: { round_turns: p.runs.phases.round_turns + 1 } } })).path).toBe("/runs/phases/round_turns");
+    expect(loosenError(() => applyOverlay(p, { runs: { phases: { round_usd: p.runs.phases.round_usd + 1 } } })).path).toBe("/runs/phases/round_usd");
     const off = structuredClone(p);
     off.runs.phases.require_acceptance = false;
     expect(applyOverlay(off, { runs: { phases: { require_acceptance: true } } }).runs.phases.require_acceptance).toBe(true);
@@ -268,6 +310,8 @@ describe("applyOverlay", () => {
     } catch (e) {
       if (!(e instanceof PolicyError)) throw e;
       expect(e.path).toBe("/runs/phases/round_usd");
+      // D20: an overlay applied in code names no file of its own.
+      expect(e.file).toBe("(overlay)");
     }
     const r = applyOverlay(p, { budgets: { run_usd: 0.5 }, runs: { phases: { round_usd: 0.5 } } });
     expect(r.budgets.run_usd).toBe(0.5);
@@ -389,7 +433,7 @@ describe("loadOverlay", () => {
     expect(loosenError(() => applyOverlay(p, o)).path).toBe("/protected_paths/AGENTS.md");
   });
 
-  test("anything other than protected_paths, egress_extra, budgets, default_risk and workflow is rejected", () => {
+  test("anything other than protected_paths, egress_extra, budgets, runs, default_risk, workflow and sidecar is rejected", () => {
     for (const key of ["commands", "trusted_sources", "approvals", "flags", "roles", "rosters", "repos", "sidecars"]) {
       const e = policyError(overlayFile(`${key}: {}\n`));
       expect(e.path).toBe(`/${key}`);

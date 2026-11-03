@@ -8,7 +8,7 @@
 import { join } from "node:path";
 import { commandRuleIssues } from "./commands";
 import { mcpIssues } from "./mcp";
-import { check, formatIssue, type Issue, readYaml, type SchemaName } from "./schema";
+import { check, formatIssue, type Issue, pointerSegment, readYaml, type SchemaName } from "./schema";
 import type { Budgets, Commands, EngineDecisions, Flags, Gates, McpCatalog, Policy, Roster, RosterName, Runs } from "./types";
 
 /** A policy or overlay file failed to load. `path` is a JSON Pointer into the file ("" = the whole file). */
@@ -82,6 +82,21 @@ export function phaseIssues(budgets: Budgets, runs: Runs): Issue[] {
   ];
 }
 
+/**
+ * The registry's keys are GitHub repos, whose names ignore case: two keys that differ only in case are one repo
+ * registered twice (M22), which would split its spend and its one-live-per-repo count. Paths are repos.yaml's.
+ */
+export function repoIssues(registry: Policy["repos"]): Issue[] {
+  const seen = new Map<string, string>();
+  const issues: Issue[] = [];
+  for (const key of Object.keys(registry.repos)) {
+    const first = seen.get(key.toLowerCase());
+    if (first !== undefined) issues.push({ path: `/repos/${pointerSegment(key)}`, message: `the same GitHub repo as ${first} (GitHub names ignore case): register each repo once` });
+    else seen.set(key.toLowerCase(), key);
+  }
+  return issues;
+}
+
 const ROSTERS: RosterName[] = ["budget", "anthropic", "portable"];
 
 /**
@@ -108,6 +123,9 @@ export function loadPolicy(dir: string): Policy {
   const runs = load<Runs>("runs.yaml", "policy-runs");
   const phase = phaseIssues(budgets, runs);
   if (phase.length > 0) throw new PolicyError(join(dir, "runs.yaml"), phase);
+  const repos = load<Policy["repos"]>("repos.yaml", "policy-repos");
+  const dup = repoIssues(repos);
+  if (dup.length > 0) throw new PolicyError(join(dir, "repos.yaml"), dup);
   return {
     protectedPaths: protectedPaths.protected_paths,
     commands,
@@ -123,7 +141,7 @@ export function loadPolicy(dir: string): Policy {
     ) as Record<RosterName, Roster>,
     flags,
     mcp,
-    repos: load("repos.yaml", "policy-repos"),
+    repos,
     sidecars: load<{ sidecars: Policy["sidecars"] }>("sidecars.yaml", "policy-sidecars").sidecars,
   };
 }

@@ -94,7 +94,10 @@ export interface Budgets {
   repo_monthly_usd: number;
   /** All repos together, per UTC calendar day. The poller checks it. Central only. */
   daily_usd: number;
-  /** The mode per enforcer: hapi-guard and Archon's budget for `run_usd`, the poller for the repo and day caps and the round counts. */
+  /**
+   * The mode per enforcer: hapi-guard and Archon's budget for `run_usd`, the poller for the repo and day caps. The
+   * round counts (`runs.max_auto_rounds`, the phases' fix rounds, `max_retries`, `max_rework_rounds`) are always hard (M19).
+   */
   enforcement: { hapi_guard: Enforcement; archon: Enforcement; poller: Enforcement };
 }
 
@@ -355,9 +358,9 @@ export interface RepoSettings {
 
 /**
  * A target repo's `.factory/config.yaml` (spec §7). It may only tighten policy,
- * except that it may add `egress_extra` hosts. `null` for a protected path is a
- * removal attempt, which `applyOverlay` rejects. `default_risk` and `workflow`
- * are repo settings, not policy.
+ * except that it may add `egress_extra` hosts (which the launcher refuses until
+ * H-207). `null` for a protected path is a removal attempt, which `applyOverlay`
+ * rejects. `default_risk`, `workflow` and `sidecar` are repo settings, not policy.
  */
 export interface RepoOverlay {
   protected_paths?: Record<string, Partial<PathModes> | null>;
@@ -369,12 +372,11 @@ export interface RepoOverlay {
     /** Modes to harden: soft may become hard, never the reverse. */
     enforcement?: Partial<Budgets["enforcement"]>;
   };
-  /** Run limits to lower; each must be at most the base value. */
-  runs?: Partial<Omit<Runs, "output_limits_mb" | "poll_interval_s" | "max_retries" | "max_rework_rounds" | "inputs_mb" | "work_order_kb" | "disk" | "phases">> & {
-    output_limits_mb?: Partial<Runs["output_limits_mb"]>;
-    disk?: Partial<Runs["disk"]>;
-    phases?: Partial<Phases>;
-  };
+  /**
+   * Run limits to lower, each at most the base value, and phases to switch on. The launcher's own limits (disk,
+   * max_live, retention_days, output_limits_mb but bundle) are central only (final review I6), as are the poller's.
+   */
+  runs?: { max_auto_rounds?: number; output_limits_mb?: Pick<Partial<Runs["output_limits_mb"]>, "bundle">; phases?: Partial<Phases> };
   default_risk?: Risk;
   workflow?: string;
   sidecar?: { name: string; data_dir: string };
