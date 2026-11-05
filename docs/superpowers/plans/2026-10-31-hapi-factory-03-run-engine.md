@@ -4123,7 +4123,8 @@ Along the way, the run exercises CodeRabbit's round, one rework and the status c
   - its Evidence shows the acceptance tests' result from the verify container, and the verdict is `Ready to merge` only if they passed;
   - its Evidence has a `decide: diff-screen` row, answered `via jev` (the sandbox is public);
   - a hold names its file in Unresolved, and it is still there after `ci / gates` turns green;
-  - a row that says `not screened` for every subject → paste it back, and stop.
+  - a row that says `not screened` for every subject → paste it back, and stop;
+  - the first harvest isn't refused naming a committer or author. The host gates' identity check expects the commit node to commit as the generated worker identity (`WORKER_IDENTITY`, `src/generate/archon.ts`); a refusal like ``commit <h7>'s committer is `<who>`, not the generated worker identity`` means Archon's executor sets its own git identity → paste it back, and stop (it fails closed: nothing is pushed).
 
   **If a row says `failed`:** paste back `hapi status`, `hapi run list` and the row's reason, then stop.
   - **If the cause was outside the work order** (a rate limit, a timeout, `mise run down`, a flaky preflight), the controller says so, and the operator runs, from their own terminal:
