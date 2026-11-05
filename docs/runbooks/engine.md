@@ -13,7 +13,8 @@ This runbook covers the run engine Plan 03 builds (design: [the run engine's des
 - [the status comment, `hapi status` and `events.jsonl`](#the-status-comment-hapi-status-and-eventsjsonl);
 - [the caps](#the-caps), in one table;
 - [stopping everything](#stopping-everything);
-- [troubleshooting](#troubleshooting).
+- [troubleshooting](#troubleshooting);
+- [end to end on the sandbox](#end-to-end-on-the-sandbox): Task 16's live run on `hapi-sandbox-fortune`, step by step, with what to paste back and when to stop, the planning PRs' files in full, and the record.
 
 Every command below that runs as hapi is run on the host, from your own terminal, in [runs.md's form](runs.md#how-to-run-the-commands): one fixed script handed to hapi's `sh`, with your words as its arguments. hapi's engine state is under `~hapi/.local/state/hapi/engine/` (the engine dir).
 
@@ -420,3 +421,920 @@ Every cap is a fail-closed default in policy (anti-goal 1: no unbounded spend, n
 | A verify or review holds with `the host gates refuse <kind> run <id>'s bundle now: <details>` | The run's bundle passed the host gates once but fails them now, most likely after a policy change (a newly protected path, a tighter overlay). The work order holds in its phase, runs the gates again each tick, and holds its repo's queue. Undo or narrow the change the details name, and the next tick goes on. There is no command to fail it instead (H-243(h)). |
 | `the PR body has no room for the host's part: <n> characters of it are outside the hapi markers` | Your own text outside the `<!-- hapi:begin -->` and `<!-- hapi:end -->` markers leaves less room than even the host's few-line fallback needs under GitHub's 65,536 characters, so the host didn't write the body (on a harvest the push still happened; a re-render pushes nothing). Trim your text: the next tick writes the body and drops the reason. |
 | `hapi:rework` starts nothing, and the PR's body doesn't say why | Past `runs.max_rework_rounds` (3), the cap's text is in the status comment and `hapi status`. The PR's body shows it too, unless you pushed to `factory/<id>` after the factory's last push: a head the factory didn't push isn't re-rendered. Close the PR, or plan the work again under a new work order id. |
+
+## End to end on the sandbox
+
+This is Plan 03's live check (design §4, Task 16): two hand-written planning PRs on the sandbox, `hapi-sandbox-fortune` (a fortune-cookie MCP server over stdio, on Bun), go through the whole engine. Planning PR 1 holds one work order with two pieces; planning PR 2, written once PR 1's factory PR has merged, holds two independent work orders. On the way it exercises CodeRabbit's round, one rework by label and the status comment. Each work order carries its acceptance tests under `.factory/work/<id>/acceptance/`: in-process MCP client tests, written by hand, that call the tools and check their outputs against the bakery's fixture fortunes. The total spend stays under $15 (the sandbox's overlay caps the month there), and the Console limit is lowered first.
+
+You run every step below, from your own terminal; nothing here runs on its own. After each step, paste back what it asks for. **Stop and report** means: do nothing more, paste what you saw, and wait for the controller's ruling before the next step. The controller records what you paste in [the record](#the-record) at the end, with `<owner>` for your login.
+
+**To stop during this run.** Stopping the poller's timer or its service (`systemctl --user stop hapi-poll.timer`, or `hapi-poll.service`) stops only the ticks and leaves live runs going: each run's supervisor lives in the service's cgroup and survives by design (H-280). To end live runs and their spend, use `hapi run stop <id>` for each run ([runs.md](runs.md#hapi-run-stop)), kill switch 3 (`mise run down`), or the provider's limit ([stopping everything](#stopping-everything)).
+
+Every as-hapi command is in [runs.md's form](runs.md#how-to-run-the-commands). Every command that names the sandbox starts from `OWNER="$(gh api user --jq .login)"`, so no login is written down. The read-outs below use `jq` as hapi: check it once with `sudo -u hapi -H -- sh -c 'command -v jq && jq --version'` (expected: a path and `jq-1.<n>`; with none, install it before you start).
+
+### Before you start
+
+In this order, each with its own runbook:
+
+1. **The run disk** (Task 4 Steps 9 and 10): [making the run disk](runs.md#making-the-run-disk-the-operator-once-with-sudo), then [the live check](runs.md#the-live-check-as-hapi). Paste back what each asks for. **H-287:** if the live check's first `docker run` (the `chown`) fails with `no such file or directory`, run the restart of hapi's Docker that runs.md gives, then the live check again, and paste back both outputs: they settle whether runs.md's diagnosis is right. If the restart doesn't clear it, stop and report: runs.md's step is then wrong.
+2. **The sandbox** (Task 5 Steps 12 to 15): [Plan 03's operator steps](new-repo.md#plan-03s-operator-steps-task-5-steps-1215), in your hapi-factory checkout on `plan/03-run-engine`. Step 15 makes the sandbox with `--clone`, so its clone is `../hapi-sandbox-fortune`, beside your checkout. Its registration in `policy/repos.yaml` is then committed on `plan/03-run-engine`, with your OK (a protected file), so Plan 03's PR carries it together with this section: the poller acts only on a registered repo.
+3. **Steps 2, 3 and 4** below, in order. Step 4 merges Plan 03's PR and deploys it.
+
+### Step 2: lower the spend limit
+
+In the Anthropic Console, set the `hapi-factory` workspace's monthly limit to **$25** (it is $100 now; [provider keys](provider-keys.md#anthropic-console-workspaces)). It is the one stop no run can get around, above the sandbox's $15. Paste back the limit as the Console shows it.
+
+### Step 3: CodeRabbit's CLI key, or none
+
+`runs.phases.coderabbit` stays `false` centrally (H-167). The sandbox's overlay may switch it on only while CodeRabbit's Advanced trial lasts (until 2026-11-10), with a trial **Agentic** key in the review zone. Choose one:
+
+- **The CLI off** (after 2026-11-10, or if you'd rather not): store nothing, leave the `coderabbit` line out of planning PR 1's `.factory/config.yaml`, and paste back "CodeRabbit CLI off". CodeRabbit's PR review still runs.
+- **The CLI on, with a trial key.** A stop-class secret step: the key never goes on a command line, into a file other than the store, or into a chat. Create and store it as [provider keys, "CodeRabbit (optional)"](provider-keys.md#coderabbit-optional) says: a dedicated Agentic key in CodeRabbit's API keys page, stored with `mise run secrets:edit` in your own checkout (on `plan/03-run-engine`, whose manifest names it) under `hapi-review-coderabbit-api-key`; then, from that checkout, give hapi the updated store:
+
+  ```bash
+  scripts/copy-secrets-to-hapi.sh
+  ```
+
+  Step 4 checks it once hapi's checkout has Plan 03's manifest, and its `mise run up` resolves it into `review.env`. Planning PR 1's `.factory/config.yaml` gets the `coderabbit: true` line ([below](#planning-pr-1s-files)). If the trial ends before planning PR 2 merges, take that line out in planning PR 2 (a work order reads the overlay at its own merge), delete the key from the store and revoke it in CodeRabbit.
+
+### Step 4: deploy, then audit
+
+1. **Merge Plan 03's PR** on GitHub, with a merge commit. Paste back the merge SHA.
+2. **Update hapi's checkout and bring the stack up** (Task 14 Step 9, with stack.md's "before the first tick": `mise install` puts gitleaks 8.30.1, which the harvester's secret scan runs, on the poller's `PATH` through `mise exec`; `mise run up` writes `build/roster` and installs the timer):
+
+   ```bash
+   sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
+     export XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus" \
+       PATH="$HOME/.local/bin:$PATH"; \
+     cd "$HOME/hapi-factory" && git pull --ff-only && mise install && \
+     mise exec -- gitleaks version && mise run up && cat build/roster && \
+     systemctl --user list-timers hapi-poll.timer --no-pager && \
+     systemctl --user status hapi-poll.service --no-pager -n 5'
+   ```
+
+   Paste back gitleaks's version, `up`'s last line, the roster, the timer's row and the service's status. Expected: `8.30.1`; `the stack is up (Compose project hapi): egress-hermes, egress-archon, egress-research, egress-review, hermes (…)`; `anthropic` (`up`'s default roster, unless you passed `--roster`); `hapi-poll.timer` activating `hapi-poll.service`, with NEXT within 120 s. Once a tick has run (two minutes after `up`), the service's status shows `status=0/SUCCESS`: if it hadn't yet, check again with [the timer and the journal's command](#the-poller).
+
+   **Only with the CLI on (Step 3):** check the key is in hapi's copy of the store:
+
+   ```bash
+   sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
+     export XDG_RUNTIME_DIR PATH="$HOME/.local/bin:$PATH"; \
+     cd "$HOME/hapi-factory" && mise run secrets:check' | grep CODERABBIT
+   ```
+
+   Paste back that one line. Expected: `found    review/CODERABBIT_API_KEY (hapi-review-coderabbit-api-key) (optional)`: the key found, never its value.
+3. **Give the `hapi-factory` App Checks: Read-only** (Task 3 Step 9): steps 1 and 2 of [adding a permission to an existing App](github-apps.md#adding-a-permission-to-an-existing-app). Paste back the installation page's permissions line. Expected: "Read access to checks and metadata" and "Read and write access to code and pull requests". The strict audit below is that section's step 3.
+4. **Your audit token, in hapi's home.** A fine-grained token of yours, with **Administration: read** and **Contents: read** on both `hapi-factory` and `hapi-sandbox-fortune` (a token for one repo leaves the other's `github.rulesets` and `github.repo-settings` to skip, which `--strict` fails), and a short expiry. Paste this command on its own, since its `read` takes the next line you paste as the token; then type or paste the token and press Enter (nothing is echoed):
+
+   ```bash
+   sudo -u hapi -H -- sh -c 'umask 077; f="$HOME/.config/hapi/audit-token"; \
+     mkdir -p "${f%/*}" && rm -f "$f" && printf "token: " && stty -echo; \
+     IFS= read -r t; stty echo; echo; \
+     [ -n "$t" ] && printf "%s\n" "$t" > "$f" && echo "token file written"'
+   ```
+
+   Expected: `token file written`. The file is `0600` and hapi's; the audit below deletes it, so make it again before Step 10's.
+5. **The strict audit**, as hapi, of both repos:
+
+   ```bash
+   OWNER="$(gh api user --jq .login)"
+   sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
+     export XDG_RUNTIME_DIR PATH="$HOME/.local/bin:$PATH"; \
+     cd "$HOME/hapi-factory" && \
+     mise run audit -- --strict --github-token-file "$HOME/.config/hapi/audit-token" \
+       --repo "$1/hapi-factory" --repo "$1/hapi-sandbox-fortune"; \
+     rm -f "$HOME/.config/hapi/audit-token"' \
+     hapi-audit "$OWNER" \
+     | grep -E '^(fail|skip) |^pass  (runtime\.(run-disk|poller-timer)|policy\.(repos|decision-models)|github\.app-perms) |^hapi audit:'
+   ```
+
+   Paste back what it prints. Expected: one fail, the `mcp.tool-hashes` line, `--strict: skipped: …` (H-101); a `pass` line for `runtime.run-disk`, `runtime.poller-timer` (its first live run), `policy.repos`, `policy.decision-models` (`decision models are on: the engine's decisions (gates.decisions.mode: enforce), the bash gate and the result screen`) and `github.app-perms` (once per repo; it now fails an App that lacks Checks: read, so its pass shows step 3 took); then `hapi audit: <n> pass, 1 fail, 0 skip`. mise then prints `[audit] ERROR task failed`, since `--strict` exits 1 on the one fail. Any other fail: stop and report.
+6. **hapi's host reaches both classifier endpoints.** The harvester asks its decisions from the host, not through a zone's proxy. No key is sent and no model is called:
+
+   ```bash
+   sudo -u hapi -H -- sh -c 'for u in https://openrouter.ai/api/alpha/decisions \
+       https://api.anthropic.com/v1/messages; do \
+       printf "%s " "$u"; curl -sS -o /dev/null -m 10 -X POST -w "%{http_code}\n" "$u"; \
+     done'
+   ```
+
+   Paste back both lines. Expected: a 4xx code on each (401, 403, 404 or 405): the host reached the endpoint and was refused for want of a key. `000` means hapi's host can't reach it, so every decision would come back `not screened`: stop and report.
+
+### Commands you run more than once
+
+None prints a key or a run's raw output: what a run or a model wrote shows only where hapi already shows it, fenced in the PR's body.
+
+**The watch:** the sandbox's work orders from hapi's local state, then every run:
+
+```bash
+OWNER="$(gh api user --jq .login)"
+sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
+  export XDG_RUNTIME_DIR PATH="$HOME/.local/bin:$PATH"; \
+  cd "$HOME/hapi-factory" && mise run hapi -- status "$1" && \
+  mise run hapi -- run list' \
+  hapi-status "$OWNER/hapi-sandbox-fortune"
+```
+
+**The sandbox's runs, from their records:** one line per run, oldest first: its start, id, work order, kind, round, pass (`retry`), status, spend, and for a verify run its `verify.json`'s exit codes (`{"check":…,"smoke":…,"acceptance":…}`; `-` for every other kind). The run table and the acceptance criterion's evidence come from it:
+
+```bash
+OWNER="$(gh api user --jq .login)"
+sudo -u hapi -H -- sh -c 'cd "$HOME/.local/state/hapi/runs" && for d in */; do \
+    [ -f "${d}record.json" ] || continue; \
+    v=$(jq -c "{check: .check.exit, smoke: .smoke.exit, acceptance: .acceptance.exit}" \
+      "${d}out/verify.json" 2>/dev/null || echo -); \
+    jq -r --arg repo "$1" --arg v "$v" "select(.forgeRepo == (\$repo | ascii_downcase)) \
+      | [.startedAt[0:19], .runId, .workOrder, .kind, .round, (.retry // 0), .status, \
+      (.spendUsd // \"-\"), \$v] | @tsv" "${d}record.json"; \
+  done | sort' \
+  hapi-runs "$OWNER/hapi-sandbox-fortune"
+```
+
+**The decision ledger, by head:** the calls made for each head (its `asking` lines; `gates.decisions.max_calls_per_head` is 24), then the answers by classifier and verdict (`default` is a subject no classifier answered: no key, a provider error, the call cap, content the diff doesn't show). The full read, line by line, is [Decisions' command](#decisions):
+
+```bash
+OWNER="$(gh api user --jq .login)"
+sudo -u hapi -H -- sh -c 'cd "$HOME/.local/state/hapi/engine/decisions/$1" && \
+  echo "calls per head (asking lines):" && \
+  jq -r "select(.kind == \"asking\") | [.workOrder, .head[0:7]] | @tsv" *.jsonl | sort | uniq -c && \
+  echo "answers per head, by via and verdict:" && \
+  jq -r "select(.kind == \"answer\") | [.workOrder, .head[0:7], .via, .verdict] | @tsv" *.jsonl \
+    | sort | uniq -c' \
+  hapi-decisions "$OWNER/hapi-sandbox-fortune"
+```
+
+**The status comment, and who wrote it.** Set `BRANCH` to the planning PR's branch (`plan/0002-search-and-fortune-of-the-day` for planning PR 2). It prints, for the status comment and the final one, a line with the author, its type and whether GitHub marks it as written through an App (H-293), then the comment:
+
+```bash
+OWNER="$(gh api user --jq .login)"; R="$OWNER/hapi-sandbox-fortune"
+BRANCH=plan/0001-skeleton-and-crack-cookie
+PLAN="$(gh pr list --repo "$R" --head "$BRANCH" --state all \
+  --json number --jq '.[0].number')"
+gh api --paginate "repos/$R/issues/$PLAN/comments" \
+  --jq '.[] | select(.body | startswith("<!-- hapi:status")) |
+    "\(.user.login) \(.user.type) via-app:\(.performed_via_github_app != null) \(.updated_at)", .body'
+```
+
+**A factory PR.** Set `WO` to the work order's id. It prints the PR's number and head, its commits (subject, author, committer, how many of the six factory trailers it has, and whether its message holds a `Co-authored-by`), the check runs on its head, CodeRabbit's root review comments by commit and severity (its first `**<Severity>**`, as the engine reads it; H-168), and the host's part of the body down to the worker's account:
+
+```bash
+OWNER="$(gh api user --jq .login)"; R="$OWNER/hapi-sandbox-fortune"
+WO=0001-skeleton-and-crack-cookie
+PR="$(gh pr list --repo "$R" --head "factory/$WO" --state all \
+  --json number --jq '.[0].number')"
+SHA="$(gh pr view "$PR" --repo "$R" --json headRefOid --jq .headRefOid)"
+echo "factory PR #$PR at $(printf '%.7s' "$SHA")"
+gh api --paginate "repos/$R/pulls/$PR/commits" --jq '.[] | [.sha[0:7],
+  (.commit.message | split("\n")[0]), .commit.author.name, .commit.committer.name,
+  ([.commit.message | split("\n")[] | select(test("^(Work-Order|Hapi-Run|Hapi-Lane|Trace-Id|Agent|Model): "))] | length),
+  (.commit.message | ascii_downcase | contains("co-authored-by:"))] | @tsv'
+gh api "repos/$R/commits/$SHA/check-runs" \
+  --jq '.check_runs[] | [.name, .app.id, .status, .conclusion, .output.title] | @tsv'
+gh api --paginate "repos/$R/pulls/$PR/comments" --jq '.[] |
+  select(.user.id == 136622811 and .in_reply_to_id == null) |
+  [.commit_id[0:7], ([.body | match("\\*\\*([A-Za-z]+)\\*\\*").captures[0].string][0] // "none")]
+  | @tsv' | sort | uniq -c
+gh pr view "$PR" --repo "$R" --json body --jq .body \
+  | sed -n '/^<!-- hapi:begin -->/,/^## The worker.s account/p'
+```
+
+**The journal's problem lines:** the poller's last lines that failed closed, couldn't run a work order, or left one waiting on a lock:
+
+```bash
+sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
+  export XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"; \
+  journalctl --user -u hapi-poll.service -n 5000 --no-pager -o cat \
+    | grep -E "failed closed|can.t run|waiting: " | tail -n 20'
+```
+
+### Planning PR 1's files
+
+Write them in the sandbox clone's root (Step 5 goes there first). Each block writes one file; paste them in order. They are as Biome formats them, so `ci / check` (`mise run check`, which runs `biome ci .` over YAML and Markdown too) passes on the planning PR.
+
+**`.factory/config.yaml`:** keep the file `new-repo` wrote (its schema line names your repo's gates commit) and add the sandbox's settings to its end. An overlay may not set `runs.disk`, `max_live`, `retention_days` or any output limit but `bundle`, which are central only, so this one doesn't:
+
+```bash
+cat >> .factory/config.yaml <<'EOF'
+
+# The sandbox's own settings (hapi-factory docs/runbooks/engine.md, "End to end on the sandbox").
+# A month's spend on this repo stops at $15, under the central $25.
+budgets:
+  repo_monthly_usd: 15
+# The smoke test's stub service: the central bun-http sidecar serves smoke/bakery/ (its server.ts and
+# fortunes.json), which the overlay makes a path workers may not write.
+sidecar:
+  name: bun-http
+  data_dir: smoke/bakery
+# Already the central default: Ready to merge needs the work order's acceptance tests to exist and pass.
+runs:
+  phases:
+    require_acceptance: true
+EOF
+```
+
+The data dir is `smoke/bakery`, not `smoke`: the overlay makes the data dir a path workers may not write, and the worker has to write `smoke/run.ts`. **Only with the CLI on (Step 3)**, add the `coderabbit` line, under `phases:`:
+
+```bash
+printf '    coderabbit: true\n' >> .factory/config.yaml
+```
+
+**`.factory/work/0001-skeleton-and-crack-cookie/order.yaml`:** two small pieces, and a fresh traceparent. `budget.usd` is $2.00, at least `runs.phases.round_usd` ($1.00): a work order below it has its review runs refused (H-259), since a review's cap is its node's own $1.00. The `skeleton` piece lists `bun.lock`, because the verify container installs from the bundle's lock (`bun ci --frozen-lockfile --ignore-scripts`), never from the worker's `node_modules`; the SDK and its dependencies come from `registry.npmjs.org`, which `egress-archon` allows (`policy/trusted_sources.yaml`).
+
+```bash
+mkdir -p .factory/work/0001-skeleton-and-crack-cookie/acceptance smoke/bakery docs/design
+```
+
+```bash
+TP="$(printf '00-%s-%s-01\n' \
+  "$(openssl rand -hex 16)" "$(openssl rand -hex 8)")"
+cat > .factory/work/0001-skeleton-and-crack-cookie/order.yaml <<EOF
+# Work order 0001, written by hand for hapi-factory's end-to-end run (docs/runbooks/engine.md).
+id: 0001-skeleton-and-crack-cookie
+lane: factory
+workflow: factory-task
+risk: low
+roles:
+  implement: large
+  review: medium
+# budget.usd is at least runs.phases.round_usd (1.00), or the review run is refused (H-259).
+budget:
+  usd: 2.00
+  turns: 40
+  minutes: 30
+pieces:
+  - id: skeleton
+    size: small
+    files:
+      - package.json
+      - bun.lock
+      - src/server.ts
+      - src/bakery.ts
+      - src/tools/health.ts
+      - tests/health.test.ts
+      - smoke/run.ts
+  - id: crack-cookie
+    size: small
+    files:
+      - src/tools/crack-cookie.ts
+      - tests/crack-cookie.test.ts
+verify:
+  smoke: true
+egress_extra: []
+trace:
+  traceparent: "$TP"
+sources:
+  - docs/design/fortune-mcp.md
+EOF
+```
+
+**`.factory/work/0001-skeleton-and-crack-cookie/task.md`:** the PR's title is the id and the first `# ` heading, and its "Asked and built" quotes the Goal's paragraph. It names `zod` beside the SDK: the SDK lists it as a peer dependency for a tool's input schema, and the contract's `AGENTS.md` forbids a dependency the work order doesn't name.
+
+```bash
+cat > .factory/work/0001-skeleton-and-crack-cookie/task.md <<'EOF'
+# The skeleton and crack_cookie
+
+## Goal
+
+A read-only MCP server over stdio, on Bun, with its data from the bakery at `BAKERY_URL` (default `http://hapi-sidecar:8080`): a `health` tool, then `crack_cookie`, which gives a fortune and three lucky numbers and takes a seed, so a test can repeat it.
+
+## Constraints
+
+- Add `@modelcontextprotocol/sdk` and `zod`, the SDK's peer dependency for a tool's input schema, with one `bun add`: `bunfig.toml` pins each to the exact newest version older than its release age. They are the only dependencies this task names.
+- `src/server.ts` exports `createServer()`, which returns (or resolves to) the SDK's `McpServer`, not yet connected, and loads every module in `src/tools/` at start, so a later tool adds only its own files. Run as the main module (`bun src/server.ts`), it connects that server to stdio; imported, it connects nothing.
+- stdout carries MCP messages only. Anything else goes to stderr.
+- Every tool is read-only and says so: `annotations: { readOnlyHint: true }`.
+- Each tool returns one text content item holding JSON. `health` gives `{"ok":true}` when the bakery answers `GET /health`. `crack_cookie({ seed })`, its `seed` an optional integer, gives `{ "id", "text", "lucky_numbers" }`: one fortune exactly as the bakery's `GET /fortunes` serves it, and three integers from 1 to 49.
+- The unit tests in `tests/` don't need the bakery running.
+- `smoke/run.ts` starts the server over stdio and calls `health` against the bakery.
+- The acceptance tests in `.factory/work/0001-skeleton-and-crack-cookie/acceptance/` call the tools through the SDK's in-memory client against `createServer()`, with the bakery running.
+
+## Acceptance criteria
+
+1. `check` and `smoke` pass.
+2. Every listed tool is read-only, and `health` and `crack_cookie` are among them.
+3. `crack_cookie({ seed: 7 })` returns the same fortune and the same three lucky numbers from 1 to 49 on every call.
+4. One commit per piece.
+EOF
+```
+
+**`.factory/work/0001-skeleton-and-crack-cookie/acceptance/tools.test.ts`:** the planner's tests, written by hand. They use the SDK's in-memory client pair against `createServer()`, and read the fixture fortunes from `smoke/bakery/fortunes.json`, the file the verify container's sidecar serves. Each `test(` starts a line, so the harvester's junit check counts them:
+
+```bash
+cat > .factory/work/0001-skeleton-and-crack-cookie/acceptance/tools.test.ts <<'EOF'
+// The planner's acceptance tests for work order 0001 (hapi-factory docs/runbooks/engine.md).
+// The verify container runs them with the bakery up: bun test ./.factory/work/0001-skeleton-and-crack-cookie/acceptance
+import { expect, test } from "bun:test";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { createServer } from "../../../../src/server.ts";
+
+type Fortune = { id: number; text: string };
+
+const fixtures: Fortune[] = await Bun.file(new URL("../../../../smoke/bakery/fortunes.json", import.meta.url)).json();
+
+async function connected(): Promise<Client> {
+  const server = await createServer();
+  const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverSide);
+  const client = new Client({ name: "acceptance", version: "0.0.0" });
+  await client.connect(clientSide);
+  return client;
+}
+
+async function callJson(client: Client, name: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const result = await client.callTool({ name, arguments: args });
+  expect(result.isError).not.toBe(true);
+  const content = result.content as { type: string; text?: string }[];
+  expect(content[0]?.type).toBe("text");
+  return JSON.parse(content[0]?.text ?? "");
+}
+
+test("health and crack_cookie are listed, and every tool is read-only", async () => {
+  const client = await connected();
+  try {
+    const { tools } = await client.listTools();
+    const names = tools.map((t) => t.name);
+    expect(names).toContain("health");
+    expect(names).toContain("crack_cookie");
+    for (const tool of tools) expect([tool.name, tool.annotations?.readOnlyHint]).toEqual([tool.name, true]);
+  } finally {
+    await client.close();
+  }
+});
+
+test("crack_cookie with a seed gives the same fixture fortune and three lucky numbers from 1 to 49", async () => {
+  const client = await connected();
+  try {
+    const first = await callJson(client, "crack_cookie", { seed: 7 });
+    const second = await callJson(client, "crack_cookie", { seed: 7 });
+    expect(second).toEqual(first);
+    expect(fixtures).toContainEqual({ id: first.id as number, text: first.text as string });
+    const lucky = first.lucky_numbers as number[];
+    expect(lucky).toHaveLength(3);
+    for (const n of lucky) {
+      expect(Number.isInteger(n)).toBe(true);
+      expect(n).toBeGreaterThanOrEqual(1);
+      expect(n).toBeLessThanOrEqual(49);
+    }
+  } finally {
+    await client.close();
+  }
+});
+EOF
+```
+
+**`docs/design/fortune-mcp.md`:** the order's one source:
+
+```bash
+cat > docs/design/fortune-mcp.md <<'EOF'
+# The fortune-cookie MCP server
+
+A small read-only MCP server over stdio, on Bun: hapi-factory's sandbox for its run engine. Its data comes from the bakery, a stub HTTP service with a fixed list of made-up fortunes.
+
+## The bakery
+
+`smoke/bakery/server.ts` serves `smoke/bakery/fortunes.json` on port 8080. hapi-factory's `bun-http` sidecar runs it as `bun /data/server.ts` on a run's own network, where its name is `hapi-sidecar`.
+
+- `GET /health`: `{"ok":true}`.
+- `GET /fortunes`: every fortune, a JSON array of `{ "id": <number>, "text": <string> }`.
+- Anything else: 404.
+
+The server reads the bakery at `BAKERY_URL`, `http://hapi-sidecar:8080` by default. On your own machine, run `bun smoke/bakery/server.ts` and set `BAKERY_URL=http://localhost:8080`.
+
+## The tools
+
+Every tool is read-only (`readOnlyHint: true`) and returns one text content item holding JSON.
+
+- `health`: `{"ok":true}` when the bakery answers.
+- `crack_cookie({ seed })`: one fortune and three lucky numbers from 1 to 49, `{ "id", "text", "lucky_numbers" }`. The seed is optional; the same seed gives the same answer.
+- `search_fortunes({ keyword })`, a later work order's: `{ "fortunes": [...] }`, every fortune whose text holds the keyword, in any case, at most 10.
+- `fortune_of_the_day({ date })`, a later work order's: one fortune for a `YYYY-MM-DD` date, `{ "id", "text" }`, the same on every call.
+
+`src/server.ts` exports `createServer()`, which loads every module in `src/tools/`, so a new tool adds only its own files. `bun src/server.ts` serves it over stdio, where stdout carries MCP messages only.
+EOF
+```
+
+**`smoke/bakery/server.ts`:** the bakery, on Bun's default host (the sidecar's rule). It reads `fortunes.json` beside itself, by `import.meta.url`, whatever the working directory:
+
+```bash
+cat > smoke/bakery/server.ts <<'EOF'
+// The bakery: the stub HTTP service the smoke test and the acceptance tests read.
+// hapi-factory's bun-http sidecar runs it as `bun /data/server.ts`, with this directory at /data.
+// It listens on Bun's default host, so a run reaches it by its name, hapi-sidecar.
+const fortunes = Bun.file(new URL("./fortunes.json", import.meta.url));
+
+Bun.serve({
+  port: 8080,
+  fetch(request) {
+    const { pathname } = new URL(request.url);
+    if (request.method === "GET" && pathname === "/health") return Response.json({ ok: true });
+    if (request.method === "GET" && pathname === "/fortunes") {
+      return new Response(fortunes, { headers: { "content-type": "application/json" } });
+    }
+    return new Response("not found\n", { status: 404 });
+  },
+});
+EOF
+```
+
+**`smoke/bakery/fortunes.json`:** ten made-up fortunes. Three hold "tomorrow", which planning PR 2's acceptance test searches for:
+
+```bash
+cat > smoke/bakery/fortunes.json <<'EOF'
+[
+  { "id": 1, "text": "A fresh loaf of luck is rising in your oven." },
+  { "id": 2, "text": "Tomorrow brings a quiet morning and a good cup of tea." },
+  { "id": 3, "text": "The crumbs you leave today feed the birds of tomorrow." },
+  { "id": 4, "text": "Your next idea will fit in a single commit." },
+  { "id": 5, "text": "A small bug, fixed early, saves a long night." },
+  { "id": 6, "text": "Someone will thank you tomorrow for the notes you write today." },
+  { "id": 7, "text": "The oven is hot: bake the hard part first." },
+  { "id": 8, "text": "A clean diff is a kind message to your future self." },
+  { "id": 9, "text": "Patience and flour make the best bread." },
+  { "id": 10, "text": "Good fortune follows those who read the error message." }
+]
+EOF
+```
+
+### Planning PR 2's files
+
+After factory PR 1 has merged (Step 9). Two work orders, each with one piece and a fresh traceparent, every other field as in 0001. They share no file, so neither is `held`.
+
+```bash
+mkdir -p .factory/work/0002-search-fortunes/acceptance \
+  .factory/work/0003-fortune-of-the-day/acceptance
+```
+
+**`0002-search-fortunes`:**
+
+```bash
+TP="$(printf '00-%s-%s-01\n' \
+  "$(openssl rand -hex 16)" "$(openssl rand -hex 8)")"
+cat > .factory/work/0002-search-fortunes/order.yaml <<EOF
+# Work order 0002, written by hand for hapi-factory's end-to-end run (docs/runbooks/engine.md).
+id: 0002-search-fortunes
+lane: factory
+workflow: factory-task
+risk: low
+roles:
+  implement: large
+  review: medium
+# budget.usd is at least runs.phases.round_usd (1.00), or the review run is refused (H-259).
+budget:
+  usd: 2.00
+  turns: 40
+  minutes: 30
+pieces:
+  - id: search-fortunes
+    size: small
+    files:
+      - src/tools/search-fortunes.ts
+      - tests/search-fortunes.test.ts
+verify:
+  smoke: true
+egress_extra: []
+trace:
+  traceparent: "$TP"
+sources:
+  - docs/design/fortune-mcp.md
+EOF
+```
+
+```bash
+cat > .factory/work/0002-search-fortunes/task.md <<'EOF'
+# search_fortunes
+
+## Goal
+
+Add `search_fortunes` to the fortune-cookie MCP server: every fortune from the bakery whose text holds a keyword.
+
+## Constraints
+
+- One new tool module, `src/tools/search-fortunes.ts`, and its unit test, `tests/search-fortunes.test.ts`: `src/server.ts` loads every module in `src/tools/`, so nothing else changes. No new dependency.
+- The tool is read-only and says so: `annotations: { readOnlyHint: true }`.
+- `search_fortunes({ keyword })`, its `keyword` a non-empty string, returns one text content item holding JSON: `{ "fortunes": [{ "id", "text" }, ...] }`, each fortune exactly as the bakery's `GET /fortunes` serves it.
+- The unit test in `tests/` doesn't need the bakery running.
+- The acceptance test in `.factory/work/0002-search-fortunes/acceptance/` calls the tool through the SDK's in-memory client against `createServer()`, with the bakery running.
+
+## Acceptance criteria
+
+1. `check` and `smoke` pass.
+2. `search_fortunes({ keyword })` returns every fortune whose text contains the keyword, case-insensitive, up to 10.
+EOF
+```
+
+```bash
+cat > .factory/work/0002-search-fortunes/acceptance/search-fortunes.test.ts <<'EOF'
+// The planner's acceptance tests for work order 0002 (hapi-factory docs/runbooks/engine.md).
+// The verify container runs them with the bakery up: bun test ./.factory/work/0002-search-fortunes/acceptance
+import { expect, test } from "bun:test";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { createServer } from "../../../../src/server.ts";
+
+type Fortune = { id: number; text: string };
+
+const fixtures: Fortune[] = await Bun.file(new URL("../../../../smoke/bakery/fortunes.json", import.meta.url)).json();
+
+async function connected(): Promise<Client> {
+  const server = await createServer();
+  const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverSide);
+  const client = new Client({ name: "acceptance", version: "0.0.0" });
+  await client.connect(clientSide);
+  return client;
+}
+
+async function search(client: Client, keyword: string): Promise<Fortune[]> {
+  const result = await client.callTool({ name: "search_fortunes", arguments: { keyword } });
+  expect(result.isError).not.toBe(true);
+  const content = result.content as { type: string; text?: string }[];
+  expect(content[0]?.type).toBe("text");
+  return (JSON.parse(content[0]?.text ?? "") as { fortunes: Fortune[] }).fortunes;
+}
+
+const byId = (a: Fortune, b: Fortune) => a.id - b.id;
+
+test("search_fortunes finds exactly the fixture fortunes holding a keyword in another case, at most 10", async () => {
+  const keyword = "TOMORROW";
+  const want = fixtures.filter((f) => f.text.toLowerCase().includes(keyword.toLowerCase()));
+  expect(want.length).toBeGreaterThan(1);
+  const client = await connected();
+  try {
+    const got = await search(client, keyword);
+    expect(got.length).toBeLessThanOrEqual(10);
+    expect([...got].sort(byId)).toEqual([...want].sort(byId).slice(0, 10));
+  } finally {
+    await client.close();
+  }
+});
+
+test("search_fortunes finds none for a keyword no fixture holds", async () => {
+  const keyword = "zeppelin";
+  expect(fixtures.some((f) => f.text.toLowerCase().includes(keyword))).toBe(false);
+  const client = await connected();
+  try {
+    expect(await search(client, keyword)).toEqual([]);
+  } finally {
+    await client.close();
+  }
+});
+EOF
+```
+
+**`0003-fortune-of-the-day`:**
+
+```bash
+TP="$(printf '00-%s-%s-01\n' \
+  "$(openssl rand -hex 16)" "$(openssl rand -hex 8)")"
+cat > .factory/work/0003-fortune-of-the-day/order.yaml <<EOF
+# Work order 0003, written by hand for hapi-factory's end-to-end run (docs/runbooks/engine.md).
+id: 0003-fortune-of-the-day
+lane: factory
+workflow: factory-task
+risk: low
+roles:
+  implement: large
+  review: medium
+# budget.usd is at least runs.phases.round_usd (1.00), or the review run is refused (H-259).
+budget:
+  usd: 2.00
+  turns: 40
+  minutes: 30
+pieces:
+  - id: fortune-of-the-day
+    size: small
+    files:
+      - src/tools/fortune-of-the-day.ts
+      - tests/fortune-of-the-day.test.ts
+verify:
+  smoke: true
+egress_extra: []
+trace:
+  traceparent: "$TP"
+sources:
+  - docs/design/fortune-mcp.md
+EOF
+```
+
+```bash
+cat > .factory/work/0003-fortune-of-the-day/task.md <<'EOF'
+# fortune_of_the_day
+
+## Goal
+
+Add `fortune_of_the_day` to the fortune-cookie MCP server: one fortune from the bakery for a date, the same every time it is asked.
+
+## Constraints
+
+- One new tool module, `src/tools/fortune-of-the-day.ts`, and its unit test, `tests/fortune-of-the-day.test.ts`: `src/server.ts` loads every module in `src/tools/`, so nothing else changes. No new dependency.
+- The tool is read-only and says so: `annotations: { readOnlyHint: true }`.
+- `fortune_of_the_day({ date })`, its `date` a `YYYY-MM-DD` string, returns one text content item holding JSON: `{ "id", "text" }`, one fortune exactly as the bakery's `GET /fortunes` serves it. It depends on the date alone, never on the clock.
+- The unit test in `tests/` doesn't need the bakery running.
+- The acceptance test in `.factory/work/0003-fortune-of-the-day/acceptance/` calls the tool through the SDK's in-memory client against `createServer()`, with the bakery running.
+
+## Acceptance criteria
+
+1. `check` and `smoke` pass.
+2. `fortune_of_the_day({ date })` returns one fortune per `YYYY-MM-DD`, the same on every call.
+EOF
+```
+
+```bash
+cat > .factory/work/0003-fortune-of-the-day/acceptance/fortune-of-the-day.test.ts <<'EOF'
+// The planner's acceptance test for work order 0003 (hapi-factory docs/runbooks/engine.md).
+// The verify container runs it with the bakery up: bun test ./.factory/work/0003-fortune-of-the-day/acceptance
+import { expect, test } from "bun:test";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { createServer } from "../../../../src/server.ts";
+
+type Fortune = { id: number; text: string };
+
+const fixtures: Fortune[] = await Bun.file(new URL("../../../../smoke/bakery/fortunes.json", import.meta.url)).json();
+
+async function connected(): Promise<Client> {
+  const server = await createServer();
+  const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverSide);
+  const client = new Client({ name: "acceptance", version: "0.0.0" });
+  await client.connect(clientSide);
+  return client;
+}
+
+async function ofTheDay(client: Client, date: string): Promise<Fortune> {
+  const result = await client.callTool({ name: "fortune_of_the_day", arguments: { date } });
+  expect(result.isError).not.toBe(true);
+  const content = result.content as { type: string; text?: string }[];
+  expect(content[0]?.type).toBe("text");
+  return JSON.parse(content[0]?.text ?? "") as Fortune;
+}
+
+test("fortune_of_the_day gives the same fixture fortune for 2026-11-01 on every call", async () => {
+  const client = await connected();
+  try {
+    const first = await ofTheDay(client, "2026-11-01");
+    const second = await ofTheDay(client, "2026-11-01");
+    expect(second).toEqual(first);
+    expect(fixtures).toContainEqual({ id: first.id, text: first.text });
+  } finally {
+    await client.close();
+  }
+});
+EOF
+```
+
+### Step 5: planning PR 1
+
+From your hapi-factory checkout, in the sandbox clone:
+
+```bash
+cd ../hapi-sandbox-fortune
+git switch main && git pull --ff-only
+git switch -c plan/0001-skeleton-and-crack-cookie
+```
+
+Write [planning PR 1's files](#planning-pr-1s-files), then:
+
+```bash
+git add .factory/ docs/design/fortune-mcp.md smoke/bakery/
+git commit -m "plan: 0001 skeleton and crack_cookie"
+git push -u origin plan/0001-skeleton-and-crack-cookie
+gh pr create --base main --label lane:planning \
+  --title "plan: 0001 skeleton and crack_cookie" \
+  --body "Planning PR 1 (hapi-factory docs/runbooks/engine.md)"
+```
+
+**Before you merge it: does CodeRabbit review the sandbox's PRs at all?** This is the sandbox's first PR. CodeRabbit asks for a manual trigger on a public repo with fewer than 10 stars on some plans ([spike 09](../spikes/09-run-engine-offline.md), finding 22), and the factory never @-mentions it. Give it 15 minutes, then read the check runs on the PR's head:
+
+```bash
+OWNER="$(gh api user --jq .login)"; R="$OWNER/hapi-sandbox-fortune"
+SHA="$(gh pr view plan/0001-skeleton-and-crack-cookie --repo "$R" \
+  --json headRefOid --jq .headRefOid)"
+gh api "repos/$R/commits/$SHA/check-runs" \
+  --jq '.check_runs[] | [.name, .app.id, .status, .conclusion, .output.title] | @tsv'
+```
+
+Paste back the rows. Expected, among the rows: `ci / gates`, `ci / check` and `ci / scan` (app `15368`) completed `success`, and `CodeRabbit` (app `347564`) completed `success` with a title starting `Finished`. No `CodeRabbit` row, or a title such as `Review skipped` or `Review paused`, or a CodeRabbit comment asking for a manual review: stop and report, since the factory PR's round would never come.
+
+Then, with `ci / gates` green, merge it on GitHub with a merge commit (your bypass of `main-review`, as for every merge into `main`), and paste back its number and merge SHA:
+
+```bash
+OWNER="$(gh api user --jq .login)"
+gh pr list --repo "$OWNER/hapi-sandbox-fortune" --state all \
+  --head plan/0001-skeleton-and-crack-cookie \
+  --json number,mergeCommit --jq '.[0] | [.number, .mergeCommit.oid] | @tsv'
+```
+
+### Step 6: watch it
+
+Run [the watch](#commands-you-run-more-than-once) every few minutes until the factory PR opens, and paste back each output in which a phase changed. Expected:
+
+- **The worker starts within 120 s of the merge** (the next tick), and the planning PR gets its status comment. Until that tick, the watch prints `hapi status: <owner>/hapi-sandbox-fortune has no work order with a state yet`. Paste it back with [the status comment command](#commands-you-run-more-than-once). **H-293:** its first line must read `hapi-factory[bot] Bot via-app:true …`: the poller adopts a lost status comment only when GitHub marks it as the App's. `via-app:false`: report it (a lost mark would then post a second comment).
+- **The phases run `queued` → `worker` → `verify` → `review` → `harvest` → `pr`**, with at most one `fix` (and its `verify` and `review`) before `harvest`, then `pr-review` while CodeRabbit reviews the PR. Verify's `smoke` passing settles design §7 item 11 (the MCP SDK's stdio server under Bun).
+- **The host gates pass on the worker's bundle** (I1's live check). The gates expect each commit's author and committer to be the generated worker identity (`hapi-factory worker`, `WORKER_IDENTITY` in `src/generate/archon.ts`). A row `failed` with ``commit <h7>'s committer is `<who>`, not the generated worker identity (src/generate/archon.ts)`` (or `author`) means Archon's executor sets its own git identity: paste it back and stop. It fails closed: nothing is pushed, and a retry would fail the same way.
+- **The worker's `bun add` works under the image's `BUN_OPTIONS=--no-install`** (Task 1's ruling). Once the factory PR is open, read its branch's `package.json` and `bun.lock`:
+
+  ```bash
+  OWNER="$(gh api user --jq .login)"; R="$OWNER/hapi-sandbox-fortune"
+  B=factory/0001-skeleton-and-crack-cookie
+  gh api "repos/$R/contents/package.json?ref=$B" \
+    -H "Accept: application/vnd.github.raw+json" | grep -n -e modelcontextprotocol -e '"zod"'
+  gh api "repos/$R/contents/bun.lock?ref=$B" \
+    -H "Accept: application/vnd.github.raw+json" | grep -c '"@modelcontextprotocol/sdk@'
+  ```
+
+  Expected: `"@modelcontextprotocol/sdk": "<x.y.z>"` (an exact version, no `^` or `~`; `zod` beside it), and a count of at least 1; the verify run's `check` passing shows `bun ci --frozen-lockfile` agreed with the lock. Then the command the worker ran, from its run's transcript, with the worker's run id (from [the runs](#commands-you-run-more-than-once)) in place of `0123456789ab`:
+
+  ```bash
+  sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
+    export XDG_RUNTIME_DIR PATH="$HOME/.local/bin:$PATH"; \
+    cd "$HOME/hapi-factory" && mise run hapi -- run watch "$1" \
+      | grep -o "bun add[^\"]\{0,100\}" | head -n 5' \
+    hapi-watch 0123456789ab
+  ```
+
+  Paste back both. No SDK in `package.json` or `bun.lock`, or a transcript showing `bun add` failing: stop and report.
+- **The PR** ([a factory PR's command](#commands-you-run-more-than-once), with `WO=0001-skeleton-and-crack-cookie`):
+  - the worker's two commits, `0001-skeleton-and-crack-cookie: skeleton` and `…: crack-cookie` (a fix before the PR adds its own, one per piece it changed), each with author and committer `hapi-factory worker`, `6` trailers and `false` for `Co-authored-by`. **H-300 is observe-only:** a `true` there means a worker wrote a `Co-authored-by` line outside git's trailer block, which the host's trailer check doesn't refuse; paste back the PR's commits page for it (does GitHub credit a co-author?). Never craft one;
+  - §3.7's description: `## Verdict`, `## Unresolved` (with **Check this yourself**), `## Links`, `## Asked and built`, `## Evidence`, `## Review rounds`, `## Cost and turns`, in that order;
+  - the Evidence's `acceptance` row from the verify container (`passed`), and the verdict **Ready to merge** only if it passed (until `ci / gates` is green on the head, **Waiting for `ci / gates`**);
+  - a `decide: diff-screen v<version>` row whose files were answered `via jev` (the cell reads `<n> files screened (<n> asked, <n> reused; jev <n>)`: the sandbox is public, so Jev is asked);
+  - any hold names its file under Unresolved, and is still there after `ci / gates` turns green;
+  - if the body is the short fallback (`_The full report is too long for this PR's body (GitHub's size limit): …_`), paste back the watch too: `hapi status` lists every reason. A row reason `the PR body has no room for the host's part: <n> characters of it are outside the hapi markers` means text you wrote outside the markers leaves no room: trim it ([Troubleshooting](#troubleshooting)).
+- **The decisions, for each harvest** ([the ledger by head](#commands-you-run-more-than-once)): paste it back after each harvest. Record, for each head, its calls (of 24) and its holds by cause, from the PR's verdict lines: coverage (`held: <n> files not screened (call cap 24)`, `… (no classifier answered)`) apart from findings (`held: text aimed at the reviewer in <paths>`). **Stop and report if any harvest's answers are all `via: default`**, or the Evidence row says `not screened` for every subject: the keys or hapi's egress are wrong. `gates.decisions.max_calls_per_head` stays 24 during the run (`policy/gates.yaml` is protected); if **Ready to merge** never shows because of coverage holds, that is the signal to propose raising it afterwards, not to change it now.
+- **CodeRabbit on a PR the factory's App opened** (design §7 item 10): the factory PR's check runs hold a `CodeRabbit` row (app `347564`) completed `success`, titled `Finished…`. If CodeRabbit skips it (a title such as `Review skipped`, or no row, so the round ends `waiting` with `CodeRabbit didn't review <h7>` after six polls, 12 minutes), paste the row and the PR's Unresolved back, and stop.
+- **The forge reads with the App's own tokens** (H-288, design §7 item 7): the CodeRabbit round reading its check run, and the verdict leaving **Waiting for `ci / gates`** once CI is green, show `GET …/commits/<sha>/check-runs` works with the factory App's Checks: read alone; [the journal's problem lines](#commands-you-run-more-than-once) show no `failed closed` naming a check-runs read. Then, once, the label half of H-288, on the merged planning PR (whose labels the engine never reads): add a label it already has, and count its `labeled` events:
+
+  ```bash
+  OWNER="$(gh api user --jq .login)"; R="$OWNER/hapi-sandbox-fortune"
+  PLAN="$(gh pr list --repo "$R" --head plan/0001-skeleton-and-crack-cookie \
+    --state all --json number --jq '.[0].number')"
+  gh api -X POST "repos/$R/issues/$PLAN/labels" -f 'labels[]=lane:planning' \
+    --jq 'map(.name) | join(",")'
+  gh api --paginate "repos/$R/issues/$PLAN/events" \
+    --jq '.[] | select(.event == "labeled" and .label.name == "lane:planning") | .created_at'
+  ```
+
+  Paste back both. Expected: `lane:planning`, then one time only, from `gh pr create`: re-adding a label a PR already has records no `labeled` event, as the fake forge assumes. Two times: report it.
+- **With the CLI on (Step 3)**, after the first review run (its id from [the runs](#commands-you-run-more-than-once), in place of `0123456789ab`), its CodeRabbit output's closing lines and finding counts (design §7 item 5: what exit 0 means), then the review proxy's tunnels (H-298: does the CLI need `cli.coderabbit.ai`?):
+
+  ```bash
+  sudo -u hapi -H -- sh -c 'f="$HOME/.local/state/hapi/runs/$1/out/coderabbit.ndjson"; \
+    jq -c "select(.type == \"complete\" or .type == \"error\" or .type == \"hapi\") \
+      | {type, status, reused, errorType, exit, skipped}" "$f"; \
+    jq -r "select(.type == \"finding\") | .severity" "$f" | sort | uniq -c' \
+    hapi-cr 0123456789ab
+  sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
+    export XDG_RUNTIME_DIR PATH="$HOME/.local/bin:$PATH"; \
+    docker logs hapi-egress-review-1 2>&1 | grep -Eo "CONNECT [^ ]+" | sort | uniq -c'
+  ```
+
+  Paste back both. Expected: a `complete` line and `{"type":"hapi","exit":0,…}` or `2` (2 is `--gate major` tripping), and tunnels to `api.anthropic.com:443`, `app.coderabbit.ai:443` and `ide.coderabbit.ai:443`. No `cli.coderabbit.ai:443` tunnel means the CLI works without it, and H-298 can drop it.
+- **H-281, the poller unit's two hardening settings:** while a run is live (the worker's, say, in `hapi run list`), run [the live check of the stop](stack.md#4-mise-run-up-and-mise-run-down) (stack.md's block, as it stands), and paste back its five lines (expected there). Once the PR is `waiting`, the modes a run container's uid needs, in the mirror and the scratch:
+
+  ```bash
+  OWNER="$(gh api user --jq .login)"
+  sudo -u hapi -H -- sh -c 'e="$HOME/.local/state/hapi/engine"; \
+    for d in "$e/mirrors/$1.git" "$e/scratch/$1"; do \
+      [ -d "$d" ] || { echo "${d#"$e"/}: not there"; continue; }; \
+      n=$(find "$d" -mindepth 1 \( -type d ! -perm -o=rx -o -type f ! -perm -o=r \) | wc -l); \
+      echo "${d#"$e"/}: $n entries other users can not read"; \
+    done; cd "$e" && stat -c "%a %n" "mirrors/$1.git" "scratch/$1"/*.git' \
+    hapi-modes "$OWNER/hapi-sandbox-fortune"
+  ```
+
+  Paste it back. Expected: `0` for both, and `755` (or `2755`) for each git dir: the harvester reopens the scratch to all once its scan is clean, and the mirror is `--shared=0644`. Step 10 checks the other half.
+
+**If a row says `failed`:** paste back the watch, [the journal's problem lines](#commands-you-run-more-than-once) and the row's reason, then stop.
+
+- **If the cause was outside the work order** (a rate limit, a timeout, `mise run down`, a flaky preflight), the controller says so, and you queue a fresh pass, from your own terminal:
+
+  ```bash
+  OWNER="$(gh api user --jq .login)"
+  sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
+    export XDG_RUNTIME_DIR PATH="$HOME/.local/bin:$PATH"; \
+    cd "$HOME/hapi-factory" && mise run hapi -- retry "$1" "$2" && \
+    mise run hapi -- status "$1"' \
+    hapi-retry "$OWNER/hapi-sandbox-fortune" 0001-skeleton-and-crack-cookie
+  ```
+
+  For planning PR 2, the last argument is `0002-search-fortunes` or `0003-fortune-of-the-day`. Paste back both outputs. Expected: `hapi retry: <owner>/hapi-sandbox-fortune 0001-skeleton-and-crack-cookie is queued again (retry 1), with <k> of the repo's work orders ahead of it: a poll tick starts its worker at <sha12> once none is ahead and the caps allow`; the row `queued`, with `retry 1` in Rounds. With `k` 0 (as for 0001), the watch shows `worker` within 120 s; with `k` 1 (planning PR 2, its sibling still before its PR), it starts once the sibling has opened its PR or settled. If a cap trips, the row says `cap-stopped` with the cap's text instead. Its refusals are in [a failed work order](#a-failed-work-order). Then keep watching.
+- **If the work order itself is wrong**, stop and report it: it needs a new id in a new planning PR, and the old id stays `failed`.
+- **If the month's cap trips**, the row is `cap-stopped` (or a verify or review waits in its phase) with `this month's spend on <owner>/hapi-sandbox-fortune ($<spent>) plus the run's budget ($<budget>) would pass budgets.repo_monthly_usd ($15.00): no new run for it until <date>`: paste it back and stop (design §4's point 9 records it).
+- Each attempt spends against the overlay's $15.
+
+### Step 7: CodeRabbit, then one rework
+
+1. Wait until the status comment's row says `waiting`. It gets there after CodeRabbit's round 0 and at most one automatic fix run (`pr-fix`, then its `verify`, `review` and harvest), or at once when CodeRabbit found nothing at major or above.
+2. Post the comment first, then add the label (a rework is given the comments there are when it starts):
+
+   ```bash
+   OWNER="$(gh api user --jq .login)"; R="$OWNER/hapi-sandbox-fortune"
+   PR="$(gh pr list --repo "$R" --head factory/0001-skeleton-and-crack-cookie \
+     --state all --json number --jq '.[0].number')"
+   gh pr comment "$PR" --repo "$R" \
+     --body "Rework: make crack_cookie's lucky numbers distinct."
+   gh pr edit "$PR" --repo "$R" --add-label hapi:rework
+   ```
+
+3. Watch, as in Step 6, until the row says `waiting` again, with `1 rework` in Rounds.
+
+Change a factory PR only this way. Never push to `factory/<id>` yourself, or use GitHub's **Update branch** or **Resolve conflicts** on it: a commit without the six trailers turns `ci / gates` red, and main-protect has no bypass (H-295; [the operator always wins](#the-operator-always-wins)).
+
+Paste back the status outputs and the PR's "Review rounds" section:
+
+```bash
+OWNER="$(gh api user --jq .login)"; R="$OWNER/hapi-sandbox-fortune"
+PR="$(gh pr list --repo "$R" --head factory/0001-skeleton-and-crack-cookie \
+  --state all --json number --jq '.[0].number')"
+gh pr view "$PR" --repo "$R" --json body --jq .body \
+  | sed -n '/^## Review rounds/,/^## Cost and turns/p'
+```
+
+Expected: `Fix rounds: <n> of <cap>.`, with a `- Round <k>, rework: run <id>` line, and a `- Round <k>, on the PR: run <id>` line before it if CodeRabbit's round ran a fix. The rework starting at all shows the poller read the label event's actor with the App's token (design §7 item 7). Nothing started and no cap's text: see [Troubleshooting](#troubleshooting)'s `hapi:rework` rows.
+
+### Step 8: merge factory PR 1
+
+Review it. Before you merge, paste back [a factory PR's command](#commands-you-run-more-than-once)'s output, [the runs](#commands-you-run-more-than-once) and [the ledger by head](#commands-you-run-more-than-once), and say, for each hold and each note, whether you **agree** (it pointed at something you reworked, closed or commented on) or **disagree** (you merge it unchanged): Plan 06's first labelled data (H-262). A hold on a PR you then merge unchanged is a false alarm, and is recorded as one.
+
+Then, with `ci / gates` green, merge it on GitHub with a merge commit, and paste back the merge SHA and, a tick later, the final comment on the planning PR's status thread ([the status comment command](#commands-you-run-more-than-once)). Expected: `This plan has settled: 1 merged, 0 closed, 0 failed. Total: $<x>.`
+
+```bash
+OWNER="$(gh api user --jq .login)"
+gh pr list --repo "$OWNER/hapi-sandbox-fortune" --state all \
+  --head factory/0001-skeleton-and-crack-cookie \
+  --json number,mergeCommit --jq '.[0] | [.number, .mergeCommit.oid] | @tsv'
+```
+
+### Step 9: planning PR 2
+
+1. Repeat Step 5 on the branch `plan/0002-search-and-fortune-of-the-day`, with [planning PR 2's files](#planning-pr-2s-files), and these `git` lines in place of Step 5's (add `.factory/config.yaml` too if you took the `coderabbit` line out):
+
+   ```bash
+   git add .factory/work/0002-search-fortunes .factory/work/0003-fortune-of-the-day
+   git commit -m "plan: 0002 search_fortunes and 0003 fortune_of_the_day"
+   git push -u origin plan/0002-search-and-fortune-of-the-day
+   gh pr create --base main --label lane:planning \
+     --title "plan: 0002 search_fortunes and 0003 fortune_of_the_day" \
+     --body "Planning PR 2 (hapi-factory docs/runbooks/engine.md)"
+   ```
+
+   CodeRabbit's check on it isn't needed again. Merge it with a merge commit once `ci / gates` is green, and paste back its number and merge SHA.
+2. Repeat Step 6 until both factory PRs are open. Expected: one work order's worker starts at the next tick, and the other stays `queued` until the first has opened its PR (one pipeline per repo); each PR's Links name the other as a sibling (`independent; merge in any order`). Paste back the status comment (with `BRANCH=plan/0002-search-and-fortune-of-the-day`) as both rows move, and, for each PR, a factory PR's command with its `WO` and the ledger by head after its harvest, as in Step 6.
+3. Merge each of them with a merge commit, giving your call on each hold and note as in Step 8, and paste back both merge SHAs and the final comment (`This plan has settled: 2 merged, 0 closed, 0 failed. …`).
+
+### Step 10: close out
+
+1. Make the audit token again ([Step 4](#step-4-deploy-then-audit), item 4), run Step 4's strict audit again, and paste back what it prints. Expected: as in Step 4.
+2. Read the workspace's month-to-date spend in the Console, and the totals from `hapi status` (the watch's first part: one `Total: $<x>` per planning PR). Paste back both. Expected: together under $15.
+3. **H-281's other half:** whether `NoNewPrivileges=yes` and `UMask=0077` would break the docker CLI a tick runs, in a throwaway unit with the poller's environment (it changes no unit and starts no run):
+
+   ```bash
+   sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
+     export XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"; \
+     systemd-run --user --wait --pipe --quiet --collect \
+       -p NoNewPrivileges=yes -p UMask=0077 \
+       --setenv=PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+       --setenv=XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+       -- sh -c "umask; docker version --format {{.Client.Version}}/{{.Server.Version}} && \
+         docker run --rm --pull never --network none --entrypoint true \
+           hapi-factory/archon:0.12.1 && echo a container started"'
+   ```
+
+   Paste it back. Expected: `0077`, the client's and the daemon's versions, and `a container started`: the docker CLI starts a container under both. Whether `UMask=0077` would leave a run container's uid unable to read what the launcher and the harvester write for it is the controller's call, from Step 6's modes and the code; the unit stays as it is until then.
+4. Paste back [the runs](#commands-you-run-more-than-once) and [Decisions' full ledger read](#decisions), for the record.
+5. Raise the Console limit again only if you choose to.
+
+### The record
+
+The controller fills these from what you pasted (Task 16 Step 11), with `<owner>` for your login, and records each retry, its cause and its spend in spike 09's "Live check" addendum. Each point that failed, and each cap that tripped without saying so, becomes a new register item.
+
+**The runs.** Every pass's runs; a later pass's carry `(retry <n>)` in Round:
+
+| Work order | Run | Kind | Round | Status | Spend | Verdict | CodeRabbit |
+|---|---|---|---|---|---|---|---|
+| (to be filled at Task 16 Step 11) | | | | | | | |
+
+**The pass criteria:** design §4's nine points, then the acceptance tests'. Criterion 3 is recorded as failed for each work order that was retried, with the retry as its evidence; criterion 8 stays reachable under the same id:
+
+| # | Criterion | Result | Evidence |
+|---|---|---|---|
+| 1 | `mise run new-repo` made the sandbox with the contract, rulesets, both Apps, labels and CodeRabbit | pending | Task 5 Step 15's output |
+| 2 | The two planning PRs merged in turn | pending | their merge SHAs |
+| 3 | Within the poll interval, exactly one run started per work order, with nobody touching anything | pending | the watch, the runs |
+| 4 | Each run passed `preflight` and built; verify passed `check`, `smoke` against the bakery and the acceptance tests; the host gates passed; the review gave its verdict and CodeRabbit's (or named why it was skipped); at most one fix round | pending | the runs, each PR's Evidence |
+| 5 | One factory PR per work order, with §3.7's description and the trailers | pending | a factory PR's command, per PR |
+| 6 | CodeRabbit's PR review started one automatic fix run, and the rework by label worked | pending | Step 7's Review rounds |
+| 7 | Planning PR 2's status comment showed both work orders' states as their runs moved | pending | Step 9's status comments |
+| 8 | The three factory PRs merged, and the strict audit still passes | pending | the merge SHAs; Step 10's audit |
+| 9 | Total spend under $15, and every cap that tripped stopped things and said so | pending | the Console, `hapi status`, the caps' texts |
+| 10 | Every factory PR marked **Ready to merge** had its acceptance tests pass in the verify container | pending | each such PR's verify run id and its `verify.json`'s `acceptance.exit` |
+
+**Decisions.** One row per harvest of a factory PR: the decision and its version; the subjects (files) screened; how many answers came `via` jev, haiku and default; the holds and notes, by file; each hold's cause (coverage: a subject no classifier answered, with why; or finding: what an answer found); the calls made for the head, of `max_calls_per_head` (24); the decisions' spend; and your call on each hold and each note, agreed or disagreed:
+
+| Factory PR | Harvest (run, head) | Decision | Subjects | Via (jev, haiku, default) | Holds and notes | Each hold's cause | Calls (of 24) | Spend | Your call |
+|---|---|---|---|---|---|---|---|---|---|
+| (to be filled at Task 16 Step 11) | | | | | | | | | |
+
+**H-168, per factory PR:** CodeRabbit's findings at major and above, and its minor ones, and how many were fixed, declined or raised again.
