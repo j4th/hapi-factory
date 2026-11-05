@@ -997,6 +997,39 @@ describe("final review I3: a rework after retention removed the pass's runs", ()
   }
 });
 
+describe("final re-review N3: a PR body with no room for the host's part", () => {
+  test("holds that work order with why on its status row, writes nothing, never throws; once there is room, the body is written and the reason goes", async () => {
+    const w = pipelineDeps();
+    await reviewed(w);
+    const h = await step(w, w.state({ phase: "harvest", runs: [W0, V0, R0], autoRounds: 1 }));
+    const p = await step(w, h.s);
+    expect(p.s.phase).toBe("pr-review");
+    // The operator's own text outside the markers nearly fills the body; then ci / gates turns green, so the body is due a re-render.
+    const host = w.ff.prs.get(1)!.body;
+    const mine = "o".repeat(65_000);
+    w.ff.prs.get(1)!.body = `${mine}\n\n${host}`;
+    w.ff.checkRun(headAt(0), { name: "ci / gates", appId: 15368, status: "completed", conclusion: "success" });
+    const n = writes(w.ff).length;
+    const full = await step(w, p.s);
+    const why = "the PR body has no room for the host's part: 65002 characters of it are outside the hapi markers";
+    expect([full.s.phase, full.s.reasons[0], full.starts]).toEqual(["pr-review", why, []]);
+    expect(full.s.reasons.slice(1)).toEqual(p.s.reasons);
+    expect(full.events).toEqual([expect.objectContaining({ phase: "pr-review", reason: why })]);
+    expect(writes(w.ff).length).toBe(n);
+    expect(statusTable([{ state: full.s, usd: 0, known: true }])).toContain(`(\`${why}\``);
+    // The next tick tries again: still no room, no write and no new event.
+    const again = await step(w, full.s);
+    expect([again.s.reasons, again.events, writes(w.ff).length]).toEqual([full.s.reasons, [], n]);
+    // The operator trims their text: the body is written, the reason goes, and the body never shows it.
+    w.ff.prs.get(1)!.body = host;
+    const room = await step(w, again.s);
+    expect(room.s.reasons).toEqual(p.s.reasons);
+    expect(writes(w.ff).at(-1)).toBe("PATCH /pulls/1");
+    expect(lastBody(w)).not.toContain("has no room");
+    expect(lastBody(w)).toContain(`| \`ci / gates\` | ${headAt(0).slice(0, 7)} | GitHub Actions, on the pushed head | passed |`);
+  });
+});
+
 test("D76: a heads-cache hit whose commit the scratch no longer holds drops the entry and runs the gates again", async () => {
   const c = pipelineDeps({ central: policy((p) => (p.budgets.daily_usd = 0.4)) });
   let gated = 0;

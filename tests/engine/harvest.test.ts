@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { ask } from "../../src/decide/record";
 import { diffSubjects, ledgerPath, readLedger, type Screened } from "../../src/engine/decisions";
 import {
+  commitObjects,
   diffStat,
   type Evidence,
   fileChanges,
@@ -31,6 +32,7 @@ import type { WorkOrderState } from "../../src/engine/state";
 import { WORKER_IDENTITY } from "../../src/generate/archon";
 import { applyOverlay } from "../../src/policy/overlay";
 import type { Policy } from "../../src/policy/types";
+import { runBytes } from "../../src/run/cli";
 import { readRecord, type RunRecord } from "../../src/run/records";
 import { runCommand, type Runner } from "../../src/stack/up";
 import { FAKE_ANTHROPIC_KEY, FAKE_JEV_KEY, recordingFetch } from "../decide/helpers";
@@ -311,6 +313,90 @@ describe("final review I1: with real git, the host gates read every commit's hea
     expect((await gatesOn(ok, { secrets })).problems).toEqual([]);
     expect(Bun.spawnSync(["git", "--git-dir", scratchOf(ok), "rev-parse", "--verify", "-q", `refs/hapi/runs/${W}`]).exitCode).toBe(0);
   });
+
+  // Final re-review N1: each commit is read from its object, so a header line that looks like `git log`'s own
+  // markers (`commit <sha>`, `diff --git`) can't move what is read as a header, a message or a patch.
+  /** The world's HEAD detached at a commit (git hash-object, no --literally) of the generated identity whose raw headers end with `extra` and whose message is `msg` (the six trailers by default). */
+  const crafted = (w: ReturnType<typeof gitWorld>, extra: string, msg = message) => {
+    w.commit({ "src/a.ts": "a\n" });
+    const tree = w.work("rev-parse", "HEAD^{tree}");
+    const parent = w.work("rev-parse", "HEAD");
+    const c = fed(w, ["hash-object", "-t", "commit", "-w", "--stdin"], `tree ${tree}\nparent ${parent}\nauthor ${who}\ncommitter ${who}\n${extra}\n${msg}`);
+    w.work("checkout", "-q", "--detach", c);
+    return c;
+  };
+
+  test("N1: an extra header `commit <40 zeros>`, then gpgsig, is refused as an extra header, not filed under another commit", async () => {
+    const w = gitWorld();
+    const c = crafted(w, `commit ${"0".repeat(40)}\ngpgsig -----BEGIN PGP SIGNATURE-----\n abc\n -----END PGP SIGNATURE-----\n`);
+    const { problems, kept } = await refused(w);
+    expect(problems).toContainEqual({ gate: "bundle", detail: `commit ${c.slice(0, 7)} has a header beyond tree, parent, author and committer: \`commit\`` });
+    expect(problems).toContainEqual({ gate: "bundle", detail: `commit ${c.slice(0, 7)} has a header beyond tree, parent, author and committer: \`gpgsig\`` });
+    expect(kept).toBe(false);
+  });
+
+  test("N1: an extra header line `diff --git a/x b/x` doesn't turn the message into a patch: a key's format in the message is found, and the header refused", async () => {
+    const w = gitWorld();
+    const ant = ["sk", "ant", "n".repeat(30)].join("-");
+    const c = crafted(w, "diff --git a/x b/x\n", `${ORDER.id}: server\n\nthe key is ${ant}\n\n${trailersFor(W).join("\n")}\n`);
+    const { problems, kept } = await refused(w);
+    expect(problems).toContainEqual({ gate: "secret", detail: `the message of commit ${c.slice(0, 7)} holds a key's format (anthropic)` });
+    expect(problems).toContainEqual({ gate: "bundle", detail: `commit ${c.slice(0, 7)} has a header beyond tree, parent, author and committer: \`diff\`` });
+    for (const p of problems) expect(p.detail).not.toContain(ant);
+    expect(kept).toBe(false);
+  });
+
+  test("N1: the re-review's commit, `commit <40 zeros>`, gpgsig and `diff --git` headers with a key's format in its message: every header refused, the message's key found", async () => {
+    const w = gitWorld();
+    const ant = ["sk", "ant", "m".repeat(30)].join("-");
+    const c = crafted(w, `commit ${"0".repeat(40)}\ngpgsig -----BEGIN PGP SIGNATURE-----\n abc\n -----END PGP SIGNATURE-----\ndiff --git a/x b/x\n`, `${ORDER.id}: server\n\n${ant}\n\n${trailersFor(W).join("\n")}\n`);
+    const { problems, kept } = await refused(w);
+    for (const k of ["commit", "gpgsig", "diff"]) expect(problems).toContainEqual({ gate: "bundle", detail: `commit ${c.slice(0, 7)} has a header beyond tree, parent, author and committer: \`${k}\`` });
+    expect(problems).toContainEqual({ gate: "secret", detail: `the message of commit ${c.slice(0, 7)} holds a key's format (anthropic)` });
+    expect(kept).toBe(false);
+  });
+
+  test("N1: a zone value on a header's continuation line is found in that commit's header, and the continuation is no header of its own", async () => {
+    const w = gitWorld();
+    const c = crafted(w, `x-sig first line\n ${key}\n`);
+    const { problems, kept } = await refused(w);
+    expect(problems).toContainEqual({ gate: "secret", detail: `the header of commit ${c.slice(0, 7)} holds ANTHROPIC_API_KEY's value` });
+    expect(problems.filter((p) => p.gate === "bundle")).toEqual([{ gate: "bundle", detail: `commit ${c.slice(0, 7)} has a header beyond tree, parent, author and committer: \`x-sig\`` }]);
+    expect(kept).toBe(false);
+  });
+});
+
+describe("final re-review N1: git cat-file --batch's output, read by its byte lengths", () => {
+  const A = "a".repeat(40);
+  const B = "b".repeat(40);
+  const enc = (s: string) => new TextEncoder().encode(s);
+  const entry = (sha: string, content: string, type = "commit") => `${sha} ${type} ${enc(content).byteLength}\n${content}\n`;
+  const batch = (...parts: string[]) => enc(parts.join(""));
+
+  test("each commit's header (its keys, a continuation line no key), and its message after the first empty line, sized in bytes", () => {
+    const a = "tree t\nparent p\nauthor é <x> 1 +0000\ncommitter € <x> 1 +0000\ngpgsig one\n two\n\nmsg\n\ncommit 0000000000000000000000000000000000000000\ndiff --git a/x b/x\n";
+    const b = "tree t\nauthor a <x> 1 +0000\ncommitter a <x> 1 +0000\n\nsecond\n";
+    const r = commitObjects(batch(entry(A, a), entry(B, b)), [A, B]);
+    expect(r.problems).toEqual([]);
+    expect(r.commits).toEqual([
+      { sha: A, keys: ["tree", "parent", "author", "committer", "gpgsig"], header: "tree t\nparent p\nauthor é <x> 1 +0000\ncommitter € <x> 1 +0000\ngpgsig one\n two", message: "msg\n\ncommit 0000000000000000000000000000000000000000\ndiff --git a/x b/x\n" },
+      { sha: B, keys: ["tree", "author", "committer"], header: "tree t\nauthor a <x> 1 +0000\ncommitter a <x> 1 +0000", message: "second\n" },
+    ]);
+  });
+
+  test("a missing object, one that isn't a commit, a size that doesn't match, another object than asked for, or more output each fail the scan closed by name", () => {
+    expect(commitObjects(batch(`${A} missing\n`), [A]).problems).toEqual(["the secret scan can't be trusted: commit aaaaaaa is missing from the scratch (git cat-file --batch)"]);
+    expect(commitObjects(batch(entry(A, "100644 x", "tree")), [A]).problems).toEqual(["the secret scan can't be trusted: aaaaaaa is a tree, not a commit (git cat-file --batch)"]);
+    const short = enc(`${A} commit 99\ntree t\n\nm\n`);
+    expect(commitObjects(short, [A]).problems).toEqual(["the secret scan can't be trusted: git cat-file --batch's entry for aaaaaaa doesn't match its size"]);
+    const off = enc(`${A} commit 3\ntree t\n\nm\n`);
+    expect(commitObjects(off, [A]).problems).toEqual(["the secret scan can't be trusted: git cat-file --batch's entry for aaaaaaa doesn't match its size"]);
+    expect(commitObjects(batch(entry(B, "tree t\n\nm\n")), [A]).problems).toEqual(["the secret scan can't be trusted: git cat-file --batch's output can't be read at commit aaaaaaa"]);
+    expect(commitObjects(batch(entry(A, "tree t\n\nm\n"), "extra\n"), [A]).problems).toEqual(["the secret scan can't be trusted: git cat-file --batch wrote more than the commits asked for"]);
+    // What came before a problem is kept; nothing after it is read.
+    const r = commitObjects(batch(entry(A, "tree t\n\nm\n"), `${B} missing\n`), [A, B]);
+    expect([r.commits.map((c) => c.sha), r.problems]).toEqual([[A], ["the secret scan can't be trusted: commit bbbbbbb is missing from the scratch (git cat-file --batch)"]]);
+  });
 });
 
 describe("final review M1: CodeRabbit's gate cross-checked", () => {
@@ -428,7 +514,7 @@ async function world(o: { central?: Policy; decide?: HarvestDeps["decide"]; work
   const base = w.base;
   const head = w.commit({ "src/a.ts": "export const a = 1;\n" });
   const f = fakeRun();
-  const run = { ...f.deps, run: runCommand };
+  const run = { ...f.deps, run: runCommand, runBytes };
   const seed = (id: string, over: Partial<RunRecord>) => seedRun(f, { id, workOrder: ORDER.id, status: "succeeded", objects: false, retry: 0, round: 0, ...over });
   const recs = {
     worker: await seed(W, { sha: base, kind: o.workerKind ?? "worker", budgetUsd: 3, ...(o.workerKind === "fix" ? { round: 1 } : {}) }),
@@ -770,7 +856,7 @@ describe("fix round 2", () => {
       if (cmd.includes("fetch") && cmd.includes(bundle)) atFetch = lstatSync(scratch).mode;
       return r;
     };
-    const g = await hostGates({ run, env: { PATH: process.env.PATH! } }, { mirror: w.mirror, scratch, bundle, runId: "000000000001", base: h1, workOrder: ORDER.workOrder, policy: SHIPPED, secrets: {} });
+    const g = await hostGates({ run, runBytes, env: { PATH: process.env.PATH! } }, { mirror: w.mirror, scratch, bundle, runId: "000000000001", base: h1, workOrder: ORDER.workOrder, policy: SHIPPED, secrets: {} });
     expect(g.problems).toEqual([]);
     expect(atFetch! & 0o077).toBe(0);
     expect(lstatSync(scratch).mode & 0o555).toBe(0o555);
@@ -884,7 +970,7 @@ describe("fix round 3", () => {
     w.work("checkout", "-q", "--detach", head);
     const run: Runner = async (cmd, o) => (cmd.includes("update-ref") ? { code: 1, stdout: "", stderr: "fatal: cannot lock ref" } : runCommand(cmd, o));
     const scratch = scratchPath(w.engineDir, ORDER.repo, ORDER.id);
-    const e = await caught(hostGates({ run, env: { PATH: process.env.PATH! } }, { mirror: w.mirror, scratch, bundle, runId: W, base: main, workOrder: ORDER.workOrder, policy: SHIPPED, secrets: { ANTHROPIC_API_KEY: key } }));
+    const e = await caught(hostGates({ run, runBytes, env: { PATH: process.env.PATH! } }, { mirror: w.mirror, scratch, bundle, runId: W, base: main, workOrder: ORDER.workOrder, policy: SHIPPED, secrets: { ANTHROPIC_API_KEY: key } }));
     expect(e.message).toBe(`cannot drop the unscanned commits from run ${W}'s scratch ${scratch}: git update-ref exited 1: fatal: cannot lock ref`);
     expect(lstatSync(scratch).mode & 0o777).toBe(0o700);
   });
@@ -929,7 +1015,49 @@ describe("final review M4: the PR body is read again just before it is written",
       fw.ff.prs.get(pr.number)!.body = `${NOTE_TEXT}\n\n${fw.ff.prs.get(pr.number)!.body}`;
       return gates(o, r);
     };
-    expect(await rerender(d, { ...opened, prHead: head }, h, { forge: fw.forge, pr, ci: "passed", phase: "pr" })).toBe(true);
+    expect(await rerender(d, { ...opened, prHead: head }, h, { forge: fw.forge, pr, ci: "passed", phase: "pr" })).toBe("written");
     expect(fw.ff.prs.get(pr.number)!.body.startsWith(`${NOTE_TEXT}\n\n<!-- hapi:begin -->`)).toBe(true);
+  });
+});
+
+describe("final re-review N3: no room in the PR body for the host's part", () => {
+  const marked = (inner: string) => `<!-- hapi:begin -->\n${inner}\n<!-- hapi:end -->`;
+  const MINE = "o".repeat(65_000);
+  const NO_ROOM = "the PR body has no room for the host's part: 65002 characters of it are outside the hapi markers";
+
+  test("harvest: the head is pushed, the body isn't written, and the state says why, first", async () => {
+    const { d, fw, s, h, base, head } = await world();
+    fw.ff.addPr({ head: "factory/0001-skeleton", body: `${MINE}\n\n${marked("old")}` });
+    fw.ff.push("factory/0001-skeleton", base);
+    const r = await harvest(d, { ...s, pr: 1, prHead: base }, h);
+    expect(fw.pushes.map((p) => p.head)).toEqual([head]);
+    expect(writes(fw.ff)).toEqual(["POST /issues/1/labels"]);
+    expect(fw.ff.prs.get(1)!.body).toBe(`${MINE}\n\n${marked("old")}`);
+    expect([r.pr, r.prHead, r.verdict, r.reasons]).toEqual([1, head, "ready", [NO_ROOM]]);
+  });
+
+  test("rerender: no room writes nothing and says why; once there is room the body is written, and the reason never shows in it", async () => {
+    const { d, fw, s, h, head } = await world();
+    const opened = await harvest(d, s, h);
+    const pr = (await fw.forge.pr(opened.pr!))!;
+    const host = fw.ff.prs.get(pr.number)!.body;
+    fw.ff.prs.get(pr.number)!.body = `${MINE}\n\n${host}`;
+    const n = writes(fw.ff).length;
+    expect(await rerender(d, { ...opened, prHead: head }, h, { forge: fw.forge, pr, ci: "passed", phase: "pr" })).toEqual({ noRoom: NO_ROOM });
+    expect(writes(fw.ff).length).toBe(n);
+    // The operator trims their text: the next re-render writes, and a no-room reason left on the state isn't the change's.
+    fw.ff.prs.get(pr.number)!.body = host;
+    expect(await rerender(d, { ...opened, prHead: head, reasons: [NO_ROOM] }, h, { forge: fw.forge, pr, ci: "passed", phase: "pr" })).toBe("written");
+    const body = fw.ff.prs.get(pr.number)!.body;
+    expect(body).not.toContain("has no room");
+    expect(body).toContain("**Ready to merge**");
+    expect(await rerender(d, { ...opened, prHead: head }, h, { forge: fw.forge, pr, ci: "passed", phase: "pr" })).toBe("unchanged");
+  });
+
+  test("harvest: a no-room reason the state carries isn't the change's: it never reaches the PR", async () => {
+    const { d, fw, s, h } = await world();
+    const r = await harvest(d, s, { ...h, carried: [NO_ROOM] });
+    expect(r.reasons).toEqual([]);
+    expect(bodyOf(fw.ff, 0)).not.toContain("has no room");
   });
 });

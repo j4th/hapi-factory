@@ -30,7 +30,9 @@
  * - **Decisions never route.** No rule here reads a screen or a decision's effect: a hold reaches the verdict and the
  *   reasons only through the harvester's `outcome`.
  * - **Re-renders**: a move to `waiting` with a reason, and `ci / gates` completing on the PR's head, re-render the
- *   PR's body (./harvest.ts `rerender`) once no run of the work order is live, asking and pushing nothing.
+ *   PR's body (./harvest.ts `rerender`) once no run of the work order is live, asking and pushing nothing. A body
+ *   with no room for the host's part beside the operator's own text is left as it is, with why first on the state
+ *   (final re-review N3), and never stops the repo's tick.
  */
 import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -51,7 +53,7 @@ import { type Discovered, unpinWorkOrder } from "./discover";
 import { codeRabbitResult, quoteUntrusted, type ReviewResult, reviewResult, type CodeRabbitResult, verifyResult } from "./evidence";
 import { harvest, type HarvestDeps, type HarvestInput, policyOf, rerender, type Round, scratchPath, worse } from "./harvest";
 import { mirrorPath } from "./mirror";
-import { BEGIN, plain } from "./pr";
+import { BEGIN, isNoRoom, plain } from "./pr";
 import { listStates, type Phase, type StatusEvent, transition, type WorkOrderState } from "./state";
 
 export interface PipelineDeps extends HarvestDeps {
@@ -303,9 +305,10 @@ async function fail(c: Ctx, reasons: string[], o: { run?: string; usd?: number }
 /** `waiting`: with a reason, `Needs your decision` and the reason added, and the PR's body re-rendered once nothing is live. */
 async function wait(c: Ctx, reason: string | undefined, o: { run?: string; usd?: number } = {}): Promise<WorkOrderState> {
   if (reason !== undefined) c.s = { ...c.s, verdict: worse(c.s.verdict ?? "ready", "decision"), reasons: dedupe([...c.s.reasons, reason]) };
-  const s = await move(c, "waiting", { reason, ...o });
-  if (reason !== undefined) await renderPr(c, undefined);
-  return s;
+  await move(c, "waiting", { reason, ...o });
+  // The move's event is this step's one: a body with no room adds its reason to the state only.
+  if (reason !== undefined) await renderPr(c, undefined, { emitted: true });
+  return c.s;
 }
 
 /** The automatic round halted before its verify or review started (final review I4): `waiting` with the halt, the start's refusal dropped. */
@@ -335,7 +338,7 @@ async function refuse(c: Ctx, reason: string): Promise<WorkOrderState> {
   }
   c.s = { ...c.s, verdict: worse(c.s.verdict ?? "ready", "decision"), reasons: dedupe([...c.s.reasons, reason]) };
   await c.d.emit(transition(c.s, c.s.phase, { at: c.at, reason }).event);
-  await renderPr(c, undefined);
+  await renderPr(c, undefined, { emitted: true });
   return c.s;
 }
 
@@ -867,13 +870,26 @@ function runOfHead(c: Ctx, head: string): RunRecord | undefined {
   return !c.phases.verify && !c.phases.review ? c.pass.filter((r) => isSource(r) && r.status === "succeeded").at(-1) : undefined;
 }
 
-/** Re-render the PR's body for its head now, unless a run of the pass is live (the gates write the scratch). */
-async function renderPr(c: Ctx, ci: "pending" | "passed" | "failed" | undefined): Promise<void> {
+/**
+ * Re-render the PR's body for its head now, unless a run of the pass is live (the gates write the scratch). A body
+ * with no room for the host's part beside the operator's own text (final re-review N3) isn't written: its reason goes
+ * first on the state, so the status row and `hapi status` show it, with an event when the reasons change and the
+ * step has emitted none (`emitted`), and never a throw, so the repo's tick goes on. Every later re-render tries again
+ * (`converge` finds the reason missing from the body); one that writes the body, or finds it current, drops it.
+ */
+async function renderPr(c: Ctx, ci: "pending" | "passed" | "failed" | undefined, o: { emitted?: boolean } = {}): Promise<void> {
   if (c.pr === undefined || c.forge === undefined || c.s.prHead === undefined) return;
   if (c.pass.some((r) => r.status === "live")) return;
   const run = runOfHead(c, c.s.prHead);
   if (run === undefined) return;
-  await rerender(c.d, c.s, await harvestInput(c, run), { forge: c.forge, pr: c.pr, ci: ci ?? (await ciOf(c, c.s.prHead)), phase: c.s.phase });
+  const r = await rerender(c.d, c.s, await harvestInput(c, run), { forge: c.forge, pr: c.pr, ci: ci ?? (await ciOf(c, c.s.prHead)), phase: c.s.phase });
+  const others = c.s.reasons.filter((x) => !isNoRoom(x));
+  if (typeof r === "object") {
+    const reasons = dedupe([r.noRoom, ...others]);
+    if (reasons.length === c.s.reasons.length && reasons.every((x, i) => x === c.s.reasons[i])) return;
+    c.s = { ...c.s, reasons };
+    if (o.emitted !== true) await c.d.emit(transition(c.s, c.s.phase, { at: c.at, reason: r.noRoom }).event);
+  } else if (r !== "not-the-head" && others.length !== c.s.reasons.length) c.s = { ...c.s, reasons: others };
 }
 
 /** In `pr-review` and `waiting`: re-render when `ci / gates` on the head changed, or a reason isn't on the PR yet. */

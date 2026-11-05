@@ -9,14 +9,14 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
-import { engineAdvance } from "../../src/engine/cli";
+import { engineAdvance, pipelineDepsOf } from "../../src/engine/cli";
 import { overlapProblem } from "../../src/engine/discover";
-import { headsFile } from "../../src/engine/pipeline";
+import { advance, headsFile } from "../../src/engine/pipeline";
 import { ACTIVE, formatTick, ON_PR, pollTick, QUEUE, SETTLED, withPollLock } from "../../src/engine/poll";
-import { markPath, renderStatus, rowsOf } from "../../src/engine/status";
+import { markPath, renderStatus, rowsOf, statusTable } from "../../src/engine/status";
 import { type Phase, readState, retryState, statePath, withOrderLock, writeState, type WorkOrderState } from "../../src/engine/state";
 import { lockHeld } from "../../src/run/records";
-import { SHA } from "../run/helpers";
+import { SHA, seedRun } from "../run/helpers";
 import { cleanup } from "../secrets/helpers";
 import { MAINT, MERGE, ORDER, SANDBOX, SECOND, tickWorld } from "./helpers";
 
@@ -425,6 +425,44 @@ describe("final review I3", () => {
       "waiting",
       `work order ${W1}'s worker run of pass 0 has no record (runs.retention_days removed it once its month ended): no rework can start on #${pr}; close the PR, or plan the work again under a new work order id`,
     ]);
+    expect(seen(w)).toEqual([W2]);
+  });
+});
+
+describe("final re-review N3", () => {
+  test("a PR body with no room for the host's part holds that work order with why, writes nothing, and the repo's next state still advances", async () => {
+    const w = tickWorld();
+    const world = w.worlds[SANDBOX]!;
+    world.push(`factory/${W1}`, SHA);
+    const mine = "o".repeat(65_000);
+    const pr = world.addPr({ head: `factory/${W1}`, body: `${mine}\n\n<!-- hapi:begin -->\nold\n<!-- hapi:end -->` });
+    // The pass whose head the PR shows: its worker, then the verify and review of that head.
+    for (const [id, kind, sha] of [["a0a0a0a0a0a0", "worker", MERGE], ["b0b0b0b0b0b0", "verify", SHA], ["c0c0c0c0c0c0", "review", SHA]] as const) {
+      await seedRun(w.f, { id, workOrder: W1, sha, kind, round: 0, retry: 0, status: "succeeded", objects: false });
+    }
+    await writeState(w.engineDir, w.state({ id: W1, phase: "waiting", pr, prHead: SHA, verdict: "ready", runs: ["a0a0a0a0a0a0", "b0b0b0b0b0b0", "c0c0c0c0c0c0"] }));
+    await writeState(w.engineDir, w.state({ id: W2, phase: "queued" }));
+    // W1's advance is the real one, with fake gates and diff reads (no scratch, no model, no secrets store).
+    const recorded = w.d.advance;
+    w.d.advance = async (s, order, t) => {
+      if (s.id !== W1) return recorded(s, order, t);
+      const events: Awaited<ReturnType<typeof recorded>>["events"] = [];
+      const d = await pipelineDepsOf(w.d.run, w.d.policy, w.engineDir, s.repo, t, async (e) => void events.push(e));
+      d.gates = async () => ({ head: SHA, files: ["src/a.ts"], problems: [], signals: [] });
+      d.subjects = async () => [];
+      d.stat = async () => ({ files: 1, insertions: 1, deletions: 0 });
+      d.secrets = async () => ({});
+      return { state: await advance(d, s, order), events };
+    };
+    const r = await pollTick(w.d);
+    expect(r.repos.find((x) => x.repo === SANDBOX)!.error).toBeUndefined();
+    const why = "the PR body has no room for the host's part: 65002 characters of it are outside the hapi markers";
+    const held = (await readState(w.engineDir, SANDBOX, W1))!;
+    expect([held.phase, held.reasons]).toEqual(["waiting", [why]]);
+    expect(statusTable([{ state: held, usd: 0, known: true }])).toContain(`(\`${why}\`)`);
+    expect(w.events()).toContainEqual(expect.objectContaining({ workOrder: W1, phase: "waiting", reason: why }));
+    expect(world.calls.filter((c) => c.method === "PATCH" && new URL(c.url).pathname.endsWith(`/pulls/${pr}`))).toEqual([]);
+    expect(world.prs.get(pr)!.body.startsWith(mine)).toBe(true);
     expect(seen(w)).toEqual([W2]);
   });
 });

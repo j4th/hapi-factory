@@ -78,11 +78,11 @@ export function stateDirOf(env: Env): string {
   return join(base, "hapi", "runs");
 }
 
-/** The real byte runner: stdout read whole as bytes (`arrayBuffer`), never decoded. */
-export const runBytes: RunDeps["runBytes"] = async (cmd, env) => {
-  let proc: Bun.Subprocess<"ignore", "pipe", "pipe">;
+/** The real byte runner: stdout read whole as bytes (`arrayBuffer`), never decoded; `stdin`, when given, is the process's whole stdin. */
+export const runBytes: RunDeps["runBytes"] = async (cmd, env, stdin) => {
+  let proc: Bun.Subprocess<"ignore" | Uint8Array, "pipe", "pipe">;
   try {
-    proc = Bun.spawn(cmd, { env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    proc = Bun.spawn(cmd, { env, stdin: stdin === undefined ? "ignore" : new TextEncoder().encode(stdin), stdout: "pipe", stderr: "pipe" });
   } catch {
     throw new Error(`cannot run ${cmd[0]}: is it installed and on PATH?`);
   }

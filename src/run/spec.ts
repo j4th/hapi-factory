@@ -71,8 +71,11 @@ import type { WorkOrder } from "../workorder/validate";
 export interface RunDeps {
   /** src/stack/up.ts's Runner (text output). */
   run: Runner;
-  /** A runner whose stdout is bytes, never decoded: copy-out reads `run.bundle` through it. */
-  runBytes: (cmd: string[], env: Record<string, string>) => Promise<{ code: number; stdout: Uint8Array; stderr: string }>;
+  /**
+   * A runner whose stdout is bytes, never decoded: copy-out reads `run.bundle` through it, and the harvester's secret
+   * scan each commit object (`git cat-file --batch`, its shas on `stdin`). stdin is closed unless `stdin` is given.
+   */
+  runBytes: (cmd: string[], env: Record<string, string>, stdin?: string) => Promise<{ code: number; stdout: Uint8Array; stderr: string }>;
   /** A runner that hands each line of stdout and stderr to `line` as it comes, without its newline, and resolves to the exit code: `hapi run watch`'s `docker logs --follow`. */
   stream: (cmd: string[], env: Record<string, string>, line: (text: string) => void) => Promise<number>;
   env: Env;

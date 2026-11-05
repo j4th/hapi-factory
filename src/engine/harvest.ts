@@ -8,9 +8,11 @@
  *   its size, that it applies and descends from the run's base, each new commit's trailers (the commit node's
  *   TOCTOU and a worker-writable git config are re-checked here, on what was committed), the changed files against
  *   the overlaid protected paths and the pieces' scopes, no-op, and the secret scan of the new commits (the pinned
- *   gitleaks; both zones' exact values, raw and base64, in contents, messages and every changed path's name; and
- *   KEY_PATTERNS in names and messages). Any problem means nothing is pushed. The added-line signals (harness
- *   tampering, placeholders, loosened tests) are "check this yourself" lines only, never a verdict.
+ *   gitleaks; both zones' exact values, raw and base64, in contents, each commit's raw header and message, and every
+ *   changed path's name; and KEY_PATTERNS in headers, messages and names). Each commit's header and message are read
+ *   from its object (`readCommits`), never parsed out of `git log`'s text. Any problem means nothing is pushed. The
+ *   added-line signals (harness tampering, placeholders, loosened tests) are "check this yourself" lines only, never
+ *   a verdict.
  * - **The outcome** (`outcome`, pure): design §3.6's rows, the operator's acceptance-test rules, then the screens'
  *   holds last. Screens never change `push` or `draft`.
  * - **The push** (`push`): `git push` without `+` or `--force`, over https alone, the token in the process's
@@ -59,7 +61,7 @@ import {
 import type { Discovered } from "./discover";
 import { type CodeRabbitResult, codeRabbitResult, type PlannerTest, type ReviewResult, reviewResult, turnsOfRun, type VerifyResult, verifyResult, type WorkerResult, workerResult } from "./evidence";
 import { mirrorPath } from "./mirror";
-import { type PrInput, renderPr, rerenderPr } from "./pr";
+import { isNoRoom, type PrInput, renderPr, rerenderPr } from "./pr";
 import type { Phase, Verdict, WorkOrderState } from "./state";
 
 /** The gitleaks the host's secret scan runs: mise.toml's pin (a test holds them equal). */
@@ -118,33 +120,99 @@ const HEADER_KEYS = ["tree", "parent", "author", "committer"] as const;
 /** The `--format` of the commits' log `trailerProblems` reads: sha, parents, author and committer, the trailers. */
 export const COMMIT_FORMAT = "%H%x1f%P%x1f%an%x1f%ae%x1f%cn%x1f%ce%x1f%(trailers:only,unfold)%x1e";
 
-/** Each commit's raw header keys, in order, from `git log --pretty=raw` (a header's continuation lines start with a space; the message is indented). */
-export function headerKeys(raw: string): Map<string, string[]> {
-  const out = new Map<string, string[]>();
-  for (const block of raw.split(/^(?=commit [0-9a-f]{40})/m)) {
-    const lines = block.split("\n");
-    const sha = /^commit ([0-9a-f]{40}(?:[0-9a-f]{24})?)\b/.exec(lines[0] ?? "")?.[1];
-    if (sha === undefined) continue;
-    const keys: string[] = [];
-    for (const l of lines.slice(1)) {
-      if (l === "") break;
-      if (!l.startsWith(" ")) keys.push(l.split(" ")[0]!);
+/** One commit object, as git stored it: its raw header (up to the first empty line), the header's keys in order, and its message. */
+export interface CommitObject {
+  sha: string;
+  /** Each header line's first word, but a continuation line's (it starts with a space). */
+  keys: string[];
+  header: string;
+  message: string;
+}
+
+/**
+ * The commits `shas` named, from one `git cat-file --batch` over them, read by its byte lengths alone (final re-review
+ * N1): each entry is `<sha> commit <size>\n`, then exactly `<size>` bytes of the object, then `\n`. Nothing in an
+ * object is searched for a marker, so no header line or message (`commit <sha>`, `diff --git`) can move where one
+ * commit ends or another begins. In each object, the header is everything before the first empty line, and the
+ * message everything after it. An entry for another object than asked, `missing`, a type but `commit`, a size that
+ * doesn't match, or output beyond the last entry is a problem, and nothing after it is read.
+ */
+export function commitObjects(out: Uint8Array, shas: readonly string[]): { commits: CommitObject[]; problems: string[] } {
+  const text = new TextDecoder();
+  const trust = (what: string) => ({ commits, problems: [`the secret scan can't be trusted: ${what}`] });
+  const commits: CommitObject[] = [];
+  let at = 0;
+  for (const sha of shas) {
+    const lf = out.indexOf(0x0a, at);
+    const line = lf === -1 ? "" : text.decode(out.subarray(at, lf));
+    if (line === `${sha} missing`) return trust(`commit ${short(sha)} is missing from the scratch (git cat-file --batch)`);
+    const m = /^([0-9a-f]{40}(?:[0-9a-f]{24})?) ([a-z]+) (\d+)$/.exec(line);
+    if (!m || m[1] !== sha) return trust(`git cat-file --batch's output can't be read at commit ${short(sha)}`);
+    if (m[2] !== "commit") return trust(`${short(sha)} is a ${m[2]}, not a commit (git cat-file --batch)`);
+    const start = lf + 1;
+    const end = start + Number(m[3]);
+    if (!Number.isSafeInteger(end) || end >= out.length || out[end] !== 0x0a) return trust(`git cat-file --batch's entry for ${short(sha)} doesn't match its size`);
+    const body = out.subarray(start, end);
+    let blank = -1;
+    for (let i = 0; i + 1 < body.length; i++) {
+      if (body[i] === 0x0a && body[i + 1] === 0x0a) {
+        blank = i;
+        break;
+      }
     }
-    out.set(sha, keys);
+    const header = text.decode(blank === -1 ? body : body.subarray(0, blank));
+    const message = blank === -1 ? "" : text.decode(body.subarray(blank + 2));
+    const keys = header.split("\n").filter((l) => l !== "" && !l.startsWith(" ")).map((l) => l.split(" ")[0]!);
+    commits.push({ sha, keys, header, message });
+    at = end + 1;
   }
-  return out;
+  if (at !== out.length) return trust("git cat-file --batch wrote more than the commits asked for");
+  return { commits, problems: [] };
+}
+
+/** The scan's git environment, after `env -i`: no system or global config, no replace objects, no in-tree attributes, no hooks or fsmonitor; `attributes`, the diff's attributes file. */
+function scanEnv(PATH: string, scratch: string, o: { home?: string; attributes?: string } = {}): string[] {
+  const config: [string, string][] = [
+    ...(o.attributes === undefined ? [] : [["core.attributesFile", o.attributes] as [string, string]]),
+    ["safe.directory", scratch],
+    ["core.hooksPath", "/dev/null"],
+    ["core.fsmonitor", "false"],
+  ];
+  return [
+    `PATH=${PATH}`, ...(o.home === undefined ? [] : [`HOME=${o.home}`]), "GIT_NO_REPLACE_OBJECTS=1", `GIT_ATTR_SOURCE=${EMPTY_TREE}`, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null",
+    `GIT_CONFIG_COUNT=${config.length}`, ...config.flatMap(([k, v], i) => [`GIT_CONFIG_KEY_${i}=${k}`, `GIT_CONFIG_VALUE_${i}=${v}`]),
+  ];
+}
+
+/**
+ * The new commits of `range`, each read whole from its object (final re-review N1): `git rev-list` over the range, then
+ * ONE `git cat-file --batch` over its shas (`commitObjects`), both as the secret scan runs git (`scanEnv`). A git that
+ * fails or writes to stderr, or an entry `commitObjects` can't read, is a problem: the scan fails closed.
+ */
+export async function readCommits(d: Pick<RunDeps, "run" | "runBytes" | "env">, scratch: string, range: string): Promise<{ commits: CommitObject[]; problems: string[] }> {
+  const PATH = d.env.PATH ?? "/usr/bin:/bin";
+  const env = ["env", "-i", ...scanEnv(PATH, scratch), "git", "-C", scratch];
+  const list = await d.run([...env, "rev-list", "--full-history", range], { env: { PATH }, inherit: false });
+  if (list.code !== 0 || (list.stderr ?? "") !== "") return { commits: [], problems: [`the secret scan can't be trusted: git rev-list exited ${list.code}${(list.stderr ?? "") === "" ? "" : " and wrote to stderr"}`] };
+  const shas = list.stdout.split("\n").filter((l) => l !== "");
+  if (shas.some((s) => !COMMIT.test(s))) return { commits: [], problems: ["the secret scan can't be trusted: git rev-list gave a line that isn't a commit id"] };
+  if (shas.length === 0) return { commits: [], problems: [] };
+  const batch = await d.runBytes([...env, "cat-file", "--batch"], { PATH }, `${shas.join("\n")}\n`);
+  if (batch.code !== 0 || batch.stderr !== "") return { commits: [], problems: [`the secret scan can't be trusted: git cat-file --batch exited ${batch.code}${batch.stderr === "" ? "" : " and wrote to stderr"}`] };
+  return commitObjects(batch.stdout, shas);
 }
 
 /**
  * Each new commit's header problems (final review I1): a merge; an author or committer other than the run container's
  * generated identity (`WORKER_IDENTITY`); a raw header beyond tree, parent, author and committer, or one of them
  * twice; and the commit node's six trailers (spec §13.2) with the values the host knows, each exactly once, and no
- * other trailer (a `Co-authored-by` credits someone else). `log` is `COMMIT_FORMAT`'s, `raw` `--pretty=raw`'s.
+ * other trailer (a `Co-authored-by` credits someone else). `log` is `COMMIT_FORMAT`'s; `headers`, each commit's
+ * header keys from its object (`readCommits`), and a commit in only one of them can't be read.
  */
-function trailerProblems(log: string, raw: string, o: { runId: string; workOrder: WorkOrder; secrets: Record<string, string> }): string[] {
+function trailerProblems(log: string, headers: Map<string, string[]>, o: { runId: string; workOrder: WorkOrder; secrets: Record<string, string> }): string[] {
   const trace = o.workOrder.trace.traceparent.split("-")[1] ?? "";
-  const headers = headerKeys(raw);
   const problems: string[] = [];
+  const logged = new Set<string>();
   for (const rec of log.split("\x1e")) {
     const body = rec.replace(/^\n/, "");
     if (body === "") continue;
@@ -154,6 +222,7 @@ function trailerProblems(log: string, raw: string, o: { runId: string; workOrder
       continue;
     }
     const at = `commit ${short(sha)}`;
+    logged.add(sha);
     if ((parents ?? "").trim().split(" ").filter(Boolean).length !== 1) {
       problems.push(`${at} is a merge: a run commits one piece at a time, in a line`);
       continue;
@@ -193,6 +262,7 @@ function trailerProblems(log: string, raw: string, o: { runId: string; workOrder
       if (v === undefined ? (got[0] ?? "") === "" : got[0] !== v) problems.push(`${at} lacks the trailer ${key}: ${v ?? "<a value>"}`);
     }
   }
+  for (const sha of headers.keys()) if (!logged.has(sha)) problems.push(`commit ${short(sha)}'s identity and trailers can't be read`);
   return problems;
 }
 
@@ -267,10 +337,15 @@ function signalsOf(changes: Map<string, FileChange>, secrets: Record<string, str
 /**
  * The secret scan of the bundle's new commits (`base..head`): gitleaks (`GITLEAKS_VERSION`, its default rules, every
  * path read as text, and its own failure modes failing closed, as the gates workflow runs it), then `secrets`' exact
- * values, raw and base64, in every patch, message and changed path's name, and KEY_PATTERNS in names and messages.
+ * values, raw and base64, in every patch, in each commit's raw header and message (`commits`, read from the objects
+ * by `readCommits`, whose problems fail the scan too) and in every changed path's name, and KEY_PATTERNS in each
+ * commit's header and message and in every name.
  */
-async function secretScan(d: Pick<RunDeps, "run" | "env">, o: { scratch: string; base: string; head: string; secrets: Record<string, string> }): Promise<string[]> {
-  const problems: string[] = [];
+async function secretScan(
+  d: Pick<RunDeps, "run" | "env">,
+  o: { scratch: string; base: string; head: string; secrets: Record<string, string>; commits: { commits: CommitObject[]; problems: string[] } },
+): Promise<string[]> {
+  const problems: string[] = [...o.commits.problems];
   const range = `${o.base}..${o.head}`;
   const tmp = await mkdtemp(join(tmpdir(), "hapi-secret-scan-"));
   try {
@@ -281,36 +356,25 @@ async function secretScan(d: Pick<RunDeps, "run" | "env">, o: { scratch: string;
     await writeFile(config, "[extend]\nuseDefault = true\n", { mode: 0o600 });
     const PATH = d.env.PATH ?? "/usr/bin:/bin";
     // git as gitleaks runs it: no in-tree attributes, every path as text, no system or global config, hooks or fsmonitor.
-    const env = [
-      `PATH=${PATH}`, `HOME=${tmp}`, "GIT_NO_REPLACE_OBJECTS=1", `GIT_ATTR_SOURCE=${EMPTY_TREE}`, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null",
-      "GIT_CONFIG_COUNT=4", "GIT_CONFIG_KEY_0=core.attributesFile", `GIT_CONFIG_VALUE_0=${attributes}`, "GIT_CONFIG_KEY_1=safe.directory", `GIT_CONFIG_VALUE_1=${o.scratch}`,
-      "GIT_CONFIG_KEY_2=core.hooksPath", "GIT_CONFIG_VALUE_2=/dev/null", "GIT_CONFIG_KEY_3=core.fsmonitor", "GIT_CONFIG_VALUE_3=false",
-    ];
+    const env = scanEnv(PATH, o.scratch, { home: tmp, attributes });
     const logOpts = ["--full-history", "-m", "--no-mailmap", "--no-renames", "--ignore-submodules=none", "--no-ext-diff", "--no-textconv"];
     const run = (cmd: string[]) => d.run(["env", "-i", ...env, ...cmd], { env: { PATH }, inherit: false });
 
-    // 1. The patches, as gitleaks will read them, and each commit whole (`--pretty=raw`: every header, the committer
-    // and any extra one included, and the message); a git that fails or warns fails the scan closed.
-    const log = await run(["git", "-C", o.scratch, "log", "-p", "-U0", "--no-color", "--pretty=raw", ...logOpts, range]);
+    // 1. Each commit's raw header (every header: the committer and any extra one included) and its message, apart, so
+    // a hit names which (never the value).
+    for (const c of o.commits.commits) {
+      for (const [part, text] of [["header", c.header], ["message", c.message]] as const) {
+        for (const h of secretHits(text, o.secrets)) problems.push(`the ${part} of commit ${short(c.sha)} holds ${h.name}'s value${h.form === "base64" ? ", base64-encoded" : ""}`);
+        for (const k of KEY_PATTERNS) if (k.re.test(text)) problems.push(`the ${part} of commit ${short(c.sha)} holds a key's format (${k.name})`);
+      }
+    }
+    // 1b. The patches alone, as gitleaks will read them (`--format=`: no header or message in the output, so every
+    // `diff --git` at a line's start is a file's own); a git that fails or warns fails the scan closed.
+    const log = await run(["git", "-C", o.scratch, "log", "-p", "-U0", "--no-color", "--format=", ...logOpts, range]);
     if (log.code !== 0 || (log.stderr ?? "") !== "") problems.push(`the secret scan can't be trusted: git log, run as gitleaks runs it, exited ${log.code}${(log.stderr ?? "") === "" ? "" : " and wrote to stderr"}`);
     else {
-      // Each commit's headers and message and each file's patch, so a hit names where it is (never the value).
-      for (const seg of log.stdout.split(/\n(?=commit [0-9a-f]{40}|diff --git )/)) {
-        const commit = /^commit ([0-9a-f]{40})/.exec(seg)?.[1];
-        if (commit !== undefined) {
-          // The raw headers end at the first empty line; the message (indented) follows.
-          const lines = seg.split("\n");
-          const end = lines.indexOf("", 1);
-          const parts: [string, string][] = [
-            ["header", (end === -1 ? lines.slice(1) : lines.slice(1, end)).join("\n")],
-            ["message", end === -1 ? "" : lines.slice(end + 1).join("\n")],
-          ];
-          for (const [part, text] of parts) {
-            for (const h of secretHits(text, o.secrets)) problems.push(`the ${part} of commit ${short(commit)} holds ${h.name}'s value${h.form === "base64" ? ", base64-encoded" : ""}`);
-            for (const k of KEY_PATTERNS) if (k.re.test(text)) problems.push(`the ${part} of commit ${short(commit)} holds a key's format (${k.name})`);
-          }
-          continue;
-        }
+      // Each file's patch, so a hit names its file.
+      for (const seg of log.stdout.split(/\n(?=diff --git )/)) {
         const file = /^diff --git a\/.* b\/(.*)$/m.exec(seg)?.[1];
         const where = file !== undefined ? shown(file, o.secrets) : "the new commits";
         for (const h of secretHits(seg, o.secrets)) problems.push(`${where} holds ${h.name}'s value${h.form === "base64" ? ", base64-encoded" : ""}`);
@@ -365,7 +429,7 @@ async function secretScan(d: Pick<RunDeps, "run" | "env">, o: { scratch: string;
  * when the host itself can't do its part (no mirror, a git failure that is no run's doing).
  */
 export async function hostGates(
-  d: Pick<RunDeps, "run" | "env">,
+  d: Pick<RunDeps, "run" | "runBytes" | "env">,
   o: { mirror: string; scratch: string; bundle: string; runId: string; base: string; workOrder: WorkOrder; policy: Policy; secrets: Record<string, string> },
 ): Promise<GateResult> {
   const end = (gate: GateProblem["gate"], detail: string, head?: string): GateResult => ({ head, files: [], problems: [{ gate, detail }], signals: [] });
@@ -433,9 +497,10 @@ export async function hostGates(
     if (anc.code !== 0) throw new Error(`cannot check the run's head descends from its base (git merge-base exited ${anc.code}): ${firstLine(anc.stderr)}`);
     // 3b. Each new commit is one piece's, as the commit node makes it: the generated identity, the four headers and
     // the six trailers (re-checked on what was committed, since a worker-writable git config reaches the commit node).
+    // The headers are read from each commit's object (`readCommits`), which the secret scan reads too.
     const log = await must(["log", "--no-mailmap", `--format=${COMMIT_FORMAT}`, `${o.base}..${head}`], "read the run's commits");
-    const raw = await must(["log", "--no-mailmap", "--pretty=raw", `${o.base}..${head}`], "read the run's commits' headers");
-    const headerProblems = trailerProblems(log, raw, o);
+    const commits = await readCommits(d, o.scratch, `${o.base}..${head}`);
+    const headerProblems = trailerProblems(log, new Map(commits.commits.map((c) => [c.sha, c.keys])), o);
     const problems: GateProblem[] = capGate("bundle", headerProblems);
     // 4. The changed files.
     const files = (await must(["diff", "--name-only", "-z", "--no-renames", o.base, head], "list the run's changed files")).split("\0").filter((f) => f !== "");
@@ -456,7 +521,7 @@ export async function hostGates(
     problems.push(...capGate("protected", prot), ...capGate("scope", scope));
     // 6. The secret scan, and the added-line signals. Only a scan with no leak, of commits whose headers pass, keeps
     // the run's commits: a forged identity or an extra header is as untrusted as an unscanned commit.
-    const leaks = await secretScan(d, { scratch: o.scratch, base: o.base, head, secrets: o.secrets });
+    const leaks = await secretScan(d, { scratch: o.scratch, base: o.base, head, secrets: o.secrets, commits });
     problems.push(...capGate("secret", leaks));
     const changes = await fileChanges(d, o.scratch, o.base, head, files);
     const signals = changes !== undefined ? signalsOf(changes, o.secrets) : ["the added-line signals could not be read: check the diff yourself"];
@@ -839,8 +904,10 @@ async function markHarvested(d: HarvestDeps, runId: string, at: string, off: boo
 
 /**
  * Harvest a work order's pipeline (see the module comment). Returns the state with `pr`, `prHead`, `verdict`,
- * `reasons` and `updatedAt`; the phase unchanged. Throws (the tick fails closed for the repo, nothing pushed after
- * the throw) on a host failure: a forge error, a failed append to the decision ledger, a push that fails.
+ * `reasons` and `updatedAt`; the phase unchanged. A PR body with no room for the host's part beside the operator's
+ * own text isn't written: its reason (`noRoomReason`) comes first, and the tick goes on. Throws (the tick fails closed
+ * for the repo, nothing pushed after the throw) on a host failure: a forge error, a failed append to the decision
+ * ledger, a push that fails.
  */
 export async function harvest(d: HarvestDeps, s: WorkOrderState, h: HarvestInput): Promise<WorkOrderState> {
   for (const r of [h.run, h.verify, h.review]) {
@@ -876,7 +943,8 @@ export async function harvest(d: HarvestDeps, s: WorkOrderState, h: HarvestInput
     worker: await workerResult(outOf(h.run)!, secrets),
     screens: [],
   };
-  const carried = h.carried ?? [];
+  // A no-room reason (final re-review N3) is the PR body's state, never the change's: it isn't carried to the PR.
+  const carried = (h.carried ?? []).filter((r) => !isNoRoom(r));
   const carry = (o: Outcome): Outcome => (carried.length === 0 ? o : { ...o, verdict: worse(o.verdict, "decision"), reasons: [...new Set([...o.reasons, ...carried])] });
   // The gates and evidence settle push and draft; the screens can't change either.
   const first = outcome(e, phases);
@@ -966,12 +1034,16 @@ export async function harvest(d: HarvestDeps, s: WorkOrderState, h: HarvestInput
     ...(fix.length > 0 ? { unfixed: fix } : {}),
   };
   let number: number;
+  let noRoom: string | undefined;
   if (pr !== undefined) {
     number = pr.number;
     // The body read again just before it is written (final review M4): an edit outside the markers made while the
-    // screens and the push ran is kept, not lost.
+    // screens and the push ran is kept, not lost. With no room beside it even for the fallback (final re-review N3),
+    // nothing is written, and the state says why, first, so the status row shows it.
     const fresh = await forge.pr(number);
-    await forge.editPrBody(number, rerenderPr(fresh.body, input));
+    const body = rerenderPr(fresh.body, input);
+    if ("noRoom" in body) noRoom = body.noRoom;
+    else await forge.editPrBody(number, body.body);
     // In a not-pushed case the body is the one state-changing write: nothing marks a head nobody vetted ready.
     if (notPushed === undefined && pr.draft && !result.draft) await forge.markReady(number);
   } else {
@@ -984,7 +1056,7 @@ export async function harvest(d: HarvestDeps, s: WorkOrderState, h: HarvestInput
       (spends.reduce((n, x) => n + x.usd, 0) > policy.flags.thresholds.run_usd || s.reworkRounds > policy.flags.thresholds.review_rounds);
     await forge.addLabels(number, flagged ? ["lane:factory", "hapi:flagged"] : ["lane:factory"]);
   }
-  return done({ ...s, pr: number, ...(prHead === undefined ? {} : { prHead }), verdict: result.verdict, reasons: result.reasons, updatedAt: now });
+  return done({ ...s, pr: number, ...(prHead === undefined ? {} : { prHead }), verdict: result.verdict, reasons: noRoom === undefined ? result.reasons : [noRoom, ...result.reasons], updatedAt: now });
 }
 
 const RANK: Record<Verdict, number> = { ready: 0, decision: 1, "do-not-merge": 2 };
@@ -997,17 +1069,24 @@ export const worse = (a: Verdict, b: Verdict): Verdict => (RANK[a] >= RANK[b] ? 
  * `waiting` with a reason (rulings m31, m50). `h.run` is the run whose head that is. The body is built as the
  * harvest builds it, from the scratch and the ledger: that run's gates and evidence, the screens re-read from the
  * ledger (`ask: false`, so it asks and spends nothing; with decision models off it builds no subjects), the whole
- * ledger's cost, and the state's reasons beyond the outcome's under Unresolved, with a verdict no better than the
- * state's. It pushes nothing, marks nothing ready and adds no label. Returns whether it wrote the body: false when
- * the body is already that, or the run's gates don't give the PR's head.
+ * ledger's cost, and the state's reasons beyond the outcome's under Unresolved (but a no-room reason, the body's own
+ * state), with a verdict no better than the state's. It pushes nothing, marks nothing ready and adds no label.
+ * Returns what it did: `written`; `unchanged` when the body is already that; `not-the-head` when the run's gates
+ * don't give the PR's head; or `noRoom` with why, writing nothing, when the operator's own text leaves no room even
+ * for the fallback (final re-review N3).
  */
-export async function rerender(d: HarvestDeps, s: WorkOrderState, h: HarvestInput, o: { forge: Forge; pr: PrInfo; ci: "pending" | "passed" | "failed"; phase: Phase }): Promise<boolean> {
+export async function rerender(
+  d: HarvestDeps,
+  s: WorkOrderState,
+  h: HarvestInput,
+  o: { forge: Forge; pr: PrInfo; ci: "pending" | "passed" | "failed"; phase: Phase },
+): Promise<"written" | "unchanged" | "not-the-head" | { noRoom: string }> {
   const policy = policyOf(d.central, h.order);
   const phases = policy.runs.phases;
   const id = h.order.id;
   const scratch = scratchPath(d.engineDir, d.repo, id);
   const gates = await d.gates(h.order, h.run);
-  if (gates.head === undefined || gates.head !== s.prHead || gates.problems.length > 0) return false;
+  if (gates.head === undefined || gates.head !== s.prHead || gates.problems.length > 0) return "not-the-head";
   const head = gates.head;
   const secrets = await d.secrets();
   const outOf = (r: RunRecord | undefined) => (r === undefined ? undefined : join(recordDir(d.run.stateDir, r.runId), "out"));
@@ -1024,7 +1103,7 @@ export async function rerender(d: HarvestDeps, s: WorkOrderState, h: HarvestInpu
   };
   e.screens = await screenHarvest(d, { s, run: h.run, head, subjects: await subjectsFor(d, policy, h.order, scratch, head, secrets), policy, ask: false });
   const result = outcome(e, phases);
-  const extra = s.reasons.filter((r) => !result.reasons.includes(r));
+  const extra = s.reasons.filter((r) => !result.reasons.includes(r) && !isNoRoom(r));
   const verdict = worse(worse(result.verdict, s.verdict ?? "ready"), extra.length > 0 ? "decision" : "ready");
   const ledger = await readLedger(ledgerPath(d.engineDir, d.repo, id));
   const spends = h.runs.map((r) => runSpend(d.run.stateDir, r, h.order.workOrder.budget.usd));
@@ -1056,7 +1135,8 @@ export async function rerender(d: HarvestDeps, s: WorkOrderState, h: HarvestInpu
   // the gates and the screens ran is kept.
   const fresh = await o.forge.pr(o.pr.number);
   const body = rerenderPr(fresh.body, input);
-  if (body === fresh.body) return false;
-  await o.forge.editPrBody(o.pr.number, body);
-  return true;
+  if ("noRoom" in body) return { noRoom: body.noRoom };
+  if (body.body === fresh.body) return "unchanged";
+  await o.forge.editPrBody(o.pr.number, body.body);
+  return "written";
 }

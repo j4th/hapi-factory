@@ -24,6 +24,7 @@ import type { TokenPurpose } from "../../src/forge/github/token";
 import { loadPolicy } from "../../src/policy/load";
 import type { DecisionModels, EngineDecision, Policy } from "../../src/policy/types";
 import type { StartOptions } from "../../src/run/lifecycle";
+import { runBytes } from "../../src/run/cli";
 import { keyPart, readRecord, runKey, type RunRecord, writeRecord } from "../../src/run/records";
 import type { RunDeps } from "../../src/run/spec";
 import { runCommand } from "../../src/stack/up";
@@ -226,7 +227,7 @@ export function gitWorld(): GitWorld {
 }
 
 /** Real git for the code under test: hardened, as the harvester runs it. */
-export const realGit = (): Pick<RunDeps, "run" | "env"> => ({ run: runCommand, env: { PATH: process.env.PATH ?? "/usr/bin:/bin" } });
+export const realGit = (): Pick<RunDeps, "run" | "runBytes" | "env"> => ({ run: runCommand, runBytes, env: { PATH: process.env.PATH ?? "/usr/bin:/bin" } });
 
 /** A noul answer per question id. */
 export type FakeAnswers = Record<string, Partial<Record<string, number>> | "fail">;

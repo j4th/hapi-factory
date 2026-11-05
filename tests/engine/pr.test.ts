@@ -2,7 +2,7 @@
 import { describe, expect, test } from "bun:test";
 import { decisionVersion, type Screened, screenHarvest } from "../../src/engine/decisions";
 import { type Evidence, type Outcome, outcome } from "../../src/engine/harvest";
-import { type PrInput, renderPr, rerenderPr } from "../../src/engine/pr";
+import { BEGIN, END, type PrInput, renderPr, rerenderPr } from "../../src/engine/pr";
 import type { RunRecord } from "../../src/run/records";
 import { NOW } from "../run/helpers";
 import { CLEAN, fakeDecide, ORDER, orderAt, SHIPPED } from "./helpers";
@@ -135,8 +135,8 @@ test("Links names a retried pass's runs, the planning PR, the siblings and the t
 test("the re-render keeps text outside the markers", () => {
   const a = input();
   const b = input({}, { review: { state: "none", why: "x" } });
-  expect(rerenderPr(`intro\n${renderPr(a)}\nnotes\n`, b)).toBe(`intro\n${renderPr(b)}\nnotes\n`);
-  expect(rerenderPr("an operator's own body", b)).toBe(`${renderPr(b)}\n\nan operator's own body`);
+  expect(rerenderPr(`intro\n${renderPr(a)}\nnotes\n`, b)).toEqual({ body: `intro\n${renderPr(b)}\nnotes\n` });
+  expect(rerenderPr("an operator's own body", b)).toEqual({ body: `${renderPr(b)}\n\nan operator's own body` });
 });
 
 describe("Evidence names each decision with its version, and Cost and turns counts decision spend", () => {
@@ -253,8 +253,8 @@ describe("final review I2: the PR body stays under GitHub's limit", () => {
     expect(body.length).toBeLessThanOrEqual(60_000);
     expect(body).toContain("<!-- hapi:end -->");
     // The quoted sections go before the account does: the account still shows, the review's block doesn't.
-    expect(body).toContain("The independent review's findings and criteria aren't shown here");
-    expect(body).toContain("CodeRabbit's findings aren't shown here");
+    expect(body).toContain("The independent review's 50 findings and 50 criteria aren't shown here");
+    expect(body).toContain("CodeRabbit's 40 findings aren't shown here");
     expect(body).toContain("aaaa");
     expect(renderPr(i)).toBe(body);
   });
@@ -263,6 +263,111 @@ describe("final review I2: the PR body stays under GitHub's limit", () => {
     const body = renderPr(input());
     expect(body).not.toContain("truncated by the host");
     expect(body).not.toContain("aren't shown here");
+  });
+});
+
+describe("final re-review N2: an item over its quoted block's cap is cut, never dropped", () => {
+  const big = { severity: "minor", file: "src/a.ts", line: 1, title: "t", text: "x".repeat(25_000) };
+  const itemOf = (f: typeof big) => `[${f.severity}] ${f.file}:${f.line}: ${f.title}\n${f.text}`;
+
+  test("one CodeRabbit finding over the 20,000-character block cap shows its first 19,999 characters and …", () => {
+    const body = renderPr(input({}, { cr: { state: "reviewed", findings: [big] } }));
+    expect(body.length).toBeLessThanOrEqual(60_000);
+    expect(body).toContain("CodeRabbit's findings, as it wrote them:");
+    expect(body).toContain(`\n${itemOf(big).slice(0, 19_999)}…\n`);
+    expect(body).not.toContain(itemOf(big).slice(0, 20_000));
+    expect(body).not.toContain("aren't shown here");
+    expect(body).not.toContain("more CodeRabbit findings");
+  });
+
+  test("a first item over the cap followed by short ones keeps the cut first item, and counts the rest", () => {
+    const short = (n: number) => ({ severity: "minor", file: `src/s${n}.ts`, line: n, title: `short ${n}`, text: "y" });
+    const body = renderPr(input({}, { cr: { state: "reviewed", findings: [big, short(1), short(2)] } }));
+    expect(body).toContain(`\n${itemOf(big).slice(0, 19_999)}…\n`);
+    expect(body).toContain("… (truncated by the host: 2 more CodeRabbit findings in the review run's outputs)");
+  });
+});
+
+describe("final re-review N3: the size guard's backstop, and the room beside the operator's own text", () => {
+  const long = (c: string, n: number) => c.repeat(n);
+  /** Every list at ten times its upstream cap or more, and every line far over its own: even the guard's last step is over 60,000 characters. */
+  function absurd(): PrInput {
+    const screens = Array.from({ length: 20 }, (_, n) =>
+      screen({
+        holds: Array.from({ length: 50 }, (_, k) => `hold ${n}.${k}: ${long("h", 1200)}`),
+        notes: Array.from({ length: 50 }, (_, k) => `note ${n}.${k}: ${long("n", 1200)}`),
+        coverage: Array.from({ length: 10 }, (_, k) => ({ cause: `cause ${k}: ${long("c", 1000)}`, files: k + 1 })),
+        held: Array.from({ length: 50 }, (_, k) => `\`src/${long("p", 1200)}${k}.ts\``),
+      }),
+    );
+    const evidence: Evidence = {
+      ...CLEAN,
+      gates: { ...CLEAN.gates, signals: Array.from({ length: 500 }, (_, k) => `\`src/${long("s", 1200)}${k}.ts\`: an added line calls process.exit`) },
+      review: {
+        state: "ran",
+        verdict: "needs-work",
+        findings: Array.from({ length: 500 }, (_, k) => ({ severity: "major" as const, path: `src/f${k}.ts:${k + 1}`, summary: long("r", 20_000) })),
+        criteria: Array.from({ length: 500 }, () => ({ criterion: long("c", 20_000), mark: "unmet" as const, evidence: long("e", 20_000) })),
+      },
+      cr: { state: "reviewed", findings: Array.from({ length: 400 }, (_, k) => ({ severity: "major", file: `src/g${k}.ts`, line: k + 1, title: long("t", 2000), text: long("x", 30_000) })) },
+      worker: { ...CLEAN.worker, account: long("a", 60_000) },
+      screens,
+    };
+    return input(
+      {
+        outcome: { push: true, draft: false, verdict: "decision", reasons: Array.from({ length: 1000 }, (_, k) => `reason ${k}: ${long("z", 3000)}`) },
+        unfixed: Array.from({ length: 100 }, (_, k) => `unfixed ${k}: ${long("u", 3000)}`),
+        runs: Array.from({ length: 100 }, (_, k) => ({ id: k.toString(16).padStart(12, "0"), kind: "fix" as const, round: k, retry: 1 })),
+        rounds: Array.from({ length: 100 }, (_, k) => ({ round: k + 1, stage: "rework" as const, run: k.toString(16).padStart(12, "0") })),
+        position: { k: 1, n: 3, siblings: Array.from({ length: 1000 }, (_, k) => k + 10) },
+      },
+      evidence,
+    );
+  }
+
+  test("when even the last step is over the budget: the fallback, with the markers, the verdict, the held: lines, where the full report is and the hidden block, provably within it", () => {
+    const i = absurd();
+    const body = renderPr(i);
+    expect(body.length).toBeLessThanOrEqual(60_000);
+    expect(body.startsWith(`${BEGIN}\n## Verdict\n\n**Needs your decision** · risk: yellow\n`)).toBe(true);
+    expect(body.endsWith(`<!-- hapi:pr v1 {"workOrder":"0001-skeleton","status":"pr","round":0,"head":"${HEAD}","verdict":"decision"} -->\n${END}`)).toBe(true);
+    const held = body.split("\n").filter((l) => l.startsWith("- held: "));
+    expect(held).toHaveLength(5);
+    for (const l of held) expect(Array.from(l).length).toBeLessThanOrEqual(2 + 300);
+    expect(body).toContain("\n- … and 215 more held lines (cut to keep the PR body under GitHub's size limit)\n");
+    expect(body).toContain("\n_The full report is too long for this PR's body (GitHub's size limit): `hapi status` lists every reason, and the runs' outputs on the host hold the rest (the evidence, the findings and the worker's account)._\n");
+    for (const part of ["## Unresolved", "## Links", "## Evidence", "## The worker's account"]) expect(body).not.toContain(part);
+    expect(unfenced(body)).not.toContain("@");
+    // Its size doesn't grow with the evidence: a budget of 3,000 still holds it, unchanged.
+    expect(body.length).toBeLessThanOrEqual(3_000);
+    expect(renderPr(i, 3_000)).toBe(body);
+    expect(renderPr(i)).toBe(body);
+  });
+
+  test("a re-render gives the host's part only the room GitHub's 65,536 leaves beside the operator's own text, less a margin", () => {
+    const i = input();
+    const host = renderPr(i);
+    // With room to spare, the body is as before.
+    expect(rerenderPr(`intro\n${host}\nnotes\n`, i)).toEqual({ body: `intro\n${host}\nnotes\n` });
+    // 64,000 characters of the operator's own leave the host's part 1,023: it shrinks (to the fallback here), and the whole body fits.
+    const mine = long("o", 64_000);
+    const r = rerenderPr(`${mine}\n${host}`, i);
+    if (!("body" in r)) throw new Error("expected a body");
+    expect(r.body.startsWith(`${mine}\n${BEGIN}`)).toBe(true);
+    expect(r.body.length).toBeLessThanOrEqual(65_536 - 512);
+    expect(r.body).toContain("_The full report is too long for this PR's body");
+    // A body with no markers is all the operator's: the host's part goes first, and the joining blank line counts too.
+    const plainBody = rerenderPr(mine, i);
+    if (!("body" in plainBody)) throw new Error("expected a body");
+    expect(plainBody.body.endsWith(`\n\n${mine}`)).toBe(true);
+    expect(plainBody.body.length).toBeLessThanOrEqual(65_536 - 512);
+  });
+
+  test("no room even for the fallback: nothing to write, and why, with how much is outside the markers", () => {
+    const i = input();
+    const mine = long("o", 65_000);
+    expect(rerenderPr(`${mine}\n${renderPr(i)}`, i)).toEqual({ noRoom: "the PR body has no room for the host's part: 65001 characters of it are outside the hapi markers" });
+    expect(rerenderPr(mine, i)).toEqual({ noRoom: "the PR body has no room for the host's part: 65000 characters of it are outside the hapi markers" });
   });
 });
 
