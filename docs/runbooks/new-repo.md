@@ -9,7 +9,7 @@
 - [Verify](#verify): what step 11 checks, and the audit as hapi.
 - [Deleting a sandbox](#deleting-a-sandbox).
 - [Changing the template](#changing-the-template).
-- [Plan 03's operator steps](#plan-03s-operator-steps-tasks-5-steps-1215): Task 5 Steps 12–15, pasteable.
+- [Plan 03's operator steps](#plan-03s-operator-steps-task-5-steps-1215): Task 5 Steps 12–15, pasteable.
 - [Troubleshooting](#troubleshooting).
 
 ## Before you run it

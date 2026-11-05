@@ -459,7 +459,14 @@ In the Anthropic Console, set the `hapi-factory` workspace's monthly limit to **
 
 ### Step 4: deploy, then audit
 
-1. **Merge Plan 03's PR** on GitHub, with a merge commit. Paste back the merge SHA.
+1. **Merge Plan 03's PR** on GitHub, with a merge commit. Paste back its number and merge SHA:
+
+   ```bash
+   OWNER="$(gh api user --jq .login)"
+   gh pr list --repo "$OWNER/hapi-factory" --state all \
+     --head plan/03-run-engine \
+     --json number,mergeCommit --jq '.[0] | [.number, .mergeCommit.oid] | @tsv'
+   ```
 2. **Update hapi's checkout and bring the stack up** (Task 14 Step 9, with stack.md's "before the first tick": `mise install` puts gitleaks 8.30.1, which the harvester's secret scan runs, on the poller's `PATH` through `mise exec`; `mise run up` writes `build/roster` and installs the timer):
 
    ```bash
@@ -505,7 +512,9 @@ In the Anthropic Console, set the `hapi-factory` workspace's monthly limit to **
        --repo "$1/hapi-factory" --repo "$1/hapi-sandbox-fortune"; \
      rm -f "$HOME/.config/hapi/audit-token"' \
      hapi-audit "$OWNER" \
-     | grep -E '^(fail|skip) |^pass  (runtime\.(run-disk|poller-timer)|policy\.(repos|decision-models)|github\.app-perms) |^hapi audit:'
+     | grep -E -e '^(fail|skip) ' -e '^hapi audit:' \
+       -e '^pass  (runtime\.(run-disk|poller-timer)|policy\.(repos|decision-models)) ' \
+       -e '^pass  github\.app-perms '
    ```
 
    Paste back what it prints. Expected: one fail, the `mcp.tool-hashes` line, `--strict: skipped: …` (H-101); a `pass` line for `runtime.run-disk`, `runtime.poller-timer` (its first live run), `policy.repos`, `policy.decision-models` (`decision models are on: the engine's decisions (gates.decisions.mode: enforce), the bash gate and the result screen`) and `github.app-perms` (once per repo; it now fails an App that lacks Checks: read, so its pass shows step 3 took); then `hapi audit: <n> pass, 1 fail, 0 skip`. mise then prints `[audit] ERROR task failed`, since `--strict` exits 1 on the one fail. Any other fail: stop and report.
@@ -586,7 +595,9 @@ SHA="$(gh pr view "$PR" --repo "$R" --json headRefOid --jq .headRefOid)"
 echo "factory PR #$PR at $(printf '%.7s' "$SHA")"
 gh api --paginate "repos/$R/pulls/$PR/commits" --jq '.[] | [.sha[0:7],
   (.commit.message | split("\n")[0]), .commit.author.name, .commit.committer.name,
-  ([.commit.message | split("\n")[] | select(test("^(Work-Order|Hapi-Run|Hapi-Lane|Trace-Id|Agent|Model): "))] | length),
+  ([.commit.message | split("\n")[]
+    | select(test("^(Work-Order|Hapi-Run|Hapi-Lane|Trace-Id|Agent|Model): "))]
+    | length),
   (.commit.message | ascii_downcase | contains("co-authored-by:"))] | @tsv'
 gh api "repos/$R/commits/$SHA/check-runs" \
   --jq '.check_runs[] | [.name, .app.id, .status, .conclusion, .output.title] | @tsv'
@@ -1117,7 +1128,7 @@ gh api "repos/$R/commits/$SHA/check-runs" \
 
 Paste back the rows. Expected, among the rows: `ci / gates`, `ci / check` and `ci / scan` (app `15368`) completed `success`, and `CodeRabbit` (app `347564`) completed `success` with a title starting `Finished`. No `CodeRabbit` row, or a title such as `Review skipped` or `Review paused`, or a CodeRabbit comment asking for a manual review: stop and report, since the factory PR's round would never come.
 
-Then, with `ci / gates` green, merge it on GitHub with a merge commit (your bypass of `main-review`, as for every merge into `main`), and paste back its number and merge SHA:
+Then, with `ci / gates` green, merge it on GitHub with a merge commit (your bypass of `main-review`, as for every merge into `main`), and paste back its number and merge SHA. Keep GitHub's merge title as it fills it in (`Merge pull request #<n> from <owner>/<branch>`): the poller finds a work order's planning PR from that subject alone, and an edited one leaves the work order with no planning PR, so no status comment.
 
 ```bash
 OWNER="$(gh api user --jq .login)"
@@ -1132,7 +1143,7 @@ Run [the watch](#commands-you-run-more-than-once) every few minutes until the fa
 
 - **The worker starts within 120 s of the merge** (the next tick), and the planning PR gets its status comment. Until that tick, the watch prints `hapi status: <owner>/hapi-sandbox-fortune has no work order with a state yet`. Paste it back with [the status comment command](#commands-you-run-more-than-once). **H-293:** its first line must read `hapi-factory[bot] Bot via-app:true …`: the poller adopts a lost status comment only when GitHub marks it as the App's. `via-app:false`: report it (a lost mark would then post a second comment).
 - **The phases run `queued` → `worker` → `verify` → `review` → `harvest` → `pr`**, with at most one `fix` (and its `verify` and `review`) before `harvest`, then `pr-review` while CodeRabbit reviews the PR. Verify's `smoke` passing settles design §7 item 11 (the MCP SDK's stdio server under Bun).
-- **The host gates pass on the worker's bundle** (I1's live check). The gates expect each commit's author and committer to be the generated worker identity (`hapi-factory worker`, `WORKER_IDENTITY` in `src/generate/archon.ts`). A row `failed` with ``commit <h7>'s committer is `<who>`, not the generated worker identity (src/generate/archon.ts)`` (or `author`) means Archon's executor sets its own git identity: paste it back and stop. It fails closed: nothing is pushed, and a retry would fail the same way.
+- **The host gates pass on the worker's bundle** (I1's live check). The gates expect each commit's author and committer to be the generated worker identity (`hapi-factory worker`, `WORKER_IDENTITY` in `src/generate/archon.ts`). A row `failed` whose reason holds `not the generated worker identity` means Archon's executor sets its own git identity: paste it back and stop. Match on those words: the raw reason is ``commit <h7>'s committer is `<who>`, not the generated worker identity (src/generate/archon.ts)`` (or `author`), but the status comment and `hapi status` show it with every backtick, `@`, `<` and `>` taken out of the name and email. It fails closed: nothing is pushed, and a retry would fail the same way.
 - **The worker's `bun add` works under the image's `BUN_OPTIONS=--no-install`** (Task 1's ruling). Once the factory PR is open, read its branch's `package.json` and `bun.lock`:
 
   ```bash
@@ -1163,8 +1174,8 @@ Run [the watch](#commands-you-run-more-than-once) every few minutes until the fa
   - any hold names its file under Unresolved, and is still there after `ci / gates` turns green;
   - if the body is the short fallback (`_The full report is too long for this PR's body (GitHub's size limit): …_`), paste back the watch too: `hapi status` lists every reason. A row reason `the PR body has no room for the host's part: <n> characters of it are outside the hapi markers` means text you wrote outside the markers leaves no room: trim it ([Troubleshooting](#troubleshooting)).
 - **The decisions, for each harvest** ([the ledger by head](#commands-you-run-more-than-once)): paste it back after each harvest. Record, for each head, its calls (of 24) and its holds by cause, from the PR's verdict lines: coverage (`held: <n> files not screened (call cap 24)`, `… (no classifier answered)`) apart from findings (`held: text aimed at the reviewer in <paths>`). **Stop and report if any harvest's answers are all `via: default`**, or the Evidence row says `not screened` for every subject: the keys or hapi's egress are wrong. `gates.decisions.max_calls_per_head` stays 24 during the run (`policy/gates.yaml` is protected); if **Ready to merge** never shows because of coverage holds, that is the signal to propose raising it afterwards, not to change it now.
-- **CodeRabbit on a PR the factory's App opened** (design §7 item 10): the factory PR's check runs hold a `CodeRabbit` row (app `347564`) completed `success`, titled `Finished…`. If CodeRabbit skips it (a title such as `Review skipped`, or no row, so the round ends `waiting` with `CodeRabbit didn't review <h7>` after six polls, 12 minutes), paste the row and the PR's Unresolved back, and stop.
-- **The forge reads with the App's own tokens** (H-288, design §7 item 7): the CodeRabbit round reading its check run, and the verdict leaving **Waiting for `ci / gates`** once CI is green, show `GET …/commits/<sha>/check-runs` works with the factory App's Checks: read alone; [the journal's problem lines](#commands-you-run-more-than-once) show no `failed closed` naming a check-runs read. Then, once, the label half of H-288, on the merged planning PR (whose labels the engine never reads): add a label it already has, and count its `labeled` events:
+- **CodeRabbit on a PR the factory's App opened** (design §7 item 10): the factory PR's check runs on the head the harvest first pushed hold a `CodeRabbit` row (app `347564`) completed `success`, titled `Finished…`. If CodeRabbit skips it, paste the row and the PR's Unresolved back, and stop. A skip shows one of two ways: a completed row that isn't a `success` titled `Finished…` (such as one titled `Review skipped` or `Review paused`) puts the work order at `waiting` at once, with `CodeRabbit did not review <h7>: <title>`; no row, or one still running, ends the round `waiting` after six polls (12 minutes), with `CodeRabbit didn't review <h7>`.
+- **The forge reads with the App's own tokens** (H-288, design §7 item 7): the CodeRabbit round reading its check run, and the verdict leaving **Waiting for `ci / gates`** once CI is green, show `GET …/commits/<sha>/check-runs` works with the factory App's Checks: read alone; [the journal's problem lines](#commands-you-run-more-than-once) show no `failed closed` naming a check-runs read. **Stop and report**, with the journal's problem lines and [a factory PR's command](#commands-you-run-more-than-once)'s output, if a `failed closed` line names `check-runs`, or if the verdict is still **Waiting for `ci / gates`** two ticks (four minutes) after `ci / gates` turned green on the head. Then, once, the label half of H-288, on the merged planning PR (whose labels the engine never reads): add a label it already has, and count its `labeled` events:
 
   ```bash
   OWNER="$(gh api user --jq .login)"; R="$OWNER/hapi-sandbox-fortune"
@@ -1176,13 +1187,13 @@ Run [the watch](#commands-you-run-more-than-once) every few minutes until the fa
     --jq '.[] | select(.event == "labeled" and .label.name == "lane:planning") | .created_at'
   ```
 
-  Paste back both. Expected: `lane:planning`, then one time only, from `gh pr create`: re-adding a label a PR already has records no `labeled` event, as the fake forge assumes. Two times: report it.
+  Paste back both. Expected: `lane:planning`, then one time only, from `gh pr create`: re-adding a label a PR already has records no `labeled` event, as the fake forge assumes. Two times, or an error from either call: stop and report.
 - **With the CLI on (Step 3)**, after the first review run (its id from [the runs](#commands-you-run-more-than-once), in place of `0123456789ab`), its CodeRabbit output's closing lines and finding counts (design §7 item 5: what exit 0 means), then the review proxy's tunnels (H-298: does the CLI need `cli.coderabbit.ai`?):
 
   ```bash
   sudo -u hapi -H -- sh -c 'f="$HOME/.local/state/hapi/runs/$1/out/coderabbit.ndjson"; \
     jq -c "select(.type == \"complete\" or .type == \"error\" or .type == \"hapi\") \
-      | {type, status, reused, errorType, exit, skipped}" "$f"; \
+      | {type, outcome, status, reused, unreviewedFileCount, errorType, exit, skipped}" "$f"; \
     jq -r "select(.type == \"finding\") | .severity" "$f" | sort | uniq -c' \
     hapi-cr 0123456789ab
   sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
@@ -1190,7 +1201,7 @@ Run [the watch](#commands-you-run-more-than-once) every few minutes until the fa
     docker logs hapi-egress-review-1 2>&1 | grep -Eo "CONNECT [^ ]+" | sort | uniq -c'
   ```
 
-  Paste back both. Expected: a `complete` line and `{"type":"hapi","exit":0,…}` or `2` (2 is `--gate major` tripping), and tunnels to `api.anthropic.com:443`, `app.coderabbit.ai:443` and `ide.coderabbit.ai:443`. No `cli.coderabbit.ai:443` tunnel means the CLI works without it, and H-298 can drop it.
+  Paste back both. Expected: a `complete` line whose `outcome` (or, with none, `status`) is `completed`, with `reused` not `true` and `unreviewedFileCount` `0` or `null`; then the `hapi` line with `exit` `0` or `2` (2 is `--gate major` tripping); and tunnels to `api.anthropic.com:443`, `app.coderabbit.ai:443` and `ide.coderabbit.ai:443`. With any other `complete` line, the PR's Evidence row `CodeRabbit's CLI` reads `not reviewed: <why>`: paste that row back too. **Stop and report** if there is no `complete` line, an `error` line, a `hapi` line with `skipped`, or a `hapi` line whose `exit` is neither `0` nor `2`. No `cli.coderabbit.ai:443` tunnel means the CLI works without it, and H-298 can drop it.
 - **H-281, the poller unit's two hardening settings:** while a run is live (the worker's, say, in `hapi run list`), run [the live check of the stop](stack.md#4-mise-run-up-and-mise-run-down) (stack.md's block, as it stands), and paste back its five lines (expected there). Once the PR is `waiting`, the modes a run container's uid needs, in the mirror and the scratch:
 
   ```bash
@@ -1222,6 +1233,7 @@ Run [the watch](#commands-you-run-more-than-once) every few minutes until the fa
   For planning PR 2, the last argument is `0002-search-fortunes` or `0003-fortune-of-the-day`. Paste back both outputs. Expected: `hapi retry: <owner>/hapi-sandbox-fortune 0001-skeleton-and-crack-cookie is queued again (retry 1), with <k> of the repo's work orders ahead of it: a poll tick starts its worker at <sha12> once none is ahead and the caps allow`; the row `queued`, with `retry 1` in Rounds. With `k` 0 (as for 0001), the watch shows `worker` within 120 s; with `k` 1 (planning PR 2, its sibling still before its PR), it starts once the sibling has opened its PR or settled. If a cap trips, the row says `cap-stopped` with the cap's text instead. Its refusals are in [a failed work order](#a-failed-work-order). Then keep watching.
 - **If the work order itself is wrong**, stop and report it: it needs a new id in a new planning PR, and the old id stays `failed`.
 - **If the month's cap trips**, the row is `cap-stopped` (or a verify or review waits in its phase) with `this month's spend on <owner>/hapi-sandbox-fortune ($<spent>) plus the run's budget ($<budget>) would pass budgets.repo_monthly_usd ($15.00): no new run for it until <date>`: paste it back and stop (design §4's point 9 records it).
+- **If the day's cap trips**, the row is `cap-stopped` (or a verify or review waits in its phase) with `today's spend ($<spent>) plus the run's budget ($<budget>) would pass budgets.daily_usd ($10.00): nothing new starts until <date> (UTC)`: paste it back and stop (design §4's point 9 records it). It is the cap this run most likely meets. `budgets.daily_usd` is central only (all repos together, per UTC day), so the sandbox's overlay can't change it, and the poller checks each start's whole budget ($2.00 for a worker, $1.00 for a review or fix) on top of the day's spend so far. The work order goes on by itself once the next UTC day begins; the controller decides whether to wait for it.
 - Each attempt spends against the overlay's $15.
 
 ### Step 7: CodeRabbit, then one rework
@@ -1238,7 +1250,7 @@ Run [the watch](#commands-you-run-more-than-once) every few minutes until the fa
    gh pr edit "$PR" --repo "$R" --add-label hapi:rework
    ```
 
-3. Watch, as in Step 6, until the row says `waiting` again, with `1 rework` in Rounds.
+3. Watch, as in Step 6. Within two ticks (four minutes) the row moves to `fix`, and `hapi run list` shows a new fix run; then wait until the row says `waiting` again, with `1 rework` in Rounds. If it is still `waiting` with no new fix run after those two ticks, see [the end of this step](#the-rework-didnt-start).
 
 Change a factory PR only this way. Never push to `factory/<id>` yourself, or use GitHub's **Update branch** or **Resolve conflicts** on it: a commit without the six trailers turns `ci / gates` red, and main-protect has no bypass (H-295; [the operator always wins](#the-operator-always-wins)).
 
@@ -1252,13 +1264,27 @@ gh pr view "$PR" --repo "$R" --json body --jq .body \
   | sed -n '/^## Review rounds/,/^## Cost and turns/p'
 ```
 
-Expected: `Fix rounds: <n> of <cap>.`, with a `- Round <k>, rework: run <id>` line, and a `- Round <k>, on the PR: run <id>` line before it if CodeRabbit's round ran a fix. The rework starting at all shows the poller read the label event's actor with the App's token (design §7 item 7). Nothing started and no cap's text: see [Troubleshooting](#troubleshooting)'s `hapi:rework` rows.
+Expected: `Fix rounds: <n> of <cap>.`, then one line per fix round, oldest first, as the raw body has them (with backticks): `` - Round <k>, before the PR: run `<id>` `` for a fix before the PR, if one ran; `` - Round <k>, on the PR: run `<id>` `` if CodeRabbit's round ran a fix; and `` - Round <k>, rework: run `<id>` `` last. The rework starting at all shows the poller read the label event's actor with the App's token (design §7 item 7).
+
+#### The rework didn't start
+
+If the row is still `waiting` two ticks after the label, with no new fix run and no cap's text, read [Troubleshooting](#troubleshooting)'s `hapi:rework` rows, then take the label off and add it once more:
+
+```bash
+OWNER="$(gh api user --jq .login)"; R="$OWNER/hapi-sandbox-fortune"
+PR="$(gh pr list --repo "$R" --head factory/0001-skeleton-and-crack-cookie \
+  --state all --json number --jq '.[0].number')"
+gh pr edit "$PR" --repo "$R" --remove-label hapi:rework
+gh pr edit "$PR" --repo "$R" --add-label hapi:rework
+```
+
+**Stop and report** if the rework still hasn't started two ticks (four minutes) after that, pasting back the watch and [the journal's problem lines](#commands-you-run-more-than-once): the poller may not be reading the label event's actor with the App's token (design §7 item 7). Re-label only that once.
 
 ### Step 8: merge factory PR 1
 
 Review it. Before you merge, paste back [a factory PR's command](#commands-you-run-more-than-once)'s output, [the runs](#commands-you-run-more-than-once) and [the ledger by head](#commands-you-run-more-than-once), and say, for each hold and each note, whether you **agree** (it pointed at something you reworked, closed or commented on) or **disagree** (you merge it unchanged): Plan 06's first labelled data (H-262). A hold on a PR you then merge unchanged is a false alarm, and is recorded as one.
 
-Then, with `ci / gates` green, merge it on GitHub with a merge commit, and paste back the merge SHA and, a tick later, the final comment on the planning PR's status thread ([the status comment command](#commands-you-run-more-than-once)). Expected: `This plan has settled: 1 merged, 0 closed, 0 failed. Total: $<x>.`
+Then, with `ci / gates` green, merge it on GitHub with a merge commit, keeping GitHub's merge title as it fills it in, as for every merge in this run, and paste back the merge SHA and, a tick later, the final comment on the planning PR's status thread ([the status comment command](#commands-you-run-more-than-once)). Expected: `This plan has settled: 1 merged, 0 closed, 0 failed. Total: $<x>.`
 
 ```bash
 OWNER="$(gh api user --jq .login)"
@@ -1268,6 +1294,8 @@ gh pr list --repo "$OWNER/hapi-sandbox-fortune" --state all \
 ```
 
 ### Step 9: planning PR 2
+
+**When to start it.** The day's cap ($10.00, all repos, per UTC day) sums every run started since 00:00 UTC, and the poller adds each start's whole budget on top of that ([Step 6](#step-6-watch-it)'s day cap). Two work orders, each with its worker, reviews and fixes, can come near it on their own, so if planning PR 1's total (Step 8's final comment, `Total: $<x>`) is above about $4, start this step on a new UTC day, not the one 0001's runs ran in. `date -u` shows the UTC date and time.
 
 1. Repeat Step 5 on the branch `plan/0002-search-and-fortune-of-the-day`, with [planning PR 2's files](#planning-pr-2s-files), and these `git` lines in place of Step 5's (add `.factory/config.yaml` too if you took the `coderabbit` line out):
 
@@ -1280,14 +1308,31 @@ gh pr list --repo "$OWNER/hapi-sandbox-fortune" --state all \
      --body "Planning PR 2 (hapi-factory docs/runbooks/engine.md)"
    ```
 
-   CodeRabbit's check on it isn't needed again. Merge it with a merge commit once `ci / gates` is green, and paste back its number and merge SHA.
-2. Repeat Step 6 until both factory PRs are open. Expected: one work order's worker starts at the next tick, and the other stays `queued` until the first has opened its PR (one pipeline per repo); each PR's Links name the other as a sibling (`independent; merge in any order`). Paste back the status comment (with `BRANCH=plan/0002-search-and-fortune-of-the-day`) as both rows move, and, for each PR, a factory PR's command with its `WO` and the ledger by head after its harvest, as in Step 6.
-3. Merge each of them with a merge commit, giving your call on each hold and note as in Step 8, and paste back both merge SHAs and the final comment (`This plan has settled: 2 merged, 0 closed, 0 failed. …`).
+   CodeRabbit's check on it isn't needed again. Merge it with a merge commit once `ci / gates` is green, keeping GitHub's merge title as it fills it in (as in Step 5: the poller finds the planning PR from it), and paste back its number and merge SHA:
+
+   ```bash
+   OWNER="$(gh api user --jq .login)"
+   gh pr list --repo "$OWNER/hapi-sandbox-fortune" --state all \
+     --head plan/0002-search-and-fortune-of-the-day \
+     --json number,mergeCommit --jq '.[0] | [.number, .mergeCommit.oid] | @tsv'
+   ```
+2. Repeat Step 6 until both factory PRs are open. Expected: one work order's worker starts at the next tick, and the other stays `queued` until the first has opened its PR (one pipeline per repo). The second PR's Links name the first as a sibling (`- Siblings: #<n> (independent; merge in any order)`). The first PR's Links name the second only if its body was harvested or re-rendered after the second opened, for example after a fix round on it: a sibling opening its PR doesn't re-render it. Record which PR's Links name which; a first PR without the line is not a failure. Paste back the status comment (with `BRANCH=plan/0002-search-and-fortune-of-the-day`) as both rows move, and, for each PR, a factory PR's command with its `WO` and the ledger by head after its harvest, as in Step 6.
+3. Merge each of them with a merge commit, keeping GitHub's merge title, and giving your call on each hold and note as in Step 8. Paste back both numbers and merge SHAs, and the final comment (`This plan has settled: 2 merged, 0 closed, 0 failed. …`):
+
+   ```bash
+   OWNER="$(gh api user --jq .login)"
+   for WO in 0002-search-fortunes 0003-fortune-of-the-day; do
+     printf '%s\t' "$WO"
+     gh pr list --repo "$OWNER/hapi-sandbox-fortune" --state all \
+       --head "factory/$WO" \
+       --json number,mergeCommit --jq '.[0] | [.number, .mergeCommit.oid] | @tsv'
+   done
+   ```
 
 ### Step 10: close out
 
 1. Make the audit token again ([Step 4](#step-4-deploy-then-audit), item 4), run Step 4's strict audit again, and paste back what it prints. Expected: as in Step 4.
-2. Read the workspace's month-to-date spend in the Console, and the totals from `hapi status` (the watch's first part: one `Total: $<x>` per planning PR). Paste back both. Expected: together under $15.
+2. Read the totals from `hapi status` (the watch's first part: one `Total: $<x>` per planning PR, runs and decisions together) and the workspace's month-to-date spend in the Console. Paste back both. Expected: `hapi status`'s totals add up to under $15: they are the figures held to $15. The Console's figure is a cross-check only: it covers the whole `hapi-factory` workspace, any other use of it this month included, and leaves out the Jev decisions, which OpenRouter bills.
 3. **H-281's other half:** whether `NoNewPrivileges=yes` and `UMask=0077` would break the docker CLI a tick runs, in a throwaway unit with the poller's environment (it changes no unit and starts no run):
 
    ```bash
@@ -1303,7 +1348,18 @@ gh pr list --repo "$OWNER/hapi-sandbox-fortune" --state all \
    ```
 
    Paste it back. Expected: `0077`, the client's and the daemon's versions, and `a container started`: the docker CLI starts a container under both. Whether `UMask=0077` would leave a run container's uid unable to read what the launcher and the harvester write for it is the controller's call, from Step 6's modes and the code; the unit stays as it is until then.
-4. Paste back [the runs](#commands-you-run-more-than-once) and [Decisions' full ledger read](#decisions), for the record.
+4. Paste back [the runs](#commands-you-run-more-than-once) and the full decision ledger, line by line ([Decisions' read](#decisions), with the sandbox filled in), for the record:
+
+   ```bash
+   OWNER="$(gh api user --jq .login)"
+   sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
+     export XDG_RUNTIME_DIR PATH="$HOME/.local/bin:$PATH"; \
+     cd "$HOME/.local/state/hapi/engine/decisions/$1" && \
+     jq -c "select(.kind == \"answer\") | {workOrder, retry, run: .run[0:12], \
+       head: .head[0:7], decision, version, subject, part, public, models, \
+       via, verdict, effect, cost_usd}" *.jsonl' \
+     hapi-decisions "$OWNER/hapi-sandbox-fortune"
+   ```
 5. Raise the Console limit again only if you choose to.
 
 ### The record
@@ -1328,7 +1384,7 @@ The controller fills these from what you pasted (Task 16 Step 11), with `<owner>
 | 6 | CodeRabbit's PR review started one automatic fix run, and the rework by label worked | pending | Step 7's Review rounds |
 | 7 | Planning PR 2's status comment showed both work orders' states as their runs moved | pending | Step 9's status comments |
 | 8 | The three factory PRs merged, and the strict audit still passes | pending | the merge SHAs; Step 10's audit |
-| 9 | Total spend under $15, and every cap that tripped stopped things and said so | pending | the Console, `hapi status`, the caps' texts |
+| 9 | Total spend under $15, and every cap that tripped stopped things and said so | pending | `hapi status`'s totals (the Console as a cross-check); the caps' texts, the day's `budgets.daily_usd` ($10.00, central) as well as the repo's month ($15.00) |
 | 10 | Every factory PR marked **Ready to merge** had its acceptance tests pass in the verify container | pending | each such PR's verify run id and its `verify.json`'s `acceptance.exit` |
 
 **Decisions.** One row per harvest of a factory PR: the decision and its version; the subjects (files) screened; how many answers came `via` jev, haiku and default; the holds and notes, by file; each hold's cause (coverage: a subject no classifier answered, with why; or finding: what an answer found); the calls made for the head, of `max_calls_per_head` (24); the decisions' spend; and your call on each hold and each note, agreed or disagreed:
