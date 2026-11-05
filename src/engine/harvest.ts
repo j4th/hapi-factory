@@ -135,7 +135,7 @@ export interface CommitObject {
  * object is searched for a marker, so no header line or message (`commit <sha>`, `diff --git`) can move where one
  * commit ends or another begins. In each object, the header is everything before the first empty line, and the
  * message everything after it. An entry for another object than asked, `missing`, a type but `commit`, a size that
- * doesn't match, or output beyond the last entry is a problem, and nothing after it is read.
+ * doesn't match, a NUL byte in the object, or output beyond the last entry is a problem, and nothing after it is read.
  */
 export function commitObjects(out: Uint8Array, shas: readonly string[]): { commits: CommitObject[]; problems: string[] } {
   const text = new TextDecoder();
@@ -153,6 +153,7 @@ export function commitObjects(out: Uint8Array, shas: readonly string[]): { commi
     const end = start + Number(m[3]);
     if (!Number.isSafeInteger(end) || end >= out.length || out[end] !== 0x0a) return trust(`git cat-file --batch's entry for ${short(sha)} doesn't match its size`);
     const body = out.subarray(start, end);
+    if (body.includes(0)) return trust(`commit ${short(sha)} holds a NUL byte, where git's own parse of its headers and trailers stops (git fsck: nulInHeader, nulInCommit)`);
     let blank = -1;
     for (let i = 0; i + 1 < body.length; i++) {
       if (body[i] === 0x0a && body[i + 1] === 0x0a) {
@@ -236,7 +237,7 @@ function trailerProblems(log: string, headers: Map<string, string[]>, o: { runId
       for (const k of new Set(keys)) {
         const n = keys.filter((x) => x === k).length;
         if (!(HEADER_KEYS as readonly string[]).includes(k)) problems.push(`${at} has a header beyond tree, parent, author and committer: ${shown(k, o.secrets)}`);
-        else if (n > 1 && k !== "parent") problems.push(`${at} has ${n} ${k} headers`);
+        else if (n > 1) problems.push(`${at} has ${n} ${k} headers`);
       }
     }
     const lines = trailers.split("\n").map((l) => l.trim()).filter((l) => l !== "");

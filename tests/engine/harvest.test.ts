@@ -326,6 +326,14 @@ describe("final review I1: with real git, the host gates read every commit's hea
     return c;
   };
 
+  test("a second parent header after the committer, which git ignores for ancestry, is refused", async () => {
+    const w = gitWorld();
+    const c = crafted(w, `parent ${"1".repeat(40)}\n`);
+    const { problems, kept } = await refused(w);
+    expect(problems).toContainEqual({ gate: "bundle", detail: `commit ${c.slice(0, 7)} has 2 parent headers` });
+    expect(kept).toBe(false);
+  });
+
   test("N1: an extra header `commit <40 zeros>`, then gpgsig, is refused as an extra header, not filed under another commit", async () => {
     const w = gitWorld();
     const c = crafted(w, `commit ${"0".repeat(40)}\ngpgsig -----BEGIN PGP SIGNATURE-----\n abc\n -----END PGP SIGNATURE-----\n`);
@@ -374,14 +382,20 @@ describe("final re-review N1: git cat-file --batch's output, read by its byte le
   const batch = (...parts: string[]) => enc(parts.join(""));
 
   test("each commit's header (its keys, a continuation line no key), and its message after the first empty line, sized in bytes", () => {
-    const a = "tree t\nparent p\nauthor é <x> 1 +0000\ncommitter € <x> 1 +0000\ngpgsig one\n two\n\nmsg\n\ncommit 0000000000000000000000000000000000000000\ndiff --git a/x b/x\n";
+    const a = `tree t\nparent p\nauthor é <x> 1 +0000\ncommitter € <x> 1 +0000\ngpgsig one\n two\n\nmsg\n\ncommit 0000000000000000000000000000000000000000\n${B} commit 5\ndiff --git a/x b/x\n`;
     const b = "tree t\nauthor a <x> 1 +0000\ncommitter a <x> 1 +0000\n\nsecond\n";
     const r = commitObjects(batch(entry(A, a), entry(B, b)), [A, B]);
     expect(r.problems).toEqual([]);
     expect(r.commits).toEqual([
-      { sha: A, keys: ["tree", "parent", "author", "committer", "gpgsig"], header: "tree t\nparent p\nauthor é <x> 1 +0000\ncommitter € <x> 1 +0000\ngpgsig one\n two", message: "msg\n\ncommit 0000000000000000000000000000000000000000\ndiff --git a/x b/x\n" },
+      { sha: A, keys: ["tree", "parent", "author", "committer", "gpgsig"], header: "tree t\nparent p\nauthor é <x> 1 +0000\ncommitter € <x> 1 +0000\ngpgsig one\n two", message: `msg\n\ncommit 0000000000000000000000000000000000000000\n${B} commit 5\ndiff --git a/x b/x\n` },
       { sha: B, keys: ["tree", "author", "committer"], header: "tree t\nauthor a <x> 1 +0000\ncommitter a <x> 1 +0000", message: "second\n" },
     ]);
+  });
+
+  test("a NUL byte in a commit object, in its header or its message, fails the scan closed: git's own parse stops at it", () => {
+    for (const content of ["tree t\nauthor a <x> 1 +0000\ncommitter a <x> 1 +0000\u0000 hidden\n\nm\n", "tree t\nauthor a <x> 1 +0000\ncommitter a <x> 1 +0000\n\nm\u0000\nCo-authored-by: x <x@x>\n"]) {
+      expect(commitObjects(batch(entry(A, content)), [A]).problems).toEqual(["the secret scan can't be trusted: commit aaaaaaa holds a NUL byte, where git's own parse of its headers and trailers stops (git fsck: nulInHeader, nulInCommit)"]);
+    }
   });
 
   test("a missing object, one that isn't a commit, a size that doesn't match, another object than asked for, or more output each fail the scan closed by name", () => {

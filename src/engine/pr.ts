@@ -347,7 +347,7 @@ function renderWith(i: PrInput, caps: Caps): string {
   if (i.unpushed === undefined && e.cr.state === "reviewed" && e.cr.findings.length > 0) {
     const items = e.cr.findings.map((f) => `[${f.severity}] ${f.file}${f.line === undefined ? "" : `:${f.line}`}: ${f.title}\n${f.text}`);
     const q = caps.quote === 0 ? { text: "", more: items.length } : quoted(items, "\n\n", caps.quote);
-    if (q.more === items.length) out.push("", `_CodeRabbit's ${counted(items.length, "finding")} aren't shown here, to keep the PR body under GitHub's size limit: they are in the review run's outputs._`);
+    if (q.more === items.length) out.push("", `_CodeRabbit's ${counted(items.length, "finding")} ${items.length === 1 ? "isn't" : "aren't"} shown here, to keep the PR body under GitHub's size limit: they are in the review run's outputs._`);
     else {
       out.push("", "CodeRabbit's findings, as it wrote them:", "", fence(q.text));
       if (q.more > 0) out.push("", `… (truncated by the host: ${q.more} more CodeRabbit findings in the review run's outputs)`);
