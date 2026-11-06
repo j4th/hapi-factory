@@ -1060,6 +1060,8 @@ The run disk sits at a fixed, root-made path, `/var/lib/hapi/rundisk`, not under
 
   The controller records the result in docs/runbooks/runs.md's section, as design §7 item 1's evidence.
 
+- As built (Task 16, 2026-11-06, Steps 9 and 10 on the build host): the `tail -2` cut `dd`'s error line, so runs.md's check keeps four lines (`tail -n 4`). `mkfs.ext4`'s default discard punched out `fallocate`'s 20 GiB, and the `dd` took 20.9 GB from the data root, so runs.md's `mkfs` passes `-E nodiscard,lazy_itable_init=0` and a `du` checks the image is allocated (H-303). The chown bound with hapi's Docker started before the mount: rootlesskit propagates the host's mounts (H-287, closed).
+
 ---
 
 ### Task 5: The repo contract template, the reusable gates workflow, `hapi new-repo`

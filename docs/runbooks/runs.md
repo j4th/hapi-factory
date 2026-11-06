@@ -300,14 +300,17 @@ A run's `/work` and `/out` are bind-backed local volumes on one fixed-size files
 
 ### Making the run disk (the operator, once, with sudo)
 
-Do this before hapi's checkout gets the run engine (Plan 03): without the run disk, `hapi run start` and the strict audit refuse. Run it **on the host, from your own terminal, as yourself**. It makes a 20 GiB ext4 image at `/var/lib/hapi/rundisk.img`, root's alone, and a systemd mount unit that loop-mounts it at `/var/lib/hapi/rundisk` at every boot, `nodev,nosuid`. `mkfs` makes the filesystem's root dir hapi's (`root_owner`), so root never has to hand hapi a path, and hapi then makes it `0700`:
+Do this before hapi's checkout gets the run engine (Plan 03): without the run disk, `hapi run start` and the strict audit refuse. Run it **on the host, from your own terminal, as yourself**. It makes a 20 GiB ext4 image at `/var/lib/hapi/rundisk.img`, root's alone, and a systemd mount unit that loop-mounts it at `/var/lib/hapi/rundisk` at every boot, `nodev,nosuid`. `mkfs` makes the filesystem's root dir hapi's (`root_owner`), so root never has to hand hapi a path, and hapi then makes it `0700`.
+
+`fallocate` reserves the image's 20 GiB on the host's disk, and `mkfs` must leave it reserved. By default `mkfs.ext4` discards a file's blocks, which punches out what `fallocate` reserved, and leaves the inode tables for the kernel to zero after the mount, which on a loop device punches them out too. A sparse image still caps the runs at 20 GiB, but their writes then come out of the host's free space, Docker's data root's included (seen on the build host, H-303). `nodiscard` and `lazy_itable_init=0` keep the whole image allocated:
 
 ```bash
 sudo install -d -o root -g root -m 0755 /var/lib/hapi /var/lib/hapi/rundisk
 sudo fallocate -l 20G /var/lib/hapi/rundisk.img
 sudo chmod 0600 /var/lib/hapi/rundisk.img
 sudo mkfs.ext4 -q -m 0 -L hapi-rundisk \
-  -E root_owner="$(id -u hapi):$(id -g hapi)" /var/lib/hapi/rundisk.img
+  -E nodiscard,lazy_itable_init=0,root_owner="$(id -u hapi):$(id -g hapi)" \
+  /var/lib/hapi/rundisk.img
 printf '%s\n' '[Unit]' 'Description=hapi run disk (H-217)' '' \
   '[Mount]' 'What=/var/lib/hapi/rundisk.img' 'Where=/var/lib/hapi/rundisk' \
   'Type=ext4' 'Options=loop,nodev,nosuid' '' '[Install]' 'WantedBy=multi-user.target' \
@@ -317,9 +320,10 @@ sudo systemctl enable --now var-lib-hapi-rundisk.mount
 sudo -u hapi -H -- chmod 0700 /var/lib/hapi/rundisk
 findmnt -no SOURCE,FSTYPE,SIZE,OPTIONS /var/lib/hapi/rundisk
 sudo -u hapi -H -- df -B1 --output=size,avail /var/lib/hapi/rundisk
+du -B1 /var/lib/hapi/rundisk.img
 ```
 
-Here `$(id -u hapi)` and `$(id -g hapi)` are your own shell looking up hapi's ids for `mkfs`. The unit is `WantedBy=multi-user.target` with systemd's default dependencies, so at every boot the run disk is mounted before user sessions start, and with them hapi's lingering user manager and its rootless Docker. If `hapi run start` ever refuses after a reboot with the run disk missing or not its own filesystem, check `systemctl status var-lib-hapi-rundisk.mount`. Expected: the `findmnt` line, a `/dev/loop<N>` `ext4` of about `19.5G` whose options hold `nosuid,nodev` and not `noexec`; and the `df` lines, a size under 21474836480 bytes (20 GiB) with nearly all of it available. Paste back both. To grow or shrink it later, change `runs.disk.gb` in a PR first, then, with no run live, `sudo systemctl disable --now var-lib-hapi-rundisk.mount`, remove the image and make it again at the new size.
+Here `$(id -u hapi)` and `$(id -g hapi)` are your own shell looking up hapi's ids for `mkfs`. The unit is `WantedBy=multi-user.target` with systemd's default dependencies, so at every boot the run disk is mounted before user sessions start, and with them hapi's lingering user manager and its rootless Docker. If `hapi run start` ever refuses after a reboot with the run disk missing or not its own filesystem, check `systemctl status var-lib-hapi-rundisk.mount`. Expected: the `findmnt` line, a `/dev/loop<N>` `ext4` of about `19.5G` whose options hold `nosuid,nodev` and not `noexec`; the `df` lines, a size under 21474836480 bytes (20 GiB) with nearly all of it available; and the `du` line, at least 21474836480: the whole image allocated. Paste back all three. Keep the image allocated: leave `discard` out of the unit's options, and keep the run disk out of `/etc/fstab`. The stock `fstrim.timer` (`fstrim --listed-in /etc/fstab:/proc/self/mountinfo`) trims only the filesystems `/etc/fstab` lists, whenever it lists any. To grow or shrink it later, change `runs.disk.gb` in a PR first, then, with no run live, `sudo systemctl disable --now var-lib-hapi-rundisk.mount`, remove the image and make it again at the new size.
 
 ### The live check (as hapi)
 
@@ -336,7 +340,7 @@ sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
     --cap-add CHOWN -v hapi-t20-diskcheck:/w --entrypoint chown "$img" 1001:1001 /w && \
   echo "data root avail before: $(df -B1 --output=avail "$root" | tail -1)" && \
   docker run --rm --pull never --network none --user 1001:1001 -v hapi-t20-diskcheck:/w \
-    --entrypoint sh "$img" -c "dd if=/dev/zero of=/w/fill bs=1M count=25600 2>&1 | tail -2"; \
+    --entrypoint sh "$img" -c "dd if=/dev/zero of=/w/fill bs=1M count=25600 2>&1 | tail -n 4"; \
   echo "data root avail after: $(df -B1 --output=avail "$root" | tail -1)"; \
   docker run --rm --pull never --network none --user 1001:1001 -v hapi-t20-diskcheck:/w \
     --entrypoint sh "$img" -c "rm -f /w/fill"; \
@@ -346,13 +350,13 @@ sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
 
 Paste back the whole output. Expected:
 
-- `dd: error writing '/w/fill': No space left on device`, and a records line short of 25600;
-- the two data-root `avail` figures within about 100 MB of each other;
+- `dd: error writing '/w/fill': No space left on device`, then its records lines, short of 25600;
+- the two data-root `avail` figures within about 100 MB of each other. A drop the size of the write means the image isn't allocated: `du -B1 /var/lib/hapi/rundisk.img` shows less than its size. With no run live, make the run disk again as [above](#making-the-run-disk-the-operator-once-with-sudo) says for a new size;
 - the closing `df` showing the run disk nearly empty again, which shows the 1001 delete and hapi's `rmdir` worked.
 
 If any `docker` step fails, the commands after it still try to remove the volume and the dir; run `sudo -u hapi -H -- sh -c 'export XDG_RUNTIME_DIR="/run/user/$(id -u)"; docker volume ls -q --filter name=hapi-t20-diskcheck; ls -la /var/lib/hapi/rundisk'` and paste that back too.
 
-**If the first `docker run` (the `chown`) fails with `no such file or directory`**, typically `error while mounting volume '…/hapi-t20-diskcheck/_data': failed to mount local volume: mount /var/lib/hapi/rundisk/hapi-t20-diskcheck:…: no such file or directory`, hapi's rootless Docker was most likely already running when the run disk was mounted, and its own mount namespace (rootlesskit's) may still see the empty dir underneath, not the new filesystem ([spike 09](../spikes/09-run-engine-offline.md), finding 17: the bind fails only at `docker run`). Restart hapi's Docker, as hapi, once no run is live (`hapi run list`): it stops and restarts the stack's containers (`restart: unless-stopped` brings them back), and a live run would be lost. The script sets hapi's runtime dir and session bus, as `scripts/host-setup.sh` does for `systemctl --user`:
+**If the first `docker run` (the `chown`) fails with `no such file or directory`**, typically `error while mounting volume '…/hapi-t20-diskcheck/_data': failed to mount local volume: mount /var/lib/hapi/rundisk/hapi-t20-diskcheck:…: no such file or directory`, hapi's rootless Docker doesn't see the run disk. Docker runs in rootlesskit's own mount namespace, which sees a mount made after Docker started only if rootlesskit propagates the host's mounts into it; if not, Docker sees the empty dir underneath, not the new filesystem ([spike 09](../spikes/09-run-engine-offline.md), finding 17: the bind fails only at `docker run`). Rootless Docker's own start script passes `--propagation=rslave`, which does propagate: on the build host, the run disk mounted while hapi's Docker ran was bound at once (Task 16, H-287). Check what yours runs with: `ps -o args= -C rootlesskit | grep -o -e '--propagation=[a-z]*'`. With `rslave` or `rshared` and the error anyway, the cause is elsewhere: keep the error and the listing above. With anything else, restart hapi's Docker, as hapi, once no run is live (`hapi run list`): it stops and restarts the stack's containers (`restart: unless-stopped` brings them back), and a live run would be lost. The script sets hapi's runtime dir and session bus, as `scripts/host-setup.sh` does for `systemctl --user`:
 
 ```bash
 sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
