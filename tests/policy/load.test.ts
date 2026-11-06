@@ -55,7 +55,7 @@ test("rejects unknown keys with file and path", () => {
 describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
   const p = loadPolicy("policy");
 
-  test("protected paths are exactly spec §8.2", () => {
+  test("protected paths are exactly spec §8.2 with its as-built additions (design §3.3's MCP configs, H-302's .gitattributes)", () => {
     const ask = { interactive: "ask", unattended: "deny", workers: "deny" } as const;
     const deny = { interactive: "deny", unattended: "deny", workers: "deny" } as const;
     expect(p.protectedPaths).toEqual({
