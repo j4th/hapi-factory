@@ -45,7 +45,7 @@ Run every command through mise. `mise install` gets the pinned tools; each task 
 
 ## Never
 
-- Edit a protected path: the agent instruction files (this file among them), `.factory/**`, `.github/**`, `mise.toml`, `mise.lock`, `.coderabbit.yaml`, `biome.json*`, `bunfig.toml`, `tsconfig*.json`, `osv-scanner.toml`, `.gitleaks.toml` and `.gitleaksignore`. The guard refuses the write, and the host's diff gate fails the run.
+- Edit a protected path: the agent instruction files (this file among them), `.factory/**`, `.github/**`, `mise.toml`, `mise.lock`, `.coderabbit.yaml`, `biome.json*`, `bunfig.toml`, `tsconfig*.json`, `osv-scanner.toml`, `.gitleaks.toml`, `.gitleaksignore` and `.gitattributes`. The guard refuses the write, and the host's diff gate fails the run.
 - Add a dependency the work order doesn't name.
 - Weaken, skip or delete a test to make it pass.
 - Commit a secret, a token or a key, even a fake-looking one.

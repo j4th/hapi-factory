@@ -78,6 +78,7 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
       "**/.rules/**": ask,
       "**/.mcp.json": ask,
       "**/.vscode/mcp.json": ask,
+      "**/.gitattributes": ask,
       ".factory/**": ask,
       ".github/**": ask,
       "mise.toml": ask,

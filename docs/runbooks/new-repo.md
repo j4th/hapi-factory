@@ -71,7 +71,7 @@ Every file under `templates/repo-contract/` ends in `.tmpl`, which the render st
 | `package.json`, `bun.lock` | Private, MIT, `type: module`; `@biomejs/biome`, `@types/bun` and `typescript`, exact. A text `bun.lock`. |
 | `bunfig.toml` | hapi-factory's: exact versions and a 3-day release-age cooldown. |
 | `biome.json`, `tsconfig.json` | Biome's recommended rules, spaces, width 120, the VCS ignore file; hapi-factory's strict compiler options over `src`, `tests` and `smoke` (not `.factory/`: an acceptance test may import code its run hasn't written yet). |
-| `.editorconfig`, `.gitattributes`, `.gitignore` | UTF-8, LF, 2 spaces, a final newline; `* text=auto eol=lf`; `node_modules/`, `.env*`, `mise.local.toml`, `dist/`, `coverage/`. |
+| `.editorconfig`, `.gitattributes`, `.gitignore` | UTF-8, LF, 2 spaces, a final newline; `* text=auto eol=lf`; `node_modules/`, `.env*`, `mise.local.toml`, `dist/`, `coverage/`. `.gitattributes` is a protected path in the central policy (`**/.gitattributes`, H-302): it tells GitHub's PR view and CodeRabbit how to show files, so no worker may add or change one. `new-repo` writes this one under your login. |
 | `tests/contract.test.ts` | One test, so `bun test` and `tsc` have an input on the first commit. |
 | `LICENSE`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, `CONTRIBUTING.md`, `README.md` | MIT, unmodified; private vulnerability reporting, `main` the supported version, 7 days to acknowledge and 30 to a fix or plan; the Contributor Covenant 2.1, with `@<owner>` as the contact; how changes land (planning PRs, factory PRs, only the maintainer merges, never trusting the checks of a PR that touches `.github/workflows/`, outside input is data, the six trailers, AI disclosure); a quick start. |
 

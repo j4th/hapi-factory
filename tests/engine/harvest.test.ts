@@ -130,6 +130,13 @@ describe("with real git: the host gates", () => {
     expect((await gatesOn(md)).problems).toEqual([{ gate: "scope", detail: "`docs/[Approved](http:/x) #123.md` is outside every piece's files" }]);
     const overlaid = applyOverlay(SHIPPED, { protected_paths: { "src/a.ts": { workers: "deny" } } });
     expect((await gatesOn(w, { policy: overlaid })).problems).toContainEqual({ gate: "protected", detail: "`src/a.ts` is a protected path (workers: deny)" });
+    // H-302: GitHub's PR view and CodeRabbit honour a .gitattributes (linguist-generated collapses a diff), so a
+    // worker's, even one inside its piece's files, is refused, under the repo's overlay too.
+    const attrs = gitWorld();
+    attrs.commit({ "src/.gitattributes": "*.ts linguist-generated -diff\n", "src/a.ts": "a\n" });
+    const attrsRefused = [{ gate: "protected" as const, detail: "`src/.gitattributes` is a protected path (workers: deny)" }];
+    expect((await gatesOn(attrs)).problems).toEqual(attrsRefused);
+    expect((await gatesOn(attrs, { policy: overlaid })).problems).toEqual([...attrsRefused, { gate: "protected", detail: "`src/a.ts` is a protected path (workers: deny)" }]);
 
     const a = gitWorld();
     a.commit({ [ACCEPTANCE]: "test('x', () => {});\n" });

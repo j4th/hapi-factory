@@ -42,8 +42,9 @@ protected_paths:
   # ... and the other agent instruction files at any depth (**/CLAUDE.md, **/.claude/** ...), .factory/**, .github/**, mise.toml and every
   # other mise config file and lockfile at any depth (**/mise.toml, **/.mise.toml, **/mise.*.toml, **/mise/**, **/.tool-versions, **/mise.lock ...), .agents/**,
   # .archon/**, .coderabbit.yaml, .coderabbit.yml, .coderabbit.config.ts, git's own files (**/.git/**, deny everywhere), and gitleaks's
-  # **/.gitleaks.toml and **/.gitleaksignore, and the MCP configs **/.mcp.json and **/.vscode/mcp.json (exactly spec §8.2, plus design §3.3's two:
-  # Claude Code loads a project's .mcp.json without asking under -p)
+  # **/.gitleaks.toml and **/.gitleaksignore, the MCP configs **/.mcp.json and **/.vscode/mcp.json, and **/.gitattributes (exactly spec §8.2,
+  # plus design §3.3's two: Claude Code loads a project's .mcp.json without asking under -p; and H-302's: a .gitattributes tells GitHub's PR
+  # view and reviewers how to show files, so a worker's could hide a change from review)
 ```
 
 Keys are globs relative to a repo's root. Each entry sets all three modes:
@@ -80,6 +81,8 @@ The error names the problem, with the path JSON-escaped so it prints safely, e.g
 When you change `protected_paths.yaml` or the matching rule, update the vectors in the same change.
 
 **Hermes and the MCP configs.** Hermes's gate keeps only a glob's last segment, so `**/.vscode/mcp.json` protects every `mcp.json` for Hermes, not just the one under `.vscode/`. That is stricter, so it is allowed; the other enforcers match the whole glob.
+
+**`.gitattributes` (H-302).** GitHub's PR view and CodeRabbit's review honour a repo's `.gitattributes`: `linguist-generated` collapses a file's diff on the PR page. So `**/.gitattributes` is protected, at any depth and in any case, and the host gates refuse a run that adds, changes or deletes one. The host's own reads of a run's change already ignore every in-tree `.gitattributes` (`scratchGit` sets `GIT_ATTR_SOURCE` to git's empty tree, `src/engine/decisions.ts`). What it doesn't reach is the `.gitattributes` a factory PR inherits: `main`'s (the contract's, which `hapi new-repo` writes under the operator's login, or any the operator merges later, a planning PR's included) still shapes GitHub's PR view and CodeRabbit's review of every factory PR, and the CodeRabbit CLI in the review container probably reads it in the run's checkout. A planning PR's own `.gitattributes` shapes that PR's view before its merge.
 
 #### Glob syntax
 

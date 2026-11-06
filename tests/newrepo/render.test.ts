@@ -119,7 +119,7 @@ test("the rendered contract passes the checks new-repo makes before it pushes", 
   expect(contractProblems(files, policy)).toEqual([]);
 
   const overlaid = applyOverlay(policy, overlayFromText(text(".factory/config.yaml"), ".factory/config.yaml"));
-  for (const path of ["biome.json", "src/biome.jsonc", "bunfig.toml", "tsconfig.json", "osv-scanner.toml", ".factory/work/0001-example/acceptance/tools.test.ts"]) {
+  for (const path of ["biome.json", "src/biome.jsonc", "bunfig.toml", "tsconfig.json", "osv-scanner.toml", ".factory/work/0001-example/acceptance/tools.test.ts", ".gitattributes"]) {
     expect([path, effectiveModes(overlaid, path).workers]).toEqual([path, "deny"]);
   }
   expect(effectiveModes(overlaid, "src/server.ts")).toEqual(UNPROTECTED);
@@ -143,7 +143,7 @@ test("the rendered contract passes the checks new-repo makes before it pushes", 
   delete ours.knowledge_base.code_guidelines;
   const theirs = YAML.parse(text(".coderabbit.yaml"));
   const instructions = (c: any) => c.reviews.pre_merge_checks.custom_checks[0].instructions as string;
-  const contractFiles = "or the gates' own config: mise.lock, biome.json*, bunfig.toml, tsconfig*.json, .gitleaks.toml, .gitleaksignore, osv-scanner.toml, at any depth)";
+  const contractFiles = "or the gates' own config: mise.lock, biome.json*, bunfig.toml, tsconfig*.json, .gitleaks.toml, .gitleaksignore, osv-scanner.toml, at any depth; or .gitattributes at any depth)";
   expect(instructions(theirs)).toBe(instructions(ours).replace(") or policy/protected_paths.yaml", `; ${contractFiles}`));
   theirs.reviews.pre_merge_checks.custom_checks[0].instructions = instructions(ours);
   expect(theirs).toEqual(ours);
@@ -185,6 +185,8 @@ test("AGENTS.md works for an unattended agent (H-228(a))", () => {
   expect([...agents.matchAll(/^## (.+)$/gm)].map((m) => m[1])).toEqual(["Commands", "What done means", "Layout", "Gotchas", "Out of scope unless the work order names it", "Never", "How to end"]);
   for (const t of ["setup", "fmt", "lint", "test", "check", "smoke", "scan"]) expect(agents).toContain(`mise run ${t}`);
   expect(agents).toContain("bun test ./.factory/work/<id>/acceptance");
+  // The never list names the central protected paths a worker might reach for, .gitattributes among them (H-302).
+  expect(agents).toContain("`.gitleaks.toml`, `.gitleaksignore` and `.gitattributes`. The guard refuses the write");
 });
 
 test("CONTRIBUTING.md explains the acceptance tests in one line", () => {

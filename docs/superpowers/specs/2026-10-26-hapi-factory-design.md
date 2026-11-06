@@ -416,6 +416,8 @@ protected_paths:
 - **gitleaks's `.gitleaks.toml` and `.gitleaksignore`** (added the same day): either could turn a repo's secret scan off. hapi-factory's own scans name their config, and its CI refuses a `.gitleaksignore`.
 - **Backstop:** CODEOWNERS plus the ruleset. A guard failing locally can't land a change.
 
+> **As built (noted 2026-11-06, H-302):** `policy/protected_paths.yaml` also protects `**/.gitattributes`, with the modes above (`ask`, `deny`, `deny`; the operator's ruling on PR #15). A `.gitattributes` tells GitHub's PR view and reviewers how to show files (`linguist-generated` collapses a file's diff), so a worker's could hide a change from review; the host's own reads of a run's change ignore every in-tree one already. The MCP configs `**/.mcp.json` and `**/.vscode/mcp.json` are in it too ([Plan 03's design](2026-10-31-hapi-factory-03-run-engine-design.md), §3.3), so the file, not the block above, is the whole list.
+
 ---
 
 ## 9. Components
