@@ -28,8 +28,11 @@ export type Tier = "small" | "medium" | "large";
 /** A trusted-source tier (spec §10). */
 export type SourceTier = "T0" | "T1" | "T2" | "T3";
 
-/** An egress zone: one per container network with its own proxy. */
-export type ZoneName = "hermes" | "archon" | "research";
+/**
+ * An egress zone: one per container network with its own proxy. `review` is the review container's (design §3.5):
+ * a review run is a run container of the archon service, joined to egress-review instead of egress-archon.
+ */
+export type ZoneName = "hermes" | "archon" | "research" | "review";
 
 export interface Zone {
   /** The source tiers this zone may reach. Their hosts join the zone's allowlist. */
@@ -87,18 +90,73 @@ export interface Budgets {
   jev_monthly_usd: number;
   run_usd: number;
   hermes_max_turns: number;
-  /** The mode per enforcer for `run_usd`: hapi-guard (Plan 02) and Archon's budget (Plan 03). */
-  enforcement: { hapi_guard: Enforcement; archon: Enforcement };
+  /** Per registered repo, per UTC calendar month. The poller checks it. */
+  repo_monthly_usd: number;
+  /** All repos together, per UTC calendar day. The poller checks it. Central only. */
+  daily_usd: number;
+  /**
+   * The mode per enforcer: hapi-guard and Archon's budget for `run_usd`, the poller for the repo and day caps. The
+   * round counts (`runs.max_auto_rounds`, the phases' fix rounds, `max_retries`, `max_rework_rounds`) are always hard (M19).
+   */
+  enforcement: { hapi_guard: Enforcement; archon: Enforcement; poller: Enforcement };
+}
+
+/** What a run does and how many fix rounds it may make, from runs.yaml. An overlay may switch a phase on, never off. */
+export interface Phases {
+  verify: boolean;
+  review: boolean;
+  /** The CodeRabbit CLI in the review container; `flags.coderabbit` is CodeRabbit's PR review. */
+  coderabbit: boolean;
+  /** "Ready to merge" needs the work order's acceptance tests to exist and pass. */
+  require_acceptance: boolean;
+  fix_rounds_before_pr: number;
+  fix_rounds_on_pr: number;
+  round_turns: number;
+  round_usd: number;
+}
+
+/** The repo registry, from repos.yaml. */
+export interface RepoRegistry {
+  installations: { planner: number; factory: number; coderabbit?: number };
+  repos: Record<string, { registered: string }>;
+}
+
+/** One central sidecar, from sidecars.yaml. */
+export interface Sidecar {
+  image: string;
+  command: string[];
+  port: number;
+  /**
+   * Its limits, each a fail-closed default to tune, and always hard: the container's (`docker run --pids-limit`,
+   * `--memory`, which Docker enforces) and the caps on the data exported to it from the run's commit
+   * (src/run/sidecar.ts `exportSidecarData`, which refuses the run when they are crossed). Central only.
+   */
+  limits: { pids: number; memory_mb: number; data_files: number; data_mb: number };
 }
 
 /** The run launcher's limits, from runs.yaml. A repo overlay may only lower them. */
 export interface Runs {
   /** Runs live at once. */
   max_live: number;
-  /** Days after a run's harvestedAt that its files are kept (H-206). */
+  /** Days after a run's harvestedAt that its files are kept (H-206), and never less than until the UTC month it started in has ended. */
   retention_days: number;
   /** The largest, in MB, each file a run writes may be. */
   output_limits_mb: { bundle: number; transcript: number; decisions: number; result: number };
+  /** The most disk one run's volumes may use. */
+  disk: { gb: number; enforcement: Enforcement };
+  /** Seconds between the poller's passes. Central only. */
+  poll_interval_s: number;
+  /** Automatic runs per work order with no human action between them. */
+  max_auto_rounds: number;
+  /** Times the operator may queue a failed work order again (`hapi retry`). Always hard; central only. */
+  max_retries: number;
+  /** Rework runs a maintainer's `hapi:rework` label may start on one factory PR. Always hard; central only. */
+  max_rework_rounds: number;
+  /** The most, in MiB, a review or fix run's inputs copy may be: refused, never truncated. Central only. */
+  inputs_mb: number;
+  /** The most, in KiB, discovery reads of each work-order file: refused, never truncated. Central only. */
+  work_order_kb: number;
+  phases: Phases;
 }
 
 /** The level-6 gate settings, from gates.yaml. Central only: an overlay can't name it. */
@@ -117,6 +175,33 @@ export interface Gates {
     /** Prices are USD per million tokens. */
     haiku: { model: "claude-haiku-5-5"; input_per_mtok: number; output_per_mtok: number };
   };
+}
+
+/** One run-engine decision's mode (gates.yaml's `decisions.by_name.<name>.mode`): off, asked and recorded only, or acted on. */
+export type DecisionMode = "off" | "shadow" | "enforce";
+
+/** The whole `decisions` block's mode (gates.yaml's `decisions.mode`): the operator's switch for running without decision models. */
+export type DecisionModels = "enforce" | "notes" | "off";
+
+/** One run-engine decision's knobs. `skip_paths` only for a decision whose subjects are changed files. */
+export interface EngineDecision {
+  mode: DecisionMode;
+  /** What a subject no classifier answered does: hold back Ready to merge, or add a note. */
+  on_unscreened: "hold" | "note";
+  /** Exact repo paths (case-sensitive, never globs) of lockfiles never screened, each skipped only while its content parses as that lockfile. */
+  skip_paths?: string[];
+}
+
+/**
+ * The run engine's `decide()` questions, from gates.yaml's `decisions` block (Plan 03 Task 12): central only, and
+ * loaded apart from the guard's gates, so `Policy.gates` keeps Plan 02's shape. `by_name`'s keys are
+ * src/engine/decisions.ts's `ENGINE_DECISIONS`, held equal by the schema and a test.
+ */
+export interface EngineDecisions {
+  mode: DecisionModels;
+  /** Classifier calls for one pushed head, over every harvest of it and every re-ask. */
+  max_calls_per_head: number;
+  by_name: Record<string, EngineDecision>;
 }
 
 /** The fixed short list of actions that always need the operator (spec §8.1). */
@@ -239,12 +324,18 @@ export interface Policy {
   budgets: Budgets;
   runs: Runs;
   gates: Gates;
+  /** gates.yaml's `decisions` block: the run engine's decisions, loaded apart from the guard's gates. */
+  decisions: EngineDecisions;
   approvals: Approval[];
   roles: Roles;
   rosters: Record<RosterName, Roster>;
   flags: Flags;
   /** The MCP catalog (spec §10.1), from mcp.yaml. */
   mcp: McpCatalog;
+  /** The repo registry (repos.yaml). */
+  repos: RepoRegistry;
+  /** The central sidecars (sidecars.yaml), by name. */
+  sidecars: Record<string, Sidecar>;
   /**
    * The repo's own settings from its overlay (spec §7). Only `applyOverlay` sets
    * it, and only when the overlay names one of them; `loadPolicy` never does.
@@ -261,26 +352,32 @@ export interface RepoSettings {
   default_risk?: Risk;
   /** The Archon workflow this repo's work orders use by default. */
   workflow?: string;
+  /** The sidecar this repo's runs start, and the repo directory mounted into it. */
+  sidecar?: { name: string; data_dir: string };
 }
 
 /**
  * A target repo's `.factory/config.yaml` (spec §7). It may only tighten policy,
- * except that it may add `egress_extra` hosts. `null` for a protected path is a
- * removal attempt, which `applyOverlay` rejects. `default_risk` and `workflow`
- * are repo settings, not policy.
+ * except that it may add `egress_extra` hosts (which the launcher refuses until
+ * H-207). `null` for a protected path is a removal attempt, which `applyOverlay`
+ * rejects. `default_risk`, `workflow` and `sidecar` are repo settings, not policy.
  */
 export interface RepoOverlay {
   protected_paths?: Record<string, Partial<PathModes> | null>;
   /** Hosts added to the archon zone. Never a forge host. */
   egress_extra?: string[];
   /** Budgets to lower; each must be at most the base value. */
-  budgets?: Partial<Omit<Budgets, "workspaces" | "enforcement">> & {
+  budgets?: Partial<Omit<Budgets, "workspaces" | "enforcement" | "daily_usd">> & {
     workspaces?: Partial<Record<Workspace, number>>;
     /** Modes to harden: soft may become hard, never the reverse. */
     enforcement?: Partial<Budgets["enforcement"]>;
   };
-  /** Run limits to lower; each must be at most the base value. */
-  runs?: Partial<Omit<Runs, "output_limits_mb">> & { output_limits_mb?: Partial<Runs["output_limits_mb"]> };
+  /**
+   * Run limits to lower, each at most the base value, and phases to switch on. The launcher's own limits (disk,
+   * max_live, retention_days, output_limits_mb but bundle) are central only (final review I6), as are the poller's.
+   */
+  runs?: { max_auto_rounds?: number; output_limits_mb?: Pick<Partial<Runs["output_limits_mb"]>, "bundle">; phases?: Partial<Phases> };
   default_risk?: Risk;
   workflow?: string;
+  sidecar?: { name: string; data_dir: string };
 }

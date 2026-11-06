@@ -15,27 +15,33 @@
  *   a line per row (`transcriptLines`), and how the run ended (`ended`).
  *
  * Everything a run wrote is untrusted text, so every line, live or stored,
- * goes through `sanitizeTerminal` (no escape sequence or control character
- * reaches the terminal), then `redactSecrets` with the archon zone's values,
- * read on the host from the env file `hapi secrets resolve` wrote; a live
- * run's lines come one at a time, so a private key's later lines are hidden
- * up to its END line (`livePrinter`). Without that file, watch fails closed and
- * prints nothing of the run. Redaction sees an exact value or a key format,
- * never an encoded or split one: it keeps keys off the screen, and is no
- * boundary.
+ * goes through `sanitizeTerminal` (no escape sequence, control character or
+ * bidi control reaches the terminal), then `redactSecrets` with the archon
+ * zone's values, and a review run's with the review zone's too
+ * (./lifecycle.ts `redactionValues`), read on the host from the env files
+ * `hapi secrets resolve` wrote; a live run's lines come one at a time, so a
+ * private key's later lines are hidden up to its END line (`livePrinter`).
+ * Without those files, watch fails closed and prints nothing of the run.
+ * Redaction sees an exact value or a key format, never an encoded or split
+ * one: it keeps keys off the screen, and is no boundary. Each line a run wrote
+ * is printed after `| ` (`RUN_LINE`), so none of them can pass for one of
+ * hapi's own (H-220): those, the ending above all, are printed unmarked.
  *
- * `list`: every run's record, newest first, with the spend Archon recorded in
- * the run's copied out/result.json, if any.
+ * `list`: every run's record, newest first, with its spend from the run's
+ * copied `out/`: the higher of the guard's ledger and Archon's
+ * `total_cost_usd`, or `-` when neither says it or the ledger falls
+ * (./spend.ts `spendOfRun`; H-229).
  */
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { closesPrivateKey, opensPrivateKey } from "../guard/secrets";
 import { definedEnv } from "../stack/up";
 import { LIST_USAGE, parseRunId, WATCH_USAGE } from "./cli";
-import { archonSecrets, asHapi, ended } from "./lifecycle";
+import { asHapi, ended, redactionValues } from "./lifecycle";
 import { listRecords, readRecord, recordDir, type RunRecord } from "./records";
 import { redactSecrets, sanitizeTerminal } from "./sanitize";
 import type { RunDeps } from "./spec";
+import { spendOfRun } from "./spend";
 
 /** How long watch waits, once a live run's log has ended, for the run to be finalized (the supervisor's copy-out takes seconds). */
 export const WATCH_WAIT_S = 120;
@@ -79,12 +85,20 @@ export function transcriptLines(text: string): string[] {
   return out;
 }
 
-/** A printer: each line of `text`, sanitized, then redacted with `values`. */
-const printer = (values: Record<string, string>) => (text: string) => {
-  for (const line of redactSecrets(sanitizeTerminal(text), values).split("\n")) console.log(line);
+/** What marks a line a run wrote (H-220): an empty one is the bare mark, with no trailing space. */
+export const RUN_LINE = "| ";
+const marked = (line: string) => (line === "" ? RUN_LINE.trimEnd() : `${RUN_LINE}${line}`);
+
+/**
+ * A printer: each line of `text`, sanitized, then redacted with `values`, then marked as the run's (`RUN_LINE`), or,
+ * for hapi's own text (`own`), unmarked. hapi's own lines go through both too: a run's ending quotes the last line
+ * of its kept log.
+ */
+const printer = (values: Record<string, string>, own = false) => (text: string) => {
+  for (const line of redactSecrets(sanitizeTerminal(text), values).split("\n")) console.log(own ? line : marked(line));
 };
 
-/** What watch prints once in place of a live private key's later lines. */
+/** What watch prints once in place of a live private key's later lines: hapi's own line, so unmarked. */
 const HIDDEN = "[hapi: private-key redacted: lines hidden until its END line]";
 
 /**
@@ -112,19 +126,19 @@ const livePrinter = (values: Record<string, string>) => {
   };
 };
 
-/** Print the run's copied transcript, then how it ended. */
-async function printEnded(d: RunDeps, rec: RunRecord, print: (text: string) => void): Promise<void> {
+/** Print the run's copied transcript through `print`, marked, then how it ended through `own`, unmarked. */
+async function printEnded(d: RunDeps, rec: RunRecord, print: (text: string) => void, own: (text: string) => void): Promise<void> {
   let text: string | undefined;
   try {
     text = await readFile(join(recordDir(d.stateDir, rec.runId), "out", "transcript.jsonl"), "utf8");
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
   }
-  if (text === undefined) print("(no transcript.jsonl was copied out)");
+  if (text === undefined) own("(no transcript.jsonl was copied out)");
   // One text, so redaction sees a key a row holds over several lines, body and all (CodeRabbit, local review);
   // each line is sanitized first, so an unterminated escape sequence takes only the rest of its own line.
   else print(transcriptLines(text).map(sanitizeTerminal).join("\n"));
-  print(ended(rec));
+  own(ended(rec));
 }
 
 /** `hapi run watch <run-id>`: see the module comment. */
@@ -134,11 +148,13 @@ export async function runWatch(args: string[], deps: Partial<RunDeps> = {}): Pro
     console.error(WATCH_USAGE);
     return 2;
   }
-  return asHapi("watch", args, deps, async (d) => {
-    const values = await archonSecrets(d.env);
-    const print = printer(values);
+  return asHapi(["run", "watch"], args, deps, async (d) => {
     let rec = await readRecord(d.stateDir, id);
     if (rec === undefined) throw new Error(`there is no run ${id} in ${d.stateDir}`);
+    // Before any line of the run is read: a zone's file that is missing fails the watch, and nothing of the run prints.
+    const values = await redactionValues(d.env, rec.kind ?? "worker");
+    const print = printer(values);
+    const own = printer(values, true);
     if (rec.status === "live") {
       // Its exit code says nothing about the run: 0 once the container exits, 1 if it is already gone.
       await d.stream(["docker", "logs", "--follow", rec.container], definedEnv(d.env), livePrinter(values));
@@ -154,21 +170,9 @@ export async function runWatch(args: string[], deps: Partial<RunDeps> = {}): Pro
         await Bun.sleep(1000);
       }
     }
-    await printEnded(d, rec, print);
+    await printEnded(d, rec, print, own);
     return 0;
   });
-}
-
-/** The spend Archon recorded for the run (out/result.json's `run.metadata.total_cost_usd`), as `$0.0000`, or "-". */
-async function spendOf(d: RunDeps, runId: string): Promise<string> {
-  let doc: { run?: { metadata?: { total_cost_usd?: unknown } } } | null = null;
-  try {
-    doc = JSON.parse(await readFile(join(recordDir(d.stateDir, runId), "out", "result.json"), "utf8"));
-  } catch {
-    doc = null;
-  }
-  const usd = doc?.run?.metadata?.total_cost_usd;
-  return typeof usd === "number" && Number.isFinite(usd) && usd >= 0 ? `$${usd.toFixed(4)}` : "-";
 }
 
 /** `hapi run list`: every run's id, status, repo, work order, start and spend, newest first. */
@@ -177,14 +181,18 @@ export async function runList(args: string[], deps: Partial<RunDeps> = {}): Prom
     console.error(LIST_USAGE);
     return 2;
   }
-  return asHapi("list", args, deps, async (d) => {
+  return asHapi(["run", "list"], args, deps, async (d) => {
     const records = (await listRecords(d.stateDir)).sort((a, b) => (a.startedAt < b.startedAt ? 1 : a.startedAt > b.startedAt ? -1 : 0));
     if (records.length === 0) {
       console.log(`no runs in ${d.stateDir}`);
       return 0;
     }
     const rows = [["RUN", "STATUS", "REPO", "WORK ORDER", "STARTED", "SPEND"]];
-    for (const r of records) rows.push([r.runId, r.status, r.repo, r.workOrder, r.startedAt, await spendOf(d, r.runId)]);
+    for (const r of records) {
+      // The higher of the guard's ledger and Archon's; an unknown spend shows as "-", never as the budget a cap counts it at.
+      const spend = spendOfRun(join(recordDir(d.stateDir, r.runId), "out"), r.budgetUsd ?? 0);
+      rows.push([r.runId, r.status, r.repo, r.workOrder, r.startedAt, spend.known ? `$${spend.usd.toFixed(4)}` : "-"]);
+    }
     const widths = rows[0]!.map((_, i) => Math.max(...rows.map((row) => row[i]!.length)));
     console.log(sanitizeTerminal(rows.map((row) => row.map((cell, i) => cell.padEnd(widths[i]!)).join("  ").trimEnd()).join("\n")));
     return 0;

@@ -90,6 +90,33 @@
       "type": "integer",
       "minimum": 1
     },
+    "rounds": {
+      "description": "A whole number of rounds, at least 0 (0 turns the rounds off).",
+      "type": "integer",
+      "minimum": 0
+    },
+    "port": {
+      "description": "A TCP port, 1-65535.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "installationId": {
+      "description": "A GitHub App installation id: the number at the end of /settings/installations/<id>. Not secret.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "ownerRepo": {
+      "description": "A GitHub repo as owner/name. This is app-token.ts's OWNER_REPO plus parseOwnerRepo's refusal of '.' and '..' as the name.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9-]{0,38}/(?!\\.\\.?$)[A-Za-z0-9._-]{1,100}$"
+    },
+    "date": {
+      "description": "A calendar date, YYYY-MM-DD.",
+      "type": "string",
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$"
+    },
     "exactVersion": {
       "description": "An exact release version, MAJOR.MINOR.PATCH (calendar versions such as 2026.10.24 too). Never a range (^4.3.0, ~4.3), a tag (latest) or a prerelease (4.3.0-canary.1).",
       "type": "string",

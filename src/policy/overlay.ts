@@ -7,10 +7,17 @@
  *   glob's modes (allow < ask < deny);
  * - add `egress_extra` hosts to the archon zone (the one exception to tighten-only),
  *   but never a forge host, since the archon zone has no forge route (spec §4.3);
- * - lower budgets and run limits, and harden budget enforcement modes (soft < hard);
- * - set the repo's `default_risk` and `workflow` (spec §7). These are repo
- *   settings, not policy, so tighten-only doesn't apply: they appear on the
- *   result as `repo`, for Plan 03 to read.
+ * - lower budgets, and harden budget enforcement modes (soft < hard);
+ * - switch a run phase on (never off), lower the fix-round counts, turns and
+ *   cap, `max_auto_rounds` and `runs.output_limits_mb.bundle` (the harvest
+ *   enforces it). The launcher's own run limits (`runs.disk`, `max_live`,
+ *   `retention_days` and the other output limits) are central only, since it
+ *   reads only policy/runs.yaml's: an overlay that sets one is refused, naming
+ *   it (final review I6), never silently ignored;
+ * - set the repo's `default_risk`, `workflow` and `sidecar` (spec §7). These are
+ *   repo settings, not policy, so tighten-only doesn't apply: they appear on the
+ *   result as `repo`, for Plan 03 to read. A sidecar must be one
+ *   policy/sidecars.yaml lists, and its data dir is denied to workers.
  * Anything else is rejected: unknown keys and non-canonical globs by the schema
  * (in `loadOverlay`, and again in `applyOverlay`), and loosening by
  * `applyOverlay`, with a `PolicyLoosenError` naming the path. Nothing is ever
@@ -20,10 +27,10 @@
  * mode is the strictest across every glob that matches it (see ./paths.ts).
  */
 import { forgeDomain, forgeHostMessage } from "./hosts";
-import { loadChecked, PolicyError } from "./load";
+import { loadChecked, PolicyError, phaseIssues } from "./load";
 import { RANK, SESSIONS, UNPROTECTED } from "./paths";
-import { check, pointerSegment } from "./schema";
-import type { Budgets, Enforcement, Policy, RepoOverlay, RepoSettings, Runs } from "./types";
+import { check, parseYaml, pointerSegment, readYaml } from "./schema";
+import type { Budgets, Enforcement, Phases, Policy, RepoOverlay, RepoSettings, Runs } from "./types";
 
 /** Tightening order of enforcement modes: soft < hard. */
 const ENFORCEMENT_RANK: Record<Enforcement, number> = { soft: 0, hard: 1 };
@@ -40,9 +47,50 @@ export class PolicyLoosenError extends Error {
   }
 }
 
+/** The run limits the launcher reads only from policy/runs.yaml (final review I6), as JSON Pointers into an overlay. */
+const CENTRAL_ONLY_RUNS = ["/runs/disk", "/runs/max_live", "/runs/retention_days", "/runs/output_limits_mb/transcript", "/runs/output_limits_mb/decisions", "/runs/output_limits_mb/result"];
+
+/**
+ * An issue per central-only run limit `data` sets (I6), so an overlay written for the old schema fails naming the
+ * key, never "unknown key" alone.
+ */
+function centralOnlyIssues(data: unknown): { path: string; message: string }[] {
+  const at = (path: string) => path.split("/").slice(1).reduce<unknown>((v, k) => (v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>)[k] : undefined), data);
+  return CENTRAL_ONLY_RUNS.filter((path) => at(path) !== undefined).map((path) => {
+    const key = path.slice(1).split("/").join(".");
+    return { path, message: `${key} is central only: the launcher reads only policy/runs.yaml's${key === "runs.disk" ? " (the run disk is one filesystem every run shares)" : ""}, so remove it from the overlay` };
+  });
+}
+
 /** Load and schema-check an overlay file. Throws PolicyError naming the file and path. */
 export function loadOverlay(file: string): RepoOverlay {
+  let data: unknown;
+  try {
+    data = readYaml(file);
+  } catch (e) {
+    throw new PolicyError(file, [{ path: "", message: (e as Error).message }]);
+  }
+  const central = centralOnlyIssues(data);
+  if (central.length > 0) throw new PolicyError(file, central);
   return loadChecked(file, "repo-overlay") as RepoOverlay;
+}
+
+/**
+ * Check overlay text read as a git blob (H-172) as `loadOverlay` checks a file.
+ * `label` names it in errors, e.g. `abc1234:.factory/config.yaml`. Throws PolicyError.
+ */
+export function overlayFromText(text: string, label: string): RepoOverlay {
+  let data: unknown;
+  try {
+    data = parseYaml(text);
+  } catch (e) {
+    throw new PolicyError(label, [{ path: "", message: e instanceof Error ? e.message : String(e) }]);
+  }
+  const central = centralOnlyIssues(data);
+  if (central.length > 0) throw new PolicyError(label, central);
+  const issues = check("repo-overlay", data);
+  if (issues.length > 0) throw new PolicyError(label, issues);
+  return data as RepoOverlay;
 }
 
 /**
@@ -53,10 +101,25 @@ export function loadOverlay(file: string): RepoOverlay {
  * `loadOverlay`; problems throw a PolicyError for the file "(overlay)".
  */
 export function applyOverlay(p: Policy, o: RepoOverlay): Policy {
+  const central = centralOnlyIssues(o);
+  if (central.length > 0) throw new PolicyError("(overlay)", central);
   const issues = check("repo-overlay", o);
   if (issues.length > 0) throw new PolicyError("(overlay)", issues);
   const result = structuredClone(p);
   if (o.protected_paths) result.protectedPaths = tightenPaths(result.protectedPaths, o.protected_paths);
+  if (o.sidecar) {
+    const { name, data_dir } = o.sidecar;
+    if (!Object.hasOwn(p.sidecars, name)) {
+      throw new PolicyError("(overlay)", [
+        {
+          path: "/sidecar/name",
+          message: `"${name}" is not a sidecar in policy/sidecars.yaml (it lists: ${Object.keys(p.sidecars).join(", ")})`,
+        },
+      ]);
+    }
+    // The sidecar's data is the sidecar's code (`bun /data/server.ts`), so a worker may not write it.
+    result.protectedPaths = tightenPaths(result.protectedPaths, { [`${data_dir}/**`]: { workers: "deny" } });
+  }
   if (o.egress_extra) {
     o.egress_extra.forEach((host, i) => {
       // The same forge list as the work-order schema's egress_extra (./hosts.ts).
@@ -68,10 +131,13 @@ export function applyOverlay(p: Policy, o: RepoOverlay): Policy {
   }
   if (o.budgets) result.budgets = lowerBudgets(result.budgets, o.budgets);
   if (o.runs) result.runs = lowerRuns(result.runs, o.runs);
+  const phase = phaseIssues(result.budgets, result.runs).map((i) => ({ ...i, path: `/runs${i.path}` }));
+  if (phase.length > 0) throw new PolicyError("(overlay)", phase);
   // Repo settings, not policy: no tighten-only check applies.
   const repo: RepoSettings = {};
   if (o.default_risk !== undefined) repo.default_risk = o.default_risk;
   if (o.workflow !== undefined) repo.workflow = o.workflow;
+  if (o.sidecar !== undefined) repo.sidecar = { ...o.sidecar };
   if (Object.keys(repo).length > 0) result.repo = { ...result.repo, ...repo };
   return result;
 }
@@ -155,19 +221,27 @@ function lowerBudgets(base: Budgets, overlay: NonNullable<RepoOverlay["budgets"]
   return result;
 }
 
+const PHASE_SWITCHES = ["verify", "review", "coderabbit", "require_acceptance"] as const;
+const PHASE_NUMBERS = ["fix_rounds_before_pr", "fix_rounds_on_pr", "round_turns", "round_usd"] as const;
+
 function lowerRuns(base: Runs, overlay: NonNullable<RepoOverlay["runs"]>): Runs {
-  const { output_limits_mb, ...scalars } = overlay;
-  const result = { ...base, output_limits_mb: { ...base.output_limits_mb } };
-  for (const [key, value] of Object.entries(scalars) as [Exclude<keyof Runs, "output_limits_mb">, number][]) {
-    result[key] = lower(`/runs/${pointerSegment(key)}`, `runs.${key}`, base[key], value);
+  const { output_limits_mb, phases, max_auto_rounds } = overlay;
+  const result = {
+    ...base,
+    output_limits_mb: { ...base.output_limits_mb },
+    disk: { ...base.disk },
+    phases: { ...base.phases },
+  };
+  result.max_auto_rounds = lower("/runs/max_auto_rounds", "runs.max_auto_rounds", base.max_auto_rounds, max_auto_rounds);
+  result.output_limits_mb.bundle = lower("/runs/output_limits_mb/bundle", "runs.output_limits_mb.bundle", base.output_limits_mb.bundle, output_limits_mb?.bundle);
+  for (const key of PHASE_NUMBERS) {
+    result.phases[key] = lower(`/runs/phases/${key}`, `runs.phases.${key}`, base.phases[key], phases?.[key]);
   }
-  for (const [key, value] of Object.entries(output_limits_mb ?? {}) as [keyof Runs["output_limits_mb"], number][]) {
-    result.output_limits_mb[key] = lower(
-      `/runs/output_limits_mb/${pointerSegment(key)}`,
-      `runs.output_limits_mb.${key}`,
-      base.output_limits_mb[key],
-      value,
-    );
+  for (const key of PHASE_SWITCHES) {
+    const value: Phases[typeof key] | undefined = phases?.[key];
+    if (value === undefined) continue;
+    if (base.phases[key] && !value) throw new PolicyLoosenError(`/runs/phases/${key}`, `switches runs.phases.${key} off`);
+    result.phases[key] = value;
   }
   return result;
 }

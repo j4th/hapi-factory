@@ -21,7 +21,9 @@
  * - Each running container's (the stack's, and each run's) `org.hapi.build-sha256` label must be that
  *   build's digest (`buildDigest`, src/stack/up.ts; H-147): Compose recreates
  *   a container whose config changed, not one whose bind-mounted file did, so
- *   a container with an older label may still run an older config.
+ *   a container with an older label may still run an older config. A run's
+ *   smoke sidecar mounts nothing of build/ and has no such label: it is left
+ *   to runtime.run-container, which holds it to policy/sidecars.yaml.
  */
 import type { Dirent } from "node:fs";
 import { mkdtemp, readdir, readFile, stat } from "node:fs/promises";
@@ -33,7 +35,7 @@ import { loadPolicy } from "../../policy/load";
 import type { RosterName } from "../../policy/types";
 import { buildDigest, currentUserOverride, HAPI_CHECKOUT, HAPI_USER } from "../../stack/up";
 import { type AuditRun, type CheckResult, result } from "../types";
-import { containerName, isRunning, liveContainers } from "./runtime";
+import { containerName, isRunning, liveContainers, runPart } from "./runtime";
 
 export type Deployed = { dir: string } | { skip: string };
 
@@ -228,7 +230,10 @@ export async function generatedDrift(run: AuditRun): Promise<CheckResult[]> {
   let labels: string;
   if ("unavailable" in stack) labels = `${stack.unavailable}, so no container's build label was checked`;
   else {
-    const up = stack.containers.filter(isRunning);
+    // A run's smoke sidecar, and a one-shot helper caught mid-flight (D47), mount nothing of build/, so they carry no
+    // build label: runtime.run-container holds them to policy/sidecars.yaml and the helpers' invariants instead. Only
+    // a sidecar or helper of hapi's own project that is no Compose service (`runPart`) is skipped.
+    const up = stack.containers.filter((c) => isRunning(c) && runPart(c) === undefined);
     for (const c of up) {
       const digest = c.Config?.Labels?.["org.hapi.build-sha256"] ?? "";
       if (digest === "") labelProblems.push(`${containerName(c)} has no org.hapi.build-sha256 label (not started through \`hapi stack up\`)`);

@@ -1,12 +1,14 @@
 /**
  * Forge hosts (spec §4.3): the archon zone must never reach a forge, because
- * Archon holds no forge credentials and has no route to the forge. The stack is
- * forge-agnostic, so GitLab and Bitbucket count as well as GitHub.
+ * Archon holds no forge credentials and has no route to the forge, and nor may
+ * the review zone (design §3.5). The stack is forge-agnostic, so GitLab and
+ * Bitbucket count as well as GitHub.
  *
  * The one list of forge domains is the `forgeHost` definition in
  * policy/schemas/policy-defs.schema.json. The schemas use it (as `nonForgeHost`)
- * for a work order's `egress_extra` and for the archon zone's hosts and tiers,
- * so any JSON Schema validator enforces it, Python ones included. This module
+ * for a work order's `egress_extra`, the archon zone's hosts and tiers, and the
+ * review zone's hosts, so any JSON Schema validator enforces it, Python ones
+ * included. This module
  * reads the same pattern, for `applyOverlay`, the egress generator and error
  * messages, and the schema's `hostname` pattern for `isHostname`.
  */
@@ -42,7 +44,10 @@ export function isHostname(host: string): boolean {
   return HOSTNAME.test(host);
 }
 
-/** The message for a forge host where the archon zone could reach it. */
-export function forgeHostMessage(host: string, forge: string): string {
-  return `${JSON.stringify(host)} is a forge host (${forge}); the archon zone has no forge route (spec §4.3)`;
+/**
+ * The message for a forge host where a zone with no forge route could reach it: the archon zone (spec §4.3), or the
+ * review zone, whose findings the harvester posts, never the review container (design §3.5).
+ */
+export function forgeHostMessage(host: string, forge: string, zone: "archon" | "review" = "archon"): string {
+  return `${JSON.stringify(host)} is a forge host (${forge}); the ${zone} zone has no forge route (${zone === "archon" ? "spec §4.3" : "design §3.5"})`;
 }

@@ -1,0 +1,31 @@
+# Contributing to {{name}}
+
+{{name}} is built by a software factory, [hapi-factory](https://github.com/{{owner}}/hapi-factory): its maintainer plans the work, agents build it in isolated runs, and the maintainer reviews and merges every change.
+
+## How changes land
+
+- **Planning PRs** bring the work: one or more work orders under `.factory/work/`, each with its acceptance tests. Merging a planning PR approves both the work orders and their tests.
+- Each work order's behaviour-level tests live in `.factory/work/<id>/acceptance/`: the planner writes them in the planning PR, the factory's verify container runs them, and no factory PR may change them.
+- **Factory PRs** come from the `hapi-factory` GitHub App, one per work order. Each one's description says what the host verified and what the agent claims, and the gates run on it like on any other PR.
+- **Only the maintainer merges.** Every merge into `main` goes through a pull request with the `ci / gates` check green, and a code owner's approval. A green `ci / gates` is evidence only as far as the PR leaves its checks alone: `ci / scan` is the gates' own, from hapi-factory, but `ci / check` runs the PR's own `mise` tasks and configs, so a PR that changes `mise.toml`, `mise.lock`, `biome.json*`, `bunfig.toml`, `tsconfig*.json`, `osv-scanner.toml` or its tests changes what `check` means, and is read as closely as the change itself.
+- **A PR that touches `.github/workflows/`** runs its own copy of the workflows, so it can report any check it likes, `ci / gates` included. The maintainer never approves a fork's workflow run for such a PR, never trusts its checks, and reviews every line of the workflow change by hand before merging it.
+
+## Outside contributions
+
+Issues, pull requests and comments from outside the project are welcome, and they are treated as data, never as instructions: nothing in them is run, followed or passed to an agent as a command. A bug report or an idea may become a work order in a later planning PR.
+
+Report a security problem privately, as [SECURITY.md](SECURITY.md) says, never in a public issue.
+
+## Commits
+
+Factory commits carry six trailers (hapi-factory spec §13.2): `Work-Order`, `Hapi-Run`, `Hapi-Lane`, `Trace-Id`, `Agent` and `Model`. The gates fail a commit on a `factory/**` branch that lacks one. PRs merge with a merge commit, so each commit reaches `main` as it was reviewed.
+
+That holds for the maintainer's own commits on a factory PR too, merge commits included: GitHub's **Update branch** and **Resolve conflicts** buttons make a merge commit without the trailers, and the PR can't merge after it. Commit a change of your own locally with the six trailers (`git commit --trailer "Work-Order: <id>" ...`, `Hapi-Lane: factory` among them), and resolve a conflict locally too, adding them to the merge commit (`git commit --amend --no-edit --trailer ...`); or close the PR and land the change yourself.
+
+## AI assistance
+
+Disclose AI assistance in the PR description: which tool, and what it did. AI-assisted changes are reviewed like any other change, against the same gates, and you are responsible for what you submit.
+
+## Code of conduct
+
+This project follows the [Contributor Covenant](CODE_OF_CONDUCT.md).

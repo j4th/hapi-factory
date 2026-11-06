@@ -111,7 +111,7 @@ describe.skipIf(!INT)("the stack's egress boundary (throwaway compose project)",
     for (const [zone, lines] of Object.entries(OVERRIDES)) {
       appendFileSync(join(p.xdg, "hapi", "env", `${zone}.env`), Object.entries(lines).map(([k, v]) => `${k}='${v}'\n`).join(""));
     }
-    await p.mustCompose(["up", "-d", "--wait", "--wait-timeout", "120", "egress-hermes", "egress-archon", "egress-research"]);
+    await p.mustCompose(["up", "-d", "--wait", "--wait-timeout", "120", "egress-hermes", "egress-archon", "egress-research", "egress-review"]);
   }, 600_000);
 
   /**
@@ -136,7 +136,7 @@ describe.skipIf(!INT)("the stack's egress boundary (throwaway compose project)",
   const members = async (): Promise<Record<string, string[]>> => {
     const testMade = new Set((await must(["docker", "ps", "-a", "--filter", `label=org.hapi.int=${p.name}`, "--format", "{{.Names}}"])).split("\n").filter(Boolean));
     const out: Record<string, string[]> = {};
-    for (const net of ["hermes-net", "archon-net", "research-net", "outbound"]) {
+    for (const net of ["hermes-net", "archon-net", "research-net", "review-net", "outbound"]) {
       const [info] = JSON.parse(await must(["docker", "network", "inspect", p.network(net)]));
       out[net] = Object.values((info.Containers ?? {}) as Record<string, { Name: string }>)
         .map((c) => c.Name)
@@ -157,8 +157,8 @@ describe.skipIf(!INT)("the stack's egress boundary (throwaway compose project)",
   }, 300_000);
 
   describe("the networks", () => {
-    test("the zone networks are internal and private, inside the proxies' zone_clients ranges; only the proxies join outbound", async () => {
-      for (const net of ["hermes-net", "archon-net", "research-net"]) {
+    test("the zone networks are internal and private, inside the proxies' zone_clients ranges; only the four proxies join outbound", async () => {
+      for (const net of ["hermes-net", "archon-net", "research-net", "review-net"]) {
         const [info] = JSON.parse(await must(["docker", "network", "inspect", p.network(net)]));
         expect([net, info.Internal]).toEqual([net, true]);
         const subnets: string[] = info.IPAM.Config.map((c: { Subnet: string }) => c.Subnet);
@@ -172,12 +172,19 @@ describe.skipIf(!INT)("the stack's egress boundary (throwaway compose project)",
         "hermes-net": ["egress-hermes"],
         "archon-net": ["egress-archon"],
         "research-net": ["egress-research"],
-        outbound: ["egress-archon", "egress-hermes", "egress-research"],
+        "review-net": ["egress-review"],
+        outbound: ["egress-archon", "egress-hermes", "egress-research", "egress-review"],
       });
     });
 
+    test("review-net holds only its proxy: no service of the stack joins it (a review run is a run container on a network of its own)", async () => {
+      expect((await members())["review-net"]).toEqual(["egress-review"]);
+      const [info] = JSON.parse(await must(["docker", "network", "inspect", p.network("review-net")]));
+      expect(info.Internal).toBe(true);
+    });
+
     test("each proxy runs non-root, with no capabilities and a read-only root filesystem and config", async () => {
-      for (const zone of ["hermes", "archon", "research"]) {
+      for (const zone of ["hermes", "archon", "research", "review"]) {
         const service = `egress-${zone}`;
         const status = (await p.exec(service, ["cat", "/proc/1/status"])).stdout;
         expect([service, /^Uid:\s+(\d+)/m.exec(status)?.[1]]).not.toEqual([service, "0"]);
@@ -222,6 +229,27 @@ describe.skipIf(!INT)("the stack's egress boundary (throwaway compose project)",
       });
     });
   }
+
+  describe("the review zone (an allowlist: the review model's API and CodeRabbit's CLI)", () => {
+    test("egress: disallowed host via proxy is denied (review): a forge, a registry, another model API", async () => {
+      for (const url of ["https://github.com/", "https://registry.npmjs.org/", "https://openrouter.ai/", "https://example.com/"]) {
+        expect([url, (await p.via("review", url)).status]).toEqual([url, 403]);
+      }
+    });
+
+    test("every IP-literal destination is refused, and so is plain http:// or any port but 443", async () => {
+      for (const host of ["203.0.113.7", "[2001:db8::1]", "[::ffff:1.2.3.4]", "2130706433"]) {
+        expect([host, await p.raw("review-net", "egress-review:3128", `CONNECT ${host}:443`)]).toEqual([host, 403]);
+      }
+      expect((await p.via("review", "http://api.anthropic.com/")).status).toBe(403);
+      expect((await p.via("review", "https://cli.coderabbit.ai:8443/")).status).toBe(403);
+    });
+
+    test.skipIf(!ONLINE)("egress: allowed host via proxy succeeds (review; internet): api.anthropic.com", async () => {
+      const r = await p.via("review", "https://api.anthropic.com/");
+      expect([r.status, r.origin >= 200 && r.origin < 500]).toEqual([200, true]);
+    });
+  });
 
   test.skipIf(!ONLINE)("(internet) the hermes zone reaches the forge; the archon zone never does", async () => {
     expect((await p.via("hermes", "https://github.com/")).status).toBe(200);
@@ -370,7 +398,8 @@ describe.skipIf(!INT)("the stack's egress boundary (throwaway compose project)",
         "hermes-net": ["egress-hermes", "hermes"],
         "archon-net": ["egress-archon"],
         "research-net": ["egress-research"],
-        outbound: ["egress-archon", "egress-hermes", "egress-research"],
+        "review-net": ["egress-review"],
+        outbound: ["egress-archon", "egress-hermes", "egress-research", "egress-review"],
       });
       for (const service of ["hermes"] as const) {
         const id = (await p.mustCompose(["ps", "-q", service])).trim();

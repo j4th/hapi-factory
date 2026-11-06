@@ -10,7 +10,8 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { auditCommand, CHECK_IDS, runAudit } from "../../src/audit/index";
 import { main } from "../../src/cli";
-import { capture, cleanup, cleanWorld, FIXTURES, only } from "./helpers";
+import { loadPolicy } from "../../src/policy/load";
+import { capture, cleanup, cleanWorld, FIXTURES, only, REPO } from "./helpers";
 
 afterEach(cleanup);
 
@@ -54,18 +55,41 @@ test("the check list replaces runtime.archon-env (no long-lived archon) with run
   expect(CHECK_IDS).not.toContain("runtime.archon-env");
 });
 
+test("Plan 03's four checks run where the plan puts them: the poller's timer after runtime.dev-override, the registry, the sidecars and decision models after policy.budget-enforcement", () => {
+  const at = (id: string) => CHECK_IDS.indexOf(id);
+  expect(CHECK_IDS.slice(at("runtime.dev-override"), at("runtime.dev-override") + 2)).toEqual(["runtime.dev-override", "runtime.poller-timer"]);
+  expect(CHECK_IDS.slice(at("policy.budget-enforcement"), at("policy.budget-enforcement") + 4)).toEqual(["policy.budget-enforcement", "policy.repos", "policy.sidecars", "policy.decision-models"]);
+});
+
 test("audit passes a clean fixture", async () => {
   const w = await cleanWorld();
   const results = await runAudit(w.ctx);
   expect(results.map((r) => r.id).sort()).toEqual([...CHECK_IDS].sort());
   for (const r of results) expect([r.id, r.status, r.detail]).toEqual([r.id, r.status === "skip" ? "skip" : "pass", r.detail]);
   // What can be checked without a repo or a secrets store passes.
-  for (const id of ["generated.drift", "runtime.run-container", "runtime.hermes-no-yolo", "runtime.dev-override", "pins.versions", "tools.archon-validate", "tools.hermes-validate", "policy.budget-enforcement"]) {
+  for (const id of [
+    "generated.drift",
+    "runtime.run-container",
+    "runtime.hermes-no-yolo",
+    "runtime.dev-override",
+    "runtime.poller-timer",
+    "pins.versions",
+    "tools.archon-validate",
+    "tools.hermes-validate",
+    "policy.budget-enforcement",
+    "policy.sidecars",
+    "policy.decision-models",
+  ]) {
     expect([id, only(results, id).status]).toEqual([id, "pass"]);
   }
+  // policy.repos on the shipped registry, which registers no repo (`repos: {}`): a pass that says so. A protected change
+  // that registers one (the sandbox's, Plan 03 Task 16) updates this pin with tests/policy/load.test.ts's, and then the
+  // clean world, which writes no host.env, skips it.
+  expect(Object.keys(loadPolicy(join(REPO, "policy")).repos.repos)).toEqual([]);
+  expect([only(results, "policy.repos").status, only(results, "policy.repos").detail]).toEqual(["pass", "policy/repos.yaml registers no repo: the poller acts on none"]);
   // The live MCP comparison waits for Plan 04 (H-101), so it is a skip until then (H-026).
   expect(only(results, "mcp.tool-hashes").status).toBe("skip");
-  for (const id of ["github.rulesets", "github.app-perms", "repo.ai-workflows"]) {
+  for (const id of ["github.rulesets", "github.app-perms", "github.repo-settings", "github.labels", "repo.ai-workflows"]) {
     expect([id, only(results, id).status, only(results, id).detail]).toEqual([id, "skip", "no --repo given"]);
   }
 });
@@ -86,6 +110,16 @@ describe("hapi audit", () => {
     expect(await auditCommand([], w.ctx)).toBe(1);
     expect(out.some((l) => /^fail +tools\.archon-validate .*bad node/.test(l))).toBe(true);
     expect(out.at(-1)).toMatch(/, 1 fail,/);
+  });
+
+  test("M16: a detail is printed with no terminal control in it", async () => {
+    const w = await cleanWorld();
+    w.archonValidate = { code: 1, out: { errors: ["bad\u001b]0;owned\u0007 \u001b[2Jnode"], parseWarnings: [] } };
+    const { out } = capture();
+    expect(await auditCommand([], w.ctx)).toBe(1);
+    const line = out.find((l) => /^fail +tools\.archon-validate /.test(l))!;
+    expect(line).toContain("bad node");
+    for (const l of out) expect(l).not.toContain("\u001b");
   });
 
   test("--strict turns every skip into a fail, saying why it was a skip", async () => {
@@ -126,7 +160,7 @@ describe("hapi audit", () => {
         };
       } else w.dockerDown = true;
       const results = await runAudit(w.ctx);
-      for (const id of ["runtime.hermes-no-yolo", "runtime.dev-override", "tools.archon-validate", "tools.hermes-validate"]) {
+      for (const id of ["runtime.hermes-no-yolo", "runtime.dev-override", "runtime.poller-timer", "policy.sidecars", "tools.archon-validate", "tools.hermes-validate"]) {
         const r = only(results, id);
         expect([how, id, r.status]).toEqual([how, id, "skip"]);
         expect(r.detail.toLowerCase()).toContain("docker");

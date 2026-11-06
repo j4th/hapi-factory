@@ -1,0 +1,49 @@
+# {{name}}'s toolchain and tasks, from hapi-factory's repo contract.
+#
+# Every tool is an exact version, and mise.lock pins each download's checksum
+# for linux-x64 and macos-arm64. To upgrade one, bump it here, run
+# `mise lock --platform linux-x64,macos-arm64`, then `mise install --locked &&
+# mise run check`, and commit both files in one PR.
+#
+# A protected path: agents may not edit it, and the gates run these tasks.
+# Tools run from node_modules/.bin, never through Bun's package runner, which
+# downloads from npm when a binary is missing.
+
+min_version = "2026.10.9"
+
+[tools]
+bun = "1.4.2"            # the run image's Bun: runtime, package manager, test runner
+gitleaks = "8.30.1"      # secret scanner (mise run scan)
+osv-scanner = "2.7.0"    # known vulnerabilities in bun.lock (mise run scan)
+zizmor = "1.31.1"        # workflow security (the gates)
+
+[tasks.setup]
+description = "Install the dependencies exactly as bun.lock records them, running no install script"
+run = "bun ci --frozen-lockfile --ignore-scripts"
+
+[tasks.fmt]
+description = "Format the code with Biome"
+depends = ["setup"]
+run = "node_modules/.bin/biome format --write ."
+
+[tasks.lint]
+description = "Biome's checks, then a strict type-check"
+depends = ["setup"]
+run = ["node_modules/.bin/biome ci .", "node_modules/.bin/tsc --noEmit"]
+
+[tasks.test]
+description = "The unit tests in tests/ (a work order's acceptance tests run on their own)"
+depends = ["setup"]
+run = "bun test ./tests"
+
+[tasks.check]
+description = "The gate: lint and test"
+depends = ["lint", "test"]
+
+[tasks.smoke]
+description = "The smoke test, smoke/run.ts, against the repo's stub service"
+run = '[ -f smoke/run.ts ] || { echo "no smoke test yet: add smoke/run.ts" >&2; exit 1; }; bun run smoke/run.ts'
+
+[tasks.scan]
+description = "gitleaks over the whole history, then OSV-Scanner over bun.lock"
+run = ["gitleaks git --redact --no-banner -v .", "osv-scanner scan source --lockfile bun.lock"]

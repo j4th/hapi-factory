@@ -21,7 +21,11 @@
  * HAPI_ALLOW_CURRENT_USER=1: the operator's own Docker, as spike 07 ran, not
  * hapi's rootless one (Task 11's paid check runs as hapi). Its supervisor is
  * spawned for real, detached, by the host's `spawnDetached`, as
- * ./int-supervisor.ts with the same `RunDeps`.
+ * ./int-supervisor.ts with the same `RunDeps`. The run disk is a temp dir of
+ * the project's (`<root>/run-disk`), neither capped nor a filesystem of its
+ * own, so `runs.disk.enforcement` is soft here and start warns: the run's
+ * bind-backed volumes, their chown, copy-out and cleanup run for real, and
+ * afterAll checks that the run disk is left empty.
  *
  * What spike 07 showed to expect is not a failure: Archon's SQLite-in-Docker
  * hint and its `workflow.base_branch_auto_detect_failed` warning on stderr
@@ -34,8 +38,8 @@ import YAML from "yaml";
 import { buildAll } from "../../src/generate/index";
 import { loadPolicy } from "../../src/policy/load";
 import { runDeps } from "../../src/run/cli";
-import { bundleProblem, runStart, runStop } from "../../src/run/lifecycle";
-import { readRecord, recordDir, type RunRecord } from "../../src/run/records";
+import { bundleProblem, reapRuns, runStart, runStop } from "../../src/run/lifecycle";
+import { lockHeld, readRecord, recordDir, type RunRecord, withRunLock } from "../../src/run/records";
 import { type RunDeps, runName } from "../../src/run/spec";
 import { runWatch } from "../../src/run/view";
 import { loadManifest } from "../../src/secrets/manifest";
@@ -79,8 +83,11 @@ describe.skipIf(!INT || !ONLINE)("hapi run on a real Docker (a throwaway project
 
   /** The project's `RunDeps`: its name, image, egress container, state dir and build, with `pack` bound. */
   const deps = (pack = CHECKS): Partial<RunDeps> => ({
-    env, project: p.name, image, egress: `${p.name}-egress-archon-1`, stateDir: state, root: REPO, buildDir: p.build, packDir: pack, spawnDetached: spawnSupervisor,
+    env, project: p.name, image, egress: `${p.name}-egress-archon-1`, stateDir: state, diskDir: join(p.root, "run-disk"), root: REPO, buildDir: p.build, packDir: pack, spawnDetached: spawnSupervisor,
+    runs: { ...loadPolicy(join(REPO, "policy")).runs, disk: { gb: 20, enforcement: "soft" } },
   });
+  /** start's warning that the temp run disk fails the check, which soft enforcement lets through. */
+  const softDisk = (l: string) => l.startsWith("hapi run start: warning: the run disk ") && l.endsWith("runs.disk.enforcement is soft, so the run starts anyway");
 
   /** Run `fn` with console.log and console.error captured. */
   async function quietly(fn: () => Promise<number>): Promise<{ code: number; out: string[]; err: string[] }> {
@@ -113,12 +120,16 @@ describe.skipIf(!INT || !ONLINE)("hapi run on a real Docker (a throwaway project
     return { ...r, id: r.out.at(-1)! };
   }
 
-  /** The run's record once it has ended (the supervisor finalizes it), or a failure naming the supervisor's log. */
+  /**
+   * The run's record once it has ended and its finalize has let go of the run's lock (the supervisor finalizes it,
+   * and writes the outcome before it removes the run's objects, H-219), or a failure naming the supervisor's log.
+   */
   async function settle(id: string, timeoutMs = 180_000): Promise<RunRecord> {
     const until = Date.now() + timeoutMs;
     for (;;) {
       const rec = await readRecord(state, id);
-      if (rec !== undefined && rec.status !== "live") return rec;
+      const finalized = async () => withRunLock({ stateDir: state, env }, id, async () => true).catch((e: unknown) => (lockHeld(e) ? false : Promise.reject(e)));
+      if (rec !== undefined && rec.status !== "live" && (await finalized())) return rec;
       if (Date.now() > until) {
         let log = "";
         try {
@@ -164,6 +175,7 @@ describe.skipIf(!INT || !ONLINE)("hapi run on a real Docker (a throwaway project
     env = { ...p.env, HAPI_ALLOW_CURRENT_USER: "1" };
     image = `${p.name}-archon:int`;
     state = join(p.root, "state");
+    mkdirSync(join(p.root, "run-disk"), { mode: 0o700 });
     // As `mise run up` does: the generated configs (into the project's own build dir), the zone env files, the archon image, the proxy.
     await buildAll(loadPolicy(join(REPO, "policy")), p.build);
     await resolveSecrets(loadManifest(join(REPO, "stack", "secrets.yaml")), fakeProvider, { outDir: join(p.xdg, "hapi") });
@@ -216,12 +228,14 @@ describe.skipIf(!INT || !ONLINE)("hapi run on a real Docker (a throwaway project
 
     // The supervisor: the host's own detached spawn, of ./int-supervisor.ts with this project's RunDeps.
     const host = (await runDeps({ env, project: p.name, image, stateDir: state, root: REPO })).spawnDetached;
-    const fields = { project: p.name, image, egress: `${p.name}-egress-archon-1`, stateDir: state, root: REPO, buildDir: p.build };
+    const fields = { project: p.name, image, egress: `${p.name}-egress-archon-1`, stateDir: state, diskDir: join(p.root, "run-disk"), root: REPO, buildDir: p.build };
     spawnSupervisor = (argv) => host([process.execPath, join(REPO, "tests", "run", "int-supervisor.ts"), JSON.stringify(fields), ...argv.slice(3)]);
   }, 1_200_000);
 
   afterAll(async () => {
     if (p === undefined) return;
+    // Every run's dirs on the run disk went with its volumes: the helper emptied what uid 1001 wrote, and hapi removed the dirs.
+    expect(readdirSync(join(p.root, "run-disk"))).toEqual([]);
     await p.down();
     // Nothing of the throwaway project is left behind, runs included...
     expect(await p.leftovers()).toEqual([]);
@@ -235,14 +249,17 @@ describe.skipIf(!INT || !ONLINE)("hapi run on a real Docker (a throwaway project
 
     beforeAll(async () => {
       const r = await start(order("0003-check-run"));
-      expect([r.code, r.err.filter((l) => !l.includes("HAPI_ALLOW_CURRENT_USER"))]).toEqual([0, []]);
+      expect([r.code, r.err.filter((l) => !l.includes("HAPI_ALLOW_CURRENT_USER") && !softDisk(l))]).toEqual([0, []]);
+      expect(r.err.filter(softDisk)).toHaveLength(1);
       check = r.id;
       rec = await settle(check);
     }, 300_000);
 
     test("a bash-only check run succeeds and leaves only its outputs", async () => {
       expect([rec.status, rec.reason]).toEqual(["succeeded", undefined]);
-      expect(readdirSync(recordDir(state, check)).sort()).toEqual(["out", "record.json", "run.json"]);
+      // Beside the record and run.json, the run's own guard settings and run config, and the host's copies of its work order and task text.
+      expect(readdirSync(recordDir(state, check)).sort()).toEqual(["hapi-guard.json", "order.json", "out", "record.json", "run-config.yaml", "run.json", "task.md"]);
+      expect([rec.kind, rec.round, rec.roster, rec.retry]).toEqual(["worker", 0, "anthropic", undefined]);
       // A bash-only run writes no decision log.
       expect(readdirSync(outDir(check)).sort()).toEqual(["result.json", "run.bundle", "transcript.jsonl"]);
       for (const f of readdirSync(outDir(check))) expect([f, statSync(join(outDir(check), f)).mode & 0o777]).toEqual([f, 0o600]);
@@ -304,6 +321,14 @@ describe.skipIf(!INT || !ONLINE)("hapi run on a real Docker (a throwaway project
         await logsHold(live, "[sleep] Started");
       }, 300_000);
 
+      // The live run is stopped here too (D89, H-221(a)): a stop test that failed or was filtered out leaves no live
+      // run behind to fail the later tests on runs.max_live. A stopped run's stop is a no-op.
+      afterAll(async () => {
+        if (live === undefined) return;
+        const rec = await readRecord(state, live);
+        if (rec?.status === "live") await quietly(() => runStop([live], deps(PACK)));
+      }, 180_000);
+
       test("the run's network holds only the run and egress-archon", async () => {
         const name = runName(p.name, live);
         const [net] = JSON.parse(await must(["docker", "network", "inspect", name]));
@@ -321,7 +346,8 @@ describe.skipIf(!INT || !ONLINE)("hapi run on a real Docker (a throwaway project
         expect(said).toContain("uid=1001");
         expect(said).toContain("CapEff:\t0000000000000000");
         expect(said).toContain("NoNewPrivs:\t1");
-        expect(posture).toMatch(/^archon=0\.12\.1 pi=1\.3\.0 node=v24\.22\.1 uv=uv 0\.13\.5\b.* python=Python 3\.14\.9$/m);
+        // mise last (Task 11, H-208): the repo contract's toolchain, from the image.
+        expect(posture).toMatch(/^archon=0\.12\.1 pi=1\.3\.0 node=v24\.22\.1 uv=uv 0\.13\.5\b.* python=Python 3\.14\.9 mise=2026\.10\.9 linux-x64 \(2026-10-13\)$/m);
         // `<url> <the proxy's answer to the CONNECT> <the origin's>`.
         const codes = (url: string) => said.find((l) => l.startsWith(`${url} `))?.split(" ").slice(1).map(Number);
         const [tunnel, origin] = codes("https://api.anthropic.com/") ?? [];
@@ -373,6 +399,20 @@ describe.skipIf(!INT || !ONLINE)("hapi run on a real Docker (a throwaway project
     });
   });
 
+  test("as the run container's PID 1, on the real image (its sh is dash), verify.sh's and review.sh's kill line ends what was left running", async () => {
+    for (const name of ["verify.sh", "review.sh"]) {
+      // The line itself, read from the prelude: a fix to its text is what this checks.
+      const line = readFileSync(join(REPO, "stack", "archon", name), "utf8").split("\n").find((l) => l.includes("kill -s KILL"))!;
+      expect(line).toStartWith('if [ "$$" = 1 ]; then kill -s KILL');
+      const script = `sleep 300 & c=$!; sleep 0.2; ${line}; sleep 0.2; if kill -0 "$c" 2>/dev/null; then echo alive; exit 1; fi; echo killed`;
+      const out = await must([
+        "docker", "run", "--rm", "--pull", "never", "--network", "none", "--read-only", "--user", "1001:1001", "--cap-drop", "ALL", "--init=false",
+        "--label", `org.hapi.int=${p.name}`, "--name", `${p.name}-kill-${name.replace(".sh", "")}`, "--entrypoint", "sh", image, "-c", script,
+      ]);
+      expect([name, out.trim()]).toEqual([name, "killed"]);
+    }
+  }, 120_000);
+
   test("a failing run still yields result.json and transcript.jsonl, status failed", async () => {
     const r = await start(order("0005-test-fail", "hapi-test-sleep"), { pack: PACK });
     expect(r.code).toBe(0);
@@ -391,12 +431,13 @@ describe.skipIf(!INT || !ONLINE)("hapi run on a real Docker (a throwaway project
     expect(r.code).toBe(0);
     const w = await quietly(() => runWatch([r.id], deps(PACK)));
     expect(w.code).toBe(0);
-    // docker logs while it ran (Archon's progress lines), then the copied transcript, then how it ended.
-    const started = w.out.indexOf("[nap] Started");
-    const completed = w.out.findIndex((l) => l.startsWith("[nap] Completed"));
-    const row = w.out.indexOf("[nap] exec_output exit 0: napping");
+    // docker logs while it ran (Archon's progress lines), then the copied transcript, each line the run's marked `| `
+    // (H-220), then how it ended, hapi's own line, unmarked.
+    const started = w.out.indexOf("| [nap] Started");
+    const completed = w.out.findIndex((l) => l.startsWith("| [nap] Completed"));
+    const row = w.out.indexOf("| [nap] exec_output exit 0: napping");
     expect({ order: [started >= 0, completed > started, row > completed], out: w.out }).toEqual({ order: [true, true, true], out: w.out });
-    expect(w.out[row + 1]).toBe("  awake");
+    expect(w.out[row + 1]).toBe("|   awake");
     expect(w.out.at(-1)).toBe(`run ${r.id}: succeeded`);
     // Nothing printed holds an escape sequence or a secret value.
     expect(w.out.filter((l) => /[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(l) || l.includes("fake-hapi-"))).toEqual([]);
@@ -410,8 +451,17 @@ describe.skipIf(!INT || !ONLINE)("hapi run on a real Docker (a throwaway project
     expect(await objectsOf(r.id)).toEqual([]);
     // The supervisor wakes as its container goes, and finalizes the run without copying out: the volumes were the cleanup's.
     const done = await settle(r.id);
-    expect([done.status, done.reason]).toEqual(["failed", "the run's container was removed before the run was finalized (`mise run down`, or a cleanup): nothing was copied out"]);
+    const N = runName(p.name, r.id);
+    expect([done.status, done.reason]).toEqual([
+      "failed",
+      `the run's container was removed before the run was finalized (\`mise run down\`, or a cleanup): nothing was copied out; the finalize left the run's volumes ${N}-work and ${N}-out in place, since nothing was copied out (H-209)`,
+    ]);
     expect(await objectsOf(r.id)).toEqual([]);
+    // The finalize removed neither the volumes nor their dirs (H-209); the cleanup had removed the volumes, so the next reap's sweep removes the dirs.
+    expect(readdirSync(join(p.root, "run-disk")).sort()).toEqual([`${N}-out`, `${N}-work`]);
+    const reap = await quietly(async () => (await reapRuns(await runDeps(deps(PACK))), 0));
+    expect([reap.code, reap.err]).toEqual([0, [`hapi run: removed run ${r.id}'s dirs on the run disk: their volumes were gone`]]);
+    expect(readdirSync(join(p.root, "run-disk"))).toEqual([]);
     // The proxy is still up: only the run's objects went.
     expect(lines(await must(["docker", "ps", "--filter", `name=${p.name}-egress-archon-1`, "--format", "{{.Names}}"]))).toEqual([`${p.name}-egress-archon-1`]);
   }, 300_000);

@@ -5,7 +5,8 @@
  *
  * A run (Plan 02, `hapi run`) is a container of its own, made from the `archon`
  * service of the compose file, on a network of its own that the launcher joins
- * `egress-archon` to; compose does not know it. Every such object carries
+ * its kind's proxy to (`egress-archon`, or `egress-review` for a review run,
+ * src/run/kinds.ts); compose does not know it. Every such object carries
  * `RUN_LABEL` and `PROJECT_LABEL`, which is how `up` sees a live run and
  * `removeRuns` (and so `down`) finds what to remove.
  *
@@ -29,8 +30,12 @@
  *    into $XDG_RUNTIME_DIR/hapi/env/<zone>.env, all or nothing. A missing
  *    secret, a provider failure or a missing pinned age stops here.
  * 4. `docker compose build archon` (a profile-only service is built only when
- *    named, spike 07 finding 17), then `docker compose up --no-start --build`:
- *    build the images, create the networks and containers, start nothing.
+ *    named, spike 07 finding 17), then `docker pull` of each sidecar image
+ *    policy/sidecars.yaml pins by digest that `docker image inspect` doesn't
+ *    find here already (a run starts its sidecar with `--pull never`,
+ *    src/run/sidecar.ts), then `docker compose up --no-start
+ *    --build`: build the images, create the networks and containers, start
+ *    nothing.
  * 5. Check the zone networks Docker made (`networkProblems`): internal, and
  *    inside the proxies' zone_clients ranges. If any check fails, or can't
  *    be made (`docker network inspect` fails, prints something that isn't
@@ -38,31 +43,57 @@
  *    (`compose down`), and stop.
  * 6. `docker compose up -d --wait`: start, and wait until every service is
  *    healthy.
+ * 7. The poller's timer (Plan 03 Task 14): `systemctl --user link --runtime` of
+ *    build/systemd's two units, `daemon-reload`, then `enable --runtime --now
+ *    hapi-poll.timer`. Linked again each time, since `disable --runtime` would
+ *    delete a linked unit (T20); a runtime link goes at a reboot, and the next
+ *    `up` makes it again. A failure here fails `up`, naming the command: the
+ *    stack is up, but no tick runs until the timer does.
  * Nothing starts unless steps 1-5 pass.
  *
- * As the hapi user, and before step 2, `up` refuses if any run container is
- * running (`liveRuns`): recreating egress-archon would cut its egress, and
- * nothing has been built or written yet.
+ * As the hapi user, `up` first stops the poller's timer and service
+ * (`systemctl --user stop`, before anything else: a tick would start a run
+ * while `up` recreates its proxy). A unit that was never loaded is no error
+ * (`SYSTEMCTL_NOT_LOADED`); any other failure stops `up` with nothing built.
+ * Then, before step 2, it refuses if any run container is running
+ * (`liveRuns`): recreating egress-archon would cut its egress, and nothing has
+ * been built or written yet. Every systemctl call reaches hapi's user manager
+ * with `systemctlEnv` (T20, m11). Under HAPI_ALLOW_CURRENT_USER=1 there is no
+ * systemctl call at all: the timer would run in the caller's own user manager,
+ * so `up` says how to tick by hand instead.
  *
- * `down` is `removeRuns` (the run containers, then egress-archon's hold on each
- * run network, then the run networks and volumes), then `docker compose -p hapi
- * down`, by project name, so it needs no compose file, build/ or
- * XDG_RUNTIME_DIR: it is kill switch 3 (spec §11.8).
+ * `down` first stops the poller's timer and service, so no tick starts a new
+ * run (a failure there is reported at the end, like the runs' leftovers: the
+ * kill switch still stops everything else). Then it is `removeRuns` (the run containers, then egress-archon's and
+ * egress-review's hold on each run network, then the run networks and volumes),
+ * then `docker compose -p hapi down`, by project name, so it needs no compose
+ * file or build/: it is kill switch 3 (spec §11.8). It removes the runs holding
+ * the run disk's lock (`withStackLock`, src/run/locks.ts; H-210), which a
+ * finalize holds while it copies a run out, so no copy-out reads a volume
+ * `down` is removing. `down` never waits for that lock: if it is held, or can't
+ * be taken at all (no XDG_RUNTIME_DIR, whose tmpfs holds it), `down` says so
+ * and removes the runs' containers and networks but leaves their volumes, which
+ * the run's finalize or the next reap removes, with their dirs on the run disk.
+ * Either way it goes on to `compose down`, and kill switch 3 still takes
+ * seconds.
  * It does load the whole CLI (`bun run src/cli.ts`), so it needs a checkout
  * that loads (src/ parses, node_modules installed) and a working mise;
- * without them, use kill switch 3b (docs/runbooks/kill-switches.md). Volumes
- * are kept. With HAPI_ALLOW_CURRENT_USER=1 it stops the dev-bypass stack on
+ * without them, use kill switch 3b (docs/runbooks/kill-switches.md). The
+ * stack's own volumes (Compose's named volumes) are kept, since `compose down`
+ * runs without `-v`; the runs' volumes go with their runs, as above, unless
+ * the run disk's lock was held. With HAPI_ALLOW_CURRENT_USER=1 it stops the dev-bypass stack on
  * the Docker the caller's CLI reaches instead (normally the caller's own), and
  * warns how to stop hapi's.
  */
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { userInfo } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { CLIENT_RANGES } from "../generate/egress";
 import { buildAll, ROSTERS } from "../generate/index";
 import { loadPolicy } from "../policy/load";
 import type { RosterName } from "../policy/types";
+import { RUN_DISK, withStackLock } from "../run/locks";
 import { secretsResolve } from "../secrets/cli";
 import { cidrContains } from "./cidr";
 
@@ -78,14 +109,29 @@ export const HAPI_USER = "hapi";
 /** The Compose project: containers are hapi-<service>-1, networks hapi_<network>. */
 export const PROJECT = "hapi";
 export const COMPOSE_FILE = "stack/compose.yaml";
-/** The zone networks, internal-only; `outbound` is the proxies' way out. */
-export const ZONE_NETWORKS = ["hermes-net", "archon-net", "research-net"] as const;
+/** The zone networks, internal-only; `outbound` is the proxies' way out. review-net is egress-review's alone (a review run is on a network of its own). */
+export const ZONE_NETWORKS = ["hermes-net", "archon-net", "research-net", "review-net"] as const;
 /** hapi's checkout, relative to its home (scripts/host-setup.sh clones it there). */
 export const HAPI_CHECKOUT = "hapi-factory";
 /** hapi's own bin directory, relative to its home; scripts/host-setup.sh installs the pinned mise there. */
 export const HAPI_BIN = ".local/bin";
 /** hapi's mise, relative to its home (scripts/host-setup.sh's install target; tests/scripts/host-setup.test.ts checks it). */
 export const HAPI_MISE = `${HAPI_BIN}/mise`;
+
+/** The poller's systemd user units (src/generate/systemd.ts), the timer first: what `up` and `down` stop. */
+export const POLL_UNITS = ["hapi-poll.timer", "hapi-poll.service"] as const;
+/** `systemctl --user stop`'s exit code for a unit that was never loaded (spike 09, T20): no error, there is nothing to stop. */
+export const SYSTEMCTL_NOT_LOADED = 5;
+
+/**
+ * The env `systemctl --user` needs to reach the user manager (T20, ruling m11): `env`, with XDG_RUNTIME_DIR (the
+ * user's /run/user/<uid> when unset or empty, as `reexecScript` does) and DBUS_SESSION_BUS_ADDRESS (its `bus`
+ * socket when unset or empty). Either one is enough for systemctl; both are set. The audit's runtime check uses it too.
+ */
+export function systemctlEnv(env: Env, uid: number = process.getuid?.() ?? 0): Record<string, string> {
+  const xdg = env.XDG_RUNTIME_DIR || `/run/user/${uid}`;
+  return { ...definedEnv(env), XDG_RUNTIME_DIR: xdg, DBUS_SESSION_BUS_ADDRESS: env.DBUS_SESSION_BUS_ADDRESS || `unix:path=${xdg}/bus` };
+}
 
 /** Who is running hapi, and whether the dev bypass is on. */
 export interface UserCheck {
@@ -198,6 +244,15 @@ export interface StackDeps {
   build?: (roster: RosterName) => Promise<string[]>;
   /** Step 3, given resolve's args (`--config <file>` or none). Default: `hapi secrets resolve`. */
   resolve?: (args: string[]) => Promise<number>;
+  /** The run disk, whose lock `down` takes (src/run/locks.ts). Default: RUN_DISK. */
+  diskDir?: string;
+  /** Step 4's sidecar images, each pinned by digest. Default: every policy/sidecars.yaml image (`policySidecarImages`). */
+  sidecarImages?: () => string[];
+}
+
+/** Every sidecar image `policyDir`'s sidecars.yaml pins, in its order: what `up` pulls. */
+export function policySidecarImages(policyDir = "policy"): string[] {
+  return Object.values(loadPolicy(policyDir).sidecars).map((s) => s.image);
 }
 
 /** The real `Runner`: `Bun.spawn`, stdin closed. `hapi run` uses it too (src/run/cli.ts). */
@@ -253,6 +308,8 @@ export async function reexec(task: "up" | "down" | "hapi", args: string[], run: 
 export const runFilters = (project: string, runId?: string): string[] => ["--filter", `label=${RUN_LABEL}${runId === undefined ? "" : `=${runId}`}`, "--filter", `label=${PROJECT_LABEL}=${project}`];
 
 const lines = (out: string): string[] => out.split("\n").map((l) => l.trim()).filter((l) => l !== "");
+/** A command's first stderr line, for an error. */
+const firstLine = (s: string | undefined) => s?.trim().split("\n")[0]?.trim() || "(no error output)";
 
 /** The ids (or names) a listing printed, one per line. Throws, naming the command, when it fails. */
 export async function listed(run: Runner, env: Env, cmd: string[]): Promise<string[]> {
@@ -277,20 +334,24 @@ async function liveRuns(run: Runner, env: Env, project: string): Promise<string[
 }
 
 /**
- * Removes every run object of `project`: the labelled containers (`rm -f`), then `<project>-egress-archon-1`'s
- * attachment to each labelled network (Docker refuses to remove a network with an endpoint attached, spike 07
- * finding 13), then the networks, then the volumes. Only what the two labels select, never by name or prefix.
- * It tries every removal and throws at the end naming the ones that failed. A listing that fails (`docker ps`,
- * `network ls`, `volume ls`) throws at once and skips the steps after it: that almost always means the daemon is
- * down, when they would fail too. Either way `down`, kill switch 3, goes on to `compose down`. A disconnect that
- * fails is not an error by itself (the proxy may be gone, or not attached); the network removal after it says
- * whether anything is left. Nor is a removal that fails while nothing it named is still listed: a supervisor
- * finalizing its run removes the same objects, and may have got there first (`not found`).
+ * Removes every run object of `project`: the labelled containers (`rm -f`: run containers, their smoke sidecars and any
+ * helper), then each egress proxy's attachment to
+ * each labelled network (Docker refuses to remove a network with an endpoint attached, spike 07 finding 13): both
+ * `<project>-egress-archon-1` and `<project>-egress-review-1`, since a review run's network has the second and every
+ * other kind's the first (src/run/kinds.ts), then the networks, then the volumes. Only what the two labels select,
+ * never by name or prefix. It tries every removal and throws at the end naming the ones that failed. A listing that
+ * fails (`docker ps`, `network ls`, `volume ls`) throws at once and skips the steps after it: that almost always
+ * means the daemon is down, when they would fail too. Either way `down`, kill switch 3, goes on to `compose down`. A
+ * disconnect that fails is not an error by itself (the proxy may be gone, or not attached); the network removal
+ * after it says whether anything is left. Nor is a removal that fails while nothing it named is still listed: a
+ * supervisor finalizing its run removes the same objects, and may have got there first (`not found`).
  *
  * With `o.runId`, only that run's objects (`org.hapi.run=<id>`): `hapi run` finalizes one run, or rolls back a
- * start, this way, disconnecting `o.egress` (its `RunDeps.egress`) when given.
+ * start, this way, disconnecting only `o.egress`, the proxies its kind joined (src/run/kinds.ts `egressOf`), when
+ * given. With `o.volumes` false (the default is true), the volumes are neither listed nor removed: the one way to
+ * keep them, for `down` without the run disk's lock, and for a finalize whose volumes must stay.
  */
-export async function removeRuns(project: string, run: Runner, env: Env, o: { runId?: string; egress?: string } = {}): Promise<void> {
+export async function removeRuns(project: string, run: Runner, env: Env, o: { runId?: string; egress?: string[]; volumes?: boolean } = {}): Promise<void> {
   const failures: string[] = [];
   /** Remove `names` with `cmd`; a failure counts while `list` (their listing) still shows one of them, or can't say. */
   const remove = async (cmd: string[], names: string[], list: string[]) => {
@@ -303,17 +364,21 @@ export async function removeRuns(project: string, run: Runner, env: Env, o: { ru
     if (left.length > 0) failures.push(`${cmd.join(" ")} failed (exit ${r.code}): ${r.stderr?.trim() || "(no error output)"}`);
   };
   const filters = runFilters(project, o.runId);
-  const egress = o.egress ?? `${project}-egress-archon-1`;
+  const egress = o.egress ?? [`${project}-egress-archon-1`, `${project}-egress-review-1`];
   const ps = ["docker", "ps", "-aq", ...filters];
   const containers = await listed(run, env, ps);
   if (containers.length > 0) await remove(["docker", "rm", "-f", ...containers], containers, ps);
   const nets = ["docker", "network", "ls", "--format", "{{.Name}}", ...filters];
   const networks = await listed(run, env, nets);
-  for (const n of networks) await run(["docker", "network", "disconnect", "-f", n, egress], { env: definedEnv(env), inherit: false });
+  for (const n of networks) {
+    for (const e of egress) await run(["docker", "network", "disconnect", "-f", n, e], { env: definedEnv(env), inherit: false });
+  }
   if (networks.length > 0) await remove(["docker", "network", "rm", ...networks], networks, nets);
-  const vols = ["docker", "volume", "ls", "-q", ...filters];
-  const volumes = await listed(run, env, vols);
-  if (volumes.length > 0) await remove(["docker", "volume", "rm", ...volumes], volumes, vols);
+  if (o.volumes !== false) {
+    const vols = ["docker", "volume", "ls", "-q", ...filters];
+    const volumes = await listed(run, env, vols);
+    if (volumes.length > 0) await remove(["docker", "volume", "rm", ...volumes], volumes, vols);
+  }
   if (failures.length > 0) throw new Error(`removing the runs of ${project} left something behind: ${failures.join("; ")}`);
 }
 
@@ -345,17 +410,27 @@ export async function stackUp(args: string[], deps: StackDeps = {}): Promise<num
   const env = deps.env ?? process.env;
   const run = deps.run ?? runCommand;
   const who = currentUserOverride(env, deps.user);
-  if (!who.isHapi && !who.override) return reexec("up", args, run, env, who.user);
+  // The re-exec runs in hapi's checkout (`reexecScript`), so a relative --config is made absolute first, from the
+  // caller's working dir, as runStart does --repo (D94, H-222(c)); an absolute one goes verbatim.
+  const forwarded = args.map((a, i) => (args[i - 1] === "--config" && !isAbsolute(a) ? resolve(a) : a));
+  if (!who.isHapi && !who.override) return reexec("up", forwarded, run, env, who.user);
   if (who.override) {
     console.error(
       `hapi stack up: warning: HAPI_ALLOW_CURRENT_USER=1: running the stack as ${who.user}, not ${HAPI_USER}: a dev-only downgrade (no dedicated user, and your own Docker, not hapi's rootless one). The containers are labelled org.hapi.dev-override=1, and hapi audit reports it.`,
     );
   }
 
+  // The poller's timer first, so no tick starts a run while the stack is rebuilt: one never loaded is fine.
+  if (!who.override) {
+    const stop = ["systemctl", "--user", "stop", ...POLL_UNITS];
+    const r = await run(stop, { env: systemctlEnv(env), inherit: false });
+    if (r.code !== 0 && r.code !== SYSTEMCTL_NOT_LOADED) throw new Error(`could not stop the poller timer (${stop.join(" ")} exited ${r.code}: ${firstLine(r.stderr)}); nothing was built or started`);
+  }
+
   const live = await liveRuns(run, env, PROJECT);
   if (live.length > 0) {
     throw new Error(
-      `hapi stack up: ${live.length} runs are live (docker ps --filter label=${RUN_LABEL}): stop them with \`hapi run stop <id>\` or wait; recreating egress-archon would cut their egress`,
+      `hapi stack up: ${live.length} runs are live (docker ps --filter label=${RUN_LABEL}): stop them with \`hapi run stop <id>\` or wait; recreating egress-archon would cut their egress${who.override ? "" : "; the poller timer is stopped, and `mise run up` starts it again"}`,
     );
   }
 
@@ -369,6 +444,17 @@ export async function stackUp(args: string[], deps: StackDeps = {}): Promise<num
   // A profile-only service is built only when named (spike 07, finding 17): `up --no-start --build` skips archon.
   const built = await compose(["build", "archon"]);
   if (built.code !== 0) throw new Error(`docker compose build archon failed (exit ${built.code}); nothing was started`);
+  // A run's sidecar is started with --pull never, so its pinned image must be here first (design §3.3). One already
+  // here by its digest reference isn't pulled again, so an offline `up` works once each has been pulled.
+  const sidecarImages = (deps.sidecarImages ?? (() => policySidecarImages()))();
+  let pulls = 0;
+  for (const image of sidecarImages) {
+    const here = await run(["docker", "image", "inspect", "--format", "{{.Id}}", image], { env: composeEnv, inherit: false });
+    if (here.code === 0) continue;
+    const pulled = await run(["docker", "pull", image], { env: composeEnv, inherit: true });
+    if (pulled.code !== 0) throw new Error(`docker pull ${image} failed (exit ${pulled.code}); nothing was started`);
+    pulls++;
+  }
   const created = await compose(["up", "--no-start", "--build"]);
   if (created.code !== 0) throw new Error(`docker compose up --no-start failed (exit ${created.code}); nothing was started`);
 
@@ -390,7 +476,24 @@ export async function stackUp(args: string[], deps: StackDeps = {}): Promise<num
   if (up.code !== 0) {
     throw new Error(`the stack did not come up healthy (docker compose exit ${up.code}): see \`docker compose -p ${PROJECT} ps\` and \`docker compose -p ${PROJECT} logs <service>\` (docs/runbooks/stack.md#troubleshooting)`);
   }
-  console.log(`the stack is up (Compose project ${PROJECT}): egress-hermes, egress-archon, egress-research, hermes (archon is built, and a container of it starts per run)`);
+  const pulled = `${sidecarImages.length === 1 ? "1 sidecar image is" : `${sidecarImages.length} sidecar images are`} here (${pulls} pulled)`;
+  console.log(
+    `the stack is up (Compose project ${PROJECT}): egress-hermes, egress-archon, egress-research, egress-review, hermes (archon is built, and a container of it starts per run; ${pulled}, and a sidecar starts with a run that smokes)`,
+  );
+
+  // Step 7: the poller's timer, linked again each time (`disable --runtime` would delete a linked unit; T20).
+  if (who.override) {
+    console.error(
+      `hapi stack up: HAPI_ALLOW_CURRENT_USER=1: the poller timer is not installed (it would run in ${who.user}'s own user manager): run \`mise run hapi -- poll --once\` by hand`,
+    );
+    return 0;
+  }
+  const units = ["hapi-poll.service", "hapi-poll.timer"].map((u) => resolve("build", "systemd", u));
+  for (const step of [["link", "--runtime", ...units], ["daemon-reload"], ["enable", "--runtime", "--now", "hapi-poll.timer"]]) {
+    const cmd = ["systemctl", "--user", ...step];
+    const r = await run(cmd, { env: { ...composeEnv, ...systemctlEnv(env) }, inherit: false });
+    if (r.code !== 0) throw new Error(`the stack is up, but the poller timer did not start: ${cmd.join(" ")} exited ${r.code}: run \`mise run up\` again (docs/runbooks/stack.md)`);
+  }
   return 0;
 }
 
@@ -413,16 +516,42 @@ export async function stackDown(args: string[], deps: StackDeps = {}): Promise<n
         `To stop ${HAPI_USER}'s stack, run \`mise run down\` in a shell without HAPI_ALLOW_CURRENT_USER, or use kill switch 3b (docs/runbooks/kill-switches.md#3b-without-a-checkout-or-mise).`,
     );
   }
-  // The runs first: Docker won't remove a network with an endpoint attached. A failure here must not stop
+  // The poller's timer first, so no tick starts a new run. A failure is reported after, as the runs' leftovers are:
+  // the kill switch still stops everything else. A unit never loaded has nothing to stop.
+  let timer: string | undefined;
+  if (!who.override) {
+    const stop = ["systemctl", "--user", "stop", ...POLL_UNITS];
+    const t = await run(stop, { env: systemctlEnv(env), inherit: false });
+    if (t.code !== 0 && t.code !== SYSTEMCTL_NOT_LOADED) timer = `could not stop the poller timer (${stop.join(" ")} exited ${t.code}: ${firstLine(t.stderr)})`;
+  }
+  // The runs next: Docker won't remove a network with an endpoint attached. A failure here must not stop
   // `compose down` (this is kill switch 3), so it is reported after.
   let leftover: Error | undefined;
+  let locked = false;
   try {
-    await removeRuns(PROJECT, run, env);
+    await withStackLock({ diskDir: deps.diskDir ?? RUN_DISK, env }, "stack-down", async () => {
+      locked = true;
+      await removeRuns(PROJECT, run, env);
+    });
   } catch (e) {
-    leftover = e as Error;
+    if (locked) leftover = e as Error;
+    else {
+      // Never wait: a finalize copying a run out holds the lock for minutes, and kill switch 3 takes seconds.
+      const why = env.XDG_RUNTIME_DIR ? (e as Error).message.replace(/\s+/g, " ").trim() : "XDG_RUNTIME_DIR is not set, and the lock is on its tmpfs";
+      console.error(
+        `hapi stack down: could not take the run disk's lock (${why}): removing the runs but leaving their volumes, and their dirs on the run disk: a finalize copying its run out removes that run's own, and the rest stay until a \`mise run down\` that takes the lock, so run it again once the lock is free (H-209, H-210)`,
+      );
+      try {
+        await removeRuns(PROJECT, run, env, { volumes: false });
+      } catch (x) {
+        leftover = x as Error;
+      }
+    }
   }
   const r = await run(["docker", "compose", "-p", PROJECT, "down"], { env: definedEnv(env), inherit: true });
-  if (r.code !== 0) throw new Error(`docker compose -p ${PROJECT} down failed (exit ${r.code})${leftover === undefined ? "" : `; also ${leftover.message}`}`);
+  const also = [timer, leftover?.message].filter((x): x is string => x !== undefined);
+  if (r.code !== 0) throw new Error(`docker compose -p ${PROJECT} down failed (exit ${r.code})${also.map((a) => `; also ${a}`).join("")}`);
+  if (timer !== undefined) throw new Error(`${timer}${leftover === undefined ? "" : `; also ${leftover.message}`}`);
   if (leftover !== undefined) throw leftover;
   return 0;
 }

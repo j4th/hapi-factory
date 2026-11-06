@@ -27,17 +27,9 @@
  * closed.
  */
 import { type AuditRun, type CheckResult, type ExecResult, result } from "../types";
+import { firstLine } from "./util";
 
 const UNSET = ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"].flatMap((v) => ["-u", v]);
-
-/** The first non-empty line of git's stderr, at most 300 characters. */
-function firstLine(text: string): string {
-  const line = text
-    .split("\n")
-    .map((l) => l.trim())
-    .find((l) => l !== "");
-  return line === undefined ? "" : line.length > 300 ? `${line.slice(0, 300)}...` : line;
-}
 
 /** repo.private-untracked */
 export async function repoPrivateUntracked(run: AuditRun): Promise<CheckResult[]> {

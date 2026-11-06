@@ -23,6 +23,7 @@
  */
 import YAML from "yaml";
 import { type ModelSpec, type Policy, ROLES, type RosterName, type Tier } from "../policy/types";
+import type { RunKind } from "../run/kinds";
 import { hashComment, notice, wrap } from "./header";
 
 /**
@@ -44,22 +45,63 @@ export const RUN_PATHS = {
   ledgerDir: "/tmp/hapi-guard",
   /** The home-scoped workflow pack, bound read-only. */
   pack: "/.archon/workflows/hapi",
+  /**
+   * The host-validated work order as JSON, bound read-only (Plan 03 Task 7). A run's nodes and prompts read it and
+   * `task`, never the clone's own order.yaml, which a worker could commit to.
+   */
+  order: "/run/hapi/order.json",
+  /** The work order's task text (its task.md), bound read-only; empty when it has none. */
+  task: "/run/hapi/task.md",
+  /**
+   * A review's or fix's inputs dir, bound read-only (Plan 03 Task 8): the host's copy of `RUN_INPUTS`' files
+   * (src/run/kinds.ts), the diff and verify's results for a review, the review's findings for a fix.
+   */
+  inputs: "/run/hapi/inputs",
 } as const;
 
 /**
  * The per-run input the launcher writes and binds read-only at
- * `RUN_PATHS.runFile`. No work-order file enters the container.
+ * `RUN_PATHS.runFile`. The work order itself enters the container only as the
+ * host's copy, `RUN_PATHS.order`.
  */
 export interface RunFile {
   run_id: string;
   /** The work order's id. */
   work_order: string;
   traceparent: string;
-  /** Already `min(work order budget.usd, --budget-usd)`. */
+  /** The run's budget, already folded: the work order's budget.usd, its kind's round cap, or lower as the caller asked. */
   budget_usd: number;
   public: boolean;
   workflow: string;
   started_at: string;
+  /** The run's kind; absent in a Plan 02 run file, which is a worker's. */
+  kind?: RunKind;
+  /** The run's round: 0 for the worker, n for the n-th fix round. */
+  round?: number;
+  /** The run's turn budget, what the guard holds it to: the work order's budget.turns, at most `runs.phases.round_turns` for a fix. Not the record's `turns`, which are the turns the run took. */
+  turns?: number;
+  /** The work order's base commit, the one its worker run started from (Task 11's CodeRabbit node: `jq -r .base /run/hapi/run.json`). */
+  base?: string;
+  /**
+   * The commit this run starts from, its checkout's HEAD before any node runs: a worker's is its base, a fix's the
+   * head it fixes. factory-task's gates hold HEAD to it, so a worker that commits for itself is caught: the run
+   * commits each piece, after the gates. Absent in a run file from before Plan 03 Task 11.
+   */
+  sha?: string;
+  /**
+   * The smoke sidecar's port, when the overlaid policy's `repo.sidecar` names one (policy/sidecars.yaml's `port`):
+   * factory-task's preflight probes `http://hapi-sidecar:<port>/` before the work starts, so a smoke that can't
+   * reach its sidecar fails there, not after the session has spent its budget.
+   */
+  sidecar_port?: number;
+  /** A review run's alone: whether its CodeRabbit step runs, the overlaid policy's `runs.phases.coderabbit`. */
+  coderabbit?: boolean;
+  /**
+   * The model the run's session runs on, as its own run config's alias names it: `@implement`'s for a worker or a fix,
+   * `@review`'s for a review (the record's `model`); absent for a verify, which runs none. factory-task's commit
+   * node writes it as the `Model:` trailer with jq, so it runs no bun that the worker's `$HOME` could steer.
+   */
+  model?: string;
 }
 
 /**
@@ -188,6 +230,13 @@ function archonEnv(): string {
   return `${head}\n\n${body}\n`;
 }
 
+/**
+ * The identity the run container's git commits as (its `~/.gitconfig`'s `[user]`): the only author and committer the
+ * host gates accept on a run's commits (src/engine/harvest.ts), so a worker-written git config can't credit them to
+ * anyone else.
+ */
+export const WORKER_IDENTITY = { name: "hapi-factory worker", email: "worker@hapi.invalid" } as const;
+
 /** The directories Git is told to trust: the source clone, and Archon's workspaces and worktrees. */
 const SAFE_DIRECTORIES = [RUN_PATHS.source, "/.archon/workspaces", "/.archon/workspaces/*", "/.archon/worktrees", "/.archon/worktrees/*"];
 
@@ -200,7 +249,7 @@ const SAFE_DIRECTORIES = [RUN_PATHS.source, "/.archon/workspaces", "/.archon/wor
 function gitconfig(): string {
   const head = hashComment(notice("Git config for the run container (~/.gitconfig)", ["the run container's paths (RUN_PATHS), no policy file"]));
   const safe = SAFE_DIRECTORIES.map((d) => `\tdirectory = ${d}`).join("\n");
-  return `${head}\n[safe]\n${safe}\n[user]\n\tname = hapi-factory worker\n\temail = worker@hapi.invalid\n`;
+  return `${head}\n[safe]\n${safe}\n[user]\n\tname = ${WORKER_IDENTITY.name}\n\temail = ${WORKER_IDENTITY.email}\n`;
 }
 
 /** Bound over `/.archon/.env`: only comments, so Archon loads no env file. */

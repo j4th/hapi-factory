@@ -1,8 +1,9 @@
 /**
  * `hapi audit` (`mise run audit`, spec §11.8): the deployed config, the pins,
- * the budget policy, the run container's definition, the running stack's
- * settings, the secrets setup and each `--repo`'s GitHub settings, checked
- * against policy. docs/audit.md describes every check: what
+ * the budget policy, the repo registry's installations, the sidecar images,
+ * which decision models are off, the run container's definition, the running
+ * stack's settings and the poller's timer, the secrets setup and each
+ * `--repo`'s GitHub settings, checked against policy. docs/audit.md describes every check: what
  * it verifies, why, the credential it uses, how to fix a failure and what its
  * skip means.
  *
@@ -23,13 +24,14 @@ import { rm } from "node:fs/promises";
 import { userInfo } from "node:os";
 import { join, resolve } from "node:path";
 import { parseOwnerRepo } from "../forge/github/app-token";
+import { sanitizeTerminal } from "../run/sanitize";
 import { generatedDrift } from "./checks/generated";
-import { githubAppPerms, githubRulesets, repoAiWorkflows } from "./checks/github";
+import { githubAppPerms, githubLabels, githubRepoSettings, githubRulesets, repoAiWorkflows } from "./checks/github";
 import { mcpToolHashes } from "./checks/mcp";
 import { pinsVersions } from "./checks/pins";
-import { budgetEnforcement } from "./checks/policy";
+import { budgetEnforcement, policyDecisionModels, policyRepos, policySidecars } from "./checks/policy";
 import { repoPrivateUntracked } from "./checks/repo";
-import { devOverride, hermesNoYolo, runContainer } from "./checks/runtime";
+import { devOverride, hermesNoYolo, pollerTimer, runContainer, runDisk } from "./checks/runtime";
 import { secretsCheck, secretsProvider } from "./checks/secrets";
 import { archonValidate, hermesValidate } from "./checks/tools";
 import { type AuditContext, type Check, type CheckResult, type Exec, newRun, type RepoRef, result } from "./types";
@@ -38,9 +40,14 @@ import { type AuditContext, type Check, type CheckResult, type Exec, newRun, typ
 const CHECKS: readonly (readonly [id: string, check: Check])[] = [
   ["generated.drift", generatedDrift],
   ["runtime.run-container", runContainer],
+  ["runtime.run-disk", runDisk],
   ["runtime.hermes-no-yolo", hermesNoYolo],
   ["runtime.dev-override", devOverride],
+  ["runtime.poller-timer", pollerTimer],
   ["policy.budget-enforcement", budgetEnforcement],
+  ["policy.repos", policyRepos],
+  ["policy.sidecars", policySidecars],
+  ["policy.decision-models", policyDecisionModels],
   ["pins.versions", pinsVersions],
   ["tools.archon-validate", archonValidate],
   ["tools.hermes-validate", hermesValidate],
@@ -49,6 +56,8 @@ const CHECKS: readonly (readonly [id: string, check: Check])[] = [
   ["secrets.check", secretsCheck],
   ["github.rulesets", githubRulesets],
   ["github.app-perms", githubAppPerms],
+  ["github.repo-settings", githubRepoSettings],
+  ["github.labels", githubLabels],
   ["repo.ai-workflows", repoAiWorkflows],
   ["repo.private-untracked", repoPrivateUntracked],
 ];
@@ -58,12 +67,14 @@ export const CHECK_IDS: readonly string[] = CHECKS.map(([id]) => id);
 /** An error as one line, never more than 500 characters. */
 const oneLine = (e: unknown) => (e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").trim().slice(0, 500);
 
-/** Run every check. With ctx.strict, every skip comes back a fail. */
+/** Run every check, or only those `ctx.only` names (an unknown id throws). With ctx.strict, every skip comes back a fail. */
 export async function runAudit(ctx: AuditContext): Promise<CheckResult[]> {
+  for (const id of ctx.only ?? []) if (!CHECK_IDS.includes(id)) throw new Error(`unknown audit check: ${id}`);
+  const checks = ctx.only === undefined ? CHECKS : CHECKS.filter(([id]) => ctx.only!.includes(id));
   const run = newRun(ctx);
   const out: CheckResult[] = [];
   try {
-    for (const [id, check] of CHECKS) {
+    for (const [id, check] of checks) {
       try {
         out.push(...(await check(run)));
       } catch (e) {
@@ -157,10 +168,12 @@ export async function auditCommand(args: string[], deps: Partial<AuditContext> =
     fetch: deps.fetch ?? fetch,
     now: deps.now ?? Date.now,
     ...(deps.secrets !== undefined ? { secrets: deps.secrets } : {}),
+    ...(deps.probeFs !== undefined ? { probeFs: deps.probeFs } : {}),
   };
   const results = await runAudit(ctx);
   const width = Math.max(...CHECK_IDS.map((id) => id.length));
-  for (const r of results) console.log(`${r.status.padEnd(4)}  ${r.id.padEnd(width)}  ${r.detail}`);
+  // A detail can carry text from GitHub, Docker or a tool: no terminal control reaches the terminal (M16).
+  for (const r of results) console.log(`${r.status.padEnd(4)}  ${r.id.padEnd(width)}  ${sanitizeTerminal(r.detail)}`);
   const count = (s: CheckResult["status"]) => results.filter((r) => r.status === s).length;
   console.log(`hapi audit: ${count("pass")} pass, ${count("fail")} fail, ${count("skip")} skip`);
   return count("fail") > 0 ? 1 : 0;

@@ -47,6 +47,7 @@ describe("a missing or invalid hapi-guard.json or run.json registers only a fail
     ["a model pin without base_url", (s: any) => delete s.models["anthropic/claude-haiku-5-5"].base_url, "models.anthropic/claude-haiku-5-5.base_url must be a string"],
     ["a result-screen tool the guard can't screen", (s: any) => (s.gates.result_screen.tools = ["bash", MARKER]), "gates.result_screen.tools[1] must be one of bash, read"],
     ["a relative path", (s: any) => (s.paths.out = "out"), "paths.out must be an absolute path"],
+    ["a path with a .. segment", (s: any) => (s.paths.out = "/out/../etc"), 'paths.out must not hold ".."'],
     ["a secret_env name that isn't an env name", (s: any) => s.secret_env.push(`A;${MARKER}`), "secret_env[4] must be an env name"],
   ] as const) {
     test(`hapi-guard.json with ${what}`, async () => {

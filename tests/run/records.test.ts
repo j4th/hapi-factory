@@ -5,13 +5,15 @@
  * labels, never a pid.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { readdirSync, readFileSync, realpathSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { RUN_KINDS } from "../../src/run/kinds";
 import { runStart } from "../../src/run/lifecycle";
-import { isLive, keyProblem, RUN_ID, runKey, type RunRecord } from "../../src/run/records";
+import { capacityProblem, isLive, keyPart, keyProblem, readRecord, RUN_ID, runKey, type RunRecord } from "../../src/run/records";
 import { PROJECT_LABEL, RUN_LABEL } from "../../src/stack/up";
-import { capture, cleanup } from "../secrets/helpers";
-import { fakeRepo, fakeRun, fakeSecret, SHA, seedRun, writeArchonEnv, writeOrder } from "./helpers";
+import { capture, caught, cleanup, tempDir } from "../secrets/helpers";
+import { fakeRepo, fakeRun, fakeSecret, SHA, seedRun, writeOrder, writeZoneEnv } from "./helpers";
 
 afterEach(cleanup);
 
@@ -33,6 +35,137 @@ describe("runKey", () => {
     expect(runKey("0004-other", SHA)).not.toBe(KEY);
     // The two parts can't be shifted into each other.
     expect(runKey("a", "bc")).not.toBe(runKey("ab", "c"));
+  });
+
+  test("a non-worker run's key adds <kind>:<round>; a hand run's key is the two-part key, unchanged, so Plan 02's records stay valid", () => {
+    const id = "0003-check-run";
+    const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
+    expect(runKey(id, SHA)).toBe(sha256(`${id}\0${SHA}`));
+    expect(runKey(id, SHA, "fix:1")).toBe(sha256(`${id}\0${SHA}\0fix:1`));
+    expect(new Set([runKey(id, SHA), runKey(id, SHA, "fix:1"), runKey(id, SHA, "fix:2"), runKey(id, SHA, "verify:0")]).size).toBe(4);
+  });
+});
+
+describe("keyPart", () => {
+  test("keyPart: a hand run keeps the two-part key, and every engine key names its kind, its round and, from the first retry on, its retry", () => {
+    expect(keyPart("worker", 0)).toBeUndefined();
+    expect(keyPart("worker", 0, 0)).toBe("worker:0");
+    expect([keyPart("verify", 0), keyPart("verify", 0, 0), keyPart("fix", 1)]).toEqual(["verify:0", "verify:0", "fix:1"]);
+    expect([keyPart("worker", 0, 1), keyPart("review", 0, 2)]).toEqual(["worker:0:retry1", "review:0:retry2"]);
+    const id = "0003-check-run";
+    const keys = [runKey(id, SHA)];
+    for (const [k, r] of [["worker", 0], ["fix", 1]] as const) for (const n of [0, 1, 2]) keys.push(runKey(id, SHA, keyPart(k, r, n)));
+    expect(new Set(keys).size).toBe(7);
+  });
+});
+
+describe("readRecord", () => {
+  /** A record dir holding `rec` as record.json, written by hand: readRecord must refuse what hapi never writes. */
+  function written(rec: Record<string, unknown>): string {
+    const state = tempDir("hapi-records-");
+    mkdirSync(join(state, rec.runId as string));
+    writeFileSync(join(state, rec.runId as string, "record.json"), JSON.stringify(rec));
+    return state;
+  }
+  const base = { ...rec("aaaaaaaaaaaa", "succeeded", "2026-10-29T10:00:00Z") };
+
+  test("a record whose kind is no run kind is not one hapi wrote", async () => {
+    expect(RUN_KINDS).toEqual(["worker", "verify", "review", "fix"]);
+    for (const kind of ["build", "", 1, null]) {
+      const e = await caught(readRecord(written({ ...base, kind }), "aaaaaaaaaaaa"));
+      expect([kind, e.message]).toEqual([kind, expect.stringContaining("is not a run record hapi wrote")]);
+    }
+    for (const kind of RUN_KINDS) expect((await readRecord(written({ ...base, kind }), "aaaaaaaaaaaa"))!.kind).toBe(kind);
+    // A Plan 02 record has no kind, and still reads back.
+    expect((await readRecord(written(base), "aaaaaaaaaaaa"))!.kind).toBeUndefined();
+  });
+
+  test("a record whose retry isn't a whole number of at least 0 is not one hapi wrote", async () => {
+    for (const retry of [-1, 1.5, "1"]) {
+      const e = await caught(readRecord(written({ ...base, retry }), "aaaaaaaaaaaa"));
+      expect([retry, e.message]).toEqual([retry, expect.stringContaining("is not a run record hapi wrote")]);
+    }
+    expect((await readRecord(written({ ...base, retry: 0 }), "aaaaaaaaaaaa"))!.retry).toBe(0);
+  });
+
+  test("a record whose budget or spend isn't a finite number of at least 0, or whose round or turns isn't a whole number of at least 0, is not one hapi wrote", async () => {
+    // JSON has no NaN or Infinity: JSON.stringify writes them as null.
+    const bad: [string, unknown][] = [
+      ["budgetUsd", -1], ["budgetUsd", Number.NaN], ["budgetUsd", "3"], ["spendUsd", -0.1], ["spendUsd", Number.POSITIVE_INFINITY],
+      ["round", -1], ["round", 1.5], ["turns", -1], ["turns", 2.5], ["turns", "2"],
+    ];
+    for (const [field, value] of bad) {
+      const e = await caught(readRecord(written({ ...base, [field]: value }), "aaaaaaaaaaaa"));
+      expect([field, value, e.message]).toEqual([field, value, expect.stringContaining("is not a run record hapi wrote")]);
+    }
+    const good = { ...base, budgetUsd: 0, spendUsd: 0.42, round: 1, turns: 0 };
+    expect(await readRecord(written(good), "aaaaaaaaaaaa")).toEqual(good as RunRecord);
+  });
+
+  test(`a record whose decisions isn't "off" is not one hapi wrote`, async () => {
+    for (const decisions of ["on", "enforce", true, ""]) {
+      const e = await caught(readRecord(written({ ...base, decisions }), "aaaaaaaaaaaa"));
+      expect([decisions, e.message]).toEqual([decisions, expect.stringContaining("is not a run record hapi wrote")]);
+    }
+    expect((await readRecord(written({ ...base, decisions: "off" }), "aaaaaaaaaaaa"))!.decisions).toBe("off");
+    expect("decisions" in (await readRecord(written(base), "aaaaaaaaaaaa"))!).toBe(false);
+  });
+
+  test("a record whose review isn't a verdict and its marks is not one hapi wrote (m20)", async () => {
+    const bad = [
+      { verdict: "great", marks: [] },
+      { verdict: "ready", marks: ["mostly"] },
+      { verdict: "ready" },
+      { verdict: "ready", marks: [], extra: 1 },
+      "ready",
+      null,
+    ];
+    for (const review of bad) {
+      const e = await caught(readRecord(written({ ...base, review }), "aaaaaaaaaaaa"));
+      expect([review, e.message]).toEqual([review, expect.stringContaining("is not a run record hapi wrote")]);
+    }
+    const review = { verdict: "needs-work", marks: ["met", "partly", "unmet"] };
+    expect((await readRecord(written({ ...base, review }), "aaaaaaaaaaaa"))!.review).toEqual(review as RunRecord["review"]);
+    expect((await readRecord(written(base), "aaaaaaaaaaaa"))!.review).toBeUndefined();
+  });
+});
+
+describe("forgeRepo (m23)", () => {
+  test("a record's forgeRepo, when it has one, is a GitHub repository's owner/name", async () => {
+    const state = (rec: object) => {
+      const dir = tempDir("hapi-records-");
+      mkdirSync(join(dir, "aaaaaaaaaaaa"));
+      writeFileSync(join(dir, "aaaaaaaaaaaa", "record.json"), JSON.stringify(rec));
+      return dir;
+    };
+    const base = rec("aaaaaaaaaaaa", "succeeded", "2026-10-29T10:00:00Z");
+    for (const forgeRepo of ["example-owner", "a/b/c", "../x", "owner/..", "", 7, null]) {
+      const e = await caught(readRecord(state({ ...base, forgeRepo }), "aaaaaaaaaaaa"));
+      expect([forgeRepo, e.message]).toEqual([forgeRepo, expect.stringContaining("is not a run record hapi wrote")]);
+    }
+    expect((await readRecord(state({ ...base, forgeRepo: "example-owner/sandbox" }), "aaaaaaaaaaaa"))!.forgeRepo).toBe("example-owner/sandbox");
+    expect((await readRecord(state(base), "aaaaaaaaaaaa"))!.forgeRepo).toBeUndefined();
+    // The container's exit code, when finalize could read it, is an integer.
+    for (const exitCode of [1.5, "0", null]) {
+      const e = await caught(readRecord(state({ ...base, exitCode }), "aaaaaaaaaaaa"));
+      expect([exitCode, e.message]).toEqual([exitCode, expect.stringContaining("is not a run record hapi wrote")]);
+    }
+    for (const exitCode of [0, 137, -1]) expect((await readRecord(state({ ...base, exitCode }), "aaaaaaaaaaaa"))!.exitCode).toBe(exitCode);
+  });
+
+  test("capacityProblem keys one live run per repo by forgeRepo when the start has one, and by the source's git dir always", () => {
+    const d = { stateDir: "/state", project: "hapi", runs: { max_live: 5 } } as Parameters<typeof capacityProblem>[3];
+    const mirror = { ...rec("aaaaaaaaaaaa", "live", "2026-10-29T10:00:00Z"), repo: "/engine/mirrors/example-owner/sandbox.git", forgeRepo: "example-owner/sandbox" };
+    const refused = "run aaaaaaaaaaaa is live for example-owner/sandbox: one live run per repo (H-090); wait for it, or stop it with `hapi run stop aaaaaaaaaaaa`";
+    // A verify from a scratch copy of the same repo: another git dir, the same GitHub repo.
+    expect(capacityProblem(["aaaaaaaaaaaa"], [mirror], { repo: "/engine/scratch/0003/repo.git", forgeRepo: "example-owner/sandbox" }, d)).toBe(refused);
+    expect(capacityProblem(["aaaaaaaaaaaa"], [mirror], { repo: "/engine/scratch/0003/repo.git", forgeRepo: "example-owner/other" }, d)).toBeUndefined();
+    // The same git dir is the same repo, whatever either says of GitHub (a hand run names none).
+    expect(capacityProblem(["aaaaaaaaaaaa"], [mirror], { repo: mirror.repo }, d)).toBe(`run aaaaaaaaaaaa is live for ${mirror.repo}: one live run per repo (H-090); wait for it, or stop it with \`hapi run stop aaaaaaaaaaaa\``);
+    // GitHub's names aren't case-sensitive, so neither is the comparison.
+    expect(capacityProblem(["aaaaaaaaaaaa"], [mirror], { repo: "/engine/scratch/0003/repo.git", forgeRepo: "Example-Owner/Sandbox" }, d)).toBe(refused.replace("for example-owner/sandbox", "for Example-Owner/Sandbox"));
+    // A run that isn't live doesn't count.
+    expect(capacityProblem([], [mirror], { repo: "/x.git", forgeRepo: "example-owner/sandbox" }, d)).toBeUndefined();
   });
 });
 
@@ -67,7 +200,7 @@ describe("keyProblem", () => {
 
 describe("admission, under the lock", () => {
   async function start(f: ReturnType<typeof fakeRun>, repo: string) {
-    writeArchonEnv(f.xdg, { ANTHROPIC_API_KEY: fakeSecret("ANTHROPIC_API_KEY") });
+    writeZoneEnv(f.xdg, "archon", { ANTHROPIC_API_KEY: fakeSecret("ANTHROPIC_API_KEY") });
     return runStart(["--repo", repo, "--work-order", writeOrder(f.tmp)], f.deps);
   }
   const LIVE_LIST = ["docker", "ps", "--filter", "label=org.hapi.run", "--filter", "label=org.hapi.project=hapi", "--format", '{{.Label "org.hapi.run"}}\t{{.Names}}'];

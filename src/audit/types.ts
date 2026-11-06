@@ -8,6 +8,7 @@
  * `ctx.fetch`, so the unit tests run the whole audit with fakes: no Docker,
  * network or secret.
  */
+import type { FsProbe } from "../run/disk";
 import type { SecretsDeps } from "../secrets/cli";
 
 export type Env = Record<string, string | undefined>;
@@ -57,6 +58,13 @@ export interface AuditContext {
   dev: boolean;
   /** `--github-token-file`: an operator token for the GitHub reads (never printed). */
   githubTokenFile?: string;
+  /**
+   * The operator's own token, in memory only, for the GitHub reads: `hapi new-repo`'s verify step passes its `gh`
+   * login. It wins over `githubTokenFile`, and is never printed, logged or written. No flag sets it.
+   */
+  githubToken?: string;
+  /** Run only these checks, by id (new-repo's verify step); an id the audit doesn't have throws. Default: every check. */
+  only?: readonly string[];
   env: Env;
   /** Who runs the audit (the process's user, not $USER). */
   user: string;
@@ -66,6 +74,14 @@ export interface AuditContext {
   now: () => number;
   /** Passed to the secret provider (tests inject fakes for sops and the checkout boundary). */
   secrets?: SecretsDeps;
+  /** What runtime.run-disk reads the run disk's filesystem with; default: src/run/disk.ts `probeFs` (tests inject a fake). */
+  probeFs?: FsProbe;
+  /**
+   * Each zone's env names, zone to names, which runtime.run-container holds a live run container's keys to: one holds
+   * only its kind's zone's keys, a verify none, a sidecar none. Default: each zone of stack/secrets.yaml, its review zone
+   * included.
+   */
+  zoneKeys?: Record<string, string[]>;
 }
 
 /** One audit: its context, and what its checks share, each computed at most once. */

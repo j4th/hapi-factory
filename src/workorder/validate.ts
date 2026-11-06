@@ -9,8 +9,19 @@
  * rejects a forge host there (`nonForgeHost`, the same list `applyOverlay`
  * uses; see src/policy/hosts.ts).
  */
+import workOrderSchema from "../../policy/schemas/work-order.schema.json";
 import { check, formatIssue, type Issue, readYaml } from "../policy/schema";
 import type { Risk, Tier } from "../policy/types";
+
+/** A work order's id, as the schema says it (`properties.id.pattern`): it names its directory and its branch. */
+export const WORK_ORDER_ID: RegExp = new RegExp(workOrderSchema.properties.id.pattern);
+/** The schema's `properties.id.maxLength`. */
+export const WORK_ORDER_ID_MAX: number = workOrderSchema.properties.id.maxLength;
+
+/** Whether `s` is a work-order id the schema accepts: its pattern, within its length. */
+export function isWorkOrderId(s: string): boolean {
+  return s.length <= WORK_ORDER_ID_MAX && WORK_ORDER_ID.test(s);
+}
 
 export interface WorkOrder {
   /** e.g. "0002-search-partners-tool": names the work-order directory and the factory/<id> branch. */

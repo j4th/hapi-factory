@@ -196,8 +196,10 @@ export function checkWrite(r: Roots, input: string, cwd: string, home: string): 
 
 /**
  * The real path of an existing dir, or the path itself when it doesn't exist (so nothing can be inside it).
- * Only for the guard's roots (the worktree, /tmp, Pi's dir, the ledger, /out), which hold no "..", so
- * realpathSync's lexical first step can't misplace them.
+ * Only for the guard's roots (the worktree, /tmp, Pi's dir, the ledger, /out). realpathSync applies a ".."
+ * lexically before it follows the link in front of it, so a root must hold none: hapi-guard.json's paths are
+ * refused with a ".." segment (config.ts absPath), and the others are fixed by the run container (RUN_PATHS:
+ * /work/repo, /tmp, /opt/hapi/pi-agent), not read from anything the run writes.
  */
 export function realDir(p: string): string {
   try {

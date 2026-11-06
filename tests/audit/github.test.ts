@@ -10,7 +10,7 @@ import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { aiWorkflowProblems } from "../../src/audit/checks/github";
 import { auditCommand, runAudit } from "../../src/audit/index";
-import { API, APP_IDS, APP_KEY, appOf, capture, cleanup, cleanWorld, FIXTURES, githubRoutes, goodRulesets, hostEnv, MINTED_TOKEN, NAME, only, OWNER } from "./helpers";
+import { API, APP_IDS, APP_KEY, appOf, capture, cleanup, cleanWorld, FIXTURES, githubRoutes, goodRulesets, goodSettings, hostEnv, LABEL_NAMES, MINTED_TOKEN, NAME, only, OWNER, registeredPolicy } from "./helpers";
 import { envFileText } from "../../src/secrets/files";
 
 afterEach(cleanup);
@@ -307,6 +307,18 @@ describe("github.app-perms", () => {
     });
   }
 
+  test("I5: an App lacking a permission the engine needs (factory without checks: read), or with it at a lower level, fails, naming the runbook's step", async () => {
+    const good = { planner: { contents: "write", pull_requests: "write", issues: "read", metadata: "read" }, factory: { contents: "write", pull_requests: "write", checks: "read", metadata: "read" } };
+    const lacking = await run(await withToken({ appPermissions: { ...good, factory: { contents: "write", pull_requests: "write", metadata: "read" } } }));
+    expect(lacking.perms.status).toBe("fail");
+    expect(lacking.perms.detail).toContain("hapi-factory lacks checks: read");
+    expect(lacking.perms.detail).toContain("hapi-factory's installation on");
+    expect(lacking.perms.detail).toContain("docs/runbooks/github-apps.md#adding-a-permission-to-an-existing-app");
+    const lower = await run(await withToken({ appPermissions: { ...good, planner: { contents: "read", pull_requests: "write", issues: "read", metadata: "read" } } }));
+    expect(lower.perms.status).toBe("fail");
+    expect(lower.perms.detail).toContain("hapi-planner has contents: read, below the runbook's contents: write");
+  });
+
   test("a response with no permissions object, or no App id, fails closed: there is nothing to clear", async () => {
     const cases: [string, (body: Record<string, unknown>) => void, string][] = [
       [`GET ${API}/app`, (b) => delete b.permissions, "GET /app returned no permissions object"],
@@ -528,5 +540,163 @@ describe("repo.ai-workflows", () => {
     const r = await run(await withToken({ workflows: { "bad.yml": "on: [unclosed\n" } }));
     expect(r.workflows.status).toBe("fail");
     expect(r.workflows.detail).toContain("bad.yml");
+  });
+});
+
+describe("github.rulesets and the contract's check", () => {
+  const withContexts = (contexts: { context: string; integration_id?: number }[]) =>
+    mutate((r) => (named(r, "main-protect").rules[2].parameters.required_status_checks = contexts));
+  const ci = { context: "ci", integration_id: 15368 };
+  const gates = { context: "ci / gates", integration_id: 15368 };
+
+  test("a repo policy/repos.yaml registers must require exactly ci / gates; any other repo exactly ci, from GitHub Actions", async () => {
+    for (const [registered, contexts, status, says] of [
+      [false, [ci], "pass", "main requires only the ci check, from GitHub Actions"],
+      [false, [gates], "fail", "main has no required_status_checks rule with the ci check"],
+      [false, [ci, gates], "fail", "main requires status checks other than ci (ci / gates)"],
+      [true, [gates], "pass", "main requires only the ci / gates check, from GitHub Actions"],
+      [true, [ci], "fail", "main has no required_status_checks rule with the ci / gates check (the contract's: the repo is registered in policy/repos.yaml)"],
+      [true, [ci, gates], "fail", "main requires status checks other than ci / gates (ci)"],
+      [true, [{ context: "ci / gates", integration_id: 347564 }], "fail", "main's ci / gates check isn't tied to GitHub Actions (integration_id 15368)"],
+      [true, [{ context: "ci / gates" }], "fail", "main's ci / gates check isn't tied to GitHub Actions (integration_id 15368)"],
+    ] as const) {
+      const w = await withToken({ rulesets: withContexts([...contexts]) });
+      if (registered) w.ctx.policyDir = registeredPolicy();
+      const r = await run(w);
+      expect([registered, contexts, r.rulesets.status]).toEqual([registered, contexts, status]);
+      expect(r.rulesets.detail).toContain(says);
+    }
+  });
+});
+
+describe("M14: main-review's require_last_push_approval", () => {
+  const withLastPush = (v: unknown) => mutate((r) => (named(r, "main-protect").rules[2].parameters.required_status_checks = [{ context: "ci / gates", integration_id: 15368 }], named(r, "main-review").rules[0].parameters.require_last_push_approval = v));
+
+  test("a registered repo fails without it, naming it; hapi-factory's own repo (not registered) is left alone", async () => {
+    for (const v of [false, undefined]) {
+      const w = await withToken({ rulesets: withLastPush(v) });
+      w.ctx.policyDir = registeredPolicy();
+      const r = await run(w);
+      expect([v, r.rulesets.status]).toEqual([v, "fail"]);
+      expect(r.rulesets.detail).toContain("main-review's pull_request rule doesn't set require_last_push_approval");
+    }
+    const ok = await withToken({ rulesets: withLastPush(true) });
+    ok.ctx.policyDir = registeredPolicy();
+    expect((await run(ok)).rulesets.status).toBe("pass");
+    // Not registered (hapi-factory's own repo keeps false until its operator step): no problem of it.
+    const own = await run(await withToken({ rulesets: mutate((r) => (named(r, "main-review").rules[0].parameters.require_last_push_approval = false)) }));
+    expect(own.rulesets.status).toBe("pass");
+  });
+});
+
+describe("github.repo-settings and github.labels: the contract's settings, for a registered repo", () => {
+  /** A world whose policy registers the repo; read with the operator's token file. */
+  async function registered(o: Parameters<typeof githubRoutes>[0] = {}): Promise<World> {
+    const w = await withToken(o);
+    w.ctx.policyDir = registeredPolicy();
+    return w;
+  }
+  const checks = async (w: World) => {
+    const all = await runAudit(w.ctx);
+    return { settings: only(all, "github.repo-settings"), labels: only(all, "github.labels") };
+  };
+
+  test("github.repo-settings passes a registered repo set up as new-repo sets it, and names each setting that differs", async () => {
+    let r = await checks(await registered());
+    expect([r.settings.status, r.settings.detail]).toEqual(["pass", expect.stringContaining(`${OWNER}/${NAME}: merge commits only`) as unknown as string]);
+    expect(r.labels.status).toBe("pass");
+
+    const s = goodSettings();
+    s.repo.allow_squash_merge = true;
+    s.repo.merge_commit_title = "PR_TITLE";
+    (s.repo.security_and_analysis as any).secret_scanning_push_protection.status = "disabled";
+    s.workflow.default_workflow_permissions = "write";
+    s.actions.sha_pinning_required = false;
+    s.selected.patterns_allowed = ["jdx/mise-action@*", `${OWNER}/hapi-factory/.github/workflows/gates.yml@*`, "evil/action@*"];
+    s.fork.approval_policy = "first_time_contributors";
+    s.pvr.enabled = false;
+    r = await checks(await registered({ settings: s }));
+    expect(r.settings.status).toBe("fail");
+    for (const says of [
+      "allow_squash_merge is true, not false",
+      'merge_commit_title is "PR_TITLE", not "MERGE_MESSAGE"',
+      'security_and_analysis.secret_scanning_push_protection.status is "disabled", not "enabled"',
+      'actions/permissions/workflow: default_workflow_permissions is "write", not "read"',
+      "actions/permissions: sha_pinning_required is false, not true",
+      "actions/permissions/selected-actions: patterns_allowed is",
+      'actions/permissions/fork-pr-contributor-approval: approval_policy is "first_time_contributors", not "all_external_contributors"',
+      "private-vulnerability-reporting: enabled is false, not true",
+    ]) {
+      expect([says, r.settings.detail.includes(says)]).toEqual([says, true]);
+    }
+  });
+
+  test("a setting GitHub hides from the credential is a skip, naming it and the credential", async () => {
+    const s = goodSettings();
+    delete s.repo.security_and_analysis;
+    const w = await registered({ settings: s });
+    w.routes[`GET ${API}/repos/${OWNER}/${NAME}/private-vulnerability-reporting`] = { status: 403, body: { message: "Must have admin rights to Repository." } };
+    const r = await checks(w);
+    expect(r.settings.status).toBe("skip");
+    expect(r.settings.detail).toContain(`${OWNER}/${NAME}: security_and_analysis isn't visible with the operator's token (--github-token-file)`);
+    expect(r.settings.detail).toContain("private-vulnerability-reporting isn't visible with");
+    // A setting that differs still fails, hidden ones or not.
+    w.routes[`GET ${API}/repos/${OWNER}/${NAME}/actions/permissions`] = { status: 200, body: { ...goodSettings().actions, allowed_actions: "all" } };
+    expect((await checks(w)).settings.status).toBe("fail");
+  });
+
+  test("github.labels skips when GitHub refuses the list to the credential, and fails on any other error", async () => {
+    let w = await registered();
+    w.routes[`GET ${API}/repos/${OWNER}/${NAME}/labels?per_page=100&page=1`] = { status: 403, body: { message: "Resource not accessible by integration" } };
+    let r = await checks(w);
+    expect([r.labels.status, r.labels.detail]).toEqual(["skip", `${OWNER}/${NAME}: the labels aren't visible with the operator's token (--github-token-file); pass --github-token-file with the operator's token`]);
+    w = await registered();
+    w.routes[`GET ${API}/repos/${OWNER}/${NAME}/labels?per_page=100&page=1`] = { status: 500, body: { message: "boom" } };
+    r = await checks(w);
+    expect([r.labels.status, r.labels.detail]).toEqual(["fail", `${OWNER}/${NAME}: GitHub: GET /repos/${OWNER}/${NAME}/labels: HTTP 500: boom`]);
+  });
+
+  test("github.labels fails a registered repo that lacks a label", async () => {
+    const r = await checks(await registered({ labels: LABEL_NAMES.filter((l) => l !== "hapi:flagged") }));
+    expect(r.labels.status).toBe("fail");
+    expect(r.labels.detail).toContain(`${OWNER}/${NAME}: no label hapi:flagged`);
+  });
+
+  test("for an unregistered repo, both pass, saying the contract's settings don't apply, and make no request", async () => {
+    const w = await withToken({ settings: { ...goodSettings(), repo: { allow_squash_merge: true } }, labels: [] });
+    const r = await checks(w);
+    for (const x of [r.settings, r.labels]) expect([x.status, x.detail]).toEqual(["pass", `${OWNER}/${NAME}: not registered in policy/repos.yaml, so the contract's settings don't apply`]);
+    expect(w.requests.some((c) => /\/(labels|private-vulnerability-reporting|actions\/permissions)/.test(c.url))).toBe(false);
+  });
+
+  test("with no --repo both skip", async () => {
+    const w = await cleanWorld();
+    const all = await runAudit(w.ctx);
+    for (const id of ["github.repo-settings", "github.labels"]) expect([id, only(all, id).status, only(all, id).detail]).toEqual([id, "skip", "no --repo given"]);
+  });
+});
+
+describe("the audit for new-repo: an in-memory token and only the checks asked for", () => {
+  test("githubToken is the credential, never printed, and wins over a token file", async () => {
+    const w = await withToken({ rulesets: mutate((r) => (named(r, "main-protect").rules[2].parameters.required_status_checks = [{ context: "ci / gates", integration_id: 15368 }])) });
+    w.ctx.policyDir = registeredPolicy();
+    w.ctx.githubToken = "fake-gh-login-token";
+    w.ctx.only = ["github.rulesets", "github.repo-settings", "github.labels", "repo.ai-workflows"];
+    const all = await runAudit(w.ctx);
+    expect(all.map((x) => [x.id, x.status])).toEqual([
+      ["github.rulesets", "pass"],
+      ["github.repo-settings", "pass"],
+      ["github.labels", "pass"],
+      ["repo.ai-workflows", "pass"],
+    ]);
+    expect(only(all, "github.rulesets").detail).toContain("read with the operator's gh login (new-repo)");
+    for (const c of w.requests) expect([c.url, c.method, c.headers.authorization]).toEqual([c.url, "GET", "Bearer fake-gh-login-token"]);
+    for (const x of all) expect(x.detail).not.toContain("fake-gh-login-token");
+  });
+
+  test("an unknown id in only throws", async () => {
+    const w = await cleanWorld();
+    w.ctx.only = ["github.rulesets", "github.nope"];
+    await expect(runAudit(w.ctx)).rejects.toThrow("unknown audit check: github.nope");
   });
 });

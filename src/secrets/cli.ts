@@ -16,7 +16,7 @@ import { initStore } from "./init";
 import { shielded } from "./interrupt";
 import { addMachine, drill, joinMachine, type LifecycleDeps, loadStore, newRecovery, recipientReport, recover, revoke, toolsFor } from "./lifecycle";
 import { loadManifest, MANIFEST_FILE, mcpSecretGaps, type McpSecretGap } from "./manifest";
-import { checkSecrets, configPath, describeSecretsConfig, entryLabel, loadSecretsConfig, resolveSecrets, SecretError, type SecretProvider, type SecretsConfig } from "./provider";
+import { checkSecrets, configPath, counted, describeSecretsConfig, entryLabel, loadSecretsConfig, resolveSecrets, SecretError, type SecretProvider, type SecretsConfig } from "./provider";
 import { type BwsRunner, bwsProvider } from "./providers/bws";
 import { envFileProvider } from "./providers/env-file";
 import { checkSopsKeys, sopsEditInvocation, sopsProvider } from "./providers/sops";
@@ -189,7 +189,7 @@ async function runCheck(config: string | undefined, deps: SecretsDeps): Promise<
   const { manifest, gaps, provider, policyDir, cfg } = prepare(config, deps);
   const { entries, unknown } = await checkSecrets(manifest, provider);
   const line = (status: string, what: string, note = "") => console.log(`${status.padEnd(8)} ${what}${note}`);
-  for (const e of entries) line(e.status, entryLabel(e), e.reason === undefined ? "" : `: ${e.reason}`);
+  for (const e of entries) line(e.status, entryLabel(e), `${e.reason === undefined ? "" : `: ${e.reason}`}${e.optional ? " (optional)" : ""}`);
   for (const g of gaps) line("missing", `${g.zone}/${g.env}`, ` (${gapReason(g, policyDir)})`);
   for (const n of unknown) line("unknown", n, ` (in the store, not in ${MANIFEST_FILE})`);
   let code = 0;
@@ -200,7 +200,8 @@ async function runCheck(config: string | undefined, deps: SecretsDeps): Promise<
     for (const e of report.errors) console.error(`hapi secrets check: ${e}`);
     if (report.errors.length > 0) code = 1;
   }
-  const bad = [...entries.filter((e) => e.status !== "found").map((e) => `${e.zone}/${e.key}`), ...gaps.map((g) => `${g.zone}/${g.env}`)];
+  // An optional entry that is missing or empty is what resolve leaves out: listed above, never counted.
+  const bad = [...entries.filter(counted).map((e) => `${e.zone}/${e.key}`), ...gaps.map((g) => `${g.zone}/${g.env}`)];
   if (bad.length === 0) return code;
   const fix = { sops: "Fill them in with `mise run secrets:edit`", bws: "Add or fill them in Bitwarden, with each id under bws.ids in your secrets config", "env-file": "Add or fill them in your env file" }[provider.name];
   console.error(`hapi secrets check: ${bad.length} of ${entries.length + gaps.length} secrets are missing or empty: ${bad.join(", ")}. ${fix} (docs/secrets.md).`);
@@ -209,13 +210,15 @@ async function runCheck(config: string | undefined, deps: SecretsDeps): Promise<
 
 /**
  * `hapi secrets check [--config file]`: print `found`, `missing`, `empty` or
- * `invalid` for every env var of the manifest, `missing` for an MCP reference
+ * `invalid` for every env var of the manifest (` (optional)` after one whose
+ * name is on the manifest's optional list), `missing` for an MCP reference
  * the manifest doesn't map, and `unknown` for each store name the manifest
  * doesn't list. Never a value. For sops, also the store's recipients (names,
  * kinds, PQ): drift or a PQ/classic mix is an error, and no recovery
  * recipient or no recovery.age a warning. Exits 1 if anything is missing,
- * empty or invalid, or on a recipient error. It writes nothing, so it needs
- * no XDG_RUNTIME_DIR.
+ * empty or invalid but an optional entry that is missing or empty (resolve
+ * leaves it out), or on a recipient error. It writes nothing, so it needs no
+ * XDG_RUNTIME_DIR.
  */
 export async function secretsCheck(args: string[], deps: SecretsDeps = {}): Promise<number> {
   const f = flagsOr(USAGE.check, args, ["--config"]);

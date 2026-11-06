@@ -7,7 +7,12 @@
  * env vars (archon's ANTHROPIC_API_KEY and CLAUDE_API_KEY).
  *
  * The manifest is the single list of what must exist: `hapi secrets resolve`
- * fails if the store lacks a name, and `hapi secrets check` names it.
+ * fails if the store lacks a name, and `hapi secrets check` names it. The one
+ * exception is its top-level `optional` list: logical names that may be absent
+ * or empty (CodeRabbit's key, until an unattended one exists: H-167). Resolve
+ * leaves such an entry out of its zone's file instead, and check reports it
+ * without counting it; whoever needs it refuses to start without it
+ * (src/run/lifecycle.ts, for a review run with `phases.coderabbit` on).
  *
  * The MCP catalog (policy/mcp.yaml) names a server's secret as
  * `secret:hapi-mcp-<slug>`, and the generated configs read it from the env var
@@ -34,8 +39,11 @@ import type { Policy } from "../policy/types";
 import { reservedEnvRule } from "../stack/env";
 import { ENV_NAME } from "./files";
 
-/** The env files hapi writes, one per zone. `host` is for host tools only, never a container. */
-export const SECRET_ZONES = ["hermes", "archon", "research", "host"] as const;
+/**
+ * The env files hapi writes, one per zone. `host` is for host tools only, never a container. `review` is the review
+ * container's alone (design §3.5): no compose service has it, and the launcher passes its names to a review run.
+ */
+export const SECRET_ZONES = ["hermes", "archon", "research", "review", "host"] as const;
 export type SecretZone = (typeof SECRET_ZONES)[number];
 
 /** A logical name: `hapi-` and lowercase words joined by `-`. */
@@ -44,15 +52,23 @@ export const LOGICAL_NAME = /^hapi-[a-z0-9]+(-[a-z0-9]+)*$/;
 /** The committed manifest, relative to the repo root (where hapi runs). */
 export const MANIFEST_FILE = "stack/secrets.yaml";
 
-/** Zone -> env var name -> logical name. A manifest built in code may leave zones out. */
-export type Manifest = Partial<Record<SecretZone, Record<string, string>>>;
+/**
+ * Zone -> env var name -> logical name, and `optional`: the logical names that may be absent or empty. A manifest
+ * built in code may leave zones out.
+ */
+export type Manifest = Partial<Record<SecretZone, Record<string, string>>> & { optional?: string[] };
 
 /** One env var of the manifest. */
 export interface ManifestEntry {
   zone: SecretZone;
   key: string;
   name: string;
+  /** Its logical name is on the manifest's `optional` list: resolve leaves it out when it is absent or empty. */
+  optional?: true;
 }
+
+/** The manifest's one top-level key that isn't a zone. */
+const OPTIONAL = "optional";
 
 /** A name as it may be shown: itself if it is a logical name, otherwise a placeholder, in case it is a pasted value. */
 export function shownName(name: string): string {
@@ -69,13 +85,15 @@ const reservedMessage = (key: string): string | undefined => {
 
 /**
  * The manifest's entries, zones in `SECRET_ZONES` order and env vars in file
- * order. Throws for a zone, env name or logical name a manifest built in code
- * got wrong, without echoing it.
+ * order, each marked `optional` when its logical name is on the `optional`
+ * list. Throws for a zone, env name or logical name a manifest built in code
+ * got wrong, without echoing it, and for an optional name no zone uses.
  */
 export function manifestEntries(m: Manifest): ManifestEntry[] {
   for (const zone of Object.keys(m)) {
-    if (!isZone(zone)) throw new Error(`the manifest has an unknown zone (<zone>, not shown); the zones are ${SECRET_ZONES.join(", ")}`);
+    if (zone !== OPTIONAL && !isZone(zone)) throw new Error(`the manifest has an unknown zone (<zone>, not shown); the zones are ${SECRET_ZONES.join(", ")}`);
   }
+  const optional = new Set(m.optional ?? []);
   const out: ManifestEntry[] = [];
   for (const zone of SECRET_ZONES) {
     for (const [key, name] of Object.entries(m[zone] ?? {})) {
@@ -85,8 +103,11 @@ export function manifestEntries(m: Manifest): ManifestEntry[] {
       if (typeof name !== "string" || !LOGICAL_NAME.test(name)) {
         throw new Error(`${zone}/${key}: not a logical name of the form ${LOGICAL_NAME.source} (not shown, in case it is a value)`);
       }
-      out.push({ zone, key, name });
+      out.push(optional.has(name) ? { zone, key, name, optional: true } : { zone, key, name });
     }
+  }
+  for (const name of optional) {
+    if (!out.some((e) => e.name === name)) throw new Error(`the manifest's optional list names ${typeof name === "string" ? shownName(name) : "(something that is not a name)"}, which no zone uses`);
   }
   return out;
 }
@@ -127,9 +148,13 @@ export function mcpSecretGaps(p: Pick<Policy, "mcp" | "flags">, m: Manifest, opt
   return gaps;
 }
 
-/** A JSON Pointer into the manifest, with a zone or env name that isn't one hidden: it may be a pasted secret. */
+/**
+ * A JSON Pointer into the manifest, with a zone or env name that isn't one hidden: it may be a pasted secret. The
+ * optional list's pointers (`/optional/<index>`) hold nothing pasted, so they are shown as they are.
+ */
 function scrubPointer(path: string): string {
   const segs = path.split("/");
+  if (segs[1] === OPTIONAL) return segs.length <= 3 && /^\d*$/.test(segs[2] ?? "") ? path : `/${OPTIONAL}/<item>`;
   if (segs.length > 1 && !isZone(segs[1]!)) segs[1] = "<zone>";
   if (segs.length > 2 && !ENV_NAME.test(segs[2]!)) segs[2] = "<ENV>";
   return segs.join("/");
@@ -139,7 +164,8 @@ function scrubPointer(path: string): string {
  * Load and check a manifest file (`secrets-manifest.schema.json`; default the
  * committed stack/secrets.yaml), then refuse any reserved env name
  * (`reservedEnvRule`). Throws a PolicyError naming the file and the JSON
- * Pointer of each problem, scrubbed as above.
+ * Pointer of each problem, scrubbed as above, and for an optional name no
+ * zone uses.
  */
 export function loadManifest(file: string = MANIFEST_FILE): Manifest {
   let m: Manifest;
@@ -159,5 +185,8 @@ export function loadManifest(file: string = MANIFEST_FILE): Manifest {
     }),
   );
   if (reserved.length > 0) throw new PolicyError(file, reserved);
+  const used = new Set(SECRET_ZONES.flatMap((zone) => Object.values(m[zone] ?? {})));
+  const unused = (m.optional ?? []).flatMap((name, i) => (used.has(name) ? [] : [{ path: `/${OPTIONAL}/${i}`, message: `the manifest's optional list names ${shownName(name)}, which no zone uses` }]));
+  if (unused.length > 0) throw new PolicyError(file, unused);
   return m;
 }

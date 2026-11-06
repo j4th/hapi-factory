@@ -22,9 +22,71 @@ describe("tools.archon-validate", () => {
   test("no errors, no parse warnings and every alias and tier read as generated passes (H-030)", async () => {
     const r = await check(await cleanWorld(), "tools.archon-validate");
     expect(r.status).toBe("pass");
-    // Archon's 24 and the shipped pack's 2, as 0.12.1 printed them with the pack bound (re-captured 2026-10-30).
-    expect(r.detail).toContain("26 workflows");
+    // Archon's 24 and the pack's 5, as 0.12.1 printed them with the pack bound (re-captured 2026-11-01, Plan 03 Task 11).
+    expect(r.detail).toContain("29 workflows");
     expect(r.detail).toContain("8 aliases and 3 tiers");
+    // factory-task's two Pi nodes on @implement and factory-review's review on @review: the run config resolves them.
+    expect(r.detail).toContain("accepted: 3 custom-alias lints on the pack's nodes, which its runs resolve from the run config");
+  });
+
+  test("validate's exit 1 passes when every error it reported is the accepted lint, as 0.12.1 exits with the pack bound; with another error left, it fails", async () => {
+    const w = await cleanWorld();
+    w.archonValidate = { code: 1, out: readJson("archon-validate-v0.12.1.json") };
+    expect((await check(w, "tools.archon-validate")).status).toBe("pass");
+    const x = await cleanWorld();
+    const out = readJson("archon-validate-v0.12.1.json") as { results: { workflowName: string; issues: unknown[] }[] };
+    out.results.find((r) => r.workflowName === "factory-verify")!.issues.push({ level: "error", nodeId: "verify", field: "bash", message: "something else" });
+    x.archonValidate = { code: 1, out };
+    const r = await check(x, "tools.archon-validate");
+    expect(r.status).toBe("fail");
+    expect(r.detail).toContain("archon validate workflows --json exited 1");
+    expect(r.detail).toContain("error: factory-verify: something else");
+    // And a 1 with nothing to show for it fails as before.
+    const y = await cleanWorld();
+    const clean = readJson("archon-validate-v0.12.1.json") as { results: { issues: unknown[] }[] };
+    for (const res of clean.results) res.issues = [];
+    y.archonValidate = { code: 1, out: clean };
+    expect((await check(y, "tools.archon-validate")).detail).toContain("archon validate workflows --json exited 1");
+  });
+
+  test("the custom-alias lint is accepted only as validate's structured issue for a pack node that names that alias, and for an alias the generated config defines; any other error fails", async () => {
+    type Issue = { level: string; nodeId: string; field: string; message: string };
+    const lint = (node: string, alias: string, over: Partial<Issue> = {}): Issue => ({ level: "error", nodeId: node, field: "model", message: `Node '${node}' uses custom model alias '${alias}', which is not portable for global workflows`, ...over });
+    const cases: [what: string, wf: string, issue: Issue][] = [
+      ["an alias the generated config lacks", "factory-task", lint("n", "@nowhere")],
+      ["a workflow not in the pack", "archon-implement", lint("n", "@implement")],
+      ["a pack node that names no alias", "factory-verify", lint("verify", "@implement")],
+      ["the lint's words on another field", "factory-task", lint("gates", "@implement", { field: "bash" })],
+      ["the lint on a node the pack doesn't have", "factory-task", lint("ghost", "@implement")],
+    ];
+    for (const [what, wf, issue] of cases) {
+      const w = await cleanWorld();
+      const out = readJson("archon-validate-v0.12.1.json") as { results: { workflowName: string; issues: unknown[] }[] };
+      out.results.find((x) => x.workflowName === wf)!.issues.push(issue);
+      w.archonValidate = { code: 1, out };
+      const r = await check(w, "tools.archon-validate");
+      expect([what, r.status]).toEqual([what, "fail"]);
+      expect([what, r.detail]).toEqual([what, expect.stringContaining(`error: ${wf}: ${issue.message}`)]);
+    }
+  });
+
+  test("the accepted lints must be the pack's alias nodes, one to one: a pack alias node validate reported no lint for fails (an Archon that changed its rule: re-check H-261)", async () => {
+    const w = await cleanWorld();
+    const out = readJson("archon-validate-v0.12.1.json") as { results: { workflowName: string; valid: boolean; issues: unknown[] }[] };
+    const review = out.results.find((x) => x.workflowName === "factory-review")!;
+    review.issues = [];
+    review.valid = true;
+    w.archonValidate = { code: 1, out };
+    const r = await check(w, "tools.archon-validate");
+    expect(r.status).toBe("fail");
+    expect(r.detail).toContain("no accepted lint for factory-review/review");
+    expect(r.detail).toContain("re-check H-261");
+    // With no lint at all (validate exits 0), every alias node is unmatched.
+    const x = await cleanWorld();
+    const clean = readJson("archon-validate-v0.12.1.json") as { results: { valid: boolean; issues: unknown[] }[] };
+    for (const res of clean.results) ((res.issues = []), (res.valid = true));
+    x.archonValidate = { code: 0, out: clean };
+    expect((await check(x, "tools.archon-validate")).detail).toContain("no accepted lint for factory-review/review, factory-task/implement, factory-task/fix");
   });
 
   test("a pack workflow that Archon's validate results don't name fails: an image that stopped scanning the pack must not pass it unvalidated (final review B-7)", async () => {
@@ -135,10 +197,11 @@ describe("tools.archon-validate", () => {
     expect(r.status).toBe("fail");
     expect(r.detail).toContain("archon validate workflows --json exited 3");
 
-    // ai alias list and ai tier list: every binding read as generated, but a non-zero exit.
+    // ai alias list and ai tier list: every binding read as generated, but a non-zero exit. validate's own marker is
+    // its 1 (the accepted lint), so the alias list's is the first 0 and the tier list's the second.
     for (const [nth, command, code] of [
-      [2, "archon ai alias list --json", 1],
-      [3, "archon ai tier list --json", 2],
+      [1, "archon ai alias list --json", 1],
+      [2, "archon ai tier list --json", 2],
     ] as const) {
       w = await cleanWorld();
       const real = w.ctx.exec;

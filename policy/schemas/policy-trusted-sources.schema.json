@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "policy-trusted-sources.schema.json",
   "title": "policy/trusted_sources.yaml",
-  "description": "Trusted-source tiers and the egress zones that use them (spec §10). A zone's allowlist is its own hosts plus the hosts of every tier it lists. The archon zone has no forge route (spec §4.3), so neither its hosts nor the tiers it may list (T0, T1) may name a forge host.",
+  "description": "Trusted-source tiers and the egress zones that use them (spec §10). A zone's allowlist is its own hosts plus the hosts of every tier it lists. The archon zone has no forge route (spec §4.3), so neither its hosts nor the tiers it may list (T0, T1) may name a forge host; nor may the review zone's hosts (it lists no tier).",
   "type": "object",
   "properties": {
     "tiers": {
@@ -52,9 +52,19 @@
           },
           "required": ["tiers", "hosts"],
           "additionalProperties": false
+        },
+        "review": {
+          "description": "The review container (design §3.5): the review model's API and CodeRabbit's CLI. No tier, so no registry (it runs none of the repo's code), and no forge route.",
+          "type": "object",
+          "properties": {
+            "tiers": { "type": "array", "$ref": "#/$defs/zoneTiers", "maxItems": 0 },
+            "hosts": { "$ref": "policy-defs.schema.json#/$defs/nonForgeHostList" }
+          },
+          "required": ["tiers", "hosts"],
+          "additionalProperties": false
         }
       },
-      "required": ["hermes", "archon", "research"],
+      "required": ["hermes", "archon", "research", "review"],
       "additionalProperties": false
     }
   },

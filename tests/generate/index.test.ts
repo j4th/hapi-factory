@@ -5,11 +5,13 @@ import { join, relative } from "node:path";
 import YAML from "yaml";
 import { main } from "../../src/cli";
 import { emitArchon } from "../../src/generate/archon";
+import { emitClaude } from "../../src/generate/claude";
 import { emitEgress } from "../../src/generate/egress";
 import { emitHermes } from "../../src/generate/hermes";
 import { buildAll, bundleEntry, DECIDE_ENTRY, GUARD_ENTRY, REPO_ROOT } from "../../src/generate/index";
 import { emitMcp } from "../../src/generate/mcp";
 import { emitPi } from "../../src/generate/pi";
+import { emitSystemd } from "../../src/generate/systemd";
 import { loadPolicy } from "../../src/policy/load";
 import type { RosterName } from "../../src/policy/types";
 
@@ -20,10 +22,12 @@ const FILES = [
   "archon/empty.env",
   "archon/gitconfig",
   "archon/run-config.yaml",
+  "claude/managed-settings.json",
   "decide/hapi-decide.js",
   "egress/archon.squid.conf",
   "egress/hermes.squid.conf",
   "egress/research.squid.conf",
+  "egress/review.squid.conf",
   "hermes/config.yaml",
   "mcp/hermes.mcp.json",
   "mcp/research.mcp.json",
@@ -32,6 +36,9 @@ const FILES = [
   "pi/models-store.json",
   "pi/models.json",
   "pi/settings.json",
+  "roster",
+  "systemd/hapi-poll.service",
+  "systemd/hapi-poll.timer",
 ];
 
 let temps: string[] = [];
@@ -58,8 +65,10 @@ function capture(): { out: string[]; err: string[] } {
 
 describe("buildAll", () => {
   // Task 3 wrote 8 files (1 Hermes, 2 Archon, 2 Pi, 3 egress); Task 3b adds the 2 per-zone mcp.json files;
-  // Plan 02 Task 4 adds 3 Archon run files, 2 Pi files, and the guard and hapi-decide bundles.
-  test("writes the seventeen generated files and returns their paths", async () => {
+  // Plan 02 Task 4 adds 3 Archon run files, 2 Pi files, and the guard and hapi-decide bundles; Plan 03 Task 7 adds
+  // build/roster, the roster the build was made for, which each run's own guard settings and run config are made for;
+  // Task 11 adds Claude Code's managed settings for the review; Task 14 the poller's two systemd user units.
+  test("writes the twenty-two generated files and returns their paths", async () => {
     const out = tempDir();
     const paths = await buildAll(p, out);
     expect(paths.map((f) => relative(out, f)).sort()).toEqual(FILES);
@@ -77,8 +86,11 @@ describe("buildAll", () => {
     add("pi", emitPi(p, "anthropic"));
     add("egress", emitEgress(p));
     add("mcp", emitMcp(p));
+    add("claude", emitClaude(p));
+    add("systemd", emitSystemd(p));
     expected["pi/extensions/hapi-guard.js"] = await bundleEntry(GUARD_ENTRY, REPO_ROOT);
     expected["decide/hapi-decide.js"] = await bundleEntry(DECIDE_ENTRY, REPO_ROOT);
+    expected.roster = "anthropic\n";
     expect(Object.keys(expected).sort()).toEqual(FILES);
     for (const [file, text] of Object.entries(expected)) expect(readFileSync(join(out, file), "utf8")).toBe(text);
   });
@@ -89,6 +101,8 @@ describe("buildAll", () => {
     expect(YAML.parse(readFileSync(join(out, "archon/config.yaml"), "utf8")).tiers.large.model).toBe("anthropic/claude-haiku-5-5");
     expect(readFileSync(join(out, "pi/models.json"), "utf8")).toBe(emitPi(p, "budget")["models.json"]!);
     expect(readFileSync(join(out, "hermes/config.yaml"), "utf8")).toBe(emitHermes(p)["config.yaml"]!);
+    // build/roster names the roster, as one bare word: what `hapi run start` makes each run's own files for.
+    expect(readFileSync(join(out, "roster"), "utf8")).toBe("budget\n");
   });
 
   test("the o11y option defaults to flags.otel.enabled and gates Hermes's MCP servers only", async () => {
@@ -130,10 +144,20 @@ describe("buildAll", () => {
         if (f.endsWith(".js")) {
           const lines = text.split("\n");
           head = lines.slice(0, lines.findIndex((l) => !l.startsWith("//"))).join("\n");
-        } else if (f.endsWith(".json") && f !== "pi/models-store.json") {
+        } else if (f.endsWith(".json") && f !== "pi/models-store.json" && f !== "claude/managed-settings.json") {
           const parsed = JSON.parse(text);
           expect({ f, first: Object.keys(parsed)[0] }).toEqual({ f, first: "$comment" });
           head = parsed.$comment;
+        } else if (f === "roster") {
+          // Exempt: readRoster (src/run/spec.ts) reads it as one bare word, the roster's name, so it holds no notice.
+          expect(text).toBe(`${roster}\n`);
+          continue;
+        } else if (f === "claude/managed-settings.json") {
+          // Exempt: Claude Code reads it as its managed settings, which outrank every other source, so it holds only
+          // its keys: a $comment it didn't know could make it ignore the file, which would fail open.
+          expect(JSON.parse(text).$comment).toBeUndefined();
+          expect(text).toBe(emitClaude(p)["managed-settings.json"]!);
+          continue;
         } else if (f === "pi/models-store.json") {
           // Exempt: Pi reads this file as its model store, so it is bound read-only as exactly {}, with no $comment
           // that Pi might treat as a catalog overlay (spike 08, finding 9; docs/generated-configs.md).

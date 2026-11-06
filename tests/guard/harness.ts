@@ -142,6 +142,8 @@ export function setup(o: SetupOptions = {}): Harness {
     public: false,
     workflow: "hapi-check",
     started_at: "2026-10-29T12:00:00Z",
+    /** The run's turn budget (Task 7 always writes it); high enough that only a turns test meets it. */
+    turns: 50,
   };
   o.run?.(run);
   if (o.runText === null) rmSync(runFile, { force: true });

@@ -1,5 +1,5 @@
 {
-  // Type-check only (`mise run lint` = `bunx tsc --noEmit`). Bun runs the .ts files directly.
+  // Type-check only (`mise run lint` = `node_modules/.bin/tsc --noEmit`). Bun runs the .ts files directly.
   // Based on Bun's recommended config for TypeScript 6/7: https://bun.com/docs/typescript
   "compilerOptions": {
     "lib": ["ESNext"],

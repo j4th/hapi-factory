@@ -50,6 +50,9 @@ Each zone gets its own env file. A container sees only its own zone's file (spec
 | `research` | `BRAVE_SEARCH_API_KEY` | Brave Search, Hermes's search backend | `hapi-research-brave-search-api-key` | [provider keys](runbooks/provider-keys.md#search-keys-brave-exa-context7) |
 | `research` | `EXA_API_KEY` | Exa, Hermes's contents (extract) backend | `hapi-research-exa-api-key` | [provider keys](runbooks/provider-keys.md#search-keys-brave-exa-context7) |
 | `research` | `HAPI_MCP_CONTEXT7_API_KEY` | Context7, for `policy/mcp.yaml`'s `context7` server | `hapi-mcp-context7-api-key` | [provider keys](runbooks/provider-keys.md#search-keys-brave-exa-context7) |
+| `review` | `ANTHROPIC_API_KEY` | **The `hapi-factory` workspace's key again**, as `archon`'s: the review model's (Claude Code reads this name) | `hapi-archon-anthropic-api-key` | [provider keys](runbooks/provider-keys.md#anthropic-console-workspaces) |
+| `review` | `CLAUDE_API_KEY` | The same secret: Archon's `claude` nodes read this name | `hapi-archon-anthropic-api-key` | |
+| `review` | `CODERABBIT_API_KEY` | CodeRabbit's CLI, a dedicated, revocable key. **Optional** (the manifest's `optional` list): absent until an unattended key exists (H-167) | `hapi-review-coderabbit-api-key` | [provider keys](runbooks/provider-keys.md#coderabbit-optional) |
 | `host` | `HAPI_PLANNER_APP_ID` | The `hapi-planner` App's App ID | `hapi-host-planner-app-id` | [GitHub Apps](runbooks/github-apps.md) |
 | `host` | `HAPI_PLANNER_APP_PRIVATE_KEY` | Its private key (the PEM) | `hapi-host-planner-app-private-key` | [GitHub Apps](runbooks/github-apps.md) |
 | `host` | `HAPI_FACTORY_APP_ID` | The `hapi-factory` App's App ID | `hapi-host-factory-app-id` | [GitHub Apps](runbooks/github-apps.md) |
@@ -58,6 +61,7 @@ Each zone gets its own env file. A container sees only its own zone's file (spec
 Why it is laid out this way:
 - **The GitHub App keys are in `host`, never in a container.** Spec §4.3 gives the App private keys to the `hapi` host user only. Host tools mint 1-hour tokens from them (`hapi token mint`, later the harvester and the `hapi-gh-token` helper, spec §9.1). The Hermes container gets a 1-hour `hapi-planner` token per session, never the key, so it can never mint its own. A test checks that no other zone holds an App key. `host.env` must never be a container's env file.
 - **Research holds only search keys** (spec §10.1): spend-capped, search-only, with no repo or forge access.
+- **The review container has a zone of its own** (design §3.5), so CodeRabbit's key never enters the archon zone a worker holds. No compose service has `review.env`: the launcher reads it for a review run alone and passes its names to that container's `docker run`, behind `egress-review`. The review reuses the `hapi-factory` workspace's Anthropic key, under the same Console limit as the workers; only CodeRabbit's key is new, and a review run is given it only when its CodeRabbit step runs (`runs.phases.coderabbit` on). A worker, fix or verify run never gets the review zone's file, and the audit fails a run container holding a name of another zone (`runtime.run-container`).
 - **Jev's key is not `OPENROUTER_API_KEY`.** Pi reads `OPENROUTER_API_KEY` for any `openrouter/` model, so under that name Pi could bill model calls to Jev's $2 key. Plan 02's `decide()` helper passes `HAPI_JEV_OPENROUTER_API_KEY` to the Jev client itself.
 - **Names that hapi owns start with `HAPI_`.** The other env var names are the ones each tool reads (Hermes, Pi, Archon).
 
@@ -72,17 +76,22 @@ archon:
   CLAUDE_API_KEY: hapi-archon-anthropic-api-key      # the same secret
 research:
   HAPI_MCP_CONTEXT7_API_KEY: hapi-mcp-context7-api-key
+review:
+  ANTHROPIC_API_KEY: hapi-archon-anthropic-api-key   # the hapi-factory workspace's key, as archon's
+  CODERABBIT_API_KEY: hapi-review-coderabbit-api-key
 host:
   HAPI_PLANNER_APP_ID: hapi-host-planner-app-id
+optional: [hapi-review-coderabbit-api-key]
 ```
 
-- **Shape:** zone → env var → logical name. The schema is [`policy/schemas/secrets-manifest.schema.json`](../policy/schemas/secrets-manifest.schema.json). The zones are exactly `hermes`, `archon`, `research` and `host`, all required. An env var is `^[A-Z_][A-Z0-9_]*$`. A logical name is `^hapi-[a-z0-9]+(-[a-z0-9]+)*$`.
-- **One logical name may fill several env vars.** `ANTHROPIC_API_KEY` and `CLAUDE_API_KEY` in `archon` share one, and the store is asked for it once.
+- **Shape:** zone → env var → logical name, plus a top-level `optional` list of logical names. The schema is [`policy/schemas/secrets-manifest.schema.json`](../policy/schemas/secrets-manifest.schema.json). The zones are exactly `hermes`, `archon`, `research`, `review` and `host`, all required. An env var is `^[A-Z_][A-Z0-9_]*$`. A logical name is `^hapi-[a-z0-9]+(-[a-z0-9]+)*$`.
+- **One logical name may fill several env vars, in several zones.** `ANTHROPIC_API_KEY` and `CLAUDE_API_KEY` in `archon` and in `review` share one, and the store is asked for it once.
 - **It is the single list of what must exist.** `hapi secrets resolve` fails if the store lacks a name, and `hapi secrets check` names it. There is no copy to keep in sync.
+- **But the `optional` list.** A name on it may be absent from the store, or empty: `resolve` leaves its entries out of each zone's file instead of failing, and `check` reports them with ` (optional)` without counting them. One that is there with a value `resolve` would refuse (a single quote, say) still fails both. Each name on the list must be one a zone uses (`the manifest's optional list names hapi-x, which no zone uses`), and it is a logical name, never shown if it isn't one. Today it holds CodeRabbit's key alone, until an unattended key exists (H-167). Whoever needs an optional key refuses to start without it, with no automatic fallback: a review run whose overlaid `runs.phases.coderabbit` is on refuses when `review.env` has no `CODERABBIT_API_KEY` ([runs.md](runbooks/runs.md#hapi-run-start)).
 - **No env name hapi sets itself.** The containers get hapi's own settings from `stack/compose.yaml`'s `environment:`: each zone's proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, in both cases), Archon's run-container settings (`ARCHON_ENV` in `src/generate/archon.ts`: the telemetry switches, Pi's `PI_OFFLINE` and `PI_CODING_AGENT_DIR`, Bun's `BUN_OPTIONS`, the `GIT_CONFIG_*` and other `GIT_*` hardening, `CLAUDE_BIN_PATH` and `ARCHON_DOCKER`) and Hermes's `HERMES_HOME`. Compose puts `environment:` above the env file, so a secret could never override them anyway, and the loader refuses the names outright, in any zone, with `ALL_PROXY` too: `stack/secrets.yaml: /archon/PI_OFFLINE: PI_OFFLINE is reserved: hapi sets it in the containers itself ...`. The list is `RESERVED_ENV_NAMES` in `src/stack/env.ts`, the one place it is kept; a unit test checks the compose file against it.
 - **No process-control or trust-store name.** hapi doesn't set these, so `environment:` can't shadow them, and a secret under one of them would change how a process in the container runs, which code it loads or which TLS certificates it trusts. So the loader refuses them too, in any zone: exact names (`PATH`, `HOME`, `BASH_ENV`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `GIT_SSH_COMMAND`, `XDG_CONFIG_HOME`, `CLAUDE_CONFIG_DIR`, ...: `CONTROL_ENV_NAMES`) and anything under a prefix (`LD_`, `DYLD_`, `GIT_CONFIG_`, `NODE_`, `BUN_`, `NPM_CONFIG_`, `PYTHON`, `PIP_`, `UV_`, `MISE_`, `HERMES_`, `ARCHON_`, `PI_`, `CLAUDE_CODE_`, `S6_`, `DOCKER_`: `CONTROL_ENV_PREFIXES`), with the rule in the error (`/hermes/LD_PRELOAD: LD_PRELOAD is reserved: env names starting LD_ ...`). `CLAUDE_CONFIG_DIR` is where Claude Code, in Archon's `claude` nodes, reads its `settings.json` (hooks and env) and its credentials. `S6_` is s6-overlay's, the Hermes image's init: `S6_CMD_ARG0` runs a program in front of the container's command. `DOCKER_` is the docker CLI's (`DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG`): the launcher passes the archon zone's secrets in its `docker run` call's environment, where one of those would send the call to another daemon. `CLAUDE_CODE_` also keeps `CLAUDE_CODE_OAUTH_TOKEN` out, since the factory bills by API key and never uses subscription OAuth.
 - **No endpoint override.** A name ending `_BASE_URL`, `_API_BASE`, `_API_URL` or `_ENDPOINT` (`ANTHROPIC_BASE_URL`, `OTEL_EXPORTER_OTLP_ENDPOINT`: `CONTROL_ENV_SUFFIXES`) would send a client's requests, and the key that goes with them, somewhere else. An endpoint is policy, committed and reviewed, not a secret, so the loader refuses those names too; the egress allowlists are the second check. A credential that is itself a URL, such as a webhook, ends in plain `_URL` and is allowed. All three lists live beside `RESERVED_ENV_NAMES` in `src/stack/env.ts`, and `reservedEnvRule` is the one check; no name in today's manifest is affected.
-- **A mistake is never echoed.** If a value is pasted where a name goes, the loader says `stack/secrets.yaml: /hermes/ANTHROPIC_API_KEY: must match pattern ...` without the value. A key that isn't one of the four zones shows as `<zone>`, and one that isn't an env name as `<ENV>`.
+- **A mistake is never echoed.** If a value is pasted where a name goes, the loader says `stack/secrets.yaml: /hermes/ANTHROPIC_API_KEY: must match pattern ...` without the value. A key that isn't one of the five zones (or `optional`) shows as `<zone>`, and one that isn't an env name as `<ENV>`; an `optional` item that isn't a logical name shows by its index alone (`/optional/0`).
 
 ### MCP secrets
 
@@ -100,7 +109,7 @@ A new secret is a PR that adds its line to `stack/secrets.yaml`, with a comment 
 
 ```text
 missing  archon/NEW_API_KEY (hapi-archon-new-api-key)
-hapi secrets check: 1 of 16 secrets are missing or empty: archon/NEW_API_KEY. Fill them in with `mise run secrets:edit` (docs/secrets.md).
+hapi secrets check: 1 of 19 secrets are missing or empty: archon/NEW_API_KEY. Fill them in with `mise run secrets:edit` (docs/secrets.md).
 ```
 
 A name your store holds but the manifest no longer lists shows as `unknown` (`unknown  hapi-old-key (in the store, not in stack/secrets.yaml)`). That doesn't fail the check; delete it from the store when you're ready.
@@ -141,7 +150,7 @@ Do this as yourself, the operator, from your checkout's root, in a terminal. The
 
    It makes this machine's age key (or reuses yours), a recovery key, the encrypted store (every manifest name, empty), its recipients file, `recovery.age` and the config ([details](#hapi-secrets-init)). In `private/`, the store is backed up with your private repo, and it is where `scripts/copy-secrets-to-hapi.sh` hands it to the `hapi` user from: that script reads only `private/`. Without `--file`, the store goes in `~/.config/hapi/`, which suits a machine that never runs the stack; `init` never overwrites its config, so moving a store later means moving the three files and editing `sops.file` by hand.
 3. **Store the 10 words.** init shows them once, on your terminal, and then asks you to type two of them back. Store them where you keep things you can't lose (a password manager, paper in a safe, or both). With `recovery.age` they open your secrets if every machine is lost ([why](#keys-and-recovery)).
-4. **Prove they work:** `mise run secrets:drill`. Type the words; it says `recovery works: 14 names readable` ([details](#hapi-secrets-drill)).
+4. **Prove they work:** `mise run secrets:drill`. Type the words; it says `recovery works: 15 names readable` ([details](#hapi-secrets-drill)).
 5. **Fill in each value:** `mise run secrets:edit`. Your editor opens the decrypted file. Replace each `""` with the value from its runbook, then save and quit; sops encrypts it again ([adding a secret](#adding-a-secret)).
 6. **Check it:** `mise run secrets:check`. Every line should say `found`, the recipients are listed, and it exits 0.
 
@@ -420,15 +429,17 @@ found    hermes/ANTHROPIC_API_KEY (hapi-hermes-anthropic-api-key)
 empty    hermes/SLACK_BOT_TOKEN (hapi-hermes-slack-bot-token)
 missing  archon/OPENCODE_API_KEY (hapi-archon-opencode-api-key)
 invalid  research/EXA_API_KEY (hapi-research-exa-api-key): the value holds a single quote ('), which an env file can't carry literally; rotate the secret to one without
+missing  review/CODERABBIT_API_KEY (hapi-review-coderabbit-api-key) (optional)
 unknown  hapi-old-key (in the store, not in stack/secrets.yaml)
 recipient machine  laptop-user (post-quantum, added 2026-10-26)
 recipient recovery recovery (post-quantum, added 2026-10-26)
 ```
 
 - `found`: present and usable. `missing`: not in the store. `empty`: `""` or blank. `invalid`: present, but a value `resolve` refuses. A missing [MCP mapping](#mcp-secrets) is a `missing` line too.
+- ` (optional)` ends the line of an env var whose name is on the manifest's [`optional` list](#the-manifest-stacksecretsyaml). Missing or empty, it is what `resolve` leaves out, so it doesn't fail the check; `invalid`, it does, since `resolve` refuses it.
 - `unknown`: a name in the store (for bws, in `bws.ids`) that the manifest doesn't list. It doesn't fail the check. A name that isn't a logical name is shown as `(a name that is not a logical name, not shown)`, in case a value was pasted as a key.
 - `recipient` (sops only): each of the store's recipients, with its kind and whether the store is post-quantum ([keys and recovery](#keys-and-recovery)).
-- **It exits 1 if anything is missing, empty or invalid**, and says so on stderr. A provider failure (sops can't decrypt, say) is an error, exit 1. For sops, so is a missing or invalid recipients file, [drift](#the-recipients-file) between it and the store, a post-quantum/classic mix, or a master key in the store that [isn't an age recipient](#the-recipients-file), a metadata field hapi doesn't know, or a setting that picks which values sops leaves in plaintext ([threat notes](#threat-notes)).
+- **It exits 1 if anything is missing, empty or invalid** (but an optional entry that is missing or empty), and says so on stderr. A provider failure (sops can't decrypt, say) is an error, exit 1. For sops, so is a missing or invalid recipients file, [drift](#the-recipients-file) between it and the store, a post-quantum/classic mix, or a master key in the store that [isn't an age recipient](#the-recipients-file), a metadata field hapi doesn't know, or a setting that picks which values sops leaves in plaintext ([threat notes](#threat-notes)).
 - For sops it is also an error when `recovery.age` isn't the one the recipients file [records](#the-recipients-file) (its SHA-256 differs). After drift it ends with what to do: add a missing recipient back only if it is exactly the key an interrupted command was adding, otherwise restore all three files from one commit and treat the recipient as a compromise ([an interrupted command](#an-interrupted-command)).
 - **It warns, and still exits 0,** when the store has no recovery recipient (`if every machine key is lost, so is the store`) or `recovery.age` is missing beside it.
 
@@ -447,8 +458,8 @@ hapi secrets resolve [--config file] [--dry-run]
 | 3. load the config; a missing file, then the schema | a `SecretError` ("no secrets config at ..."), then a `PolicyError` |
 | 4. check the manifest maps every MCP reference (`mcpSecretGaps`) | a `SecretError` |
 | 5. check `XDG_RUNTIME_DIR` is a real directory, yours, mode `0700` as systemd makes it, and make `hapi/` in it (`0700`) | a plain `Error` |
-| 6. fetch every logical name once, from the configured provider only (for sops: the pinned age, the key checks, the file's shape, then `sops decrypt`) | a `SecretError` naming the file, the exit code or the names |
-| 7. check every value: present, not empty or blank, no single quote, no NUL, no backslash at the end | a `SecretError` naming `zone/ENV (name)` |
+| 6. fetch every logical name once, from the configured provider only (for sops: the pinned age, the key checks, the file's shape, then `sops decrypt`); an [optional](#the-manifest-stacksecretsyaml) name only when the store lists it | a `SecretError` naming the file, the exit code or the names |
+| 7. check every value: present, not empty or blank, no single quote, no NUL, no backslash at the end. An optional entry that is absent or empty is left out of its zone's file instead | a `SecretError` naming `zone/ENV (name)` |
 | 8. write the whole set ([the env files](#the-env-files)) and print each path | |
 
 Nothing is written unless every step passes. `hapi` prints the error and exits 1:
@@ -464,7 +475,7 @@ hapi secrets resolve: age key file /home/hapi/.config/sops/age/keys.txt has grou
 
 ## The env files
 
-Consumers read **`$XDG_RUNTIME_DIR/hapi/env/<zone>.env`**: `hermes.env`, `archon.env`, `research.env` and `host.env`.
+Consumers read **`$XDG_RUNTIME_DIR/hapi/env/<zone>.env`**: `hermes.env`, `archon.env`, `research.env`, `review.env` and `host.env`. No compose service reads `review.env`: the launcher reads it for a review run alone (and `host.env` is never a container's).
 
 - **The whole set at once.** `env` is a symlink to a generation directory, `env.<random>/` (`0700`). Each resolve writes every zone file into a fresh generation, then swaps the symlink with one `rename`, then deletes the generation it replaced, and any other more than a minute old (one a crash left behind; a younger one may be a concurrent resolve's, still being written, and is left for a later run). A reader sees the old set or the new one, never a mix, and a zone file the manifest no longer has disappears with the old generation. If `env` is a real directory, not hapi's symlink, resolve refuses to touch it. It also removes the `<zone>.env` files an earlier version wrote directly in `$XDG_RUNTIME_DIR/hapi/` (regular files only).
 - **Modes:** each file `0600`, whatever the umask; `hapi/` and each generation `0700`. `XDG_RUNTIME_DIR` itself must be yours and exactly `0700`.
@@ -555,7 +566,7 @@ It mints a 1-hour installation token for **one** repo, with the App's fixed perm
 | `--app` | App | Token permissions |
 |---|---|---|
 | `planner` | `hapi-planner` (Hermes) | `contents: write`, `pull_requests: write`, `issues: read`, `metadata: read` |
-| `factory` | `hapi-factory` (the harvester) | `contents: write`, `pull_requests: write`, `metadata: read` |
+| `factory` | `hapi-factory` (the harvester) | `contents: write`, `pull_requests: write`, `checks: read`, `metadata: read` |
 
 How it works:
 1. It checks `XDG_RUNTIME_DIR` (yours, `0700`), then reads the App's id and key from `$XDG_RUNTIME_DIR/hapi/env/host.env` (`HAPI_<APP>_APP_ID`, `HAPI_<APP>_APP_PRIVATE_KEY`). Run `hapi secrets resolve` first. It checks `tokens/` too (ours, a real directory, `0700`) before it asks GitHub for anything, so a bad `tokens/` stops it before a token is minted.
@@ -563,7 +574,7 @@ How it works:
 3. It looks up the App's installation on that repo (`GET /repos/{owner}/{repo}/installation`). It fails if the App isn't installed there, or if the installation is suspended (kill switch 2, spec §11.8).
 4. It asks for a token for that one repository with exactly the permissions above (`POST /app/installations/{id}/access_tokens`).
 5. **It checks the token GitHub returns.** Its `permissions` must not exceed the request: no extra permission and no higher level. `metadata: read` is implicit, since GitHub adds it to every token. Its repositories must equal the request: `repository_selection: selected`, and exactly that one repo. It must have a valid `expires_at`. Anything else throws (`TokenScopeError` for a broader token), and **the token is revoked at once** (`DELETE /installation/token`). If the revoke fails, the error says how long the token stays valid.
-6. It writes the new token, then deletes the token files in `tokens/` that are more than an hour old (their tokens have expired). That cleanup is best effort: a file a concurrent mint removes mid-scan is skipped, and any other failure is a one-line warning (`hapi token mint: wrote the token, but could not remove the expired token files in <dir> (<code>); the next mint tries again`), and the mint still exits 0. So nothing after GitHub mints the token, but writing it, can lose it.
+6. It writes the new token, then deletes the token files in `tokens/` that are more than an hour old (their tokens have expired). That cleanup is best effort: a file a concurrent mint removes mid-scan is skipped, and any other failure is a one-line warning (`hapi token mint: wrote the token, but could not remove the expired token files in <dir> (<code>); the next mint tries again`), and the mint still exits 0. So nothing after GitHub mints the token, but writing it, can lose it. If the write itself fails, the token is revoked first (H-195), and the error says so (`could not write the token to <file> (<code>): it was revoked`), or, if the revoke failed too, until when it stays valid.
 
 `mintInstallationToken` (in `src/forge/github/app-token.ts`) also refuses, before sending anything, a request for anything but exactly one repository, or with no permissions. With no permissions, GitHub would grant every permission the installation has. With no repositories, it would cover every repo of the installation. Plans 03 and 04 call it in-process from the harvester and the `hapi-gh-token` helper.
 
@@ -585,6 +596,7 @@ The error kinds: a `PolicyError` when the manifest or the config doesn't match i
 - **Each container sees its own zone's values.** `stack/compose.yaml` gives each container its zone's env file and no other; `host.env` goes to no container. Model keys are still visible inside their own containers, and in Docker's config of each, bounded by spend caps and egress (spec §11.5, residual risk; H-189).
 - **The encrypted file is checked before it is decrypted.** Every top-level value must be sops-encrypted (or `""`), and it must be encrypted to an age recipient and to no other kind of master key: a PGP, cloud KMS or Vault key, or key groups, would open it without appearing in the [recipients file](#the-recipients-file). Besides `age`, only sops 3.13.3's bookkeeping (`lastmodified`, `mac`, `version`, `shamir_threshold`) and empty key lists may be there. Any other key list, and any field hapi doesn't know, whatever its value, is refused; a field whose name isn't a plain identifier is not shown.
 - **No setting may pick which values sops leaves in plaintext.** sops 3.13.3's `unencrypted_suffix`, `encrypted_suffix`, `unencrypted_regex`, `encrypted_regex`, `unencrypted_comment_regex`, `encrypted_comment_regex` and `mac_only_encrypted` are each refused by name (never by value), before any decrypt, edit or recipient change. The two exceptions are `unencrypted_suffix: _unencrypted`, sops's default, which `sops encrypt` writes (or no suffix at all), and `mac_only_encrypted` absent or `false`. Why: while the values such a setting matches are `""`, the MAC still verifies, so a planted `unencrypted_regex` would let `sops edit` write the next value you enter in plaintext. If one is there and you didn't put it there, someone who can write the store did: restore it from a commit without it. A top-level value left in plaintext (a name ending in `_unencrypted`, a hand edit) is refused too, and `edit` checks the store again when sops ends ([`hapi secrets edit`](#hapi-secrets-edit)). Together, these keep a plaintext secret from sitting in `private/` looking encrypted.
+- **One key goes on a command line: CodeRabbit's, in the review container.** A secret never goes in argv, with one written exception, the operator's (2026-11-01): `factory-review`'s `coderabbit` node passes the review zone's `CODERABBIT_API_KEY` to CodeRabbit's CLI as `--api-key "$CODERABBIT_API_KEY"`, since the CLI takes it no other way. Three conditions bound it, each held by a test (Plan 03 Task 11): the node runs only after the review node has fully ended (its `depends_on`), so no untrusted process is alive to read the process list; the review's Claude Code managed settings deny any read of `/proc/**` (which also keeps the Anthropic key in the review's environment out of the session's reach); and the key is a dedicated, revocable CodeRabbit Agentic key, in the review zone only, never the archon zone. It is absent (`optional`) until an unattended key exists, and `runs.phases.coderabbit` stays `false` centrally (H-167). Those conditions bound the review session, not the host: while the CLI runs, its argv is readable host-wide in `/proc/<pid>/cmdline` by any process of a user that can read it (procfs without `hidepid`), so revoking the dedicated key is the response to a host you doubt, and mounting `/proc` with `hidepid=2` narrows it. The threat model records it ([Plan 03: the run engine](security/threat-model.md#plan-03-the-run-engine)).
 - **No automatic fallback.** `providerFor` builds exactly the configured provider. If it fails, nothing is written and nothing starts.
 - **bws:** the access token is a bearer credential for every hapi secret; keep it in your environment only, with an expiry. **env-file:** plaintext on disk, audited.
 

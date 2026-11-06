@@ -38,8 +38,8 @@ import { HERMES_HOME, proxyEnv, serviceEnvironment } from "../../stack/env";
 import { type AuditRun, type CheckResult, result } from "../types";
 import { deployedBuild } from "./generated";
 import { dockerfileImages, dockerfileOf } from "./pins";
-
-const firstLine = (s: string) => (s.trim().split("\n")[0] ?? "").slice(0, 300);
+import { mountable } from "../../run/mount";
+import { firstLine } from "./util";
 
 /** The image to run for `service`: the one Compose built, else its Dockerfile's last FROM, if either is here. Never pulled. */
 async function localImage(run: AuditRun, service: string): Promise<{ image: string; user?: string } | { skip: string }> {
@@ -73,12 +73,6 @@ const exists = async (p: string) => {
     return false;
   }
 };
-
-/** A path a `-v src:dst` mount can hold, else throws naming `into` (the run launcher reuses it, src/run/spec.ts). */
-export function mountable(path: string, into = "the validation container"): string {
-  if (path.includes(":") || path.includes(",")) throw new Error(`cannot mount ${path} into ${into}: its path holds ":" or ","`);
-  return path;
-}
 
 /** The three read-only Archon commands the validation run makes, in order. */
 const ARCHON_COMMANDS = ["validate workflows --json", "ai alias list --json", "ai tier list --json"] as const;
@@ -152,6 +146,60 @@ function bindingProblems(kind: "alias" | "tier", generated: Record<string, unkno
   return problems;
 }
 
+/**
+ * Archon 0.12.1's `validate workflows` calls a custom alias in a home-scoped workflow an error ("not portable for
+ * global workflows"), though its runs resolve one from the run config like any alias (Plan 03 Task 11's spike,
+ * 2026-11-01: a home-scoped Pi node on `@implement` started on the run config's model). hapi's pack is home-scoped by
+ * design (a run binds it at /.archon/workflows/hapi, never in the clone), and its factory nodes name `@implement` and
+ * `@review` so that each run's own config (the work order's tiers, ./lifecycle.ts) picks their model. So this lint is
+ * accepted for a node of a pack workflow whose alias the generated config defines; every other error still fails.
+ */
+/** A pack node that names a custom alias as its model: `@implement`, `@review`. */
+export interface AliasNode {
+  workflow: string;
+  nodeId: string;
+  alias: string;
+}
+
+/**
+ * The validate issues the check accepts, read from validate's structured output: for each pack node that names a
+ * custom alias the generated config defines, the one issue with `level: error`, `field: model`, that node's
+ * `nodeId`, and exactly Archon's message for that node and alias. `accepted` is them, as `readValidate` words an
+ * error (`<workflow>: <message>`), to drop from its errors. `problems` is set when the issues Archon reported don't
+ * match the pack's alias nodes one to one: an alias node it reported no lint for (an Archon that changed the rule:
+ * re-check H-261), or one whose lint isn't accepted (its alias isn't generated). Every other issue stays an error.
+ */
+export function acceptedLints(out: string, aliasNodes: AliasNode[], aliases: string[]): { accepted: string[]; problems: string[] } {
+  let doc: Record<string, unknown> | undefined;
+  try {
+    doc = asRecord(JSON.parse(out));
+  } catch {
+    doc = undefined;
+  }
+  const results = Array.isArray(doc?.results) ? doc.results.map(asRecord) : [];
+  const accepted: string[] = [];
+  const seen = new Set<string>();
+  for (const n of aliasNodes) {
+    if (!aliases.includes(n.alias)) continue;
+    const message = `Node '${n.nodeId}' uses custom model alias '${n.alias}', which is not portable for global workflows`;
+    for (const r of results) {
+      if (r?.workflowName !== n.workflow || !Array.isArray(r.issues)) continue;
+      for (const i of r.issues.map(asRecord)) {
+        if (i?.level === "error" && i.field === "model" && i.nodeId === n.nodeId && i.message === message) {
+          accepted.push(`${n.workflow}: ${message}`);
+          seen.add(`${n.workflow}/${n.nodeId}`);
+        }
+      }
+    }
+  }
+  const missing = aliasNodes.map((n) => `${n.workflow}/${n.nodeId}`).filter((k) => !seen.has(k));
+  const problems =
+    missing.length === 0
+      ? []
+      : [`the pack's custom-alias nodes and the lint validate reported don't match: no accepted lint for ${missing.join(", ")} (an alias the generated config lacks, or an Archon that changed its rule: re-check H-261)`];
+  return { accepted, problems };
+}
+
 /** The workflow pack a run binds at /.archon/workflows/hapi (the default `hapi run` uses). */
 const packOf = (root: string) => join(root, "archon", "workflows", "hapi");
 
@@ -160,7 +208,7 @@ const packOf = (root: string) => join(root, "archon", "workflows", "hapi");
  * its file's stem, and every node that sets `pi.enableExtensions: false`, which would drop hapi-guard from that step.
  * `hapi run start` reads it too: a work order may name only these workflows.
  */
-export async function packNodes(pack: string): Promise<{ workflows: { file: string; name: string }[]; problems: string[] } | { missing: string }> {
+export async function packNodes(pack: string): Promise<{ workflows: { file: string; name: string }[]; problems: string[]; aliasNodes: AliasNode[] } | { missing: string }> {
   let names: string[];
   try {
     names = (await readdir(pack)).filter((n) => /\.ya?ml$/.test(n)).sort();
@@ -169,6 +217,7 @@ export async function packNodes(pack: string): Promise<{ workflows: { file: stri
   }
   const problems: string[] = [];
   const workflows: { file: string; name: string }[] = [];
+  const aliasNodes: AliasNode[] = [];
   for (const name of names) {
     let doc: unknown;
     try {
@@ -185,9 +234,10 @@ export async function packNodes(pack: string): Promise<{ workflows: { file: stri
     for (const node of Array.isArray(asRecord(doc)?.nodes) ? (asRecord(doc)!.nodes as unknown[]) : []) {
       const n = asRecord(node);
       if (asRecord(n?.pi)?.enableExtensions === false) problems.push(`${name}: node ${String(n?.id ?? "(no id)")} sets pi.enableExtensions: false, so hapi-guard would not load in it`);
+      if (typeof n?.model === "string" && n.model.startsWith("@") && typeof n.id === "string") aliasNodes.push({ workflow: typeof named === "string" ? named : stem, nodeId: n.id, alias: n.model });
     }
   }
-  return { workflows, problems };
+  return { workflows, problems, aliasNodes };
 }
 
 /** tools.archon-validate */
@@ -219,10 +269,22 @@ export async function archonValidate(run: AuditRun): Promise<CheckResult[]> {
   if (parts.length < 9) return [result(id, "fail", `could not read the Archon validation run's output (${img.image})`)];
   // parts: [validate's output, its exit code, alias list's output, its exit code, tier list's output, its exit code, the read-back, its exit code, ...].
   // A command that exits non-zero fails whatever it printed: its output can't be taken as its verdict.
-  const exits = [...ARCHON_COMMANDS, READ_BACK].map((command, i) => ({ command, code: parts[2 * i + 1]! })).filter((x) => x.code !== "0");
-  const readBack = (parts[6] ?? "").trim().split("\n").at(-1)?.trim() ?? "";
-  const v = readValidate(parts[0]!);
+  const read = readValidate(parts[0]!);
   const generated = (YAML.parse(await readFile(config, "utf8")) ?? {}) as { aliases?: Record<string, unknown>; tiers?: Record<string, unknown> };
+  const lint = "unreadable" in read ? { accepted: [], problems: [] } : acceptedLints(parts[0]!, nodes.aliasNodes, Object.keys(generated.aliases ?? {}));
+  // Each accepted lint drops one error readValidate worded the same way; the rest stay.
+  const left = "unreadable" in read ? [] : [...read.errors];
+  for (const a of lint.accepted) {
+    const at = left.indexOf(a);
+    if (at !== -1) left.splice(at, 1);
+  }
+  const v = "unreadable" in read ? read : { ...read, errors: left };
+  // validate exits 1 on any error it reports, the accepted lint included: its 1 is its verdict only when an error is left.
+  const onlyLints = !("unreadable" in read) && lint.accepted.length > 0 && left.length === 0 && lint.problems.length === 0;
+  const exits = [...ARCHON_COMMANDS, READ_BACK]
+    .map((command, i) => ({ command, code: parts[2 * i + 1]! }))
+    .filter((x) => x.code !== "0" && !(x.command === ARCHON_COMMANDS[0] && x.code === "1" && onlyLints));
+  const readBack = (parts[6] ?? "").trim().split("\n").at(-1)?.trim() ?? "";
   const json = (s: string): unknown => {
     try {
       return JSON.parse(s);
@@ -234,6 +296,7 @@ export async function archonValidate(run: AuditRun): Promise<CheckResult[]> {
     ...exits.map((x) => `archon ${x.command} exited ${x.code}`),
     ...(readBack === "true" ? [] : [`assistants.pi.enableExtensions reads back as ${readBack === "" ? "nothing" : readBack} in Archon's loadConfig, not true (hapi-guard is a Pi extension; H-152)`]),
     ...nodes.problems,
+    ...lint.problems,
     ...("unreadable" in v ? [v.unreadable] : [...v.errors.map((e) => `error: ${e}`), ...v.warnings.map((w) => `parse warning: ${w}`)]),
     // An image that stopped scanning the pack's directory would validate nothing of it and still pass (final review B-7).
     ...("unreadable" in v
@@ -251,11 +314,12 @@ export async function archonValidate(run: AuditRun): Promise<CheckResult[]> {
   }
   const aliases = Object.keys(generated.aliases ?? {}).length;
   const tiers = Object.keys(generated.tiers ?? {}).length;
+  const lints = lint.accepted.length > 0 ? `; accepted: ${lint.accepted.length} custom-alias lint${lint.accepted.length === 1 ? "" : "s"} on the pack's nodes, which its runs resolve from the run config` : "";
   return [
     result(
       id,
       "pass",
-      `archon validate workflows (${img.image}): ${v.workflows} workflows, no errors, no parse warnings; Archon reads all ${aliases} aliases and ${tiers} tiers as generated (ai alias list, ai tier list), and assistants.pi.enableExtensions is true (loadConfig); the pack ${RUN_PATHS.pack} has ${nodes.workflows.length} workflows, each among the validated, and no node that turns Pi's extensions off${notes}`,
+      `archon validate workflows (${img.image}): ${v.workflows} workflows, no errors, no parse warnings${lints}; Archon reads all ${aliases} aliases and ${tiers} tiers as generated (ai alias list, ai tier list), and assistants.pi.enableExtensions is true (loadConfig); the pack ${RUN_PATHS.pack} has ${nodes.workflows.length} workflows, each among the validated, and no node that turns Pi's extensions off${notes}`,
     ),
   ];
 }

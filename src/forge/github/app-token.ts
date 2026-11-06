@@ -20,11 +20,9 @@
 import { lstat, readdir, readFile, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { ENV_DIR, parseEnvFile, runtimeDir, secureDir, writeSecretFile } from "../../secrets/files";
-import { HAPI_VERSION } from "../../version";
+import { GITHUB_API, GITHUB_API_VERSION, asRecord, ghMessage, rest } from "./rest";
 
-export const GITHUB_API = "https://api.github.com";
-/** The REST API version hapi was written against (docs.github.com, 2026-10-26). */
-export const GITHUB_API_VERSION = "2026-03-10";
+export { GITHUB_API, GITHUB_API_VERSION };
 
 export type Permissions = Record<string, "read" | "write">;
 
@@ -52,11 +50,11 @@ export const APPS = {
     envPrefix: "HAPI_PLANNER",
     permissions: { contents: "write", pull_requests: "write", issues: "read", metadata: "read" },
   },
-  /** The harvester: pushes factory/* branches, opens delivery PRs, labels them. */
+  /** The harvester: pushes factory/* branches, opens delivery PRs, labels them, and reads the check runs on their heads (`ci / gates`, and CodeRabbit's). */
   factory: {
     name: "hapi-factory",
     envPrefix: "HAPI_FACTORY",
-    permissions: { contents: "write", pull_requests: "write", metadata: "read" },
+    permissions: { contents: "write", pull_requests: "write", checks: "read", metadata: "read" },
   },
 } as const satisfies Record<string, { name: string; envPrefix: string; permissions: Permissions }>;
 export type AppName = keyof typeof APPS;
@@ -115,41 +113,6 @@ export async function appJwt(appId: string, privateKeyPem: string, nowMs: number
   return `${signingInput}.${Buffer.from(signature).toString("base64url")}`;
 }
 
-/** One GitHub REST call. Redirects are refused, so a credential never follows one. */
-async function github(f: typeof fetch, method: string, path: string, bearer: string, body?: unknown): Promise<{ status: number; json: unknown }> {
-  const res = await f(`${GITHUB_API}${path}`, {
-    method,
-    headers: {
-      Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${bearer}`,
-      "X-GitHub-Api-Version": GITHUB_API_VERSION,
-      "User-Agent": `hapi-factory/${HAPI_VERSION}`,
-      ...(body === undefined ? {} : { "Content-Type": "application/json" }),
-    },
-    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-    redirect: "error",
-  });
-  const text = await res.text();
-  let json: unknown;
-  try {
-    json = text === "" ? undefined : JSON.parse(text);
-  } catch {
-    json = undefined;
-  }
-  return { status: res.status, json };
-}
-
-const asRecord = (v: unknown): Record<string, unknown> | undefined =>
-  typeof v === "object" && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined;
-
-/** GitHub's error `message`, as ": <message>", one line and short; "" if there is none. */
-function ghMessage(json: unknown): string {
-  const message = asRecord(json)?.message;
-  if (typeof message !== "string") return "";
-  const line = message.replace(/\s+/g, " ").trim();
-  return `: ${line.length > 200 ? `${line.slice(0, 200)}...` : line}`;
-}
-
 /** A repository name as GitHub allows it, without the owner. */
 const REPO_NAME = /^[A-Za-z0-9._-]{1,100}$/;
 
@@ -206,9 +169,9 @@ function scopeProblem(o: MintOptions, r: Record<string, unknown>): string | unde
 }
 
 /** Revoke an installation token with its own credential. Resolves to whether GitHub confirmed it (204). */
-async function revoke(f: typeof fetch, token: string): Promise<boolean> {
+export async function revoke(f: typeof fetch, token: string): Promise<boolean> {
   try {
-    return (await github(f, "DELETE", "/installation/token", token)).status === 204;
+    return (await rest(f, "DELETE", "/installation/token", token)).status === 204;
   } catch {
     return false;
   }
@@ -239,7 +202,7 @@ export async function mintInstallationToken(o: MintOptions): Promise<{ token: st
   const f = o.fetch ?? fetch;
   const jwt = await appJwt(o.appId, o.privateKeyPem, (o.now ?? Date.now)());
   const body = { repositories: o.repositories, permissions: o.permissions };
-  const { status, json } = await github(f, "POST", `/app/installations/${o.installationId}/access_tokens`, jwt, body);
+  const { status, json } = await rest(f, "POST", `/app/installations/${o.installationId}/access_tokens`, jwt, body);
   if (status !== 201) throw new Error(`GitHub refused the token request: HTTP ${status}${ghMessage(json)}`);
   const r = asRecord(json);
   if (r === undefined || typeof r.token !== "string" || r.token === "") throw new Error("GitHub's token response has no token");
@@ -278,7 +241,7 @@ export async function findInstallationId(o: {
 }): Promise<number> {
   const jwt = await appJwt(o.appId, o.privateKeyPem, (o.now ?? Date.now)());
   const where = `${o.owner}/${o.repo}`;
-  const { status, json } = await github(o.fetch ?? fetch, "GET", `/repos/${encodeURIComponent(o.owner)}/${encodeURIComponent(o.repo)}/installation`, jwt);
+  const { status, json } = await rest(o.fetch ?? fetch, "GET", `/repos/${encodeURIComponent(o.owner)}/${encodeURIComponent(o.repo)}/installation`, jwt);
   if (status === 404) throw new Error(`the App is not installed on ${where} (GitHub 404): install it there (docs/runbooks/github-apps.md)`);
   if (status !== 200) throw new Error(`GitHub: the App's installation on ${where}: HTTP ${status}${ghMessage(json)}`);
   const r = asRecord(json);
@@ -403,7 +366,20 @@ export async function tokenMint(args: string[], deps: TokenDeps = {}): Promise<n
   const { token, expiresAt } = await mintInstallationToken({ ...common, installationId, repositories: [repo], permissions: { ...spec.permissions } });
 
   const file = join(tokens, `${app}.${owner}.${repo}.token`);
-  await writeSecretFile(file, `${token}\n`);
+  try {
+    await writeSecretFile(file, `${token}\n`);
+  } catch (e) {
+    // H-195: a token nobody holds is revoked, not left valid for an hour.
+    const code = (e as NodeJS.ErrnoException).code;
+    const revoked = await revoke(deps.fetch ?? fetch, token);
+    throw new Error(
+      `could not write the token to ${file}${code ? ` (${code})` : ""}: ` +
+        (revoked
+          ? "it was revoked"
+          : `it could not be revoked, so it stays valid until ${expiresAt}; suspend the App's installation if that is too long (docs/runbooks/github-apps.md)`),
+      { cause: e },
+    );
+  }
   console.log(`${file} (expires ${expiresAt})`);
   try {
     await removeExpiredTokens(tokens, (deps.now ?? Date.now)());

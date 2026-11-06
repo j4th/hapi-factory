@@ -16,9 +16,14 @@
 #   .githooks/** the commit hooks (gitleaks, the personal-strings check). They
 #              run on the operator's machine at every commit, so a change to
 #              them runs its code there, and could switch the checks off.
+#   templates/** the repo contract (templates/repo-contract/): `hapi new-repo`
+#              seeds every new repo from it, its AGENTS.md, mise.toml, gates
+#              wrapper and overlay included, so a change to it reaches every
+#              repo made afterwards.
 # Same modes as AGENTS.md: the operator approves in an interactive session;
 # unattended sessions and workers may not edit them.
 protected_paths:
   "policy/**": { interactive: ask, unattended: deny, workers: deny }
   "stack/**":  { interactive: ask, unattended: deny, workers: deny }
   ".githooks/**": { interactive: ask, unattended: deny, workers: deny }
+  "templates/**": { interactive: ask, unattended: deny, workers: deny }

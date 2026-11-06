@@ -15,7 +15,7 @@
  * - caches nothing and logs to stdout;
  * - ends with `http_access deny all`.
  *
- * An allowlisted zone (hermes, archon) allows only HTTPS tunnels to its
+ * An allowlisted zone (hermes, archon, review) allows only HTTPS tunnels to its
  * allowlist (`zoneHosts`, src/policy/zones.ts): each domain and its subdomains,
  * as a Squid dstdomain with a leading dot, matched by name only. The research
  * zone (`openWeb`) allows any public host by name: HTTPS tunnels to 443 and
@@ -31,7 +31,7 @@ import type { Policy, ZoneName } from "../policy/types";
 import { zoneHosts } from "../policy/zones";
 import { hashComment, notice, wrap } from "./header";
 
-const ZONES: ZoneName[] = ["hermes", "archon", "research"];
+const ZONES: ZoneName[] = ["hermes", "archon", "research", "review"];
 
 /** The port each zone's proxy listens on, inside its own container. */
 export const PROXY_PORT = 3128;
@@ -40,6 +40,7 @@ const ABOUT: Record<ZoneName, string> = {
   hermes: "the Hermes main session: model APIs, the forge, Slack and package registries",
   archon: "Archon and its Pi workers: model APIs and package registries. No forge route (spec §4.3)",
   research: "hapi-research, the only role that reaches the open web (spec §10)",
+  review: "the review container: the review model's API and CodeRabbit's CLI; no forge route, no registry",
 };
 
 /**
@@ -113,7 +114,9 @@ const SOURCE_TIERS: readonly string[] = defs.$defs.sourceTier.enum;
  *   Squid matches domains case-insensitively, so case is folded, not refused.
  *   Anything else, such as a host holding a space or a newline, could add a
  *   squid.conf directive (`http_access allow all`);
- * - a forge host in the archon zone, in any case (spec §4.3).
+ * - a forge host in the archon zone (spec §4.3) or the review zone (design §3.5),
+ *   in any case: neither has a forge route;
+ * - any tier in the review zone, whose allowlist is its own hosts alone.
  */
 function checkedHosts(p: Policy, zone: ZoneName): string[] {
   const z = p.trustedSources.zones[zone];
@@ -123,14 +126,18 @@ function checkedHosts(p: Policy, zone: ZoneName): string[] {
   for (const tier of z.tiers) {
     if (!SOURCE_TIERS.includes(tier)) throw new Error(`${zone} zone: unknown source tier ${JSON.stringify(tier)}`);
   }
+  // The schema's maxItems: 0, again: a tier would add its hosts (a registry, say) to the review container's allowlist.
+  if (zone === "review" && z.tiers.length > 0) {
+    throw new Error(`review zone: it lists tiers (${z.tiers.length}), where it may list none: its allowlist is its own hosts alone (design §3.5)`);
+  }
   const hosts = new Set<string>();
   for (const host of zoneHosts(p, zone) as unknown[]) {
     const name = typeof host === "string" ? host.toLowerCase() : undefined;
     if (name === undefined || !isHostname(name)) {
       throw new Error(`${zone} zone: ${JSON.stringify(host)} is not a plain domain name (the policy schema's hostname)`);
     }
-    const forge = zone === "archon" ? forgeDomain(name) : undefined;
-    if (forge !== undefined) throw new Error(`archon zone: ${forgeHostMessage(host as string, forge)}`);
+    const forge = zone === "archon" || zone === "review" ? forgeDomain(name) : undefined;
+    if (forge !== undefined) throw new Error(`${zone} zone: ${forgeHostMessage(host as string, forge, zone as "archon" | "review")}`);
     hosts.add(name);
   }
   return [...hosts].sort();
@@ -144,7 +151,7 @@ function squidConf(p: Policy, zone: ZoneName): string {
   const head = hashComment([
     ...notice(`Squid egress proxy for the ${zone} zone`, ["policy/trusted_sources.yaml"]),
     "",
-    ...wrap(`Zone ${zone} (tiers ${z.tiers.join(", ")}): ${ABOUT[zone]}.`),
+    ...wrap(`Zone ${zone} (${z.tiers.length === 0 ? "no tiers" : `tiers ${z.tiers.join(", ")}`}): ${ABOUT[zone]}.`),
     ...wrap(
       open
         ? "Open web: any public host, by name, as HTTPS tunnels to port 443 or http:// requests to port 80."

@@ -1,0 +1,62 @@
+name: factory-verify
+description: "A work order's verify run (Plan 03 Task 11, design §3.5): the repo's own checks on the bundle's head, in a container that holds no key: the mise-config scan, the install from the bundle's lockfile through the archon zone's proxy, check, smoke, then the planner's acceptance tests. Writes /out/verify.json last. Bash only, no model."
+inputs:
+  work_order_id: { required: true }
+  traceparent: { default: "" }
+worktree:
+  enabled: false
+# Archon bounds the run's nodes: the one node runs once.
+budget:
+  max_work_units: 1
+nodes:
+  # Each step's exit code is kept in a shell variable and its output in its own log under /tmp; /out/verify.json is
+  # written once, last, from those (S3's shape), and the node exits 1 unless every step that ran exited 0. The change's
+  # own code runs here and could rewrite /out after this node writes it (H-251): CI on the pushed head is the
+  # independent check.
+  - id: verify
+    bash: |
+      set -u
+      order=/run/hapi/order.json
+      L=/tmp/hapi-verify
+      mkdir -p "$L"
+      id=$(jq -r .id "$order")
+      smoke=$(jq -r .verify.smoke "$order")
+      # A log's last 40 lines (at most 8 KiB of them): what verify.json keeps of it, as untrusted text.
+      tail40() { tail -n 40 "$1" 2> /dev/null | tail -c 8192; }
+      # check: its exit and log, or the first failing step's before it; smoke and acceptance: empty when not run.
+      ce=1; clog=$L/check.log; se=; ae=
+      if [ "$id" != "${INPUTS_WORK_ORDER_ID:-}" ]; then
+        echo "the work order at $order is $id, not the run's input ${INPUTS_WORK_ORDER_ID:-(none)}" > "$clog"
+      # CI's scan for mise config besides the root mise.toml and mise.lock, before mise runs (H-194): a hit is check's failure.
+      elif ! sh /.archon/workflows/hapi/mise-config-scan.sh > "$L/scan.log" 2>&1; then
+        clog=$L/scan.log
+      else
+        # The toolchain from the image, offline, then the install from the bundle's own lockfile through the archon
+        # zone's proxy, with no key and no install script (S4): never the worker's node_modules. A failure of either is
+        # check's, with that step's exit and log, and nothing after it runs.
+        mise install --locked > "$L/install.log" 2>&1; ie=$?
+        if [ "$ie" -ne 0 ]; then
+          ce=$ie; clog=$L/install.log
+        else
+          mise exec -- bun ci --frozen-lockfile --ignore-scripts > "$L/ci.log" 2>&1; be=$?
+          if [ "$be" -ne 0 ]; then
+            ce=$be; clog=$L/ci.log
+          else
+            # Then each check, whatever the others gave.
+            mise run check > "$L/check.log" 2>&1; ce=$?
+            if [ "$smoke" = true ]; then mise run smoke > "$L/smoke.log" 2>&1; se=$?; fi
+            # The planner's acceptance tests, when the checkout has them (S2), with bun's junit report for Task 12.
+            if [ -d ".factory/work/$id/acceptance" ]; then
+              mise exec -- bun test ./.factory/work/"$id"/acceptance --reporter=junit --reporter-outfile="$L/junit.xml" > "$L/acceptance.log" 2>&1; ae=$?
+            fi
+          fi
+        fi
+      fi
+      rc=0
+      for x in "$ce" "$se" "$ae"; do if [ -n "$x" ] && [ "$x" != 0 ]; then rc=1; fi; done
+      if [ -n "$ae" ] && [ -f "$L/junit.xml" ]; then cp "$L/junit.xml" /out/acceptance.junit.xml; fi
+      jq -n --argjson ce "$ce" --arg ct "$(tail40 "$clog")" \
+        --arg se "$se" --arg st "$(if [ -n "$se" ]; then tail40 "$L/smoke.log"; fi)" \
+        --arg ae "$ae" --arg at "$(if [ -n "$ae" ]; then tail40 "$L/acceptance.log"; fi)" \
+        '{check: {exit: $ce, tail: $ct}, smoke: (if $se == "" then null else {exit: ($se | tonumber), tail: $st} end), acceptance: (if $ae == "" then null else {exit: ($ae | tonumber), tail: $at} end)}' > /out/verify.json || rc=1
+      exit "$rc"

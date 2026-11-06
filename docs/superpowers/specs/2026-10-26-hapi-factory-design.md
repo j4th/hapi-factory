@@ -143,6 +143,8 @@ You ── chat / TUI ──► HERMES  (container, user `hapi`)
  └──── review + merge ── GitHub (ruleset: your approval + required checks)
 ```
 
+> **As built (noted 2026-11-03, H-183):** there is no `archon trigger fire` and no long-lived Archon (Plan 02): the poller calls the launcher's API, `startRun`, for each run of a work order, and each work order runs in three kinds of container: the worker (and a fix), a verify that holds no key, and a review that runs no repo code. The harvester fetches the run's `run.bundle` into a scratch copy of the mirror, never a `refs/hapi/<run-id>` ref in the mirror itself, and pushes `factory/<id>` only after its host gates ([Plan 03's design](2026-10-31-hapi-factory-03-run-engine-design.md), §3.0, §3.5).
+
 ### 4.3 Trust zones [call]
 
 | Zone | Runs as | Has | Lacks |
@@ -218,6 +220,8 @@ A **lightweight lane** exists for tiny changes: a `lane:planning` doc-only PR wi
 - So runs start from **a merge or a maintainer's rework label**. Nothing else starts one.
 - A work order still maps to exactly one delivery PR.
 
+> **As built (noted 2026-11-03, H-166):** two more ways in, and nothing else. At most one automatic CodeRabbit round per factory PR, on CodeRabbit's own review of the head commit the factory pushed (its major and critical findings, from the pinned bot only, confirmed by its check run), and none once anyone but the operator, hapi's Apps or CodeRabbit comments ([Plan 03's design](2026-10-31-hapi-factory-03-run-engine-design.md), §3.6). And the operator's `hapi retry <owner>/<name> <id>`, from their own terminal as hapi, which queues a failed work order with no PR again at the same merge commit, at most `runs.max_retries` times, so its run still starts through the poller (the m19 amendment, 2026-11-01); no label, comment or check maps to it. The rework label counts only when the label event's actor is a human with at least triage permission, not an App, since the Apps' Pull requests write can add labels too (§3.4).
+
 ### 5.3 One plan, one run, one PR [user]
 
 - A planning PR can carry several work orders. **Each work order produces exactly one Archon run and one delivery PR.**
@@ -227,6 +231,8 @@ A **lightweight lane** exists for tiny changes: a `lane:planning` doc-only PR wi
 
 > **As built (noted 2026-10-30, H-213):** there is no resume. Each run is one container, removed with the run, and Archon's run database dies with it, so a failed, timed-out or stopped run has nothing to resume from. It starts over from a fresh clone as a new run, `hapi run start --retry-of <run-id>`; a Pi node is an idempotent unit of work, and the cost of starting over is the repeated spend, bounded by the run's budget ([Plan 02's design](2026-10-29-hapi-factory-02-worker-design.md), §3.1 and §6a items 1 and 14; [the runs runbook](../../runbooks/runs.md)). Resume, reconsidered, comes with the observability profile (Phase 3, H-213).
 
+> **As built (noted 2026-11-03, H-090):** one work order is one run pipeline (a worker, then a verify, a review and at most one fix before the PR) and one PR, with one commit per piece, made by `factory-task`'s commit node. Work orders in one planning PR are independent: each starts from `main` at its merge, none is stacked on another, the poller runs one pipeline per repo at a time, and two whose pieces declare overlapping files are held, `Needs your decision` ([Plan 03's design](2026-10-31-hapi-factory-03-run-engine-design.md), §3.4).
+
 ### 5.4 Fan-out inside a run [call]
 
 - **Hermes proposes** the pieces in the work order: each piece's files and a rough size.
@@ -234,6 +240,8 @@ A **lightweight lane** exists for tiny changes: a `lane:planning` doc-only PR wi
 - Fan-out children share the run's checkout. Children of one `fan_out` node are allowed to [verified].
 - After implementing, a **scope check** fails the run if any piece touched files outside its declared scope.
 - Rationale: each child is a full agent session with its own setup cost. Anthropic's measurements show splitting only pays for large routine work or work bigger than one context window. Three one-line edits in three files is **one step** [user example].
+
+> **As built (noted 2026-11-03, H-234):** there is no fan-out in Plan 03. `factory-task` runs one implement step, and its `preflight` refuses a work order whose pieces would fan out by these thresholds (two or more pieces, each `medium` or `large`, sharing no file); building fan-out is H-234 (Phase 2+).
 
 ### 5.5 Branches over a feature [call]
 
@@ -290,6 +298,8 @@ Rules:
   - in Archon's `prepare` step.
 - A frozen work order, the repo at that commit and its expected outcome make up an **eval case** (§14).
 
+> **As built (noted 2026-11-03, H-183):** the poller keys a work order by its id and the merge commit that first added it to `main`, so a later commit to `main` never starts it again, and one merge carrying several work orders starts each. An engine run's key adds its kind, round and pass (`runKey(id, sha, keyPart(kind, round, retry))`), so a retry never reuses the failed pass's runs ([Plan 03's design](2026-10-31-hapi-factory-03-run-engine-design.md), §3.4, §6a item 1).
+
 ---
 
 ## 7. The per-repo contract
@@ -319,6 +329,8 @@ Agents never create repos.
 `mise` tasks in target repos are repo-controlled code. The factory only runs them **inside the Archon container** [call].
 
 The onboarding PR must also **remove or harden any CI workflow that runs an AI agent with secrets on PR, issue or comment triggers**. That's §11.7, and the 2026 "Comment and Control" incident class. `mise run audit` fails until that's done [call].
+
+> **As built (noted 2026-11-03, H-178):** the contract is `templates/repo-contract/` in hapi-factory, every file ending in `.tmpl`, which the render strips, so hapi-factory's own protected paths, its CI's mise-file scan and its tests never read a template as a live file. `mise run new-repo` renders it in Plan 03 (pulled forward from Plan 05), creates the repo, sets it up, applies the rulesets and makes the labels; the repo's CI calls hapi-factory's reusable gates workflow pinned by commit SHA, never a tag, and the repo's `.factory/template.lock` records the template's commit and each file's sha256 ([Plan 03's design](2026-10-31-hapi-factory-03-run-engine-design.md), §3.2, §3.3; docs/runbooks/new-repo.md).
 
 ---
 
@@ -403,6 +415,8 @@ protected_paths:
 - **git's own files at any depth** (`**/.git/**`, deny everywhere; added the same day): git runs the commands `.git/config` names (`core.fsmonitor`, `diff.external`, `credential.helper`) from the git argv Hermes's rules allow, and a linked worktree's `.git` file names the git dir git uses. No agent edits them directly.
 - **gitleaks's `.gitleaks.toml` and `.gitleaksignore`** (added the same day): either could turn a repo's secret scan off. hapi-factory's own scans name their config, and its CI refuses a `.gitleaksignore`.
 - **Backstop:** CODEOWNERS plus the ruleset. A guard failing locally can't land a change.
+
+> **As built (noted 2026-11-06, H-302):** `policy/protected_paths.yaml` also protects `**/.gitattributes`, with the modes above (`ask`, `deny`, `deny`; the operator's ruling on PR #15). A `.gitattributes` tells GitHub's PR view and reviewers how to show files (`linguist-generated` collapses a file's diff), so a worker's could hide a change from review; the host's own reads of a run's change ignore every in-tree one already. The MCP configs `**/.mcp.json` and `**/.vscode/mcp.json` are in it too ([Plan 03's design](2026-10-31-hapi-factory-03-run-engine-design.md), §3.3), so the file, not the block above, is the whole list.
 
 ---
 
@@ -511,6 +525,8 @@ protected_paths:
 
 **Not used in v1:** the SDLC pack, the Archon merge queue, Archon approval nodes as security controls, the Slack plugin (optional later).
 
+> **As built (noted 2026-11-03, H-229):** three workflows, each in a container of its own: `factory-task` (preflight, implement, the gates, a commit per piece, the bundle), `factory-verify` (no model: the install, `check`, `smoke` and the acceptance tests) and `factory-review` (the review node, and CodeRabbit's CLI when it is on). Each one's budget is `max_work_units`, pinned to its node count, never `max_spend_usd`, so an attempt that reports no cost never stops a run; the dollars are hapi-guard's, and the review node's own `maxBudgetUsd` (H-204, H-229; [Plan 03's design](2026-10-31-hapi-factory-03-run-engine-design.md), §3.5).
+
 ### 9.3 Pi (worker)
 
 - **Pinned** to the version Archon embeds (1.3.0 for Archon 0.12.1) [verify skew].
@@ -549,6 +565,8 @@ Small scripts run by `hapi` (systemd user timers, installed by `mise run up`):
 - **Mirror:** keeps a local bare mirror the Archon container fetches from. Archon has no route to the forge.
 - **Harvester:** watches for `refs/hapi/<run-id>`. With a 1-hour `hapi-factory` GitHub App token, it pushes `factory/<id>`, opens the PR from a template (work order, run link, cost, gate results, review findings), adds `lane:factory` and a `hapi:flagged` label if thresholds were crossed. It never merges.
 - All forge calls go through one `forge` interface, so GitHub is one adapter (§16).
+
+> **As built (noted 2026-11-03, H-161):** the poller is `hapi poll --once` on a systemd user timer as hapi, every `runs.poll_interval_s` (120 s). The mirror is a bare repo per registered repo, fetched with a read-only token minted per tick and never stored in it; every engine run starts from it, or from the harvester's scratch copy of it. The harvester is deterministic host code: it checks the bundle (protected paths with the overlay, scope, sizes, trailers, a secret scan) before any push and writes the PR from the design's template; there is no `refs/hapi/<run-id>` to watch. The poller never retries a failed work order on its own: the operator's `hapi retry`, from their own terminal, is its only restart, queuing it again at the same merge commit, at most `runs.max_retries` times (m19) ([Plan 03's design](2026-10-31-hapi-factory-03-run-engine-design.md), §3.4, §3.6; docs/runbooks/engine.md).
 
 ---
 
@@ -610,6 +628,8 @@ Small scripts run by `hapi` (systemd user timers, installed by `mise run up`):
 
 > **As built (noted 2026-10-29, H-083):** the "7 Should I compact" row: spike T11 settled its [verify] for the harnesses' own compaction, not for a Jev-driven one (docs/spikes/04-anthropic-history-and-billing.md). On an account that enforces the check, Pi's compaction survives through `drop_block`, but only for the models its catalog flags (H-184). A Hermes compression gets one rejected request, then strips the stale thinking blocks and resends (H-185). A compaction at a cut point Jev picks wasn't tested.
 
+> **As built (noted 2026-11-03, H-262):** the run engine's harvester asks decide() one decision before a PR's verdict (Plan 03 design §3.6, "Decisions"): diff-screen, per changed file. Its reviewer_steer question is level 1's screen on the diff going into the review (a hold); its beyond_goal question is level 10's "does the diff stay within the work order's intent?" (flag only, a note). Both use level 4(b)'s floor and bar, as note and hold. gates.decisions.mode (enforce, notes, off) is the operator's switch for running without decision models, never automatic. Levels 3, 5 and 8–9 are H-270 to H-272; level 1's screen on text passed on is H-264; finding triage is H-263; level 10's failure triage is H-266.
+
 **Lessons carried over from ten-levels' "Where it can still fail":**
 - **The agent can read its own environment.** Pi gets the minimum env, and the Jev key is its **own** OpenRouter key with a tiny monthly cap ($2), since it's visible inside the Archon zone.
 - **The mock is shape, not intelligence.** CI tests the decision files' contracts and thresholds on the mock. Eval runs exercise live Jev.
@@ -630,6 +650,8 @@ Small scripts run by `hapi` (systemd user timers, installed by `mise run up`):
   - whether CodeRabbit's CLI (pre-PR review "in coding-agent loops") is usable on the free tier, as an optional in-run step;
   - its data-retention terms (`trust.coderabbit.ai`) before using it on private repos;
   - GitLab support, which matters for §16.
+
+> **As built (noted 2026-11-03, H-166, H-167):** CodeRabbit's CLI (0.9.1, pinned by checksum) runs in the review container, after the review node has ended, as `factory-review`'s `coderabbit` node, when `runs.phases.coderabbit` is on; it ships off centrally until an unattended key exists (H-167), and its key is the one secret passed in argv, under three tested conditions (docs/secrets.md). On the PR, CodeRabbit's review of the head commit counts only when its check run there is completed, `success` and titled `Finished…`, and its major and critical findings from the pinned bot start at most one automatic fix round (H-166; [Plan 03's design](2026-10-31-hapi-factory-03-run-engine-design.md), §3.5, §3.6). It is still never a merge authority or a required check.
 
 ## 10. Web and documentation access
 
@@ -916,6 +938,8 @@ Cost rules:
 - **Merge outcome.** After merge, the harvester appends: merged without changes? Number of review rounds? Time to merge?
 - **Upkeep.** `mise run upgrade` records its own duration and what broke.
 
+> **As built (noted 2026-11-03, H-233):** Plan 03 writes the status events, one JSON line per transition, to `events.jsonl` in hapi's engine state, and each run's record carries the fields an eval compares: the model and roster per phase, a hash of the effective policy and config, cost, turns, rounds, the verdict and the criteria's marks, and `decisions: "off"` when decision models were off; the harvester's decision ledger keeps each decision's answers. How evals run and store their results is Plan 06's (H-233; [Plan 03's design](2026-10-31-hapi-factory-03-run-engine-design.md), §3.8).
+
 ### 13.2 Commit trailers (provenance) [call]
 
 Every factory-lane commit carries:
@@ -927,6 +951,8 @@ Every factory-lane commit carries:
 - `Model: <id>`
 
 CI enforces them on `lane:factory` PRs. Direct-lane commits get `Hapi-Lane: direct` from an optional git hook. This fills the "run provenance" gap no framework covers. Run manifests go in git notes as a next-level option.
+
+> **As built (noted 2026-11-03, H-113):** `factory-task`'s commit node writes one commit per piece with `Work-Order`, `Hapi-Run`, `Hapi-Lane: factory`, `Trace-Id`, `Agent` and `Model`. `Hapi-Run` carries hapi's run id, since an Archon run id dies with its container (Plan 03's ruling b2(6)). The harvester checks them again on the host, the reusable gates fail a commit on a `factory/**` PR without all six, and the repo's merge method is a merge commit, so each piece's commit keeps its trailers on `main`. The `plan/**` half is H-237, and the lane labels are still H-113's.
 
 ### 13.3 Flags and thresholds [user: configurable by flags]
 
@@ -1024,6 +1050,8 @@ A flagged run gets `hapi:flagged` on its PR and an alert in `#hapi-alerts`.
    - The eval passes once more with `jev.enabled: false`, which proves the fallback.
    - CodeRabbit has reviewed the delivery PRs, with its findings linked in the PR summary.
 8. `mise run audit` passes throughout.
+
+> **As built (noted 2026-11-03, H-161):** Plan 03 builds steps 3 to 5 (the poller, the run's containers, the host gates, one factory PR per work order with its trailers, and rework by label) and runs them end to end on a sandbox repo before v1's subject is picked (Plan 03 Task 16; [Plan 03's design](2026-10-31-hapi-factory-03-run-engine-design.md), §3.3). Step 3's "one Archon run" is one pipeline of runs per work order (a worker, a verify, a review, at most one fix before the PR), each in its own container, and step 4's review verdict is advice.
 
 ---
 

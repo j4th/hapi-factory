@@ -35,6 +35,7 @@ Set these permissions **exactly**. Everything not listed is **No access**, inclu
 |---|---|---|---|
 | Contents | Read and write | Read and write | Push the App's own branches |
 | Pull requests | Read and write | Read and write | Open PRs, and label them: GitHub accepts Pull requests write for labels on a PR |
+| Checks | No access | Read-only | The poller reads `ci / gates` on every factory PR's head (Ready to merge shows only once it is green), and CodeRabbit's check run when its round is on (design §3.6) |
 | Issues | Read-only | No access | The planner reads issues for context. Neither App writes them. |
 | Metadata | Read-only | Read-only | Mandatory for every App |
 | Administration | **No access** | **No access** | Neither App may change settings or rulesets |
@@ -42,7 +43,7 @@ Set these permissions **exactly**. Everything not listed is **No access**, inclu
 
 | | `hapi-planner` | `hapi-factory` |
 |---|---|---|
-| Used by | Hermes. A host helper mints a 1-hour token per session, outside the container (spec §9.1, `hapi-gh-token`). | The harvester, a host script run by the `hapi` user (spec §9.4) |
+| Used by | Hermes. A host helper mints a 1-hour token per session, outside the container (spec §9.1, `hapi-gh-token`). | The harvester, a host script run by the `hapi` user (spec §9.4), and the run engine: `forgeToken` mints this App's tokens for the mirror (fetch), the push, PR writes and reads, and the poller's reads of the check runs on a factory PR's head (`ci / gates`, and CodeRabbit's) |
 | Branches | `plan/*` | `factory/*` |
 | Private key | In your secrets store, as `hapi-host-planner-app-private-key` | In your secrets store, as `hapi-host-factory-app-private-key` |
 | App ID | In your secrets store, as `hapi-host-planner-app-id` | In your secrets store, as `hapi-host-factory-app-id` |
@@ -50,6 +51,44 @@ Set these permissions **exactly**. Everything not listed is **No access**, inclu
 `hapi token mint` asks for exactly these permissions (`APPS` in `src/forge/github/app-token.ts`), and rejects a token that comes back broader ([docs/secrets.md](../secrets.md#hapi-token-mint)).
 
 Both private keys live only in your secrets store and in the `host` zone's env file, which no container ever gets ([docs/secrets.md](../secrets.md#the-zones-and-their-keys)).
+
+## The engine's tokens
+
+The run engine (`src/forge/github/token.ts`) does not use `hapi token mint`'s files. `forgeToken(env, repo, purpose)` mints each token in memory, for one repository, with only the permissions of its purpose (`PURPOSE_PERMISSIONS`):
+
+| Purpose | Permission | Used for |
+|---|---|---|
+| `mirror` | Contents: read | The mirror's `git fetch` |
+| `push` | Contents: write | The harvester's push of `factory/*` |
+| `pr` | Pull requests: write | Opening and editing PRs, comments, labels, and the reads: PR, issue comments, label events, reviews, review comments, collaborator permission |
+| `checks` | Checks: read | The check runs on a factory PR's head: `ci / gates` on every converge, and CodeRabbit's |
+
+CodeRabbit's round uses two of them: its reviews and review comments are read with the `pr` token, its check run with the `checks` token.
+
+- It never writes a token file. The engine revokes each token at the end of the tick or harvest that minted it.
+- It refuses a repo that `policy/repos.yaml` does not register, and a repo whose `hapi-factory` installation is not the id `policy/repos.yaml` records.
+- `markReady` (a draft PR to ready for review) is the only GraphQL call (`markPullRequestReadyForReview`): GitHub's REST "Update a pull request" takes no `draft` field (checked against API version `2026-03-10`).
+- GitHub documents these routes as accepting Pull requests (the issue-comment, label and "List issue events" routes accept Issues or Pull requests), so the factory App needs no Issues permission. "Get repository permissions for a user" needs only Metadata, and its `role_name` tells triage and maintain apart.
+
+## Adding a permission to an existing App
+
+When a release adds a permission to an App (Plan 03 adds **Checks: Read-only** to `hapi-factory`), do this once, after the release is merged and hapi's checkout has pulled it:
+
+1. **Settings → Developer settings → GitHub Apps → hapi-factory → Permissions & events → Repository permissions → Checks: Read-only → Save changes.**
+2. **Settings → Applications → Installed GitHub Apps → hapi-factory → Configure**, then review and accept the new permission.
+3. Run the audit as hapi (`<file>` is your audit token file, mode 0600; docs/runbooks/stack.md §5):
+
+   ```bash
+   sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
+     export XDG_RUNTIME_DIR PATH="$HOME/.local/bin:$PATH"; \
+     cd "$HOME/hapi-factory" && exec mise run audit -- \
+     --repo <owner>/hapi-factory --strict --github-token-file <file>' \
+     | grep -E '^(fail|skip) |github\.app-perms|^hapi audit:'
+   ```
+
+   Paste back the `github.app-perms` line (expected `pass`), the summary line, and the permissions line from the installation's page ("Read access to checks and metadata", "Read and write access to code and pull requests").
+
+**The window:** until step 2 is done, the installation lacks Checks. `hapi token mint --app factory` and a `checks` `forgeToken` ask for a permission the installation does not have, GitHub refuses them (HTTP 422), and `github.app-perms` fails, naming it (`hapi-factory's installation on <repo> lacks checks: read: accept the App's new permissions on the installation (…)`), as it does for an App that lacks a permission of the table or has it at a lower level. Checks is needed whether or not CodeRabbit is on: every converge of a factory PR reads `ci / gates` with the `checks` token, so a repo's every tick fails until it is accepted.
 
 ## Creating each App
 
@@ -88,13 +127,13 @@ hapi-host-planner-app-private-key: |
 
 ## The rulesets
 
-Rulesets are where the "no merge" rule lives. Neither App is a bypass actor in any of them. `hapi audit --repo $OWNER/hapi-factory` checks the four rulesets and both Apps against this page (`github.rulesets`, `github.app-perms`, [docs/audit.md](../audit.md#githubrulesets)), and that no ruleset has an App as a bypass actor. `tests/docs/rulesets.test.ts` holds the JSON on this page and in the README to the same rules. GitHub shows a ruleset's bypass actors only to a user with write access to it, so the audit's bypass checks use your own token (`--github-token-file`; a fine-grained one with Administration read-only is enough, H-150), never an App's: the Apps never get Administration. Keep `main` the default branch: `main-protect` and `main-review` follow the default branch (`~DEFAULT_BRANCH`) and `agent-branch-scope` exempts it, but the audit reads `main`'s rules, so it fails if `main` isn't the default.
+Rulesets are where the "no merge" rule lives. Neither App is a bypass actor in any of them. `hapi audit --repo $OWNER/hapi-factory` checks the four rulesets and both Apps against this page (`github.rulesets`, `github.app-perms`, [docs/audit.md](../audit.md#githubrulesets)), and that no ruleset has an App as a bypass actor. `tests/docs/rulesets.test.ts` holds the files in `policy/github/rulesets/`, which this page and the README apply, to the same rules. GitHub shows a ruleset's bypass actors only to a user with write access to it, so the audit's bypass checks use your own token (`--github-token-file`; a fine-grained one with Administration read-only is enough, H-150), never an App's: the Apps never get Administration. Keep `main` the default branch: `main-protect` and `main-review` follow the default branch (`~DEFAULT_BRANCH`) and `agent-branch-scope` exempts it, but the audit reads `main`'s rules, so it fails if `main` isn't the default.
 
 **The Admin role is you, on a repo your personal account owns.** Three of the rulesets let the repository Admin role (`actor_id` 5) bypass them. A personal account's repo has one Admin, its owner: collaborators get write access at most. On an organization's repo, every repository Admin and every organization owner has the same bypasses, so give no one else the Admin role there.
 
 ### The two rulesets on `main` (Plan 01 Task 1)
 
-The exact commands are in the README, under [Publishing, after Task 7b](../../README.md#publishing-after-task-7b-the-remotes-the-rulesets-and-the-apps). In short:
+The rulesets are the files `policy/github/rulesets/main-protect.json` and `main-review.json`. The exact commands are in the README, under [Publishing, after Task 7b](../../README.md#publishing-after-task-7b-the-remotes-the-rulesets-and-the-apps). In short:
 
 | Ruleset | Rules | Bypass actors |
 |---|---|---|
@@ -140,37 +179,14 @@ Two more rulesets keep the Apps on their own branches and off tags:
 
 Apply both **before you install either App** ([creating each App](#creating-each-app)).
 
-```bash
-gh api -X POST "repos/$OWNER/hapi-factory/rulesets" --input - <<'EOF'
-{
-  "name": "agent-branch-scope",
-  "target": "branch",
-  "enforcement": "active",
-  "conditions": { "ref_name": {
-    "include": ["~ALL"],
-    "exclude": ["~DEFAULT_BRANCH", "refs/heads/plan/**", "refs/heads/factory/**"] } },
-  "bypass_actors": [
-    { "actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always" }
-  ],
-  "rules": [ { "type": "creation" }, { "type": "update" }, { "type": "deletion" } ]
-}
-EOF
+The two rulesets are files, `policy/github/rulesets/agent-branch-scope.json` and `tags-admin-only.json`. Apply each from your checkout of hapi-factory:
 
-gh api -X POST "repos/$OWNER/hapi-factory/rulesets" --input - <<'EOF'
-{
-  "name": "tags-admin-only",
-  "target": "tag",
-  "enforcement": "active",
-  "conditions": { "ref_name": { "include": ["~ALL"], "exclude": [] } },
-  "bypass_actors": [
-    { "actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always" }
-  ],
-  "rules": [ { "type": "creation" }, { "type": "update" }, { "type": "deletion" } ]
-}
-EOF
+```bash
+gh api -X POST "repos/$OWNER/hapi-factory/rulesets" --input policy/github/rulesets/agent-branch-scope.json
+gh api -X POST "repos/$OWNER/hapi-factory/rulesets" --input policy/github/rulesets/tags-admin-only.json
 ```
 
-`actor_id` 5 is the repository Admin role, which bypasses both rulesets always, so your own pushes to other branches still go through. These commands were first run on 2026-10-27, and GitHub accepted every field; read back, each ruleset holds exactly these fields. If GitHub ever rejects a field, set up the same rulesets in the UI. **A trailing `**` matches one segment of a branch name** (GitHub matches with `File::FNM_PATHNAME`): the Apps can push `plan/x` and `factory/x`, never `plan/x/y`. GitHub's rules for a branch (`gh api "repos/$OWNER/hapi-factory/rules/branches/plan%2Fx%2Fy"`) showed `creation`, `update` and `deletion` on 2026-10-27. hapi's branches are one segment (`plan/<slug>`, `factory/<id>`). Dependabot's aren't (`dependabot/<ecosystem>/<name>`), so if you turn on Dependabot version updates, add `refs/heads/dependabot/**/*` to `agent-branch-scope`'s `exclude`, or Dependabot can't push its branches. That exclusion lets the Apps push those branches too ([above](#branch-and-tag-scope)).
+`actor_id` 5 is the repository Admin role, which bypasses both rulesets always, so your own pushes to other branches still go through. These files were first run on 2026-10-27 (as the same JSON pasted in), and GitHub accepted every field; read back, each ruleset holds exactly these fields. If GitHub ever rejects a field, set up the same rulesets in the UI. **A trailing `**` matches one segment of a branch name** (GitHub matches with `File::FNM_PATHNAME`): the Apps can push `plan/x` and `factory/x`, never `plan/x/y`. GitHub's rules for a branch (`gh api "repos/$OWNER/hapi-factory/rules/branches/plan%2Fx%2Fy"`) showed `creation`, `update` and `deletion` on 2026-10-27. hapi's branches are one segment (`plan/<slug>`, `factory/<id>`). Dependabot's aren't (`dependabot/<ecosystem>/<name>`), so if you turn on Dependabot version updates, add `refs/heads/dependabot/**/*` to `agent-branch-scope`'s `exclude`, or Dependabot can't push its branches. That exclusion lets the Apps push those branches too ([above](#branch-and-tag-scope)).
 
 **What rulesets can't do: keep each App to its own prefix.** GitHub rulesets can only say "nobody but the bypass actors". "Only `hapi-planner` may push `plan/**`" would need `hapi-planner` as a bypass actor on a `plan/**` ruleset, and no App is ever a bypass actor. So either App can push either prefix. In practice:
 - only the harvester's deterministic code holds `hapi-factory` tokens, and it pushes `factory/<id>` only;

@@ -1,0 +1,9 @@
+# Bun settings for this repo. See https://bun.com/docs/runtime/bunfig
+
+[install]
+# Pin everything (spec §3): `bun add` writes exact versions, never ^ or ~ ranges.
+exact = true
+# Release-age cooldown (spec §11.6): ignore package versions published less than
+# 3 days ago, so a compromised release has time to be caught and pulled first.
+# 3 days matches Hermes's own `exclude-newer` window.
+minimumReleaseAge = 259200 # seconds

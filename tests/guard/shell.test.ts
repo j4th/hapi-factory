@@ -10,11 +10,18 @@ import { cleanupAll, gatesOff, setup } from "./harness";
 
 afterEach(cleanupAll);
 
+/** What every rule 7 reason ends with, inside its "(rule shell-write...)". */
+const NOTE = "; a best-effort check, not a boundary; to only read a file, use the read tool";
+
 /**
  * [command, blocked]. The worktree holds AGENTS.md, .github/workflows/ci.yml, .git/{objects,hooks}, src/a.ts,
  * notes.md, app.log, pkg/CLAUDE.md, node_modules/bun-types/CLAUDE.md (bun-types ships one), and the links
  * link.md -> AGENTS.md, obj -> .git/objects, wf -> .github/workflows and hook -> obj/../hooks/pre-push (dangling),
- * x.md, and CLAUDE.md -> notes.md (a protected name over an unprotected file).
+ * x.md, CLAUDE.md -> notes.md (a protected name over an unprotected file), and loop -> loop (a symlink loop).
+ * `/tmp/stage`, `/tmp/lstage` and `/tmp/big` are the harness's /tmp: stage holds .github/workflows/ci.yml, AGENTS.md,
+ * pkg/CLAUDE.md, ci.yml and gh/.github/workflows/ci.yml; lstage/sub links to a dir holding AGENTS.md; big holds 2100
+ * files and sub/AGENTS.md; payload holds AGENTS.md, and dst/payload/AGENTS.md links to the worktree's (a planted
+ * link). `[g]` in the worktree links to .github, and WORK is the worktree.
  */
 const VECTORS: [string, boolean][] = [
   // Redirection: >, >>, and the fd and &> forms, attached or not.
@@ -81,6 +88,231 @@ const VECTORS: [string, boolean][] = [
   // The working directory follows cd.
   ["cd .github && echo x > workflows/ci.yml", true],
   ["cd src; rm ../AGENTS.md", true],
+  // cd's options are parsed; a later word is checked against every directory the command may be in (H-223(b)).
+  ["cd -- .github && echo x > workflows/ci.yml", true],
+  ["cd -P .github && echo x > workflows/ci.yml", true],
+  ["test -d src && cd src; echo x > .github/workflows/ci.yml", true],
+  ["(cd src); echo x > .github/workflows/ci.yml", true],
+  ["cd src | cat; echo x > .github/workflows/ci.yml", true],
+  ["cd src || true; echo x > .github/workflows/ci.yml", true],
+  ["cd -x src && ls", true],
+  ["cd - && ls", false],
+  ["mkdir -p dist && cd dist && cp ../x.md .", false],
+  // A file command counts only at the command position, and only its targets count (H-223(a)).
+  ["grep -n install AGENTS.md", false],
+  ["cp AGENTS.md /tmp/agents.md", false],
+  ["cp -t /tmp AGENTS.md", false],
+  ["dd if=AGENTS.md of=/tmp/x", false],
+  ["cp --target-directory=.github/workflows notes.md", true],
+  ["env rm AGENTS.md", true],
+  ["find . -name x | xargs rm AGENTS.md", true],
+  // The command position is past the shell's reserved words, and past a wrapper's options and their values.
+  ["if true; then rm AGENTS.md; fi", true],
+  ["for f in a; do rm AGENTS.md; done", true],
+  ["{ rm AGENTS.md; }", true],
+  ["! rm AGENTS.md", true],
+  ["nohup rm AGENTS.md", true],
+  ["command rm AGENTS.md", true],
+  ["timeout 5 rm AGENTS.md", true],
+  ["xargs -n 1 rm AGENTS.md", true],
+  ["sudo -u root rm AGENTS.md", true],
+  ["timeout -s KILL 5s rm AGENTS.md", true],
+  ["function f { rm AGENTS.md; }", true],
+  ["sudo -u root grep -rn rm AGENTS.md", false],
+  ["xargs -I {} grep install {}", false],
+  ["find . -name AGENTS.md -exec rm {} \\;", true],
+  ["rm -- -x AGENTS.md", true],
+  ["cd src > AGENTS.md", true],
+  // A copy's target, and the file it makes in a target directory; ln with one operand makes ./<name>.
+  ["cp src/a.ts .github/", true],
+  ["cp src/a.ts pkg/CLAUDE.md", true],
+  ["cp notes.md pkg", false],
+  ["cp pkg/CLAUDE.md src", true],
+  ["cp pkg/CLAUDE.md x2.md", false],
+  ["ln -s /tmp/elsewhere/AGENTS.md", true],
+  ["install -d src/x .github/y", true],
+  ["sed -i -e s/a/b/ AGENTS.md", true],
+  ["sed -f fix.sed -i AGENTS.md", true],
+  ["cd /tmp && echo x > a.txt", false],
+  // Opaque wrappers run their command in ways rule 7 can't follow: Plan 02's broad rule judges the segment.
+  ["eval rm AGENTS.md", true],
+  ["eval 'rm AGENTS.md'", true],
+  ["watch rm AGENTS.md", true],
+  ["flock /tmp/l rm AGENTS.md", true],
+  ["chroot / rm AGENTS.md", true],
+  ["strace rm AGENTS.md", true],
+  ["fakeroot rm AGENTS.md", true],
+  ["unshare rm AGENTS.md", true],
+  ["coproc rm AGENTS.md", true],
+  ["nsenter -t 1 rm AGENTS.md", true],
+  ["su -c x; runuser rm AGENTS.md", true],
+  ["parallel rm ::: AGENTS.md", true],
+  ["sudo -R /x rm AGENTS.md", true],
+  // find -exec's command is read as any simple command is.
+  ["find . -name AGENTS.md -exec sudo rm {} \\;", true],
+  ["find . -name '*.md' -exec sed -i s/a/b/ {} +", true],
+  ["find . -name '*.md' -exec grep -n x {} +", false],
+  // A wrapper's directory (env -C, sudo -D) runs the command there, and env -S's string is read as commands.
+  ["env -C .github rm workflows/ci.yml", true],
+  ["env --chdir=.github rm workflows/ci.yml", true],
+  ["env --chdir .github rm workflows/ci.yml", true],
+  ["env --ch=.github rm workflows/ci.yml", true],
+  ["sudo -D .github rm workflows/ci.yml", true],
+  ["sudo --chdir=.github rm workflows/ci.yml", true],
+  ["env -S 'rm AGENTS.md'", true],
+  // GNU long options by any prefix.
+  ["cp --target=.github/workflows notes.md", true],
+  ["cp --t .github/workflows notes.md", true],
+  ["cp --targ .github/workflows notes.md", true],
+  ["install --target=.github/workflows notes.md", true],
+  ["ln -s --target=.github/workflows /tmp/x", true],
+  ["sed -i --ex=s/a/b/ AGENTS.md", true],
+  ["sed -i --expr=s/a/b/ AGENTS.md", true],
+  ["sed -i --fi=fix.sed AGENTS.md", true],
+  ["sed --in-pl s/a/b/ AGENTS.md", true],
+  ["cp --preserve=all AGENTS.md /tmp/x", false],
+  ["cp -a AGENTS.md /tmp/x", false],
+  // CDPATH and OLDPWD can send a cd anywhere.
+  ["CDPATH=.github; cd workflows; echo x > ci.yml", true],
+  ["export CDPATH=.github && cd workflows && echo x > ci.yml", true],
+  ["OLDPWD=.github; cd - && echo x > workflows/ci.yml", true],
+  ["CDPATH=x; cd ./src && ls", false],
+  // Copies: a trailing "/" names the same file, and a recursive copy's tree lands under its target.
+  ["cp /tmp/stage/AGENTS.md/ .", true],
+  ["cp -r /tmp/stage/.github/ .", true],
+  ["cp -r /tmp/stage/. .", true],
+  ["cp -r /tmp/stage/pkg .", true],
+  ["cp -R /tmp/stage/pkg newdir", true],
+  ["cp --rec /tmp/stage/pkg src", true],
+  ["cp -r /tmp/stage/pkg/ /tmp/elsewhere", false],
+  // A directory made earlier in the same command is a target directory.
+  ["mkdir d && cp CLAUDE.md d", true],
+  ["mkdir -p d/e && cp notes.md d", false],
+  // Fix round 2, item 1: an exact long option wins over a prefix (install's --strip is a flag).
+  ["install --strip /tmp/stage/ci.yml AGENTS.md", true],
+  ["install --st /tmp/stage/ci.yml AGENTS.md", true],
+  ["install --strip-program=true -s /tmp/stage/ci.yml AGENTS.md", true],
+  ["install -m 644 notes.md /tmp/x", false],
+  // Item 2: cp -T puts the source at the target itself.
+  ["cp -T /tmp/stage/ci.yml AGENTS.md", true],
+  ["cp -rT /tmp/stage/gh .", true],
+  ["cp -r --no-target-directory /tmp/stage/gh .", true],
+  ["cp --no-t -r /tmp/stage/gh .", true],
+  ["cp -r -t . -T /tmp/stage/gh", true],
+  ["cp -rT /tmp/stage/gh newdir", false],
+  // Item 3: env's and sudo's options are listed; one they don't list takes the broad rule; `env -` is -i.
+  ["env - rm AGENTS.md", true],
+  ["env -a x rm AGENTS.md", true],
+  ["env --argv0 x rm AGENTS.md", true],
+  ["env -i -- rm AGENTS.md", true],
+  ["env -0 rm AGENTS.md", true],
+  ["env --frobnicate rm AGENTS.md", true],
+  ["sudo -a x rm AGENTS.md", true],
+  ["sudo -c x rm AGENTS.md", true],
+  ["sudo -E -H rm AGENTS.md", true],
+  ["sudo -k rm AGENTS.md", true],
+  ["sudo --preserve-env=PATH rm AGENTS.md", true],
+  ["sudo -Z rm AGENTS.md", true],
+  ["sudo --preserve-env PATH rm AGENTS.md", false],
+  ["env -C src ls", false],
+  ["sudo -D src ls", false],
+  // Item 4: CDPATH and OLDPWD from the parsed words; a cd operand that can't be resolved.
+  ["export CD''PATH=.github; cd workflows; rm ci.yml", true],
+  ["declare -x CD\\PATH=.github; cd workflows; rm ci.yml", true],
+  ["printf -v CD''PATH .github; cd workflows; rm ci.yml", true],
+  ["read CD''PATH <<< .github; cd workflows; rm ci.yml", true],
+  ["eval CD''PATH=.github; cd workflows; rm ci.yml", true],
+  ["export OLD''PWD=.github; cd -; rm workflows/ci.yml", true],
+  ["export OLD''PWD=.github; cd ~-; rm workflows/ci.yml", true],
+  ["OLDPWD=.github; pushd ~- && rm workflows/ci.yml", true],
+  ["X=.github; cd $X && rm workflows/ci.yml", true],
+  ["cd \"$(echo .github)\" && rm workflows/ci.yml", true],
+  ["cd `echo .github` && rm workflows/ci.yml", true],
+  ["cd .gith* && rm workflows/ci.yml", true],
+  ["cd .githu[b] && rm workflows/ci.yml", true],
+  ["cd ~- && rm workflows/ci.yml", true],
+  // A command naming CDPATH or OLDPWD anywhere makes a later relative cd unknowable: a fail-closed false positive (H-256).
+  ["grep -rn CDPATH . ; cd src && ls", true],
+  ["cd ~ && ls", false],
+  // Item 5: env -S's escapes and options, and a $ in its string.
+  ["env -S 'rm\\_AGENTS.md'", true],
+  ["env -S 'rm\\tAGENTS.md'", true],
+  ["env -vS 'rm\\_AGENTS.md'", true],
+  ["env -S '-C .github rm workflows/ci.yml'", true],
+  ["env -S '-C src/../.github rm workflows/ci.yml'", true],
+  ["X=AGENTS.md env -S 'rm ${X}'", true],
+  // Item 6: nested wrapper directories compose.
+  ["env -C src sudo -D ../.github rm workflows/ci.yml", true],
+  ["env -C src env -C ../.github rm workflows/ci.yml", true],
+  ["sudo -D src env -C ../.github rm workflows/ci.yml", true],
+  // Item 7: the copy walk fails closed: past its limit, with -L through links, with --parents, a glob's matches.
+  ["cp -rL /tmp/lstage .", true],
+  ["cp -r -L /tmp/lstage .", true],
+  ["cp -r /tmp/lstage .", false],
+  ["cp -r /tmp/big .", true],
+  ["cd /tmp/stage && cp --parents .github/workflows/ci.yml WORK/", true],
+  ["cp /tmp/stage/AG* .", true],
+  ["cp -r /tmp/stage/* .", true],
+  ["cp -r src /tmp/out", false],
+  ["mkdir -p build && cp -r src build/", false],
+  ["cp -r . /tmp/snap", false],
+  // Item 8: a glob is also judged as written (bash keeps one that matches nothing, and a quoted one isn't a glob).
+  ["rm '[g]/workflows/ci.yml'", true],
+  ["rm [g]/workflows/ci.yml", true],
+  ["echo x > .github/workflows/new.y[m]l", true],
+  ["cp /tmp/stage/ci.yml '.github/workflows/n*'", true],
+  // Item 9: sh -c's script and an opaque wrapper's words are read as commands; eval's exactly.
+  ["bash -c 'rm AGENTS.md'", true],
+  ["sh -c 'rm AGENTS.md'", true],
+  ["sudo sh -c 'rm AGENTS.md'", true],
+  ["bash -lc 'echo x > AGENTS.md'", true],
+  ["watch 'rm AGENTS.md'", true],
+  ["su -c 'rm AGENTS.md'", true],
+  ["flock /tmp/l -c 'rm AGENTS.md'", true],
+  ["script -c 'rm AGENTS.md' /dev/null", true],
+  ["parallel 'rm {}' ::: AGENTS.md", true],
+  ["eval \"rm 'AGENTS.md'\"", true],
+  ["eval \"eval \\\"rm AGENTS.md\\\"\"", true],
+  ["eval r\\m AGENTS.md", true],
+  ["command eval 'rm AGENTS.md'", true],
+  ["eval cp AGENTS.md /tmp/x", false],
+  ["eval ls", false],
+  ["watch -n 5 git status", false],
+  ["flock /tmp/l bun test", false],
+  ["bash -c 'cat AGENTS.md'", false],
+  // Fix round 3: CDPATH and OLDPWD are named in the text, or set by a parsed word (the union).
+  ["CDPATH+=:.github; cd workflows; rm ci.yml", true],
+  ["CDPATH[0]=.github; cd workflows; rm ci.yml", true],
+  ["OLDPWD+=.github; cd - && rm workflows/ci.yml", true],
+  [": ${CDPATH:=.github}; cd workflows; rm ci.yml", true],
+  ["echo ${CDPATH:=.github} && cd workflows && rm ci.yml", true],
+  ["true ${OLDPWD=.github}; cd -; rm workflows/ci.yml", true],
+  ["for CDPATH in .github; do cd workflows && rm ci.yml; done", true],
+  ["for OLDPWD in .github; do cd - && rm workflows/ci.yml; done", true],
+  ["select CDPATH in .github; do cd workflows; rm ci.yml; done", true],
+  ["declare -n r=CDPATH; r=.github; cd workflows; rm ci.yml", true],
+  // D56: CDPATH or OLDPWD in any de-quoted word, pieces and printf's attached -v included.
+  ["declare -n r=CD''PATH; r=.github; cd workflows; rm ci.yml", true],
+  ["printf -vCD''PATH .github; cd workflows; rm ci.yml", true],
+  ["printf -vOLD\"\"PWD .github; cd -; rm workflows/ci.yml", true],
+  ["export PATH=$PATH:/x && cd src && ls", false],
+  ["source \"$HOME/.venv/bin/activate\" && cd src && ls", false],
+  ["trap 'rm -f $t' EXIT; cd src && ls", false],
+  ["local x=$1; cd src && ls", false],
+  ["printf '%s\\n' \"$HOME\"; cd src && ls", false],
+  // A copy into an existing tree outside the worktree is walked: a planted link there lands in it.
+  ["cp -r /tmp/payload /tmp/dst", true],
+  ["cp -r /tmp/payload /tmp/fresh", false],
+  // D57: a copy into what an earlier cp, ln or mv of the same command made: what it planted there is unseen.
+  ["ln -s WORK/.github /tmp/fresh && cp -r /tmp/payload /tmp/fresh", true],
+  ["cp -r /tmp/dst /tmp/fresh && cp -r /tmp/payload /tmp/fresh", true],
+  ["mkdir /tmp/fresh && ln -s WORK/AGENTS.md /tmp/fresh/AGENTS.md; cp -r /tmp/payload/. /tmp/fresh", true],
+  ["cp -r /tmp/payload /tmp/fresh && cp -r /tmp/stage/pkg /tmp/elsewhere", false],
+  // An in-place edit's script is no target; a ".." after a missing dir, and a symlink loop, block (H-223(c)).
+  ["sed -i 's/../X/' notes.md", false],
+  ["perl -pi -e 's/../X/' notes.md", false],
+  ["echo x > nothere/../x.md", true],
+  ["echo x > loop", true],
   // Allowed: no write indicator, or none of them names a protected path.
   ["cat AGENTS.md", false],
   ["cat AGENTS.md | grep -n agents", false],
@@ -135,9 +367,33 @@ test("the vector table: each command blocks or allows as listed", async () => {
   symlinkSync("obj/../hooks/pre-push", join(h.work, "hook"));
   writeFileSync(join(h.work, "x.md"), "x\n");
   symlinkSync("notes.md", join(h.work, "CLAUDE.md"));
+  symlinkSync("loop", join(h.work, "loop"));
+  mkdirSync(join(h.tmp, "stage", ".github", "workflows"), { recursive: true });
+  writeFileSync(join(h.tmp, "stage", ".github", "workflows", "ci.yml"), "on: push\n");
+  writeFileSync(join(h.tmp, "stage", "AGENTS.md"), "# staged\n");
+  mkdirSync(join(h.tmp, "stage", "pkg"));
+  writeFileSync(join(h.tmp, "stage", "pkg", "CLAUDE.md"), "# staged pkg\n");
+  writeFileSync(join(h.tmp, "stage", "ci.yml"), "on: push\n");
+  mkdirSync(join(h.tmp, "stage", "gh", ".github", "workflows"), { recursive: true });
+  writeFileSync(join(h.tmp, "stage", "gh", ".github", "workflows", "ci.yml"), "on: push\n");
+  mkdirSync(join(h.tmp, "real"));
+  writeFileSync(join(h.tmp, "real", "AGENTS.md"), "# real\n");
+  mkdirSync(join(h.tmp, "lstage"));
+  symlinkSync(join(h.tmp, "real"), join(h.tmp, "lstage", "sub"));
+  mkdirSync(join(h.tmp, "big", "sub"), { recursive: true });
+  for (let i = 0; i < 2100; i++) writeFileSync(join(h.tmp, "big", `f${i}`), "");
+  writeFileSync(join(h.tmp, "big", "sub", "AGENTS.md"), "# deep\n");
+  symlinkSync(".github", join(h.work, "[g]"));
+  mkdirSync(join(h.tmp, "payload"));
+  writeFileSync(join(h.tmp, "payload", "AGENTS.md"), "# payload\n");
+  mkdirSync(join(h.tmp, "dst", "payload"), { recursive: true });
+  symlinkSync(join(h.work, "AGENTS.md"), join(h.tmp, "dst", "payload", "AGENTS.md"));
   await h.start();
   const got: [string, boolean][] = [];
-  for (const [command] of VECTORS) got.push([command, (await h.tool("bash", { command }))?.block === true]);
+  for (const [command] of VECTORS) {
+    const real = command.replace(/\/tmp\/(stage|lstage|big|payload|dst|fresh)\b/g, (_m, d: string) => join(h.tmp, d)).replaceAll("WORK", h.work);
+    got.push([command, (await h.tool("bash", { command: real }))?.block === true]);
+  }
   expect(got).toEqual(VECTORS);
 });
 
@@ -146,10 +402,67 @@ test("a block names the path and the rule; the log records it", async () => {
   await h.start();
   expect(await h.tool("bash", { command: "echo x > AGENTS.md" })).toEqual({
     block: true,
-    reason: "hapi-guard: this command writes to the protected path AGENTS.md (rule shell-write; a best-effort check, not a boundary)",
+    reason: `hapi-guard: this command writes to the protected path AGENTS.md (rule shell-write${NOTE})`,
   });
   const r = h.log().at(-1);
   expect([r.event, r.decision, r.rule, r.tool, r.path]).toEqual(["tool_call", "block", "shell-write", "bash", "AGENTS.md"]);
+});
+
+test("CDPATH in the guard's env makes a relative cd unknowable, but not a ./-led one", async () => {
+  const h = setup({ settings: gatesOff, env: { CDPATH: "/elsewhere" } });
+  mkdirSync(join(h.work, "src"));
+  await h.start();
+  expect(await h.tool("bash", { command: "cd src && ls" })).toEqual({
+    block: true,
+    reason: `hapi-guard: this command's cd src can't be followed, so where its later words land can't be known (rule shell-write${NOTE})`,
+  });
+  expect(await h.tool("bash", { command: "cd ./src && ls" })).toBeUndefined();
+  expect((await h.tool("bash", { command: "cd - && ls" }))?.block).toBe(true);
+});
+
+test("fix round 2's refusals carry their own reasons, and the copy walk's budget keeps a big copy cheap", async () => {
+  const h = setup({ settings: gatesOff });
+  mkdirSync(join(h.tmp, "big"));
+  for (let i = 0; i < 2100; i++) writeFileSync(join(h.tmp, "big", `f${i}`), "");
+  for (let d = 0; d < 5; d++) {
+    mkdirSync(join(h.tmp, "many", `d${d}`), { recursive: true });
+    for (let f = 0; f < 1700; f++) writeFileSync(join(h.tmp, "many", `d${d}`, `f${f}`), "");
+  }
+  await h.start();
+  const reason = async (command: string) => (await h.tool("bash", { command }))?.reason;
+  expect(await reason(`cp -r ${h.tmp}/big .`)).toBe(
+    `hapi-guard: this command copies more than 2000 files into ./big, too many to check where they land (rule shell-write${NOTE})`,
+  );
+  const t0 = performance.now();
+  // The directory a glob reaches last isn't fixed (readdir's order), so the reason names whichever tripped the budget.
+  expect(await reason(`cp -r ${h.tmp}/many/* .`)).toMatch(/^hapi-guard: this command copies more than 8000 files in all into \.\/d\d, too many to check where they land \(rule shell-write;/);
+  expect(performance.now() - t0).toBeLessThan(3000);
+  // A copy that lands wholly outside the worktree and the guard's dirs isn't walked.
+  expect(await reason(`cp -r ${h.tmp}/big ${h.tmp}/copy`)).toBeUndefined();
+  expect(await reason("X=AGENTS.md env -S 'rm ${X}'")).toBe(`hapi-guard: this command's env -S string holds a $, so what it runs can't be known (rule shell-write${NOTE})`);
+  expect(await reason("cd $X && ls")).toBe(`hapi-guard: this command's cd $X can't be followed, so where its later words land can't be known (rule shell-write${NOTE})`);
+  expect(await reason("cd ~- && ls")).toBe(`hapi-guard: this command's cd ~- can't be followed, so where its later words land can't be known (rule shell-write${NOTE})`);
+  // env's unknown option takes the broad rule: a file command's name anywhere.
+  expect(await reason("env --frobnicate rm AGENTS.md")).toBe(`hapi-guard: this command writes to the protected path AGENTS.md (rule shell-write${NOTE})`);
+  expect(await reason("env --frobnicate cat AGENTS.md")).toBeUndefined();
+}, 30000);
+
+test("an option-led cd and a symlink loop block with their own reasons", async () => {
+  const h = setup({ settings: gatesOff });
+  symlinkSync("loop", join(h.work, "loop"));
+  await h.start();
+  expect(await h.tool("bash", { command: "cd -x src && ls" })).toEqual({
+    block: true,
+    reason: `hapi-guard: this command's cd -x can't be followed, so where its later words land can't be known (rule shell-write${NOTE})`,
+  });
+  expect(await h.tool("bash", { command: "echo x > loop" })).toEqual({
+    block: true,
+    reason: `hapi-guard: this command names loop, which goes through too many levels of symbolic links (rule shell-write${NOTE})`,
+  });
+  expect(await h.tool("bash", { command: "echo x > nothere/../x.md" })).toEqual({
+    block: true,
+    reason: `hapi-guard: this command names nothere/../x.md, which goes through ${join(h.work, "nothere")}, which doesn't exist, and then "..", so where it lands can't be known (rule shell-write${NOTE})`,
+  });
 });
 
 test("a shell write into Pi's agent dir, the guard's ledger or the decision log's dir blocks too", async () => {
@@ -159,7 +472,7 @@ test("a shell write into Pi's agent dir, the guard's ledger or the decision log'
   expect((await h.tool("bash", { command: `rm -rf ${h.ledgerDir}` }))?.block).toBe(true);
   expect(await h.tool("bash", { command: `echo '{}' >> ${join(h.out, "decisions.jsonl")}` })).toEqual({
     block: true,
-    reason: `hapi-guard: this command writes into hapi-guard's decision log dir (${h.out}) (rule shell-write; a best-effort check, not a boundary)`,
+    reason: `hapi-guard: this command writes into hapi-guard's decision log dir (${h.out}) (rule shell-write${NOTE})`,
   });
   expect((await h.tool("bash", { command: `truncate -s 0 ${h.out}/decisions.jsonl` }))?.block).toBe(true);
   expect((await h.tool("bash", { command: `echo x > ${join(h.tmp, "scratch.txt")}` }))?.block).toBeUndefined();

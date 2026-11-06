@@ -7,10 +7,30 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { lockHeld, RUN_DISK, withStackLock } from "../../src/run/locks";
 import { SecretError } from "../../src/secrets/provider";
 import { secretsResolve } from "../../src/secrets/cli";
 import { resolveAgeDir } from "../../src/secrets/providers/sops";
-import { buildDigest, currentUserOverride, networkProblem, networkProblems, PROJECT_LABEL, reexecScript, RUN_LABEL, removeRuns, type StackDeps, stackDown, stackUp } from "../../src/stack/up";
+import { loadPolicy } from "../../src/policy/load";
+import {
+  buildDigest,
+  currentUserOverride,
+  networkProblem,
+  networkProblems,
+  POLL_UNITS,
+  policySidecarImages,
+  PROJECT_LABEL,
+  reexecScript,
+  RUN_LABEL,
+  removeRuns,
+  type StackDeps,
+  stackDown,
+  stackUp,
+  SYSTEMCTL_NOT_LOADED,
+  systemctlEnv,
+  ZONE_NETWORKS,
+} from "../../src/stack/up";
+import { REPO } from "./helpers";
 import { capture, caught, cleanup, fullStore, sopsConfig, sopsStore, tempDir } from "../secrets/helpers";
 
 afterEach(cleanup);
@@ -19,7 +39,9 @@ type Call = { cmd: string[]; env: Record<string, string>; inherit: boolean };
 
 /** A private, internal zone network, as `docker network inspect` prints it. */
 const net = (name: string, subnet = "172.20.0.0/16", internal = true) => ({ Name: name, Internal: internal, IPAM: { Config: [{ Subnet: subnet }] } });
-const GOOD = [net("hapi_hermes-net"), net("hapi_archon-net", "172.21.0.0/16"), net("hapi_research-net", "192.168.16.0/20"), net("hapi_outbound", "172.23.0.0/16", false)];
+const GOOD = [net("hapi_hermes-net"), net("hapi_archon-net", "172.21.0.0/16"), net("hapi_research-net", "192.168.16.0/20"), net("hapi_review-net", "172.22.0.0/16"), net("hapi_outbound", "172.23.0.0/16", false)];
+/** The sidecar image the fakes pull unless a test names its own: pinned by digest, as policy/sidecars.yaml's are. */
+const SIDECAR_IMAGE = `example/bun:1.4.4-slim@sha256:${"b".repeat(64)}`;
 
 /** Fakes for every step; `steps` records the order. */
 function fakes(
@@ -45,6 +67,13 @@ function fakes(
     failing?: string[];
     resolve?: StackDeps["resolve"];
     build?: StackDeps["build"];
+    sidecarImages?: string[];
+    /** Exit code of `docker pull`. */
+    pullCode?: number;
+    /** Images `docker image inspect` finds here already (none by default). */
+    images?: string[];
+    /** The exit code of a joined command (e.g. a systemctl call), and the stderr it prints when that isn't 0. */
+    codes?: Record<string, number>;
   } = {},
 ) {
   const steps: string[] = [];
@@ -56,10 +85,13 @@ function fakes(
     env: o.env ?? { HOME: "/home/hapi", XDG_RUNTIME_DIR: "/run/user/1001", PATH: "/usr/bin" },
     build: o.build ?? (async (roster) => (steps.push(`build ${roster}`), [built])),
     resolve: o.resolve ?? (async (args) => (steps.push(`resolve ${args.join(" ")}`.trim()), 0)),
+    sidecarImages: () => o.sidecarImages ?? [SIDECAR_IMAGE],
     run: async (cmd, opts) => {
       calls.push({ cmd, env: opts.env, inherit: opts.inherit });
       steps.push(cmd.slice(0, 3).join(" ") === "docker network inspect" ? "docker network inspect" : cmd.join(" "));
       if (o.failing?.includes(cmd.join(" "))) return { code: 1, stdout: "", stderr: "boom" };
+      const code = o.codes?.[cmd.join(" ")];
+      if (code !== undefined) return { code, stdout: "", stderr: code === 0 ? "" : "Failed to connect to bus: No medium found\nmore" };
       const lines = (ids: string[] | undefined) => ({ code: 0, stdout: (ids ?? []).map((i) => `${i}\n`).join(""), stderr: "" });
       const rows = [...(o.live ?? []).map((id) => `${id}\thapi-run-${id}`), ...(o.liveHelpers ?? []).map((id) => `${id}\tfervent_turing`)];
       if (cmd[1] === "ps") return cmd.includes("-aq") ? lines(o.runs?.containers) : o.liveCode ? { code: o.liveCode, stdout: "", stderr: "daemon down" } : lines(rows);
@@ -69,6 +101,8 @@ function fakes(
       if (cmd.includes("--wait")) return { code: o.upCode ?? 0, stdout: "" };
       if (cmd.at(-1) === "down") return { code: o.downCode ?? 0, stdout: "" };
       if (cmd.slice(-2).join(" ") === "build archon") return { code: o.buildCode ?? 0, stdout: "" };
+      if (cmd[1] === "pull") return { code: o.pullCode ?? 0, stdout: "" };
+      if (cmd[1] === "image" && cmd[2] === "inspect") return (o.images ?? []).includes(cmd.at(-1)!) ? { code: 0, stdout: "sha256:0123\n", stderr: "" } : { code: 1, stdout: "", stderr: `Error response from daemon: No such image: ${cmd.at(-1)}` };
       return { code: 0, stdout: "" };
     },
   };
@@ -80,6 +114,15 @@ const COMPOSE = ["docker", "compose", "-f", "stack/compose.yaml", "-p", "hapi"];
 const composeCalls = (f: { calls: Call[] }) => f.calls.filter((c) => c.cmd[1] === "compose");
 /** `up`'s first docker call: are any runs live? */
 const LIVE_CHECK = 'docker ps --filter label=org.hapi.run --filter label=org.hapi.project=hapi --format {{.Label "org.hapi.run"}}\t{{.Names}}';
+/** `up`'s and `down`'s first call: the poller's timer stopped, so no new run starts. */
+const STOP = "systemctl --user stop hapi-poll.timer hapi-poll.service";
+/** `up`'s last three calls, after `--wait`: the units linked, the manager reloaded, the timer enabled and started. */
+const UNIT = (u: string) => join(REPO, "build", "systemd", u);
+const TIMER_STEPS = [
+  `systemctl --user link --runtime ${UNIT("hapi-poll.service")} ${UNIT("hapi-poll.timer")}`,
+  "systemctl --user daemon-reload",
+  "systemctl --user enable --runtime --now hapi-poll.timer",
+];
 
 /** The whole script the re-exec hands `sh -c` as hapi, for `up`: fixed text, no argument in it. */
 const UP_SCRIPT = `: "\${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; export XDG_RUNTIME_DIR; export PATH="$HOME/.local/bin:$PATH"; cd "$HOME/hapi-factory" && exec "$HOME/.local/bin/mise" run up -- "$@"`;
@@ -124,23 +167,36 @@ describe("currentUserOverride (the dev bypass, for Task 6's audit)", () => {
 });
 
 describe("hapi stack up", () => {
-  test("as hapi: the live-run check, policy build, secrets, then compose build archon, compose create, the network check, and compose up --wait, in that order", async () => {
-    capture();
+  test("as hapi: the live-run check, policy build, secrets, then compose build archon, the sidecar images' pull, compose create, the network check, and compose up --wait, in that order", async () => {
+    const { out } = capture();
     const f = fakes();
     expect(await stackUp(["--roster", "budget"], f.deps)).toBe(0);
     expect(f.steps).toEqual([
+      STOP,
       LIVE_CHECK,
       "build budget",
       "resolve",
       [...COMPOSE, "build", "archon"].join(" "),
+      `docker image inspect --format {{.Id}} ${SIDECAR_IMAGE}`,
+      `docker pull ${SIDECAR_IMAGE}`,
       [...COMPOSE, "up", "--no-start", "--build"].join(" "),
       "docker network inspect",
       [...COMPOSE, "up", "-d", "--wait", "--wait-timeout", "300"].join(" "),
+      ...TIMER_STEPS,
     ]);
+    expect(POLL_UNITS).toEqual(["hapi-poll.timer", "hapi-poll.service"]);
+    // Every systemctl call reaches hapi's user manager: XDG_RUNTIME_DIR, and DBUS_SESSION_BUS_ADDRESS from it (T20).
+    const systemctl = f.calls.filter((c) => c.cmd[0] === "systemctl");
+    expect(systemctl).toHaveLength(4);
+    for (const c of systemctl) expect(c.env).toMatchObject({ XDG_RUNTIME_DIR: "/run/user/1001", DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1001/bus" });
     const inspect = f.calls.find((c) => c.cmd[1] === "network" && c.cmd[2] === "inspect")!;
-    expect(inspect.cmd.slice(3)).toEqual(["hapi_hermes-net", "hapi_archon-net", "hapi_research-net"]);
+    expect(inspect.cmd.slice(3)).toEqual(["hapi_hermes-net", "hapi_archon-net", "hapi_research-net", "hapi_review-net"]);
+    expect(ZONE_NETWORKS).toEqual(["hermes-net", "archon-net", "research-net", "review-net"]);
+    expect(out.at(-1)).toBe(
+      "the stack is up (Compose project hapi): egress-hermes, egress-archon, egress-research, egress-review, hermes (archon is built, and a container of it starts per run; 1 sidecar image is here (1 pulled), and a sidecar starts with a run that smokes)",
+    );
     // Compose gets the caller's env (XDG_RUNTIME_DIR for the env files) and the labels' values.
-    const up = f.calls.at(-1)!;
+    const up = f.calls.find((c) => c.cmd.includes("--wait"))!;
     expect(up.inherit).toBe(true);
     expect(up.env).toMatchObject({ XDG_RUNTIME_DIR: "/run/user/1001", HAPI_STARTED_BY: "hapi", HAPI_DEV_OVERRIDE: "0" });
     // The build's digest labels every container, so a changed generated file recreates them.
@@ -178,7 +234,7 @@ describe("hapi stack up", () => {
     capture();
     const f = fakes();
     expect(await stackUp(["--config", "/home/hapi/.config/hapi/other.yaml"], f.deps)).toBe(0);
-    expect(f.steps.slice(1, 3)).toEqual(["build anthropic", "resolve --config /home/hapi/.config/hapi/other.yaml"]);
+    expect(f.steps.slice(2, 4)).toEqual(["build anthropic", "resolve --config /home/hapi/.config/hapi/other.yaml"]);
   });
 
   test("as another user: re-execs `mise run up` as hapi through sudo -u hapi -H (never -i), in hapi's checkout, with hapi's XDG_RUNTIME_DIR and mise", async () => {
@@ -192,6 +248,17 @@ describe("hapi stack up", () => {
     expect(sudo!.inherit).toBe(true);
     expect(err.join("\n")).toContain("running as hapi (sudo -u hapi -H), not dev");
     expect(err.join("\n")).toContain("HAPI_ALLOW_CURRENT_USER=1");
+  });
+
+  test("D94: a relative --config is made absolute, from the caller's working dir, before the re-exec into hapi's checkout", async () => {
+    capture();
+    const f = fakes({ user: "dev" });
+    expect(await stackUp(["--config", "conf/hapi.yaml", "--roster", "budget"], f.deps)).toBe(0);
+    expect(f.calls[0]!.cmd.slice(8)).toEqual(["hapi-stack", "--config", join(process.cwd(), "conf/hapi.yaml"), "--roster", "budget"]);
+    // As hapi, no re-exec: the path reaches the secrets step as given.
+    const h = fakes();
+    expect(await stackUp(["--config", "conf/hapi.yaml"], h.deps)).toBe(0);
+    expect(h.steps).toContain("resolve --config conf/hapi.yaml");
   });
 
   test("the re-exec never hands sudo a login shell (-i) or a shell (-s), and its script holds none of the forwarded arguments (H-148)", async () => {
@@ -315,7 +382,7 @@ describe("hapi stack up", () => {
       },
     });
     await expect(stackUp([], f.deps)).rejects.toThrow(/trusted_sources/);
-    expect(f.steps).toEqual([LIVE_CHECK]);
+    expect(f.steps).toEqual([STOP, LIVE_CHECK]);
   });
 
   test("when `mise where age` fails, up fails with nothing started and names the fix (the real resolve path)", async () => {
@@ -361,7 +428,7 @@ describe("hapi stack up", () => {
     capture();
     const f = fakes({ inspect: { code: 1, stdout: "[]", stderr: "Error response from daemon: Cannot connect to the Docker daemon at unix:///run/user/1001/docker.sock\n" } });
     const e = await caught(stackUp([], f.deps));
-    expect(e.message).toMatch(/^docker network inspect hapi_hermes-net hapi_archon-net hapi_research-net exited 1: Error response from daemon: Cannot connect to the Docker daemon/);
+    expect(e.message).toMatch(/^docker network inspect hapi_hermes-net hapi_archon-net hapi_research-net hapi_review-net exited 1: Error response from daemon: Cannot connect to the Docker daemon/);
     // Not mistaken for a missing network.
     expect(e.message).not.toContain("does not exist");
     expect(e.message).toContain("Nothing was started, and what `compose up --no-start` created was removed");
@@ -411,6 +478,54 @@ describe("hapi stack up", () => {
     expect(f.calls[build]!.env).toMatchObject({ XDG_RUNTIME_DIR: "/run/user/1001", HAPI_STARTED_BY: "hapi" });
   });
 
+  test("up pulls every sidecar image by digest after building archon and before creating the stack", async () => {
+    capture();
+    const images = [SIDECAR_IMAGE, `example/postgres:17@sha256:${"c".repeat(64)}`];
+    const f = fakes({ sidecarImages: images });
+    expect(await stackUp([], f.deps)).toBe(0);
+    const at = (step: string) => f.steps.indexOf(step);
+    const pulls = images.map((i) => at(`docker pull ${i}`));
+    expect(pulls.every((i) => i > at([...COMPOSE, "build", "archon"].join(" ")) && i < at([...COMPOSE, "up", "--no-start", "--build"].join(" ")))).toBe(true);
+    // With compose's env (the caller's, and the labels' values), in the terminal, so the operator sees a slow pull.
+    const pull = f.calls.find((c) => c.cmd[1] === "pull")!;
+    expect([pull.cmd, pull.inherit]).toEqual([["docker", "pull", SIDECAR_IMAGE], true]);
+    expect(pull.env).toMatchObject({ XDG_RUNTIME_DIR: "/run/user/1001", HAPI_STARTED_BY: "hapi" });
+    // No sidecar in policy: no pull.
+    const g = fakes({ sidecarImages: [] });
+    expect(await stackUp([], g.deps)).toBe(0);
+    expect(g.steps.some((st) => st.startsWith("docker pull"))).toBe(false);
+  });
+
+  test("a sidecar image already here by its digest reference isn't pulled again, so an offline up works once it has been; one that isn't is", async () => {
+    const { out } = capture();
+    const other = `example/postgres:17@sha256:${"c".repeat(64)}`;
+    const f = fakes({ sidecarImages: [SIDECAR_IMAGE, other], images: [SIDECAR_IMAGE] });
+    expect(await stackUp([], f.deps)).toBe(0);
+    const inspects = f.calls.filter((c) => c.cmd[1] === "image" && c.cmd[2] === "inspect");
+    expect(inspects.map((c) => [c.cmd, c.inherit])).toEqual([
+      [["docker", "image", "inspect", "--format", "{{.Id}}", SIDECAR_IMAGE], false],
+      [["docker", "image", "inspect", "--format", "{{.Id}}", other], false],
+    ]);
+    expect(inspects.every((c) => c.env.HAPI_STARTED_BY === "hapi")).toBe(true);
+    expect(f.calls.filter((c) => c.cmd[1] === "pull").map((c) => c.cmd)).toEqual([["docker", "pull", other]]);
+    expect(out.at(-1)).toContain("2 sidecar images are here (1 pulled)");
+    // Every one here: no pull at all, and a pull that would fail (offline) is never tried.
+    const g = fakes({ sidecarImages: [SIDECAR_IMAGE, other], images: [SIDECAR_IMAGE, other], pullCode: 1 });
+    expect(await stackUp([], g.deps)).toBe(0);
+    expect(g.steps.some((st) => st.startsWith("docker pull"))).toBe(false);
+  });
+
+  test("a failed sidecar pull stops up before anything is created; the default images are every policy/sidecars.yaml image, each pinned by digest", async () => {
+    capture();
+    const f = fakes({ pullCode: 1 });
+    await expect(stackUp([], f.deps)).rejects.toThrow(`docker pull ${SIDECAR_IMAGE} failed (exit 1); nothing was started`);
+    expect(f.steps.some((st) => st.includes("--no-start"))).toBe(false);
+    const policy = loadPolicy("policy");
+    expect(policySidecarImages("policy")).toEqual(Object.values(policy.sidecars).map((s) => s.image));
+    expect(policySidecarImages("policy").length).toBeGreaterThan(0);
+    for (const image of policySidecarImages("policy")) expect(image).toMatch(/@sha256:[0-9a-f]{64}$/);
+  });
+
   test("a failed `compose build archon` stops up before anything is created", async () => {
     capture();
     const f = fakes({ buildCode: 1 });
@@ -423,25 +538,25 @@ describe("hapi stack up", () => {
     const f = fakes({ live: ["aaaaaaaaaaaa", "bbbbbbbbbbbb"], liveHelpers: ["cccccccccccc"] });
     const e = await caught(stackUp([], f.deps));
     expect(e.message).toBe(
-      "hapi stack up: 2 runs are live (docker ps --filter label=org.hapi.run): stop them with `hapi run stop <id>` or wait; recreating egress-archon would cut their egress",
+      "hapi stack up: 2 runs are live (docker ps --filter label=org.hapi.run): stop them with `hapi run stop <id>` or wait; recreating egress-archon would cut their egress; the poller timer is stopped, and `mise run up` starts it again",
     );
-    // Only the live-run check ran: no policy build, no secrets, no compose.
-    expect(f.steps).toEqual([LIVE_CHECK]);
-    expect(f.calls[0]!.cmd).toEqual(["docker", "ps", "--filter", `label=${RUN_LABEL}`, "--filter", `label=${PROJECT_LABEL}=hapi`, "--format", '{{.Label "org.hapi.run"}}\t{{.Names}}']);
+    // Only the timer's stop and the live-run check ran: no policy build, no secrets, no compose.
+    expect(f.steps).toEqual([STOP, LIVE_CHECK]);
+    expect(f.calls[1]!.cmd).toEqual(["docker", "ps", "--filter", `label=${RUN_LABEL}`, "--filter", `label=${PROJECT_LABEL}=hapi`, "--format", '{{.Label "org.hapi.run"}}\t{{.Names}}']);
   });
 
   test("a live helper container (the chown, a copy-out) is not a live run: it carries the labels, not the run's name (final review B-5)", async () => {
     capture();
     const f = fakes({ liveHelpers: ["aaaaaaaaaaaa"] });
     expect(await stackUp([], f.deps)).toBe(0);
-    expect(f.steps.slice(0, 2)).toEqual([LIVE_CHECK, "build anthropic"]);
+    expect(f.steps.slice(0, 3)).toEqual([STOP, LIVE_CHECK, "build anthropic"]);
   });
 
   test("when it cannot tell whether runs are live, up stops rather than assuming none", async () => {
     capture();
     const f = fakes({ liveCode: 1 });
     await expect(stackUp([], f.deps)).rejects.toThrow(/cannot tell whether runs are live \(docker ps exited 1: daemon down\); nothing was started/);
-    expect(f.steps).toEqual([LIVE_CHECK]);
+    expect(f.steps).toEqual([STOP, LIVE_CHECK]);
   });
 
   test("as another user, up re-execs before it looks at Docker", async () => {
@@ -449,6 +564,52 @@ describe("hapi stack up", () => {
     const f = fakes({ user: "dev", live: ["aaa"] });
     expect(await stackUp([], f.deps)).toBe(0);
     expect(f.calls.map((c) => c.cmd[0])).toEqual(["sudo"]);
+  });
+
+  test("a stop that finds no poller unit (exit 5) is fine; any other failure stops up before anything is built", async () => {
+    capture();
+    expect(SYSTEMCTL_NOT_LOADED).toBe(5);
+    const f = fakes({ codes: { [STOP]: SYSTEMCTL_NOT_LOADED } });
+    expect(await stackUp([], f.deps)).toBe(0);
+    expect(f.steps.slice(-3)).toEqual(TIMER_STEPS);
+    const g = fakes({ codes: { [STOP]: 1 } });
+    const e = await caught(stackUp([], g.deps));
+    expect(e.message).toBe(`could not stop the poller timer (${STOP} exited 1: Failed to connect to bus: No medium found); nothing was built or started`);
+    expect(g.steps).toEqual([STOP]);
+  });
+
+  test("a timer that won't start after a healthy up fails up, naming the command", async () => {
+    const { out } = capture();
+    for (const step of TIMER_STEPS) {
+      const f = fakes({ codes: { [step]: 1 } });
+      const e = await caught(stackUp([], f.deps));
+      expect(e.message).toBe(`the stack is up, but the poller timer did not start: ${step} exited 1: run \`mise run up\` again (docs/runbooks/stack.md)`);
+      expect(f.steps.at(-1)).toBe(step);
+      // The stack itself came up: --wait ran, and nothing after the failed step.
+      expect(f.steps.some((st) => st.includes("--wait"))).toBe(true);
+      expect(out.some((l) => l.startsWith("the stack is up"))).toBe(true);
+      out.length = 0;
+    }
+  });
+
+  test("HAPI_ALLOW_CURRENT_USER=1: up makes no systemctl call and says how to poll by hand", async () => {
+    const { err } = capture();
+    const f = fakes({ user: "dev", env: { HOME: "/home/dev", XDG_RUNTIME_DIR: "/run/user/1000", HAPI_ALLOW_CURRENT_USER: "1" } });
+    expect(await stackUp([], f.deps)).toBe(0);
+    expect(f.calls.filter((c) => c.cmd[0] === "systemctl")).toEqual([]);
+    expect(err).toContain(
+      "hapi stack up: HAPI_ALLOW_CURRENT_USER=1: the poller timer is not installed (it would run in dev's own user manager): run `mise run hapi -- poll --once` by hand",
+    );
+    // The live-run refusal doesn't claim a stopped timer it never touched.
+    const g = fakes({ user: "dev", env: { HOME: "/home/dev", XDG_RUNTIME_DIR: "/run/user/1000", HAPI_ALLOW_CURRENT_USER: "1" }, live: ["aaaaaaaaaaaa"] });
+    expect((await caught(stackUp([], g.deps))).message).toEndWith("recreating egress-archon would cut their egress");
+  });
+
+  test("systemctlEnv: XDG_RUNTIME_DIR defaults to /run/user/<uid>, and DBUS_SESSION_BUS_ADDRESS to its bus (T20, m11)", () => {
+    expect(systemctlEnv({ HOME: "/home/hapi", PATH: "/usr/bin" }, 1001)).toEqual({ HOME: "/home/hapi", PATH: "/usr/bin", XDG_RUNTIME_DIR: "/run/user/1001", DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1001/bus" });
+    expect(systemctlEnv({ XDG_RUNTIME_DIR: "/run/user/4242" }, 1001)).toEqual({ XDG_RUNTIME_DIR: "/run/user/4242", DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/4242/bus" });
+    expect(systemctlEnv({ XDG_RUNTIME_DIR: "", DBUS_SESSION_BUS_ADDRESS: "unix:path=/x/bus" }, 7)).toEqual({ XDG_RUNTIME_DIR: "/run/user/7", DBUS_SESSION_BUS_ADDRESS: "unix:path=/x/bus" });
+    expect(systemctlEnv({}).XDG_RUNTIME_DIR).toBe(`/run/user/${process.getuid!()}`);
   });
 
   test("usage errors exit 2 and run nothing", async () => {
@@ -465,7 +626,7 @@ describe("hapi stack up", () => {
 describe("networkProblems", () => {
   test("none for internal zone networks inside the proxies' zone_clients ranges", () => {
     expect(networkProblems(GOOD, "hapi")).toEqual([]);
-    expect(networkProblems([net("p_hermes-net", "10.1.0.0/24"), net("p_archon-net", "fd00:1::/64"), net("p_research-net", "192.168.0.0/24")], "p")).toEqual([]);
+    expect(networkProblems([net("p_hermes-net", "10.1.0.0/24"), net("p_archon-net", "fd00:1::/64"), net("p_research-net", "192.168.0.0/24"), net("p_review-net", "10.2.0.0/24")], "p")).toEqual([]);
   });
 
   test("names each missing, non-internal or non-private zone network", () => {
@@ -473,6 +634,7 @@ describe("networkProblems", () => {
       "zone network hapi_hermes-net is not internal: it would have a route out around the proxy",
       "zone network hapi_archon-net has subnet 100.64.0.0/24, outside the proxies' zone_clients ranges, so its requests would all be refused: set Docker's default-address-pools to private ranges",
       "zone network hapi_research-net does not exist",
+      "zone network hapi_review-net does not exist",
     ]);
   });
 });
@@ -504,15 +666,18 @@ describe("networkProblem (one network: a run's own, and each zone network)", () 
 const LABELS = (project: string) => ["--filter", `label=${RUN_LABEL}`, "--filter", `label=${PROJECT_LABEL}=${project}`];
 
 describe("removeRuns", () => {
-  test("removes the run containers, disconnects the egress proxy from each run network, removes the networks, then the volumes: the exact docker calls, in order", async () => {
+  test("with no egress named, removeRuns disconnects both proxies from every run network: it removes the run containers, disconnects egress-archon and egress-review from each run network, removes the networks, then the volumes: the exact docker calls, in order", async () => {
     const f = fakes({ runs: { containers: ["c1", "c2"], networks: ["hapi-run-1", "hapi-run-2"], volumes: ["hapi-run-1-work", "hapi-run-1-out"] } });
     await removeRuns("hapi", f.deps.run!, f.deps.env!);
     expect(f.calls.map((c) => c.cmd)).toEqual([
       ["docker", "ps", "-aq", ...LABELS("hapi")],
       ["docker", "rm", "-f", "c1", "c2"],
       ["docker", "network", "ls", "--format", "{{.Name}}", ...LABELS("hapi")],
+      // `down` doesn't know each network's kind: a review's joined egress-review, every other kind's egress-archon.
       ["docker", "network", "disconnect", "-f", "hapi-run-1", "hapi-egress-archon-1"],
+      ["docker", "network", "disconnect", "-f", "hapi-run-1", "hapi-egress-review-1"],
       ["docker", "network", "disconnect", "-f", "hapi-run-2", "hapi-egress-archon-1"],
+      ["docker", "network", "disconnect", "-f", "hapi-run-2", "hapi-egress-review-1"],
       ["docker", "network", "rm", "hapi-run-1", "hapi-run-2"],
       ["docker", "volume", "ls", "-q", ...LABELS("hapi")],
       ["docker", "volume", "rm", "hapi-run-1-work", "hapi-run-1-out"],
@@ -529,15 +694,17 @@ describe("removeRuns", () => {
     expect(calls.filter((c) => c[1] === "rm" || c[2] === "rm" || c[2] === "disconnect")).toEqual([
       ["docker", "rm", "-f", "c1"],
       ["docker", "network", "disconnect", "-f", "hapi-int-ab12cd34-run-9", "hapi-int-ab12cd34-egress-archon-1"],
+      ["docker", "network", "disconnect", "-f", "hapi-int-ab12cd34-run-9", "hapi-int-ab12cd34-egress-review-1"],
       ["docker", "network", "rm", "hapi-int-ab12cd34-run-9"],
       ["docker", "volume", "rm", "hapi-int-ab12cd34-run-9-out"],
     ]);
     expect(JSON.stringify(calls)).not.toContain('"hapi-egress-archon-1"');
+    expect(JSON.stringify(calls)).not.toContain('"hapi-egress-review-1"');
   });
 
-  test("with a run id and an egress container, it selects that one run's objects and disconnects that container", async () => {
+  test("with a run id and its egress containers, it selects that one run's objects and disconnects only those containers", async () => {
     const f = fakes({ runs: { containers: ["c1"], networks: ["hapi-run-ab12cd34ef56"], volumes: ["hapi-run-ab12cd34ef56-work", "hapi-run-ab12cd34ef56-out"] } });
-    await removeRuns("hapi", f.deps.run!, f.deps.env!, { runId: "ab12cd34ef56", egress: "hapi-egress-archon-1" });
+    await removeRuns("hapi", f.deps.run!, f.deps.env!, { runId: "ab12cd34ef56", egress: ["hapi-egress-archon-1"] });
     const one = ["--filter", `label=${RUN_LABEL}=ab12cd34ef56`, "--filter", `label=${PROJECT_LABEL}=hapi`];
     expect(f.calls.map((c) => c.cmd)).toEqual([
       ["docker", "ps", "-aq", ...one],
@@ -550,8 +717,22 @@ describe("removeRuns", () => {
     ]);
     // A test project's egress container is the one given.
     const g = fakes({ runs: { networks: ["p-run-ab12cd34ef56"] } });
-    await removeRuns("p", g.deps.run!, g.deps.env!, { runId: "ab12cd34ef56", egress: "p-egress-archon-1" });
-    expect(g.calls.find((c) => c.cmd[2] === "disconnect")!.cmd).toEqual(["docker", "network", "disconnect", "-f", "p-run-ab12cd34ef56", "p-egress-archon-1"]);
+    await removeRuns("p", g.deps.run!, g.deps.env!, { runId: "ab12cd34ef56", egress: ["p-egress-archon-1"] });
+    expect(g.calls.filter((c) => c.cmd[2] === "disconnect").map((c) => c.cmd)).toEqual([["docker", "network", "disconnect", "-f", "p-run-ab12cd34ef56", "p-egress-archon-1"]]);
+    // A review run's: egress-review alone.
+    const h = fakes({ runs: { networks: ["hapi-run-ab12cd34ef56"] } });
+    await removeRuns("hapi", h.deps.run!, h.deps.env!, { runId: "ab12cd34ef56", egress: ["hapi-egress-review-1"] });
+    expect(h.calls.filter((c) => c.cmd[2] === "disconnect").map((c) => c.cmd)).toEqual([["docker", "network", "disconnect", "-f", "hapi-run-ab12cd34ef56", "hapi-egress-review-1"]]);
+  });
+
+  test("removeRuns with volumes: false neither lists nor removes a volume", async () => {
+    const f = fakes({ runs: { containers: ["c1"], networks: ["hapi-run-1"], volumes: ["hapi-run-1-work", "hapi-run-1-out"] } });
+    await removeRuns("hapi", f.deps.run!, f.deps.env!, { volumes: false });
+    expect(f.calls.map((c) => c.cmd.slice(0, 3).join(" "))).toEqual(["docker ps -aq", "docker rm -f", "docker network ls", "docker network disconnect", "docker network disconnect", "docker network rm"]);
+    // The default is true: the volumes are listed and removed.
+    const g = fakes({ runs: { volumes: ["hapi-run-1-out"] } });
+    await removeRuns("hapi", g.deps.run!, g.deps.env!, {});
+    expect(g.steps.at(-1)).toBe("docker volume rm hapi-run-1-out");
   });
 
   test("with no runs it lists and removes nothing", async () => {
@@ -603,23 +784,28 @@ describe("removeRuns", () => {
 });
 
 describe("hapi stack down", () => {
-  test("as hapi: run objects first, then compose down by project name, keeping the volumes, with no compose file or XDG_RUNTIME_DIR needed", async () => {
+  /** hapi's env, with a runtime dir of its own for the run disk's lock. */
+  const hapiEnv = () => ({ HOME: "/home/hapi", XDG_RUNTIME_DIR: tempDir("hapi-stack-xdg-") });
+
+  test("as hapi: run objects first, then compose down by project name, keeping the volumes, with no compose file needed", async () => {
     capture();
-    const f = fakes({ env: { HOME: "/home/hapi" } });
+    const f = fakes({ env: hapiEnv() });
     expect(await stackDown([], f.deps)).toBe(0);
     expect(f.calls.at(-1)).toMatchObject({ cmd: ["docker", "compose", "-p", "hapi", "down"], inherit: true });
-    expect(f.calls.map((c) => c.cmd.slice(0, 3).join(" "))).toEqual(["docker ps -aq", "docker network ls", "docker volume ls", "docker compose -p"]);
+    expect(f.calls.map((c) => c.cmd.slice(0, 3).join(" "))).toEqual(["systemctl --user stop", "docker ps -aq", "docker network ls", "docker volume ls", "docker compose -p"]);
   });
 
-  test("down removes run containers, disconnects egress-archon from each run network, removes the run networks and volumes, then runs compose down", async () => {
+  test("down removes run containers, disconnects egress-archon and egress-review from each run network, removes the run networks and volumes, then runs compose down", async () => {
     capture();
-    const f = fakes({ env: { HOME: "/home/hapi" }, runs: { containers: ["c1"], networks: ["hapi-run-1"], volumes: ["hapi-run-1-out"] } });
+    const f = fakes({ env: hapiEnv(), runs: { containers: ["c1"], networks: ["hapi-run-1"], volumes: ["hapi-run-1-out"] } });
     expect(await stackDown([], f.deps)).toBe(0);
     expect(f.calls.map((c) => c.cmd)).toEqual([
+      ["systemctl", "--user", "stop", "hapi-poll.timer", "hapi-poll.service"],
       ["docker", "ps", "-aq", ...LABELS("hapi")],
       ["docker", "rm", "-f", "c1"],
       ["docker", "network", "ls", "--format", "{{.Name}}", ...LABELS("hapi")],
       ["docker", "network", "disconnect", "-f", "hapi-run-1", "hapi-egress-archon-1"],
+      ["docker", "network", "disconnect", "-f", "hapi-run-1", "hapi-egress-review-1"],
       ["docker", "network", "rm", "hapi-run-1"],
       ["docker", "volume", "ls", "-q", ...LABELS("hapi")],
       ["docker", "volume", "rm", "hapi-run-1-out"],
@@ -627,11 +813,86 @@ describe("hapi stack down", () => {
     ]);
   });
 
-  test("when removing the runs fails, compose down still runs (the kill switch stops what it can), and down then fails naming the leftovers", async () => {
+  test("down holds the run disk's lock while it removes the runs (H-210)", async () => {
     capture();
-    const f = fakes({ env: { HOME: "/home/hapi" }, runs: { containers: ["c1"] }, failing: ["docker rm -f c1"] });
+    const env = hapiEnv();
+    const f = fakes({ env, runs: { containers: ["c1"], volumes: ["hapi-run-1-out"] } });
+    const run = f.deps.run!;
+    let during: unknown;
+    f.deps.run = async (cmd, o) => {
+      if (cmd.slice(0, 3).join(" ") === "docker ps -aq") during = await withStackLock({ diskDir: RUN_DISK, env }, "run-copyout", async () => {}).catch((e: unknown) => e);
+      return run(cmd, o);
+    };
+    expect(await stackDown([], f.deps)).toBe(0);
+    expect(lockHeld(during)).toBe(true);
+    expect(f.steps).toContain("docker volume rm hapi-run-1-out");
+    // Let go once the runs are removed: a finalize can take it again.
+    await withStackLock({ diskDir: RUN_DISK, env }, "run-copyout", async () => {});
+  });
+
+  test("down never waits for the run disk's lock: held, or with no XDG_RUNTIME_DIR, it removes the runs but leaves their volumes, and says so (H-210)", async () => {
+    // A run whose container down removed is finalized as gone, which leaves its volumes in place (H-209), and no reap removes a volume.
+    const LINE =
+      /^hapi stack down: could not take the run disk's lock \(.+\): removing the runs but leaving their volumes, and their dirs on the run disk: a finalize copying its run out removes that run's own, and the rest stay until a `mise run down` that takes the lock, so run it again once the lock is free \(H-209, H-210\)$/;
+    // Held by a finalize copying a run out: down doesn't wait for it.
+    const env = hapiEnv();
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let entered!: () => void;
+    const inside = new Promise<void>((r) => (entered = r));
+    const copying = withStackLock({ diskDir: RUN_DISK, env }, "run-copyout", () => (entered(), held));
+    await inside;
+    const { err } = capture();
+    try {
+      for (const e of [env, { HOME: "/home/hapi" }]) {
+        err.length = 0;
+        const f = fakes({ env: e });
+        expect(await stackDown([], f.deps)).toBe(0);
+        // The poller's timer first, so no new run starts, then the runs, then compose.
+        expect(f.calls.map((c) => c.cmd.slice(0, 3).join(" "))).toEqual(["systemctl --user stop", "docker ps -aq", "docker network ls", "docker compose -p"]);
+        // With no XDG_RUNTIME_DIR, systemctl still gets hapi's: /run/user/<uid>, and its bus (m11).
+        const xdg = (e as { XDG_RUNTIME_DIR?: string }).XDG_RUNTIME_DIR ?? `/run/user/${process.getuid!()}`;
+        expect(f.calls[0]!.env).toMatchObject({ XDG_RUNTIME_DIR: xdg, DBUS_SESSION_BUS_ADDRESS: `unix:path=${xdg}/bus` });
+        expect(err).toHaveLength(1);
+        expect(err[0]).toMatch(LINE);
+      }
+      // A stop that can't run (no user manager to reach): the runs and compose still go, and down fails, naming it.
+      err.length = 0;
+      const f = fakes({ env: { HOME: "/home/hapi" }, codes: { [STOP]: 1 } });
+      const e = await caught(stackDown([], f.deps));
+      expect(e.message).toBe(`could not stop the poller timer (${STOP} exited 1: Failed to connect to bus: No medium found)`);
+      expect(f.calls.map((c) => c.cmd.slice(0, 3).join(" "))).toEqual(["systemctl --user stop", "docker ps -aq", "docker network ls", "docker compose -p"]);
+    } finally {
+      release();
+      await copying;
+    }
+  });
+
+  test("when removing the runs fails, compose down still runs (the kill switch stops what it can), and down then fails naming the leftovers", async () => {
+    const { err } = capture();
+    const f = fakes({ env: hapiEnv(), runs: { containers: ["c1"] }, failing: ["docker rm -f c1"] });
     await expect(stackDown([], f.deps)).rejects.toThrow(/docker rm -f c1 failed/);
     expect(f.calls.at(-1)!.cmd).toEqual(["docker", "compose", "-p", "hapi", "down"]);
+    // The failure came from inside the run disk's lock: one removal pass, volumes included (the second `ps` is that
+    // pass seeing what the failed `rm` left), and no fall-back pass without the lock.
+    expect(err.filter((l) => l.includes("could not take the run disk's lock"))).toEqual([]);
+    expect(f.calls.map((c) => c.cmd.slice(0, 3).join(" "))).toEqual(["systemctl --user stop", "docker ps -aq", "docker rm -f", "docker ps -aq", "docker network ls", "docker volume ls", "docker compose -p"]);
+  });
+
+  test("down still removes the runs and runs compose down when the timer won't stop, then fails naming it", async () => {
+    capture();
+    const f = fakes({ env: hapiEnv(), runs: { containers: ["c1"] }, codes: { [STOP]: 1 } });
+    const e = await caught(stackDown([], f.deps));
+    expect(e.message).toBe(`could not stop the poller timer (${STOP} exited 1: Failed to connect to bus: No medium found)`);
+    expect(f.steps).toContain("docker rm -f c1");
+    expect(f.calls.at(-1)!.cmd).toEqual(["docker", "compose", "-p", "hapi", "down"]);
+    // A never-loaded unit is no failure, and with a leftover too, both are named.
+    const g = fakes({ env: hapiEnv(), codes: { [STOP]: SYSTEMCTL_NOT_LOADED } });
+    expect(await stackDown([], g.deps)).toBe(0);
+    const h = fakes({ env: hapiEnv(), runs: { containers: ["c1"] }, failing: ["docker rm -f c1"], codes: { [STOP]: 1 } });
+    expect((await caught(stackDown([], h.deps))).message).toMatch(/^could not stop the poller timer \(.+\); also removing the runs of hapi left something behind: docker rm -f c1 failed/);
+    const i = fakes({ env: hapiEnv(), downCode: 3, codes: { [STOP]: 1 } });
+    expect((await caught(stackDown([], i.deps))).message).toBe(`docker compose -p hapi down failed (exit 3); also could not stop the poller timer (${STOP} exited 1: Failed to connect to bus: No medium found)`);
   });
 
   test("as another user: re-execs `mise run down` as hapi (the host admin's kill switch)", async () => {
@@ -644,7 +905,7 @@ describe("hapi stack down", () => {
 
   test("with HAPI_ALLOW_CURRENT_USER=1: stops the dev-bypass stack on the Docker this shell's CLI reaches, without claiming which one that is, and says how to stop hapi's", async () => {
     const { err } = capture();
-    const f = fakes({ user: "dev", env: { HOME: "/home/dev", HAPI_ALLOW_CURRENT_USER: "1" } });
+    const f = fakes({ user: "dev", env: { HOME: "/home/dev", HAPI_ALLOW_CURRENT_USER: "1", XDG_RUNTIME_DIR: tempDir("hapi-stack-xdg-") } });
     expect(await stackDown([], f.deps)).toBe(0);
     expect(f.calls.at(-1)!.cmd).toEqual(["docker", "compose", "-p", "hapi", "down"]);
     expect(f.calls.map((c) => c.cmd[1])).toEqual(["ps", "network", "volume", "compose"]);
