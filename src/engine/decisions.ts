@@ -14,7 +14,8 @@
  *   resolution, integrity or path); one that isn't is unscreened, so a worker can't hide text from the screen behind
  *   a lockfile's name. Every string is redacted first (`redactSecretForms`), then a
  *   long diff is cut into windows of whole lines, each with the file's header lines, covering every line once.
- *   Content the diff doesn't show (a binary, a `-diff` attribute, a gitlink) is a subject with no state: unscreened.
+ *   Content the diff doesn't show (a binary or a gitlink) is a subject with no state: unscreened. No in-tree
+ *   `.gitattributes` applies (`scratchGit`), so a `-diff` attribute hides nothing.
  * - **The ledger**, `<engineDir>/decisions/<owner>/<name>/<id>.jsonl` (0600, dirs 0700, append-only): an `asking`
  *   line before each call, an `answer` line after it (or for a subject not asked). It is the cache (an answered
  *   state is never asked again: its key is a digest of the host's own state), the spend (`decisionSpend`: an
@@ -313,9 +314,17 @@ export function goalOf(taskMd: string): string {
 
 const firstLine = (s: string | undefined) => (s ?? "").trim().split("\n")[0]?.trim().slice(0, 300) || "(no error output)";
 
-/** Hardened git on the scratch, as the host gates run it. */
+/** git's empty tree: the attribute source of every host read of the scratch (`scratchGit`, and the secret scan's). */
+export const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+/**
+ * Hardened git on the scratch, as the host gates run it, with `GIT_ATTR_SOURCE` set to the empty tree: no
+ * `.gitattributes` in a tree, `main`'s included, changes what the diff screen, the review's diff or the PR's stat
+ * reads. git's own default for a bare repository differs by version (2.43 reads `HEAD:.gitattributes`, 2.56 doesn't),
+ * so it is never left to the host's git.
+ */
 export function scratchGit(d: Pick<RunDeps, "run" | "env">, scratch: string, args: string[], pre: string[] = []) {
-  const g = hardenedGit(d);
+  const g = hardenedGit(d, { env: [`GIT_ATTR_SOURCE=${EMPTY_TREE}`] });
   return d.run([...g.cmd, "-c", `safe.directory=${scratch}`, "--git-dir", scratch, ...pre, ...args], { env: g.env, inherit: false });
 }
 
@@ -604,7 +613,7 @@ export const LOCKFILES: Readonly<Record<string, (text: string) => boolean>> = Ob
  * The `"diff"` subjects of `o.decision`: each file of `diff --name-only -z --no-renames <base> <head>` that matches
  * no `o.skip` glob, ordered by path, then part. The state is `{ goal, path, part, diff }`, every string redacted
  * (`redactSecretForms`, with `o.secrets`) before the diff is cut into windows; content the diff doesn't show (a
- * binary, a `-diff` attribute from the scratch's HEAD tree, a gitlink) is a subject with no state.
+ * binary or a gitlink; no in-tree attribute applies, see `scratchGit`) is a subject with no state.
  */
 export async function diffSubjects(d: Pick<RunDeps, "run" | "env">, o: DiffInput): Promise<Subject[]> {
   const names = (await mustGit(d, o.scratch, ["diff", "--name-only", "-z", "--no-renames", o.base, o.head])).split("\0").filter((p) => p !== "");

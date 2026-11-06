@@ -16,6 +16,7 @@ import {
   decisionSpend,
   decisionVersion,
   diffSubjects,
+  EMPTY_TREE,
   ENGINE_DECISIONS,
   goalOf,
   isBunLock,
@@ -25,11 +26,13 @@ import {
   type ScreenDeps,
   type Screened,
   screenHarvest,
+  scratchGit,
   shownPath,
   type Subject,
 } from "../../src/engine/decisions";
 import type { WorkOrderState } from "../../src/engine/state";
 import type { RunRecord } from "../../src/run/records";
+import type { Runner } from "../../src/stack/up";
 import { FAKE_ANTHROPIC_KEY, FAKE_JEV_KEY, haikuReply, isOpenrouter, json, recordingFetch } from "../decide/helpers";
 import { fakeSecret, NOW } from "../run/helpers";
 import { cleanup, tempDir } from "../secrets/helpers";
@@ -112,6 +115,16 @@ test("shownPath is host text in a code span: no mention, no marker, at most 120 
   expect(shownPath("src/\x1b[2Ja.ts")).toBe("`src/a.ts`");
 });
 
+test("scratchGit runs git with the empty tree as its attribute source", async () => {
+  const calls: string[][] = [];
+  const run: Runner = async (cmd) => (calls.push(cmd), { code: 0, stdout: "", stderr: "" });
+  await scratchGit({ run, env: { PATH: "/usr/bin:/bin" } }, "/tmp/scratch.git", ["diff", "a", "b"]);
+  expect(calls[0]!.slice(0, 2)).toEqual(["env", "-i"]);
+  expect(calls[0]).toContain(`GIT_ATTR_SOURCE=${EMPTY_TREE}`);
+  expect(calls[0]!.indexOf(`GIT_ATTR_SOURCE=${EMPTY_TREE}`)).toBeLessThan(calls[0]!.indexOf("git"));
+  expect(EMPTY_TREE).toBe("4b825dc642cb6eb9a060e54bf8d69288fbee4904");
+});
+
 describe("with real git", () => {
   test("the diff screen has one subject per changed file, none for skip_paths, windows for a long file, a header for a deleted one, and no state for content the diff doesn't show", async () => {
     const w = gitWorld();
@@ -167,13 +180,21 @@ describe("with real git", () => {
     expect(del).not.toContain("@@");
   });
 
-  test("a -diff attribute merged on main makes a text change content the diff doesn't show", async () => {
+  // git 2.43 reads a bare repo's HEAD:.gitattributes by default and git 2.56 doesn't, so the attribute source is
+  // pinned: the empty tree, as the secret scan's. The scratch sets attr.tree=HEAD (2.43's default) so that, on any
+  // git, only GIT_ATTR_SOURCE (which outranks attr.tree) keeps the merged `* -diff` from hiding the change.
+  test("a -diff attribute merged on main hides nothing: in-tree attributes never change what the host reads", async () => {
     const w = gitWorld();
     w.onMain({ "src/.gitattributes": "* -diff\n" });
     const base = w.base;
     w.commit({ "src/c.ts": "export const c = 1;\n" });
-    const subjects = await diffSubjects(realGit(), { decision: "diff-screen", scratch: w.scratch(), base, head: w.work("rev-parse", "HEAD"), goal: GOAL, skip: [], maxChars: 6000, secrets: {} });
-    expect(subjects).toEqual([{ decision: "diff-screen", subject: "src/c.ts", part: "whole", state: undefined, unscreened: "content not shown in the diff" }]);
+    const scratch = w.scratch();
+    const set = Bun.spawnSync(["git", "--git-dir", scratch, "config", "attr.tree", "HEAD"], { env: { PATH: process.env.PATH ?? "/usr/bin:/bin", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } });
+    expect(set.exitCode).toBe(0);
+    const subjects = await diffSubjects(realGit(), { decision: "diff-screen", scratch, base, head: w.work("rev-parse", "HEAD"), goal: GOAL, skip: [], maxChars: 6000, secrets: {} });
+    expect(subjects).toHaveLength(1);
+    expect(subjects[0]!.unscreened).toBeUndefined();
+    expect((subjects[0]!.state as { diff: string }).diff).toContain("+export const c = 1;\n");
   });
 
   describe("skip_paths names exact paths, case-sensitively, and a skipped file must be the lockfile it claims to be", () => {

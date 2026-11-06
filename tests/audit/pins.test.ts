@@ -170,7 +170,8 @@ describe("pins.versions", () => {
       expect([line, r.status]).toEqual([line, status]);
       if (says !== undefined) expect([line, r.detail]).toEqual([line, expect.stringContaining(says)]);
     }
-  });
+    // One whole audit per case: 4.4 s on a CI runner against bun's 5 s default, so it gets 30 s.
+  }, 30_000);
 
   test("an ADD of a URL needs its SHA-256 (--checksum=sha256:<64 hex>): without it, whatever the URL serves that day is built in (Task 11)", async () => {
     const sum = "a".repeat(64);
@@ -287,5 +288,6 @@ describe("pins.versions", () => {
       expect([line, r.status]).toEqual([line, status]);
       if (status === "fail") expect([line, r.detail]).toEqual([line, expect.stringContaining("stack/archon/Dockerfile: a RUN pipes a download into a shell")]);
     }
-  });
+    // One whole audit per case: 2.7 s on a CI runner, near bun's 5 s default, so it gets 30 s.
+  }, 30_000);
 });

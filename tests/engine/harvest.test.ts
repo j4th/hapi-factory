@@ -3,11 +3,11 @@
  * never-forced push, and harvest() over Task 3's fake forge (the real githubForge adapter over `fakeForge().fetch`).
  * No model is called: fakeDecide, or the real ask() over a recording fetch with fake keys.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { existsSync, lstatSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ask } from "../../src/decide/record";
-import { diffSubjects, ledgerPath, readLedger, type Screened } from "../../src/engine/decisions";
+import { diffSubjects, EMPTY_TREE, ledgerPath, readLedger, type Screened } from "../../src/engine/decisions";
 import {
   commitObjects,
   diffStat,
@@ -62,6 +62,10 @@ import {
   writes,
   writeVerify,
 } from "./helpers";
+
+// These tests run real git and gitleaks, several times each, and a CI runner is slower than a laptop: 5 s, bun's
+// default, was too close (the secret scan's test took 4.8 s on the build host and timed out in CI). The default is per file.
+setDefaultTimeout(30_000);
 
 afterEach(cleanup);
 
@@ -509,7 +513,7 @@ describe("with real git: a push never uses +, and a moved branch is never forced
     expect(argv.some((a) => a.startsWith("+") || a.startsWith("--force") || a === "-f")).toBe(false);
     expect(argv.join(" ")).not.toContain("fake-push-token");
     const { authedGit } = await import("../../src/forge/github/git");
-    expect(calls[0]!.env).toMatchObject({ ...authedGit("fake-push-token"), GIT_TERMINAL_PROMPT: "0", GIT_ALLOW_PROTOCOL: "https" });
+    expect(calls[0]!.env).toMatchObject({ ...authedGit("fake-push-token"), GIT_ATTR_SOURCE: EMPTY_TREE, GIT_TERMINAL_PROMPT: "0", GIT_ALLOW_PROTOCOL: "https" });
     await expect(push(realGit(), { scratch, remote, id: ORDER.id, head, token: "fake-push-token" })).rejects.toThrow(/^git push to factory\/0001-skeleton failed \(exit \d+\)/);
     // Another commit lands on the remote branch; pushing a head that doesn't descend from it is refused, never forced.
     const later = w.commit({ "src/b.ts": "b\n" });

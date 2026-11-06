@@ -47,6 +47,7 @@ import {
   codeSpan,
   type DiffInput,
   decisionSpend,
+  EMPTY_TREE,
   emptyScreens,
   ENGINE_DECISIONS,
   goalOf,
@@ -66,8 +67,6 @@ import type { Phase, Verdict, WorkOrderState } from "./state";
 
 /** The gitleaks the host's secret scan runs: mise.toml's pin (a test holds them equal). */
 export const GITLEAKS_VERSION = "8.30.1";
-/** git's empty tree: GIT_ATTR_SOURCE, so no in-tree .gitattributes changes what the secret scan reads. */
-const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 /** secret: the Task 8 → 12 ruling's scan of the bundle's new commits. */
 export interface GateProblem {
@@ -291,7 +290,7 @@ export interface FileChange {
 /**
  * Each of `files`' changes, `base..head`, from one `--literal-pathspecs diff -U0 --text` per file of a `-z` list, so a
  * file is never named by parsing a header (a quoted or escaped name, or an added line that looks like `+++ b/…`, can't
- * misattribute a line), and `--text` sees through a `-diff` attribute. Only `@@` lines give ranges; every `+` line
+ * misattribute a line), and `--text` sees through a `-diff` attribute (and `scratchGit` reads no in-tree attributes). Only `@@` lines give ranges; every `+` line
  * after the first is content. undefined when git fails.
  */
 export async function fileChanges(d: Pick<RunDeps, "run" | "env">, scratch: string, base: string, head: string, files: readonly string[]): Promise<Map<string, FileChange> | undefined> {
@@ -660,7 +659,7 @@ export type PushResult = { pushed: true } | { moved: string } | { refused: strin
 export async function push(d: Pick<RunDeps, "run" | "env">, o: PushOptions): Promise<PushResult> {
   if (!isWorkOrderId(o.id)) throw new Error(`not a work-order id: ${JSON.stringify(o.id)}`);
   if (!COMMIT.test(o.head)) throw new Error("not a commit id to push");
-  const env = { PATH: d.env.PATH ?? "/usr/bin:/bin", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0", GIT_ALLOW_PROTOCOL: "https", ...authedGit(o.token) };
+  const env = { PATH: d.env.PATH ?? "/usr/bin:/bin", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_ATTR_SOURCE: EMPTY_TREE, GIT_TERMINAL_PROMPT: "0", GIT_ALLOW_PROTOCOL: "https", ...authedGit(o.token) };
   const r = await d.run(
     ["git", "--git-dir", o.scratch, "-c", `safe.directory=${o.scratch}`, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "push", "--porcelain", o.remote, `${o.head}:refs/heads/factory/${o.id}`],
     { env, inherit: false },

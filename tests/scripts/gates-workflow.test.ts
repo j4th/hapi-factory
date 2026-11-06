@@ -10,13 +10,17 @@
  * itself (the pin mise.toml holds) against every way a PR could hide history from it, the trailer check, and the
  * aggregator.
  */
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { randomBytes } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import YAML from "yaml";
 import { aiWorkflowProblems } from "../../src/audit/checks/github";
+
+// These tests run the real gitleaks and git, several times each, and a CI runner is slower than a laptop: 5 s, bun's
+// default, is too close (the slowest took 2.0 s in CI). The default is per file.
+setDefaultTimeout(30_000);
 
 const REPO = resolve(import.meta.dir, "../..");
 interface Step {
