@@ -368,7 +368,13 @@ Expected: `active`. Then run the live check above again: the failed attempt remo
 
 **The live result, design §7 item 1's evidence:**
 
-> **PLACEHOLDER, to be filled by the controller:** the live check above has not been run on hapi's rootless Docker yet. When the operator has run it, the controller records here the date, the host, the `dd` error line, the data root's two `avail` figures and the closing `df`, and whether each expectation held.
+> 2026-11-06, the build host, on hapi's rootless Docker (Task 16; Task 4 Steps 9 and 10). The first run, on a run disk made without `nodiscard`, held the cap but not the data root. `dd` stopped at 19970 records with the run disk full, and the data root's `avail` fell from 1175850995712 to 1154923843584 bytes, the write's size, since `mkfs.ext4`'s discard had left the image sparse (H-303). Made again as above (`du`: 21474840576 bytes, the whole image), the run disk met all three expectations:
+>
+> - `dd: error writing '/w/fill': No space left on device`, then `19971+0 records in` and `19970+0 records out` (20940062720 bytes): the cap held;
+> - the data root's `avail`: 1154512650240 bytes before, 1154513227776 after, 0.6 MB apart: untouched;
+> - the closing `df`: `24K` used, `20G` available: the 1001 delete and hapi's `rmdir` worked.
+>
+> Both times the `chown` bound with hapi's Docker started before the mount (H-287, closed).
 
 ### A dir the reap can't clean
 
