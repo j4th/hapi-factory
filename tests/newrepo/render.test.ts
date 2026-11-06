@@ -143,8 +143,11 @@ test("the rendered contract passes the checks new-repo makes before it pushes", 
   delete ours.knowledge_base.code_guidelines;
   const theirs = YAML.parse(text(".coderabbit.yaml"));
   const instructions = (c: any) => c.reviews.pre_merge_checks.custom_checks[0].instructions as string;
-  const contractFiles = "or the gates' own config: mise.lock, biome.json*, bunfig.toml, tsconfig*.json, .gitleaks.toml, .gitleaksignore, osv-scanner.toml, at any depth; or .gitattributes at any depth)";
-  expect(instructions(theirs)).toBe(instructions(ours).replace(") or policy/protected_paths.yaml", `; ${contractFiles}`));
+  // Both name the central list (policy/protected_paths.yaml) in the same words; each ends with its own overlay's.
+  const hapiTail = "), or a path .factory/config.yaml protects (policy/**, stack/**, .githooks/**, templates/**)";
+  const contractTail = "; or the gates' own config, at any depth: biome.json*, bunfig.toml, tsconfig*.json, osv-scanner.toml)";
+  expect(instructions(ours)).toContain(hapiTail);
+  expect(instructions(theirs)).toBe(instructions(ours).replace(hapiTail, contractTail));
   theirs.reviews.pre_merge_checks.custom_checks[0].instructions = instructions(ours);
   expect(theirs).toEqual(ours);
   expect(text(".coderabbit.yaml")).not.toContain("personal account");
@@ -159,6 +162,15 @@ test("the rendered contract passes the checks new-repo makes before it pushes", 
       expect([tool, p, entry?.[p]]).toEqual([tool, p, expect.objectContaining({ checksum: expect.stringMatching(/^sha256:[0-9a-f]{64}$/), url: expect.stringMatching(/^https:\/\//) })]);
     }
   }
+});
+
+test("hapi-factory's CodeRabbit check names every central protected path, so its list can't fall behind policy", () => {
+  const ours = YAML.parse(readFileSync(join(REPO, ".coderabbit.yaml"), "utf8"));
+  const said = ours.reviews.pre_merge_checks.custom_checks[0].instructions as string;
+  // How the check words a glob: "**/X/**" is "X/" (anything under it, at any depth), "**/X" is "X", a root glob as it is.
+  const named = (glob: string) => (glob.startsWith("**/") && glob.endsWith("/**") ? `${glob.slice(3, -3)}/` : glob.startsWith("**/") ? glob.slice(3) : glob);
+  const missing = Object.keys(loadPolicy(join(REPO, "policy")).protectedPaths).filter((g) => !said.includes(named(g)));
+  expect(missing).toEqual([]);
 });
 
 test("contractProblems names what new-repo would refuse to push", () => {
@@ -185,8 +197,8 @@ test("AGENTS.md works for an unattended agent (H-228(a))", () => {
   expect([...agents.matchAll(/^## (.+)$/gm)].map((m) => m[1])).toEqual(["Commands", "What done means", "Layout", "Gotchas", "Out of scope unless the work order names it", "Never", "How to end"]);
   for (const t of ["setup", "fmt", "lint", "test", "check", "smoke", "scan"]) expect(agents).toContain(`mise run ${t}`);
   expect(agents).toContain("bun test ./.factory/work/<id>/acceptance");
-  // The never list names the central protected paths a worker might reach for, .gitattributes among them (H-302).
-  expect(agents).toContain("`.gitleaks.toml`, `.gitleaksignore` and `.gitattributes`. The guard refuses the write");
+  // The never list names the central protected paths a worker might reach for, the MCP configs and .gitattributes among them (H-302).
+  expect(agents).toContain("`.gitleaks.toml`, `.gitleaksignore`, the MCP configs `.mcp.json` and `.vscode/mcp.json`, and `.gitattributes`. The guard refuses the write");
 });
 
 test("CONTRIBUTING.md explains the acceptance tests in one line", () => {

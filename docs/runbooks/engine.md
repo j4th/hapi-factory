@@ -1284,7 +1284,7 @@ gh pr edit "$PR" --repo "$R" --add-label hapi:rework
 
 ### Step 8: merge factory PR 1
 
-Review it. Before you merge, paste back [a factory PR's command](#commands-you-run-more-than-once)'s output, [the runs](#commands-you-run-more-than-once) and [the ledger by head](#commands-you-run-more-than-once), and say, for each hold and each note, whether you **agree** (it pointed at something you reworked, closed or commented on) or **disagree** (you merge it unchanged): Plan 06's first labelled data (H-262). A hold on a PR you then merge unchanged is a false alarm, and is recorded as one.
+Review it. On the PR's **Files changed** tab, open every file GitHub collapsed (**Load diff**) and check the file count against the PR body's: GitHub collapses files it classes as generated with no `.gitattributes` at all (H-302). Before you merge, paste back [a factory PR's command](#commands-you-run-more-than-once)'s output, [the runs](#commands-you-run-more-than-once) and [the ledger by head](#commands-you-run-more-than-once), and say, for each hold and each note, whether you **agree** (it pointed at something you reworked, closed or commented on) or **disagree** (you merge it unchanged): Plan 06's first labelled data (H-262). A hold on a PR you then merge unchanged is a false alarm, and is recorded as one.
 
 Then, with `ci / gates` green, merge it on GitHub with a merge commit, keeping GitHub's merge title as it fills it in, as for every merge in this run, and paste back the merge SHA and, a tick later, the final comment on the planning PR's status thread ([the status comment command](#commands-you-run-more-than-once)). Expected: `This plan has settled: 1 merged, 0 closed, 0 failed. Total: $<x>.`
 
