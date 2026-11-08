@@ -172,13 +172,6 @@ describe("new-repo refuses before any write", () => {
     ["scopes without workflow", { scopes: "repo, read:org" }, "missing scope workflow: run gh auth refresh -s workflow"],
     ["an organization account", { type: "Organization" }, `${OWNER} is an Organization account: new-repo makes repos for a personal account only`],
     ["a repo that already exists", { repoExists: true }, `${FULL} already exists`],
-    [
-      "an App on all repositories",
-      { installations: [{ id: 11, app_slug: "hapi-planner", repository_selection: "selected" }, { id: 12, app_slug: "hapi-factory", repository_selection: "all" }] },
-      "hapi-factory is installed on all repositories: make it selected first",
-    ],
-    ["an installation id that policy doesn't name", { policyInstallations: { planner: 11, factory: 99, coderabbit: 13 } }, "hapi-factory's installation is 12, but policy/repos.yaml says 99"],
-    ["an App that isn't installed", { installations: [{ id: 12, app_slug: "hapi-factory", repository_selection: "selected" }] }, "hapi-planner isn't installed on example-owner's account"],
     ["a dirty templates/", { dirtyTemplates: true }, "templates/repo-contract, .github/workflows/gates.yml or policy/github/rulesets has changes git hasn't committed"],
     ["gates.yml not on GitHub at HEAD", { gatesOnGitHub: false }, `GitHub has no .github/workflows/gates.yml in ${OWNER}/hapi-factory at ${GATES.slice(0, 7)}`],
   ] as const) {
@@ -218,23 +211,22 @@ describe("new-repo refuses before any write", () => {
     expect(failLine(w)).toContain("GET /user returned no x-oauth-scopes header");
   });
 
-  test("a CodeRabbit installation on all repositories is reported, and its PUT skipped", async () => {
-    const w = newRepoWorld({
-      installations: [
-        { id: 11, app_slug: "hapi-planner", repository_selection: "selected" },
-        { id: 12, app_slug: "hapi-factory", repository_selection: "selected" },
-        { id: 13, app_slug: "coderabbitai", repository_selection: "all" },
-      ],
-    });
+  test("new-repo reads no installation, which GitHub answers an OAuth login 403: the ids are policy/repos.yaml's, said to be (Task 16)", async () => {
+    const w = newRepoWorld();
     expect(await go(w)).toBe(0);
-    expect(w.out.some((l) => l.includes("coderabbitai is installed on all repositories"))).toBe(true);
-    expect(w.writes().filter((e) => e.startsWith("PUT /user/installations/"))).toEqual([`PUT /user/installations/11/repositories/${REPO_ID}`, `PUT /user/installations/12/repositories/${REPO_ID}`]);
+    expect(w.events.filter((e) => e.startsWith("GET /user/installations"))).toEqual([]);
+    expect(w.out.find((l) => l.startsWith("[1/11] preflight"))).toContain("installations hapi-planner 11, hapi-factory 12, coderabbitai 13, as policy/repos.yaml records them;");
+    expect(w.out.find((l) => l.startsWith("[8/11] apps"))).toContain(
+      `${FULL} added to hapi-planner (11), hapi-factory (12), coderabbitai (13); the strict audit as hapi proves hapi-planner and hapi-factory cover it (github.app-perms; docs/runbooks/new-repo.md#verify); nothing checks coderabbitai's: see its Repository access on github.com`,
+    );
   });
 
-  test("with no coderabbit id in policy/repos.yaml, CodeRabbit isn't added", async () => {
+  test("with no coderabbit id in policy/repos.yaml, CodeRabbit isn't added, and the lines say so", async () => {
     const w = newRepoWorld({ policyInstallations: { planner: 11, factory: 12 } });
     expect(await go(w)).toBe(0);
     expect(w.writes().filter((e) => e.startsWith("PUT /user/installations/"))).toEqual([`PUT /user/installations/11/repositories/${REPO_ID}`, `PUT /user/installations/12/repositories/${REPO_ID}`]);
+    expect(w.out.find((l) => l.startsWith("[1/11] preflight"))).toContain("installations hapi-planner 11, hapi-factory 12, as policy/repos.yaml records them; the gates at c0ffee0; policy/repos.yaml names no coderabbit installation, so CodeRabbit isn't added");
+    expect(w.out.find((l) => l.startsWith("[8/11] apps"))).toEndWith(`${FULL} added to hapi-planner (11), hapi-factory (12); the strict audit as hapi proves hapi-planner and hapi-factory cover it (github.app-perms; docs/runbooks/new-repo.md#verify)`);
   });
 
   test("--clone onto a path that exists is refused here, before the repo is made", async () => {
@@ -295,19 +287,37 @@ test("M16: GitHub's text is printed with no terminal control in it", async () =>
   for (const l of w.out) expect(l).not.toContain("\u001b");
 });
 
-test("an App install GitHub refuses becomes a web step the command waits on (design §3.2)", async () => {
-  const w = newRepoWorld({ routes: { [`PUT ${API}/user/installations/12/repositories/${REPO_ID}`]: { status: 403, body: { message: "Resource not accessible by integration" } } } });
-  w.setOnConfirm(() => w.installed.get(12)!.add(REPO_ID));
+test("an App install GitHub refuses becomes a web step the command waits on, then the other Apps' PUTs go on (design §3.2)", async () => {
+  const puts = [11, 12, 13].map((id) => `PUT /user/installations/${id}/repositories/${REPO_ID}`);
+  let w = newRepoWorld({ routes: { [`PUT ${API}/user/installations/12/repositories/${REPO_ID}`]: { status: 403, body: { message: "Resource not accessible by integration" } } } });
   expect(await go(w)).toBe(0);
-  expect(w.prompts).toEqual([`Add ${FULL} to hapi-factory: github.com → Settings → Applications → hapi-factory → Configure → Repository access, then press Enter`]);
-  expect(w.events.lastIndexOf(`GET /user/installations/12/repositories`)).toBeGreaterThan(w.events.indexOf(`PUT /user/installations/12/repositories/${REPO_ID}`));
+  expect(w.prompts).toEqual([`Add ${FULL} to hapi-factory: github.com → Settings → Applications → hapi-factory → Configure → Repository access (selected repositories only), then press Enter`]);
+  expect(w.events.filter((e) => e.startsWith("PUT /user/installations/"))).toEqual(puts);
+  expect(w.events.indexOf("confirmed")).toBeGreaterThan(w.events.indexOf(puts[1]!));
+  expect(w.events.indexOf("confirmed")).toBeLessThan(w.events.indexOf(puts[2]!));
+  expect(w.out.find((l) => l.startsWith("[8/11] apps"))).toContain("coderabbitai (13) (hapi-factory by the web step); the strict audit as hapi proves");
+  expect(w.events.filter((e) => e.startsWith("GET /user/installations"))).toEqual([]);
+  // A web step on the first App doesn't end the step either.
+  w = newRepoWorld({ routes: { [`PUT ${API}/user/installations/11/repositories/${REPO_ID}`]: { status: 403, body: { message: "Resource not accessible by integration" } } } });
+  expect(await go(w)).toBe(0);
+  expect(w.events.filter((e) => e.startsWith("PUT /user/installations/"))).toEqual(puts);
+  expect(w.events.indexOf("confirmed")).toBeLessThan(w.events.indexOf(puts[1]!));
 });
 
-test("the web step fails the step if the installation still doesn't list the repo", async () => {
-  const w = newRepoWorld({ routes: { [`PUT ${API}/user/installations/12/repositories/${REPO_ID}`]: { status: 404, body: { message: "Not Found" } } } });
+test("a 404 (an id GitHub doesn't know) and a 422 become the web step too; a 304 is done; any other answer fails the step", async () => {
+  let w = newRepoWorld({ policyInstallations: { planner: 11, factory: 99, coderabbit: 13 } });
+  expect(await go(w)).toBe(0);
+  expect(w.prompts.map((l) => l.slice(0, l.indexOf(": ")))).toEqual([`Add ${FULL} to hapi-factory`]);
+  w = newRepoWorld({ routes: { [`PUT ${API}/user/installations/13/repositories/${REPO_ID}`]: { status: 422, body: { message: "Validation Failed" } } } });
+  expect(await go(w)).toBe(0);
+  expect(w.prompts).toEqual([`Add ${FULL} to coderabbitai: github.com → Settings → Applications → coderabbitai → Configure → Repository access (an App on all repositories has it already), then press Enter`]);
+  w = newRepoWorld({ routes: { [`PUT ${API}/user/installations/11/repositories/${REPO_ID}`]: { status: 304 } } });
+  expect(await go(w)).toBe(0);
+  expect(w.prompts).toEqual([]);
+  w = newRepoWorld({ routes: { [`PUT ${API}/user/installations/12/repositories/${REPO_ID}`]: { status: 500, body: { message: "boom" } } } });
   expect(await go(w)).toBe(1);
-  expect(w.prompts.length).toBe(1);
-  expect(failLine(w)).toBe(`step 8 (apps) failed: hapi-factory's installation (12) doesn't list ${FULL} (repo id ${REPO_ID}): add it on github.com, then run the audit (docs/runbooks/new-repo.md)`);
+  expect(w.prompts).toEqual([]);
+  expect(failLine(w)).toBe(`step 8 (apps) failed: PUT /user/installations/12/repositories/${REPO_ID}: HTTP 500: boom`);
 });
 
 test("register adds the repo to policy/repos.yaml and keeps its comments", async () => {

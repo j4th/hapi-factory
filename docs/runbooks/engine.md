@@ -1378,7 +1378,7 @@ The controller fills these from what you pasted (Task 16 Step 11), with `<owner>
 
 | # | Criterion | Result | Evidence |
 |---|---|---|---|
-| 1 | `mise run new-repo` made the sandbox with the contract, rulesets, both Apps, labels and CodeRabbit | pending | Task 5 Step 15's output |
+| 1 | `mise run new-repo` made the sandbox with the contract, rulesets, both Apps, labels and CodeRabbit | pending | Task 5 Step 15's output; for hapi's two Apps, Step 4's `github.app-perms` and `policy.repos` passes (`new-repo` can't read installations, H-304); for CodeRabbit, its Configure page and its review on planning PR 1 |
 | 2 | The two planning PRs merged in turn | pending | their merge SHAs |
 | 3 | Within the poll interval, exactly one run started per work order, with nobody touching anything | pending | the watch, the runs |
 | 4 | Each run passed `preflight` and built; verify passed `check`, `smoke` against the bakery and the acceptance tests; the host gates passed; the review gave its verdict and CodeRabbit's (or named why it was skipped); at most one fix round | pending | the runs, each PR's Evidence |

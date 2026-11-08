@@ -1210,8 +1210,8 @@ Two steps are stop-class and the operator's: editing `policy/repos.yaml` (Step 1
       - scopes of only `repo`, with the message `missing scope workflow: run gh auth refresh -s workflow`;
       - a `type: "Organization"` account;
       - a repo that already exists: `example-owner/example-repo already exists`;
-      - an installation on all repositories: `hapi-factory is installed on all repositories: make it selected first`;
-      - an installation id that doesn't match `policy/repos.yaml`: `hapi-factory's installation is 12, but policy/repos.yaml says 99`;
+      - (first build, removed by H-304: see Step 13's as-built note) an installation on all repositories: `hapi-factory is installed on all repositories: make it selected first`;
+      - (first build, removed by H-304) an installation id that doesn't match `policy/repos.yaml`: `hapi-factory's installation is 12, but policy/repos.yaml says 99`;
       - a dirty `templates/`;
       - a 404 from `GET /repos/example-owner/hapi-factory/contents/.github/workflows/gates.yml?ref=GATES`.
     - `--dry-run makes no write`:
@@ -1227,7 +1227,7 @@ Two steps are stop-class and the operator's: editing `policy/repos.yaml` (Step 1
       - no output line contains `fake-gh-token`.
     - `an App install GitHub refuses becomes a web step the command waits on (design §3.2)`:
       - a 403 on `PUT …/12/…` gives `confirm` the prompt `Add example-owner/example-repo to hapi-factory: github.com → Settings → Applications → hapi-factory → Configure → Repository access, then press Enter`;
-      - the step passes once `GET /user/installations/12/repositories` lists 4242.
+      - (first build, removed by H-304: no OAuth login can list it) the step passes once `GET /user/installations/12/repositories` lists 4242.
     - `register adds the repo to policy/repos.yaml and keeps its comments`: `loadPolicy` gives `repos["example-owner/example-repo"]` as `{ registered: "2026-10-31" }`, and every comment line is unchanged.
     - `--clone clones into ../<name> beside the checkout and refuses a path that exists (H-178)`:
       - the clone is `git clone --quiet https://github.com/example-owner/example-repo.git <dirname(root)>/example-repo`;
@@ -1370,7 +1370,7 @@ Two steps are stop-class and the operator's: editing `policy/repos.yaml` (Step 1
        - read the scopes from `x-oauth-scopes`;
        - the account must be `type: "User"`;
        - `parseOwnerRepo` must accept `<login>/<name>`, and the name must be free;
-       - `GET /user/installations?per_page=100`, matched by `app_slug` against `policy/repos.yaml`'s ids. hapi's two Apps must be `selected`. A CodeRabbit installation on all repos is reported, and its PUT is skipped;
+       - (first build, removed by H-304: GitHub answers an OAuth login 403; see Step 13's as-built note) `GET /user/installations?per_page=100`, matched by `app_slug` against `policy/repos.yaml`'s ids. hapi's two Apps must be `selected`. A CodeRabbit installation on all repos is reported, and its PUT is skipped;
        - `git -C root rev-parse HEAD` gives `gates_sha`;
        - `git status --porcelain -- templates/repo-contract .github/workflows/gates.yml` must be empty;
        - GitHub must have `gates.yml` at that SHA.
@@ -1402,7 +1402,7 @@ Two steps are stop-class and the operator's: editing `policy/repos.yaml` (Step 1
     8. **`apps`:**
        - `PUT /user/installations/<id>/repositories/<repo id>` for each App;
        - a 403 or 404 becomes the `confirm` web step;
-       - afterwards, each installation's repositories (read with Task 3's paginator) must include the repo.
+       - (first build, removed by H-304) afterwards, each installation's repositories (read with Task 3's paginator) must include the repo.
     9. **`register`:**
        - `parseDocument`, then `setIn(["repos", "<o>/<r>"], { registered: <YYYY-MM-DD> })`, written to a temp file and renamed into place;
        - `loadPolicy(join(root, "policy"))` must pass, or the old text is restored;
@@ -1466,6 +1466,7 @@ Two steps are stop-class and the operator's: editing `policy/repos.yaml` (Step 1
   git diff policy/repos.yaml
   ```
   Paste back both outputs. If the first command fails, that is the live check of §7.2's read failing. In that case, take each id from the end of the App's Configure URL (Settings → Applications → Installed GitHub Apps → Configure) and paste the error too, so the controller can rule on `preflight`.
+  - As built (Task 16, 2026-11-06): it failed, `GET /user/installations` answering the operator's login 403 ("You must authenticate with an access token authorized to a GitHub App"), and `GET /user/installations/{id}/repositories` does the same. Ruling on `preflight`: `new-repo` reads no installation and takes `policy/repos.yaml`'s ids as recorded; step 8 PUTs each App, with a 403, 404 or 422 as its web step and a 304 as done; the strict audit as hapi proves hapi-planner's and hapi-factory's ids and coverage (`policy.repos`, `github.app-perms`), and the operator checks CodeRabbit's on github.com. Step 13 takes the ids from github.com (new-repo.md). This replaces the installation reads in Steps 1 and 6 below (marked first build). H-304.
 - [ ] **Step 14 (operator): Re-apply hapi-factory's `main-review` with `require_last_push_approval`, or decide not to.**
   ```bash
   id="$(gh api repos/j4th/hapi-factory/rulesets \

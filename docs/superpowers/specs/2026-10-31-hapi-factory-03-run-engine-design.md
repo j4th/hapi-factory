@@ -101,6 +101,8 @@ As H-217 designs it:
 - `policy/runs.yaml` and its schema are protected paths: the build asks the operator's OK for the change.
 - [verify] bind-backed volumes on hapi's rootless Docker, the chown helper on them, and that a full filesystem fails the run (`ENOSPC`) without touching the Docker data root.
 
+> **As built (noted 2026-11-06, Task 16):** the [verify] held on the build host, with one change to how the filesystem is made. `ENOSPC` stopped the write at the cap, but the first data root figure fell by the write's size: `mkfs.ext4`'s default discard had punched out the image's `fallocate`d blocks, so the run disk was taking its writes from the host's free space. The runbook now makes it with `-E nodiscard,lazy_itable_init=0` and checks it with `du`, and the second run left the data root 0.6 MB apart ([the runs runbook](../../runbooks/runs.md#the-live-check-as-hapi)). No check yet holds that the image stays allocated (H-303). The chown helper bound with hapi's Docker started before the mount, since rootlesskit propagates the host's mounts (H-287).
+
 ### 3.2 `mise run new-repo` [user: pulled forward from Plan 05]
 
 **What it is:** a command the operator runs from their own terminal, with their own GitHub login, that makes a new public repo ready for the factory. Agents never run it and never create repos (spec §7) [user]. It is the only Plan 03 piece that acts with the operator's rights.
@@ -121,6 +123,8 @@ As H-217 designs it:
 11. **Verify** with the strict audit for the new repo.
 
 A failed step stops the command and prints what was done and what to undo; it never retries. Deleting a sandbox repo needs `delete_repo`, which `gh` lacks by default: that is a runbook step, not a command [call].
+
+> **As built (noted 2026-11-06, Task 16, §7.2):** the operator's `gh` login can't read installations at all. `GET /user/installations` answers it 403, since GitHub lists a user's installations only to a GitHub App's own user token. `GET /user/installations/{id}/repositories` answers 403 too (an App's user token, a personal access token or basic auth only). So step 1 reads no installation and takes `policy/repos.yaml`'s ids as recorded. Step 8 PUTs each App; a 403, 404 or 422 becomes its web step, and a 304 means it's done. For hapi-planner and hapi-factory, the proof of the ids, the selected-only installations and the repo's coverage is the strict audit as hapi, with each App's own JWT (`policy.repos` once the registration is in hapi's checkout, `github.app-perms`). The sandbox's runbook runs it after the deploy, before the first planning PR. Nothing checks CodeRabbit's installation (hapi holds no key for its App): the operator checks it on github.com, and its review on the first PR shows it (H-304).
 
 ### 3.3 The repo contract template and the sandbox [user: a sandbox repo; call: its subject]
 

@@ -5,10 +5,13 @@
  *
  * The eleven steps, in this order (the order matters):
  *  1. preflight: reads only. The login has the `repo` and `workflow` scopes and is a personal account; the name is
- *     valid and free; hapi-planner and hapi-factory are installed on selected repositories only, with the ids
- *     policy/repos.yaml records (and CodeRabbit's, if it records one), which doesn't register the repo yet; the
- *     checkout's HEAD is the gates commit, its template, gates.yml and rulesets are committed, and GitHub has gates.yml
- *     at that commit; a --clone target is free.
+ *     valid and free; policy/repos.yaml doesn't register the repo yet; the checkout's HEAD is the gates commit, its
+ *     template, gates.yml and rulesets are committed, and GitHub has gates.yml at that commit; a --clone target is
+ *     free. The Apps' installation ids are policy/repos.yaml's, taken as recorded: GitHub lists a user's
+ *     installations (GET /user/installations) only to a GitHub App's user token, which new-repo never takes (Task 16,
+ *     design §7.2). The strict audit as hapi proves hapi-planner's and hapi-factory's with each App's own JWT, once
+ *     the registration is in hapi's checkout (policy.repos, github.app-perms); nothing checks CodeRabbit's, since
+ *     hapi holds no key for its App.
  *  2. render: templates/repo-contract, then the checks of `contractProblems` (H-194, exact versions, mise.lock,
  *     repo.ai-workflows, the overlay only tightening).
  *  3. create: the repo, public and empty, issues on.
@@ -21,8 +24,10 @@
  *     excluding Dependabot's branches; each read back by id, then the rules GitHub applies on main, a feature
  *     branch, plan/** and factory/**.
  *  7. labels: LABELS.
- *  8. apps: only now, the repo added to each App's installation; a 403 or 404 becomes a web step the command waits on
- *     (`confirm`); then each installation must list the repo.
+ *  8. apps: only now, the repo added to each App's installation; a 403, 404 or 422 becomes a web step the command
+ *     waits on (`confirm`). Nor can an OAuth login list an installation's repositories, so the strict audit as hapi
+ *     (github.app-perms) proves hapi-planner and hapi-factory cover the repo; CodeRabbit's the operator sees on
+ *     github.com.
  *  9. register: the repo in policy/repos.yaml, an uncommitted change the operator reviews and commits by PR.
  * 10. clone: with --clone only, into ../<name> beside the checkout, never inside it (H-178).
  * 11. verify: the strict audit's GitHub checks for the new repo, on the same in-memory token.
@@ -75,14 +80,13 @@ const ACTIONS = 15368;
 const RULESETS = ["main-protect", "main-review", "agent-branch-scope", "tags-admin-only"] as const;
 /** Dependabot's branches, dependabot/<ecosystem>/<name>: the template turns Dependabot on (the audit's `mayExclude`). */
 const DEPENDABOT = "refs/heads/dependabot/**/*";
-/** The Apps, by the slug GitHub lists their installations under. */
+/** The Apps, by their slugs: the names their web steps give. */
 const APP_SLUGS = { planner: "hapi-planner", factory: "hapi-factory", coderabbit: "coderabbitai" } as const;
 
 interface App {
   slug: string;
+  /** Its installation id, as policy/repos.yaml records it. */
   id: number;
-  /** Why its PUT is skipped (CodeRabbit installed on all repositories), if it is. */
-  skip?: string;
 }
 
 /** What every step works on. */
@@ -171,27 +175,16 @@ async function preflight(c: Ctx): Promise<StepResult> {
   const registry = loadPolicy(join(d.root, "policy")).repos;
   const ids = registry.installations;
   if (Object.keys(registry.repos).some((k) => k.toLowerCase() === c.full.toLowerCase())) throw new Error(`policy/repos.yaml already registers ${c.full}: drop the stale entry by PR first`);
-  const listed = (await paginate(d.fetch, "/user/installations", c.token, (j) => asRecord(j)?.installations as unknown[] | undefined)).map(asRecord);
+  // The ids as recorded: no token new-repo takes can list installations (GET /user/installations answers an OAuth
+  // login 403; only a GitHub App's user token may). The strict audit as hapi proves hapi's two Apps' ids
+  // (policy.repos, github.app-perms); nothing checks CodeRabbit's.
   const notes: string[] = [];
-  const find = (slug: string, want: number) => {
-    const inst = listed.find((i) => i?.app_slug === slug);
-    if (inst === undefined) throw new Error(`${slug} isn't installed on ${c.owner}'s account, but policy/repos.yaml names installation ${want}: install it on selected repositories (docs/runbooks/github-apps.md), then run new-repo again`);
-    if (inst.id !== want) throw new Error(`${slug}'s installation is ${String(inst.id)}, but policy/repos.yaml says ${want}`);
-    return inst;
-  };
-  c.apps = [];
-  for (const app of ["planner", "factory"] as const) {
-    const inst = find(APP_SLUGS[app], ids[app]);
-    if (inst.repository_selection !== "selected") throw new Error(`${APP_SLUGS[app]} is installed on all repositories: make it selected first`);
-    c.apps.push({ slug: APP_SLUGS[app], id: ids[app] });
-  }
+  c.apps = [
+    { slug: APP_SLUGS.planner, id: ids.planner },
+    { slug: APP_SLUGS.factory, id: ids.factory },
+  ];
   if (ids.coderabbit === undefined) notes.push("policy/repos.yaml names no coderabbit installation, so CodeRabbit isn't added");
-  else {
-    const inst = find(APP_SLUGS.coderabbit, ids.coderabbit);
-    const skip = inst.repository_selection === "selected" ? undefined : "coderabbitai is installed on all repositories, so it covers the new repo already: its PUT is skipped";
-    if (skip !== undefined) notes.push(skip);
-    c.apps.push({ slug: APP_SLUGS.coderabbit, id: ids.coderabbit, ...(skip === undefined ? {} : { skip }) });
-  }
+  else c.apps.push({ slug: APP_SLUGS.coderabbit, id: ids.coderabbit });
 
   const head = (await git(c, d.root, ["rev-parse", "HEAD"])).trim();
   if (!/^[0-9a-f]{40}$/.test(head)) throw new Error(`git rev-parse HEAD in ${d.root} printed no commit`);
@@ -204,7 +197,7 @@ async function preflight(c: Ctx): Promise<StepResult> {
   if (c.o.clone && (await exists(cloneTarget(c)))) throw new Error(cloneTaken(cloneTarget(c), c.o.name));
 
   const apps = c.apps.map((a) => `${a.slug} ${a.id}`).join(", ");
-  return { line: `${c.owner} (user ${c.userId}) with the repo and workflow scopes; ${c.full} is free; installations ${apps}; the gates at ${short(head)}${notes.length > 0 ? `; ${notes.join("; ")}` : ""}`, acted: false };
+  return { line: `${c.owner} (user ${c.userId}) with the repo and workflow scopes; ${c.full} is free; installations ${apps}, as policy/repos.yaml records them; the gates at ${short(head)}${notes.length > 0 ? `; ${notes.join("; ")}` : ""}`, acted: false };
 }
 
 async function render(c: Ctx): Promise<StepResult> {
@@ -334,22 +327,29 @@ async function labels(c: Ctx): Promise<StepResult> {
   return done(names);
 }
 
+/** What proves step 8, since an OAuth login can't list an installation's repositories: the audit for hapi's two Apps, the operator's eyes for CodeRabbit's. */
+function appsProof(apps: readonly App[]): string {
+  const hapi = "the strict audit as hapi proves hapi-planner and hapi-factory cover it (github.app-perms; docs/runbooks/new-repo.md#verify)";
+  const cr = apps.some((a) => a.slug === APP_SLUGS.coderabbit) ? "; nothing checks coderabbitai's: see its Repository access on github.com" : "";
+  return hapi + cr;
+}
+
 async function apps(c: Ctx): Promise<StepResult> {
-  const adding = c.apps.filter((a) => a.skip === undefined);
-  const skipped = c.apps.filter((a) => a.skip !== undefined).map((a) => `; ${a.skip}`).join("");
-  if (c.o.dryRun) return would(`add ${c.full} to ${adding.map((a) => `${a.slug} (${a.id})`).join(", ")}, then check each installation lists it${skipped}`);
-  for (const a of adding) {
+  const names = c.apps.map((a) => `${a.slug} (${a.id})`).join(", ");
+  if (c.o.dryRun) return would(`add ${c.full} to ${names}; ${appsProof(c.apps)}`);
+  const web: string[] = [];
+  for (const a of c.apps) {
     const r = await rest(c.d.fetch, "PUT", `/user/installations/${a.id}/repositories/${c.repoId}`, c.token);
-    if (r.status === 403 || r.status === 404) {
-      // GitHub's docs don't say an OAuth login may add a repo to an installation (design §7.2): the web UI can.
-      await c.d.confirm(`Add ${c.full} to ${a.slug}: github.com → Settings → Applications → ${a.slug} → Configure → Repository access, then press Enter`);
-    } else if (r.status !== 204) throw new Error(`PUT /user/installations/${a.id}/repositories/${c.repoId}: HTTP ${r.status}${ghMessage(r.json)}`);
+    if (r.status === 204 || r.status === 304) continue;
+    if (r.status !== 403 && r.status !== 404 && r.status !== 422) throw new Error(`PUT /user/installations/${a.id}/repositories/${c.repoId}: HTTP ${r.status}${ghMessage(r.json)}`);
+    // GitHub's docs name tokens that may add a repo to an installation, and an OAuth login isn't one (design §7.2):
+    // the web UI can. A wrong id, or an installation on all repositories, also lands here; for hapi's two Apps the
+    // audit tells them apart, and an all-repositories one fails it.
+    const access = a.slug === APP_SLUGS.coderabbit ? "an App on all repositories has it already" : "selected repositories only";
+    await c.d.confirm(`Add ${c.full} to ${a.slug}: github.com → Settings → Applications → ${a.slug} → Configure → Repository access (${access}), then press Enter`);
+    web.push(a.slug);
   }
-  for (const a of adding) {
-    const repos = await paginate(c.d.fetch, `/user/installations/${a.id}/repositories`, c.token, (j) => asRecord(j)?.repositories as unknown[] | undefined);
-    if (!repos.some((r) => asRecord(r)?.id === c.repoId)) throw new Error(`${a.slug}'s installation (${a.id}) doesn't list ${c.full} (repo id ${c.repoId}): add it on github.com, then run the audit (docs/runbooks/new-repo.md)`);
-  }
-  return done(`${c.full} added to ${adding.map((a) => `${a.slug} (${a.id})`).join(", ")}, and each installation lists it${skipped}`);
+  return done(`${c.full} added to ${names}${web.length > 0 ? ` (${web.join(", ")} by the web step)` : ""}; ${appsProof(c.apps)}`);
 }
 
 /** The repos map of policy/repos.yaml's text, as plain data, or undefined if the text has none. */

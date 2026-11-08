@@ -3,7 +3,8 @@
  * table that holds the new repo's state), a fake `Runner` that answers the checkout's `git rev-parse HEAD` and
  * `git status` and records the push and the clone, but runs every other git call for real, and recording fakes for
  * `confirm` and `audit`. The checkout is a temp dir with a copy of policy/ (its repos.yaml naming the fake
- * installations 11, 12 and 13) and templates/ linked. No network, no real token.
+ * installations 11, 12 and 13) and templates/ linked. GitHub's two installation reads answer 403, as they answer
+ * an OAuth login (Task 16): new-repo never makes them. No network, no real token.
  */
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -32,10 +33,12 @@ export function cleanup(): void {
 }
 
 type Route = Reply | ((c: Call) => Reply);
+/** GitHub's answers to an OAuth login's GET /user/installations and GET /user/installations/{id}/repositories (live, 2026-11-06). */
+const OAUTH_403 = "You must authenticate with an access token authorized to a GitHub App in order to list installations";
+const OAUTH_403_REPOS = "You must authenticate with an access token authorized to a GitHub App, a personal access token, or basic auth in order to list repositories for an installation.";
 export interface Installation {
   id: number;
   app_slug: string;
-  repository_selection: "selected" | "all";
 }
 export interface WorldOptions {
   scopes?: string;
@@ -83,11 +86,10 @@ export function newRepoWorld(o: WorldOptions = {}) {
   writeFileSync(join(root, "policy", "repos.yaml"), reposYaml);
 
   const installations = o.installations ?? [
-    { id: 11, app_slug: "hapi-planner", repository_selection: "selected" },
-    { id: 12, app_slug: "hapi-factory", repository_selection: "selected" },
-    { id: 13, app_slug: "coderabbitai", repository_selection: "selected" },
+    { id: 11, app_slug: "hapi-planner" },
+    { id: 12, app_slug: "hapi-factory" },
+    { id: 13, app_slug: "coderabbitai" },
   ];
-  const installed = new Map<number, Set<number>>(installations.map((i) => [i.id, new Set<number>()]));
   const rulesets = new Map<number, Record<string, any>>();
   const labels: Record<string, unknown>[] = [];
   let created = o.repoExists ?? false;
@@ -105,7 +107,7 @@ export function newRepoWorld(o: WorldOptions = {}) {
   const routes: Record<string, Route> = {
     [`GET ${API}/user`]: { status: 200, body: { login: OWNER, id: USER_ID, type: o.type ?? "User" }, headers: { "x-oauth-scopes": o.scopes ?? "repo, workflow, read:org" } },
     [`GET ${R}`]: () => (created ? { status: 200, body: repoJson() } : { status: 404, body: { message: "Not Found" } }),
-    [`GET ${API}/user/installations?per_page=100`]: { status: 200, body: { total_count: installations.length, installations } },
+    [`GET ${API}/user/installations?per_page=100`]: { status: 403, body: { message: OAUTH_403 } },
     [`GET ${API}/repos/${OWNER}/hapi-factory/contents/.github/workflows/gates.yml?ref=${GATES}`]:
       o.gatesOnGitHub === false ? { status: 404, body: { message: "No commit found for the ref" } } : { status: 200, body: { type: "file", name: "gates.yml", path: ".github/workflows/gates.yml" } },
     [`POST ${API}/user/repos`]: () => {
@@ -137,14 +139,8 @@ export function newRepoWorld(o: WorldOptions = {}) {
     routes[`GET ${R}/rules/branches/${path}?per_page=100`] = () => ({ status: 200, body: effective(branch) });
   }
   for (const i of installations) {
-    routes[`PUT ${API}/user/installations/${i.id}/repositories/${REPO_ID}`] = () => {
-      installed.get(i.id)!.add(REPO_ID);
-      return { status: 204 };
-    };
-    routes[`GET ${API}/user/installations/${i.id}/repositories?per_page=100`] = () => {
-      const list = [...installed.get(i.id)!].map((id) => ({ id, full_name: FULL }));
-      return { status: 200, body: { total_count: list.length, repository_selection: i.repository_selection, repositories: list } };
-    };
+    routes[`PUT ${API}/user/installations/${i.id}/repositories/${REPO_ID}`] = { status: 204 };
+    routes[`GET ${API}/user/installations/${i.id}/repositories?per_page=100`] = { status: 403, body: { message: OAUTH_403_REPOS } };
   }
   Object.assign(routes, o.routes ?? {});
   const gh = fakeFetch(routes);
@@ -193,6 +189,9 @@ export function newRepoWorld(o: WorldOptions = {}) {
     confirm: async (prompt) => {
       prompts.push(prompt);
       onConfirm(prompt);
+      // Resolve on a later tick, as the operator's Enter does: a step that didn't wait would act before "confirmed".
+      await new Promise((r) => setTimeout(r, 1));
+      events.push("confirmed");
     },
     audit: async (ctx) => {
       audits.push(ctx);
@@ -212,7 +211,6 @@ export function newRepoWorld(o: WorldOptions = {}) {
     audits,
     rulesets,
     labels,
-    installed,
     /** The non-GET requests and the git push/clone, in order. */
     writes: () => events.filter((e) => !e.startsWith("GET ")),
     setAuditResults: (r: CheckResult[]) => void (auditResults = r),
