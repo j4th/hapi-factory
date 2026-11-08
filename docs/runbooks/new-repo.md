@@ -189,11 +189,13 @@ gh api -X PUT "repos/$OWNER/hapi-factory/rulesets/$id" \
   --jq '.rules[] | select(.type == "pull_request") | .parameters.require_last_push_approval'
 ```
 
-**Step 15: make the sandbox.** The first two lines are the personal-strings check over everything the push would publish, commit messages included: it should print `0`, and the push runs only then. The dry run changes nothing; the second `new-repo` makes the repo and clones it into `../hapi-sandbox-fortune`.
+**Step 15: make the sandbox.** The first lines are the personal-strings check over what the push would publish: every commit message and every commit's diff. It matches as the commit hooks do (`.githooks/lib.sh`): fixed strings, ignoring case, as whole words, with the file's blank and `#` lines left out, since a blank pattern matches every line. It reads no commit header, since each one names you as its author with your noreply email, as every public commit does. It should print `0`, and the push runs only then; an empty count means the file is missing or has no usable line, and the push doesn't run either. The dry run changes nothing; the second `new-repo` makes the repo and clones it into `../hapi-sandbox-fortune`.
 
 ```bash
-n="$(git log -p main..plan/03-run-engine \
-  | grep -c -i -w -f private/personal-strings.txt)"
+n="$( { git log --format=%B main..plan/03-run-engine; \
+    git log -p --format= main..plan/03-run-engine; } \
+  | grep -c -F -i -w -f <(grep -v -e '^[[:space:]]*$' -e '^#' \
+    private/personal-strings.txt))"
 echo "personal strings: $n"
 [ "$n" = 0 ] && git push origin plan/03-run-engine
 mise run new-repo -- hapi-sandbox-fortune --clone --dry-run

@@ -1494,6 +1494,8 @@ Two steps are stop-class and the operator's: editing `policy/repos.yaml` (Step 1
   - the diff;
   - whether step 8 asked for a web step.
 
+  - As built (Task 16, 2026-11-08): the personal-strings line above counted 75257 in the operator's zsh. GNU `grep -w` took the file's blank lines as patterns that match nearly every line (`.githooks/lib.sh` skips blank and `#` lines for that reason), and every commit header names the operator as its author (noreply email, as on all of public `main`). new-repo.md's check now reads only the messages and the diffs, and matches as the hooks do (`grep -F -i -w`, blank and `#` lines left out): 0 on the branch, and a stand-in pattern still matched.
+
   If the check has a different name, the controller records a ruling: `CONTRACT_CHECK` becomes that name, and you re-apply the sandbox's `main-protect` with it. Then commit `policy/repos.yaml` on this branch. It is a protected file, so that commit needs your OK.
 
 ---
