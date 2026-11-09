@@ -82,10 +82,9 @@ test("audit passes a clean fixture", async () => {
   ]) {
     expect([id, only(results, id).status]).toEqual([id, "pass"]);
   }
-  // policy.repos on the shipped registry, which registers no repo (`repos: {}`): a pass that says so. A protected change
-  // that registers one (the sandbox's, Plan 03 Task 16) updates this pin with tests/policy/load.test.ts's, and then the
-  // clean world, which writes no host.env, skips it.
-  expect(Object.keys(loadPolicy(join(REPO, "policy")).repos.repos)).toEqual([]);
+  // policy.repos on the world's registry, the shipped policy's with no repo registered (`shippedPolicy`): a pass that
+  // says so. The committed registry lists the sandbox since Task 16: tests/policy/load.test.ts pins it.
+  expect(Object.keys(loadPolicy(w.ctx.policyDir).repos.repos)).toEqual([]);
   expect([only(results, "policy.repos").status, only(results, "policy.repos").detail]).toEqual(["pass", "policy/repos.yaml registers no repo: the poller acts on none"]);
   // The live MCP comparison waits for Plan 04 (H-101), so it is a skip until then (H-026).
   expect(only(results, "mcp.tool-hashes").status).toBe("skip");

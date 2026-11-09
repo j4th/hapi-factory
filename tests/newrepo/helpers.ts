@@ -13,6 +13,7 @@ import type { AuditContext, CheckResult } from "../../src/audit/types";
 import { runCommand, type Runner } from "../../src/stack/up";
 import type { NewRepoDeps } from "../../src/newrepo/steps";
 import { type Call, fakeFetch, type Reply } from "../forge/helpers";
+import { emptyRegistry } from "../policy/helpers";
 
 export const REPO = resolve(import.meta.dir, "../..");
 export const API = "https://api.github.com";
@@ -79,10 +80,10 @@ export function newRepoWorld(o: WorldOptions = {}) {
   cpSync(join(REPO, "policy"), join(root, "policy"), { recursive: true });
   symlinkSync(join(REPO, "templates"), join(root, "templates"));
   const ids = o.policyInstallations ?? { planner: 11, factory: 12, coderabbit: 13 };
-  const reposYaml = readFileSync(join(REPO, "policy", "repos.yaml"), "utf8")
+  const reposYaml = emptyRegistry(readFileSync(join(REPO, "policy", "repos.yaml"), "utf8"))
     .replace(/^ {2}planner: \d+/m, `  planner: ${ids.planner}`)
     .replace(/^ {2}factory: \d+/m, `  factory: ${ids.factory}`)
-    .replace(/^ {2}# coderabbit: <id>/m, ids.coderabbit === undefined ? "  # coderabbit: <id>" : `  coderabbit: ${ids.coderabbit}`);
+    .replace(/^ {2}(# )?coderabbit: (<id>|\d+)/m, ids.coderabbit === undefined ? "  # coderabbit: <id>" : `  coderabbit: ${ids.coderabbit}`);
   writeFileSync(join(root, "policy", "repos.yaml"), reposYaml);
 
   const installations = o.installations ?? [

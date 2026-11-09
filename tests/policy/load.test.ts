@@ -179,7 +179,10 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
   });
 
   test("loads the repo registry and the sidecars exactly", () => {
-    expect(p.repos).toEqual({ installations: { planner: 176015763, factory: 176015322 }, repos: {} });
+    expect(p.repos).toEqual({
+      installations: { planner: 176015763, factory: 176015322, coderabbit: 175947293 },
+      repos: { "j4th/hapi-sandbox-fortune": { registered: "2026-11-09" } },
+    });
     expect(p.sidecars).toEqual({
       "bun-http": {
         image: "oven/bun:1.4.4-slim@sha256:1846adf22496bd711036aae8be147e57bdebbaea2e5264e3e0b5af1db187d9a4",

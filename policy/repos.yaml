@@ -8,5 +8,6 @@
 installations:
   planner: 176015763     # hapi-planner
   factory: 176015322     # hapi-factory
-  # coderabbit: <id>     # optional; Plan 03 Task 5's operator step adds it
-repos: {}                # "owner/name": { registered: "YYYY-MM-DD" }
+  coderabbit: 175947293     # coderabbitai
+repos:                   # "owner/name": { registered: "YYYY-MM-DD" }
+  "j4th/hapi-sandbox-fortune": { registered: "2026-11-09" }

@@ -24,6 +24,7 @@ import { envFileText } from "../../src/secrets/files";
 import { loadManifest, MANIFEST_FILE, manifestEntries } from "../../src/secrets/manifest";
 import { serviceEnvironment } from "../../src/stack/env";
 import { buildDigest } from "../../src/stack/up";
+import { emptyRegistry } from "../policy/helpers";
 
 export const REPO = resolve(import.meta.dir, "../..");
 export const FIXTURES = join(import.meta.dir, "fixtures");
@@ -286,6 +287,18 @@ export type Settings = ReturnType<typeof goodSettings>;
 export const LABEL_NAMES = ["lane:planning", "lane:factory", "lane:direct", "hapi:rework", "hapi:flagged"];
 
 /**
+ * A copy of the shipped policy/ with no repo registered (`emptyRegistry`): every check reads the shipped policy, but
+ * not what the committed registry lists (the sandbox, since Task 16), whose content tests/policy/load.test.ts pins.
+ * Each world starts from it. Removed by `cleanup`.
+ */
+export function shippedPolicy(): string {
+  const dir = join(tempDir("hapi-audit-policy-"), "policy");
+  cpSync(join(REPO, "policy"), dir, { recursive: true });
+  writeFileSync(join(dir, "repos.yaml"), emptyRegistry(readFileSync(join(dir, "repos.yaml"), "utf8")));
+  return dir;
+}
+
+/**
  * A copy of policy/ whose repos.yaml registers `OWNER/NAME`, so the contract's checks (github.repo-settings,
  * github.labels) apply to it. Removed by `cleanup`.
  */
@@ -457,7 +470,7 @@ export async function cleanWorld(o: { repos?: boolean; workflows?: Record<string
   };
   world.ctx = {
     root: REPO,
-    policyDir: join(REPO, "policy"),
+    policyDir: shippedPolicy(),
     buildDir: build,
     repos: o.repos ? [{ owner: OWNER, name: NAME }] : [],
     strict: false,

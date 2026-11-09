@@ -30,6 +30,7 @@ import type { RunDeps } from "../../src/run/spec";
 import { runCommand } from "../../src/stack/up";
 import { validateWorkOrder } from "../../src/workorder/validate";
 import { fakeForge, OPERATOR } from "../forge/helpers";
+import { emptyRegistry } from "../policy/helpers";
 import { fakeRun, NOW, seedRun, writeOrder } from "../run/helpers";
 import { tempDir } from "../secrets/helpers";
 
@@ -569,7 +570,7 @@ export function policyRoot(o: { models?: DecisionModels; repos?: string[] } = {}
   const dir = join(root, "policy");
   Bun.spawnSync(["cp", "-R", join(import.meta.dir, "..", "..", "policy"), dir]);
   const listed = (o.repos ?? [SANDBOX, SECOND]).map((r) => `  ${r}: { registered: "2026-11-01" }`).join("\n");
-  const repos = readFileSync(join(dir, "repos.yaml"), "utf8").replace(/^repos: \{\}.*$/m, `repos:\n${listed}`);
+  const repos = emptyRegistry(readFileSync(join(dir, "repos.yaml"), "utf8")).replace(/^repos: \{\}.*$/m, `repos:\n${listed}`);
   writeFileSync(join(dir, "repos.yaml"), repos);
   if (o.models !== undefined) {
     const gates = readFileSync(join(dir, "gates.yaml"), "utf8").replace(/^(  mode: )enforce(\s)/m, `$1${o.models}$2`);

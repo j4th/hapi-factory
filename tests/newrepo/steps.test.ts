@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { CONTRACT_CHECK, LABELS } from "../../src/forge/index";
 import { STEPS, newRepo, type NewRepoOptions, registerText } from "../../src/newrepo/steps";
 import { loadPolicy } from "../../src/policy/load";
+import { emptyRegistry } from "../policy/helpers";
 import { API, cleanup, FULL, GATES, NAME, newRepoWorld, OWNER, R, REPO, REPO_ID, TOKEN, USER_ID, type World } from "./helpers";
 
 afterEach(cleanup);
@@ -333,7 +334,7 @@ test("register adds the repo to policy/repos.yaml and keeps its comments", async
 });
 
 test("registerText adds one line and leaves every other line byte-identical, on a first registration and on a later one", () => {
-  const text = readFileSync(join(REPO, "policy", "repos.yaml"), "utf8");
+  const text = emptyRegistry(readFileSync(join(REPO, "policy", "repos.yaml"), "utf8"));
   const one = registerText(text, "example-owner/a", "2026-10-31");
   const two = registerText(one, "example-owner/b", "2026-11-01");
   const old = text.split("\n");
