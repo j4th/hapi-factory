@@ -8,8 +8,8 @@
 import { join } from "node:path";
 import { commandRuleIssues } from "./commands";
 import { mcpIssues } from "./mcp";
-import { check, formatIssue, type Issue, readYaml, type SchemaName } from "./schema";
-import type { Commands, Flags, Gates, McpCatalog, Policy, Roster, RosterName } from "./types";
+import { check, formatIssue, type Issue, pointerSegment, readYaml, type SchemaName } from "./schema";
+import type { Budgets, Commands, EngineDecisions, Flags, Gates, McpCatalog, Policy, Roster, RosterName, Runs } from "./types";
 
 /** A policy or overlay file failed to load. `path` is a JSON Pointer into the file ("" = the whole file). */
 export class PolicyError extends Error {
@@ -48,17 +48,51 @@ export function loadChecked(file: string, schema: SchemaName): unknown {
  * such a run would take the gate's fallback on every call, blocking every bash
  * command and wrapping every result while it spends its budget, so refuse it here
  * rather than at the first run (final review A-6).
+ *
+ * The run engine's decisions (gates.yaml's `decisions` block) are held the same way: one whose `mode` isn't `off`
+ * would give every subject its file's fallback (a hold), so it is refused at `/decisions/by_name/<name>/mode`, unless
+ * `decisions.mode` is `off`, which asks nothing. `notes` still asks, so it is refused too.
  */
-function gateIssues(flags: Flags, gates: Gates): Issue[] {
+function gateIssues(flags: Flags, gates: Gates, decisions: EngineDecisions): Issue[] {
   if (flags.jev.fallback !== "none") return [];
   const issues: Issue[] = [];
+  const message =
+    "on, but flags.jev.fallback is none, so a run that isn't public has no classifier whatever flags.jev.enabled says: set fallback to haiku, or turn the gate off here";
   for (const gate of ["bash_gate", "result_screen"] as const) {
     if (!gates[gate].enabled) continue;
-    issues.push({
-      path: `/${gate}/enabled`,
-      message:
-        "on, but flags.jev.fallback is none, so a run that isn't public has no classifier whatever flags.jev.enabled says: set fallback to haiku, or turn the gate off here",
-    });
+    issues.push({ path: `/${gate}/enabled`, message });
+  }
+  if (decisions.mode !== "off") {
+    for (const [name, d] of Object.entries(decisions.by_name)) if (d.mode !== "off") issues.push({ path: `/decisions/by_name/${name}/mode`, message });
+  }
+  return issues;
+}
+
+/**
+ * A fix round must fit in one run's budget: `phases.round_usd` is at most
+ * `budgets.run_usd`. Paths are relative to runs.yaml's root, so `/phases/round_usd`.
+ */
+export function phaseIssues(budgets: Budgets, runs: Runs): Issue[] {
+  if (runs.phases.round_usd <= budgets.run_usd) return [];
+  return [
+    {
+      path: "/phases/round_usd",
+      message: `phases.round_usd ${runs.phases.round_usd} is more than budgets.run_usd ${budgets.run_usd}: a fix round must fit in one run's budget; lower round_usd`,
+    },
+  ];
+}
+
+/**
+ * The registry's keys are GitHub repos, whose names ignore case: two keys that differ only in case are one repo
+ * registered twice (M22), which would split its spend and its one-live-per-repo count. Paths are repos.yaml's.
+ */
+export function repoIssues(registry: Policy["repos"]): Issue[] {
+  const seen = new Map<string, string>();
+  const issues: Issue[] = [];
+  for (const key of Object.keys(registry.repos)) {
+    const first = seen.get(key.toLowerCase());
+    if (first !== undefined) issues.push({ path: `/repos/${pointerSegment(key)}`, message: `the same GitHub repo as ${first} (GitHub names ignore case): register each repo once` });
+    else seen.set(key.toLowerCase(), key);
   }
   return issues;
 }
@@ -69,7 +103,7 @@ const ROSTERS: RosterName[] = ["budget", "anthropic", "portable"];
  * Load the policy directory `dir` (normally `policy`). Throws PolicyError on the
  * first bad file. Beyond the schemas, it checks that every commands.yaml pattern
  * compiles, the MCP catalog's floors, blocklist, tool denylists and env
- * (`mcpIssues`, ./mcp.ts), and that no gate is on without a classifier (`gateIssues`).
+ * (`mcpIssues`, ./mcp.ts), and that no gate or engine decision is on without a classifier (`gateIssues`).
  */
 export function loadPolicy(dir: string): Policy {
   const load = <T>(file: string, schema: SchemaName) => loadChecked(join(dir, file), schema) as T;
@@ -81,16 +115,25 @@ export function loadPolicy(dir: string): Policy {
   const catalogIssues = mcpIssues(mcp);
   if (catalogIssues.length > 0) throw new PolicyError(join(dir, "mcp.yaml"), catalogIssues);
   const flags = load<Flags>("flags.yaml", "policy-flags");
-  const gates = load<Gates>("gates.yaml", "policy-gates");
-  const gate = gateIssues(flags, gates);
+  // gates.yaml holds the guard's gates and the run engine's decisions; Policy.gates keeps Plan 02's shape.
+  const { decisions, ...gates } = load<Gates & { decisions: EngineDecisions }>("gates.yaml", "policy-gates");
+  const gate = gateIssues(flags, gates, decisions);
   if (gate.length > 0) throw new PolicyError(join(dir, "gates.yaml"), gate);
+  const budgets = load<Budgets>("budgets.yaml", "policy-budgets");
+  const runs = load<Runs>("runs.yaml", "policy-runs");
+  const phase = phaseIssues(budgets, runs);
+  if (phase.length > 0) throw new PolicyError(join(dir, "runs.yaml"), phase);
+  const repos = load<Policy["repos"]>("repos.yaml", "policy-repos");
+  const dup = repoIssues(repos);
+  if (dup.length > 0) throw new PolicyError(join(dir, "repos.yaml"), dup);
   return {
     protectedPaths: protectedPaths.protected_paths,
     commands,
     trustedSources: load("trusted_sources.yaml", "policy-trusted-sources"),
-    budgets: load("budgets.yaml", "policy-budgets"),
-    runs: load("runs.yaml", "policy-runs"),
+    budgets,
+    runs,
     gates,
+    decisions,
     approvals: load("approvals.yaml", "policy-approvals"),
     roles: load("roles.yaml", "policy-roles"),
     rosters: Object.fromEntries(
@@ -98,5 +141,7 @@ export function loadPolicy(dir: string): Policy {
     ) as Record<RosterName, Roster>,
     flags,
     mcp,
+    repos,
+    sidecars: load<{ sidecars: Policy["sidecars"] }>("sidecars.yaml", "policy-sidecars").sidecars,
   };
 }

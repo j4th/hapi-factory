@@ -291,7 +291,9 @@ describe("hapi secrets recover, drill and new-recovery", () => {
     tools.calls.length = 0;
 
     expect(await secretsDrill([], a.deps)).toBe(0);
-    expect(out).toContain(`recovery works: ${NAMES.length} names readable`);
+    // fill() writes fullStore()'s names: every required one, and not CodeRabbit's, which the manifest lists optional.
+    expect(out).toContain(`recovery works: ${Object.keys(fullStore()).length} names readable`);
+    expect(Object.keys(fullStore()).length).toBe(NAMES.length - 1);
     const [decrypt] = sopsCalls(tools, "decrypt");
     const tmp = decrypt!.env.HOME!;
     expect(tmp.startsWith(join(a.xdg, "hapi", "drill-"))).toBe(true);

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { cpSync, mkdtempSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { FORGE_DOMAINS, forgeDomain } from "../../src/policy/hosts";
 import { loadPolicy, PolicyError } from "../../src/policy/load";
 import rolesSchema from "../../policy/schemas/policy-roles.schema.json";
@@ -55,7 +55,7 @@ test("rejects unknown keys with file and path", () => {
 describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
   const p = loadPolicy("policy");
 
-  test("protected paths are exactly spec §8.2", () => {
+  test("protected paths are exactly spec §8.2 with its as-built additions (design §3.3's MCP configs, H-302's .gitattributes)", () => {
     const ask = { interactive: "ask", unattended: "deny", workers: "deny" } as const;
     const deny = { interactive: "deny", unattended: "deny", workers: "deny" } as const;
     expect(p.protectedPaths).toEqual({
@@ -76,6 +76,9 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
       "**/.cursor/**": ask,
       "**/.clinerules/**": ask,
       "**/.rules/**": ask,
+      "**/.mcp.json": ask,
+      "**/.vscode/mcp.json": ask,
+      "**/.gitattributes": ask,
       ".factory/**": ask,
       ".github/**": ask,
       "mise.toml": ask,
@@ -125,7 +128,9 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
       jev_monthly_usd: 2,
       run_usd: 3,
       hermes_max_turns: 60,
-      enforcement: { hapi_guard: "hard", archon: "hard" },
+      repo_monthly_usd: 25,
+      daily_usd: 10,
+      enforcement: { hapi_guard: "hard", archon: "hard", poller: "hard" },
     });
     expect(p.approvals).toEqual([
       "merge",
@@ -138,11 +143,28 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
   });
 
   test("loads the new limits exactly", () => {
-    expect(p.budgets.enforcement).toEqual({ hapi_guard: "hard", archon: "hard" });
+    expect(p.budgets.enforcement).toEqual({ hapi_guard: "hard", archon: "hard", poller: "hard" });
     expect(p.runs).toEqual({
       max_live: 1,
       retention_days: 14,
       output_limits_mb: { bundle: 256, transcript: 64, decisions: 16, result: 4 },
+      disk: { gb: 20, enforcement: "hard" },
+      poll_interval_s: 120,
+      max_auto_rounds: 3,
+      max_retries: 2,
+      max_rework_rounds: 3,
+      inputs_mb: 16,
+      work_order_kb: 1024,
+      phases: {
+        verify: true,
+        review: true,
+        coderabbit: false,
+        require_acceptance: true,
+        fix_rounds_before_pr: 1,
+        fix_rounds_on_pr: 1,
+        round_turns: 40,
+        round_usd: 1,
+      },
     });
     // The design screens every bash call by default: the skip list starts empty.
     expect(p.gates).toEqual({
@@ -154,6 +176,98 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
         haiku: { model: "claude-haiku-5-5", input_per_mtok: 0.1, output_per_mtok: 0.5 },
       },
     });
+  });
+
+  test("loads the repo registry and the sidecars exactly", () => {
+    expect(p.repos).toEqual({
+      installations: { planner: 176015763, factory: 176015322, coderabbit: 175947293 },
+      repos: { "j4th/hapi-sandbox-fortune": { registered: "2026-11-09" } },
+    });
+    expect(p.sidecars).toEqual({
+      "bun-http": {
+        image: "oven/bun:1.4.4-slim@sha256:1846adf22496bd711036aae8be147e57bdebbaea2e5264e3e0b5af1db187d9a4",
+        command: ["bun", "/data/server.ts"],
+        port: 8080,
+        // Fail-closed defaults (ruling m47(5)): the container's limits, and the caps on its data's export.
+        limits: { pids: 128, memory_mb: 512, data_files: 256, data_mb: 16 },
+      },
+    });
+  });
+
+  test("a fix round's cap above run_usd fails to load", () => {
+    const text = readFileSync("policy/runs.yaml", "utf8").replace("round_usd: 1.00", "round_usd: 3.50");
+    const dir = policyWith("runs.yaml", text);
+    const e = policyError(dir);
+    expect(e.file).toBe(join(dir, "runs.yaml"));
+    expect(e.issues[0]!.path).toBe("/phases/round_usd");
+    expect(e.message).toContain("phases.round_usd 3.5 is more than budgets.run_usd 3: a fix round must fit in one run's budget");
+  });
+
+  test("zero fix rounds load; a negative one, a poll under 30 s or a 0 GB disk doesn't", () => {
+    const runs = readFileSync("policy/runs.yaml", "utf8");
+    const zero = policyWith("runs.yaml", runs.replace("fix_rounds_on_pr: 1", "fix_rounds_on_pr: 0"));
+    expect(loadPolicy(zero).runs.phases.fix_rounds_on_pr).toBe(0);
+    const cases: [string, string, string][] = [
+      ["fix_rounds_on_pr: 1", "fix_rounds_on_pr: -1", "/phases/fix_rounds_on_pr"],
+      ["poll_interval_s: 120", "poll_interval_s: 10", "/poll_interval_s"],
+      ["gb: 20", "gb: 0", "/disk/gb"],
+    ];
+    for (const [from, to, path] of cases) {
+      const e = policyError(policyWith("runs.yaml", runs.replace(from, to)));
+      expect(e.issues.map((i) => i.path)).toContain(path);
+    }
+  });
+
+  test("repos.yaml takes owner/name keys, positive installation ids and a date", () => {
+    const repos = (installations: string, key: string, registered: string) =>
+      `installations: ${installations}\nrepos:\n  ${key}: { registered: "${registered}" }\n`;
+    const ok = repos("{ planner: 1, factory: 2 }", "example-owner/hapi-sandbox-fortune", "2026-10-31");
+    expect(loadPolicy(policyWith("repos.yaml", ok)).repos).toEqual({
+      installations: { planner: 1, factory: 2 },
+      repos: { "example-owner/hapi-sandbox-fortune": { registered: "2026-10-31" } },
+    });
+    const bad = (text: string) => policyError(policyWith("repos.yaml", text));
+    const good = "example-owner/hapi-sandbox-fortune";
+    let e = bad(repos("{ planner: 1, factory: 2 }", "hapi-sandbox-fortune", "2026-10-31"));
+    expect(e.issues).toContainEqual({ path: "/repos/hapi-sandbox-fortune", message: "invalid key" });
+    e = bad(repos("{ planner: 1, factory: 2 }", "example-owner/..", "2026-10-31"));
+    expect(e.issues.map((i) => i.path)).toContain("/repos/example-owner~1..");
+    e = bad(repos("{ planner: 0, factory: 2 }", good, "2026-10-31"));
+    expect(e.issues.map((i) => i.path)).toContain("/installations/planner");
+    e = bad(repos("{ planner: 1, factory: 2 }", good, "31-10-2026"));
+    expect(e.issues.map((i) => i.path)).toContain("/repos/example-owner~1hapi-sandbox-fortune/registered");
+    // M22: two keys that differ only in case are one GitHub repo, registered twice.
+    e = bad(`installations: { planner: 1, factory: 2 }\nrepos:\n  ${good}: { registered: "2026-10-31" }\n  Example-Owner/Hapi-Sandbox-Fortune: { registered: "2026-11-01" }\n`);
+    expect(e.issues).toEqual([
+      { path: "/repos/Example-Owner~1Hapi-Sandbox-Fortune", message: `the same GitHub repo as ${good} (GitHub names ignore case): register each repo once` },
+    ]);
+    expect(e.file).toBe(join(dirname(e.file), "repos.yaml"));
+  });
+
+  test("sidecars.yaml pins each image by digest", () => {
+    const text = readFileSync("policy/sidecars.yaml", "utf8");
+    const bad = (t: string) => policyError(policyWith("sidecars.yaml", t)).issues.map((i) => i.path);
+    expect(bad(text.replace(/@sha256:[0-9a-f]{64}/, ""))).toContain("/sidecars/bun-http/image");
+    expect(bad(text.replace("port: 8080", "port: 70000"))).toContain("/sidecars/bun-http/port");
+    expect(bad(text.replace(/command: \[.*\]/, "command: []"))).toContain("/sidecars/bun-http/command");
+  });
+
+  test("sidecars.yaml sets each sidecar's limits, every one a whole number of at least 1, and nothing else", () => {
+    const text = readFileSync("policy/sidecars.yaml", "utf8");
+    const bad = (t: string) => policyError(policyWith("sidecars.yaml", t)).issues.map((i) => i.path);
+    for (const [from, to, path] of [
+      ["pids: 128", "pids: 0", "/sidecars/bun-http/limits/pids"],
+      ["memory_mb: 512", "memory_mb: 1.5", "/sidecars/bun-http/limits/memory_mb"],
+      ["data_files: 256", "data_files: -1", "/sidecars/bun-http/limits/data_files"],
+      ["data_mb: 16", "data_mb: 16\n      cpus: 2", "/sidecars/bun-http/limits/cpus"],
+    ] as const) {
+      expect(text).toContain(from);
+      expect([from, bad(text.replace(from, to))]).toEqual([from, expect.arrayContaining([path])]);
+    }
+    // No limits at all: refused, never a sidecar without them.
+    const without = text.replace(/\n    limits:[^\n]*(\n      [^\n]*)+/, "");
+    expect(without).not.toContain("pids:");
+    expect(bad(without)).toContain("/sidecars/bun-http/limits");
   });
 
   test("rejects an unknown enforcement", () => {
@@ -173,7 +287,8 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
   describe("a gate that is on needs Haiku as the fallback (Plan 02 has no other classifier for a repo that isn't public)", () => {
     const jev = (enabled: boolean, fallback: string) =>
       readFileSync("policy/flags.yaml", "utf8").replace(/^jev:.*$/m, `jev:          { enabled: ${enabled}, fallback: ${fallback}, via: openrouter }`);
-    const gates = readFileSync("policy/gates.yaml", "utf8");
+    // The engine's diff-screen off, so each refusal names only its gate (the engine's decisions are held the same way below).
+    const gates = readFileSync("policy/gates.yaml", "utf8").replace(/(diff-screen:[^\n]*\n\s*mode:) enforce/, "$1 off");
     const off = (text: string, gate: string) => text.replace(new RegExp(`(${gate}:\\s*enabled:) true`), "$1 false");
     const message =
       "on, but flags.jev.fallback is none, so a run that isn't public has no classifier whatever flags.jev.enabled says: set fallback to haiku, or turn the gate off here";
@@ -201,6 +316,59 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
         writeFileSync(join(dir, "gates.yaml"), off(off(gates, "result_screen"), "bash_gate"));
         const p = loadPolicy(dir);
         expect([p.flags.jev.enabled, p.gates.bash_gate.enabled, p.gates.result_screen.enabled]).toEqual([enabled, false, false]);
+      }
+    });
+  });
+
+  test("loads the engine's decisions, and keeps them out of the guard's gates", () => {
+    expect(p.decisions).toEqual({ mode: "enforce", max_calls_per_head: 24, by_name: { "diff-screen": { mode: "enforce", on_unscreened: "hold", skip_paths: ["bun.lock"] } } });
+    expect("decisions" in p.gates).toBe(false);
+  });
+
+  describe("an engine decision that is on while flags.jev.fallback is none is refused", () => {
+    const flags = readFileSync("policy/flags.yaml", "utf8").replace(/^jev:.*$/m, "jev:          { enabled: true, fallback: none, via: openrouter }");
+    const gatesOff = readFileSync("policy/gates.yaml", "utf8")
+      .replace(/(bash_gate:\s*enabled:) true/, "$1 false")
+      .replace(/(result_screen:\s*enabled:) true/, "$1 false");
+    const decision = (mode: string, text = gatesOff) => text.replace(/(diff-screen:[^\n]*\n\s*mode:) enforce/, `$1 ${mode}`);
+    const models = (mode: string, text = gatesOff) => text.replace(/^(  mode:) enforce/m, `$1 ${mode}`);
+    const dirWith = (gates: string) => {
+      const dir = policyWith("flags.yaml", flags);
+      writeFileSync(join(dir, "gates.yaml"), gates);
+      return dir;
+    };
+    const message =
+      "on, but flags.jev.fallback is none, so a run that isn't public has no classifier whatever flags.jev.enabled says: set fallback to haiku, or turn the gate off here";
+
+    test("shadow, enforce and notes are refused", () => {
+      for (const text of [decision("shadow"), gatesOff, models("notes")]) {
+        const e = policyError(dirWith(text));
+        expect(e.file).toEndWith("gates.yaml");
+        expect(e.issues).toEqual([{ path: "/decisions/by_name/diff-screen/mode", message }]);
+      }
+    });
+
+    test("the decision off, or decision models off, loads", () => {
+      expect(loadPolicy(dirWith(decision("off"))).decisions.by_name["diff-screen"]!.mode).toBe("off");
+      const p = loadPolicy(dirWith(models("off")));
+      expect([p.decisions.mode, p.decisions.by_name["diff-screen"]!.mode]).toEqual(["off", "enforce"]);
+    });
+
+    test("a malformed decisions block is a schema error", () => {
+      const shipped = readFileSync("policy/gates.yaml", "utf8");
+      const bad = [
+        decision("on", shipped),
+        shipped.replace("      on_unscreened: hold", "      on_unscreened: hold\n      extra: 1"),
+        shipped.replace("  by_name:", "  by_name:\n    nope:\n      mode: off\n      on_unscreened: hold"),
+        shipped.replace(/    diff-screen:[\s\S]*$/, "    {}\n").replace("  by_name:\n    {}", "  by_name: {}"),
+        models("shadow", shipped),
+        shipped.replace("skip_paths: [bun.lock]", 'skip_paths: ["**/bun.lock"]'),
+        shipped.replace(/^  mode: enforce[^\n]*\n/m, ""),
+      ];
+      for (const text of bad) {
+        const e = policyError(policyWith("gates.yaml", text));
+        expect(e.file).toEndWith("gates.yaml");
+        expect(e.path.startsWith("/decisions")).toBe(true);
       }
     });
   });
@@ -233,8 +401,9 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
     expect(r.small.model).toBe("anthropic/claude-haiku-5-5");
   });
 
-  test("budget roster is Haiku 5.5 on every tier", () => {
-    for (const spec of Object.values(p.rosters.budget)) expect(spec.model).toMatch(/(^|\/)claude-haiku-5-5$/);
+  test("budget roster is Haiku 5.5 on every tier but review's, which is Sonnet 5.5", () => {
+    // Haiku on every tier but review's, Sonnet, so a review runs on another model than implement's (Plan 03 Task 11).
+    expect(Object.fromEntries(Object.entries(p.rosters.budget).map(([t, spec]) => [t, spec.model]))).toEqual({ small: "anthropic/claude-haiku-5-5", medium: "claude-sonnet-5-5", large: "anthropic/claude-haiku-5-5" });
   });
 
   test("portable roster uses only zero-retention OpenCode Go models, with review on a different family", () => {
@@ -272,6 +441,8 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
     expect(zones.research.tiers).toEqual(["T0", "T1", "T2", "T3"]);
     expect(zones.archon.openWeb).toBeUndefined();
     expect(zones.hermes.openWeb).toBeUndefined();
+    // The review container (design §3.5): the review model's API and CodeRabbit's three hosts, no tier, so no registry.
+    expect(zones.review).toEqual({ tiers: [], hosts: ["api.anthropic.com", "cli.coderabbit.ai", "app.coderabbit.ai", "ide.coderabbit.ai"] });
     expect(tiers.T0.hosts).toEqual([]);
     expect(tiers.T3.hosts).toEqual([]);
     expect(tiers.T2.hosts).toEqual(["context7.com", "deepwiki.com"]);
@@ -364,6 +535,17 @@ describe("loadPolicy rejects bad policy with the file and path", () => {
       );
       expect(policyError(policyWith("trusted_sources.yaml", hermes)).path).toBe("/zones/hermes/tiers/2");
     }
+  });
+
+  test("the review zone lists no tier, and no forge host", () => {
+    const ts = readFileSync("policy/trusted_sources.yaml", "utf8");
+    const at = "  review:";
+    expect(ts.split(at).length).toBe(2);
+    const tiered = policyError(policyWith("trusted_sources.yaml", ts.replace(/(\n  review:[^\n]*\n    tiers: )\[\]/, "$1[T1]")));
+    expect(tiered.path).toBe("/zones/review/tiers");
+    const forge = policyError(policyWith("trusted_sources.yaml", ts.replace("- ide.coderabbit.ai", "- ide.coderabbit.ai\n      - github.com")));
+    expect(forge.path).toBe("/zones/review/hosts/4");
+    expect(forge.message).toContain('"github.com" is a forge host (github.com); the review zone has no forge route (design §3.5)');
   });
 
   test("a host that isn't a plain domain", () => {

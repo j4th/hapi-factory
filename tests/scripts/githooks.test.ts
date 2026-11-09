@@ -8,11 +8,15 @@
  * mise.toml pins, so the hooks run exactly as they would in a checkout. The
  * personal strings are made up.
  */
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { randomBytes } from "node:crypto";
 import { chmodSync, cpSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+
+// These tests commit through the real hooks with real git, and a CI runner is slower than a laptop: 5 s, bun's
+// default, is too close (a merge commit's test took 3.0 s in CI). The default is per file.
+setDefaultTimeout(30_000);
 
 const REPO = resolve(import.meta.dir, "../..");
 const HOOKS = join(REPO, ".githooks");

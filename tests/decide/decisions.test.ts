@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import bashGate from "../../policy/decisions/bash-gate";
+import diffScreen from "../../policy/decisions/diff-screen";
 import resultScreen from "../../policy/decisions/result-screen";
 import { KEY_PATTERNS } from "../../policy/decisions/write-gate";
 import type { Answers } from "../../src/decide/index";
@@ -32,6 +33,23 @@ test("result-screen: wrap at 0.7, flag at 0.5, else allow", () => {
   expect(resultScreen.verdict(a(0.69))).toBe("flag");
   expect(resultScreen.verdict(a(0.5))).toBe("flag");
   expect(resultScreen.verdict(a(0.49))).toBe("allow");
+});
+
+test("the engine's files are named for their slugs, their fallback is hold, and each says its hold and note", () => {
+  expect(diffScreen.name).toBe("diff-screen");
+  expect(diffScreen.fallback).toBe("hold");
+  expect(diffScreen.says.hold.length).toBeGreaterThan(0);
+  expect(diffScreen.says.note.length).toBeGreaterThan(0);
+});
+
+test("diff-screen: hold at 0.7 on reviewer_steer; note at 0.5 on any question; else pass", () => {
+  const a = (reviewer_steer: number, loosened_check: number, stand_in: number, beyond_goal: number): Answers =>
+    Object.fromEntries(Object.entries({ reviewer_steer, loosened_check, stand_in, beyond_goal }).map(([k, noul]) => [k, { type: "noul", noul }]));
+  const v = diffScreen.verdict;
+  expect(v(a(0.7, 0, 0, 0))).toBe("hold");
+  for (const note of [a(0.69, 0, 0, 0), a(0.5, 0, 0, 0), a(0, 1, 0, 0), a(0, 0, 1, 0), a(0, 0, 0, 0.5), a(0, 1, 1, 1)]) expect(v(note)).toBe("note");
+  expect(v(a(0.49, 0.49, 0.49, 0.49))).toBe("pass");
+  expect(() => v({ reviewer_steer: { type: "noul", noul: 0 } })).toThrow();
 });
 
 test("a decision whose answer is missing is an error, not a quiet allow", () => {

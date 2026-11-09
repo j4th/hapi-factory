@@ -23,10 +23,27 @@ test("RUN_PATHS holds the run container's fixed paths", () => {
     runFile: "/run/hapi/run.json",
     ledgerDir: "/tmp/hapi-guard",
     pack: "/.archon/workflows/hapi",
+    order: "/run/hapi/order.json",
+    task: "/run/hapi/task.md",
+    inputs: "/run/hapi/inputs",
   });
   expect(RUN_PATHS.piDir).toBe(PI_AGENT_DIR);
+  // The host's copies of the work order and its task text, beside run.json: Task 11's nodes and prompts read them, never the clone's order.yaml.
+  expect([RUN_PATHS.order, RUN_PATHS.task]).toEqual(["/run/hapi/order.json", "/run/hapi/task.md"]);
   const run: RunFile = { run_id: "r", work_order: "w", traceparent: "t", budget_usd: 1, public: false, workflow: "x", started_at: "now" };
   expect(Object.keys(run)).toHaveLength(7);
+  // A run of Plan 03 also says its kind, round, turn budget and base commit.
+  const engine: RunFile = { ...run, kind: "fix", round: 1, turns: 10, base: "a".repeat(40) };
+  expect(Object.keys(engine)).toHaveLength(11);
+  // A review's or fix's inputs dir (Plan 03 Task 8), beside run.json; a review's run file says whether CodeRabbit's step runs.
+  expect(RUN_PATHS.inputs).toBe("/run/hapi/inputs");
+  const review: RunFile = { ...engine, kind: "review", round: 0, coderabbit: false };
+  expect(Object.keys(review)).toHaveLength(12);
+  // Task 11: the commit the run starts from (factory-task's gates hold HEAD to it), and the smoke sidecar's port when the repo names one.
+  const smoked: RunFile = { ...engine, sha: "b".repeat(40), sidecar_port: 8080 };
+  expect(Object.keys(smoked)).toHaveLength(13);
+  // Fix round 1: the model its session runs on, which factory-task's commit trailer reads with jq.
+  expect(Object.keys({ ...smoked, model: "anthropic/claude-opus-5-5" } satisfies RunFile)).toHaveLength(14);
 });
 
 test("config.yaml holds assistants.pi.enableExtensions: true for every roster (H-181(b))", () => {
@@ -134,12 +151,23 @@ test("archon env is plain KEY=value lines, comments and blank lines, each key on
 
 test("archon tiers come from the selected roster", () => {
   const c = config(p, "budget");
-  for (const tier of TIERS) expect(modelId(c.tiers[tier].model)).toBe("claude-haiku-5-5");
+  // Haiku on every Pi tier; the review's tier is Sonnet, so a review runs on another model than implement's (Task 11).
+  for (const tier of ["small", "large"] as const) expect(modelId(c.tiers[tier].model)).toBe("claude-haiku-5-5");
   expect(c.tiers).toEqual({
     small: { provider: "pi", model: "anthropic/claude-haiku-5-5", effort: "low" },
-    medium: { provider: "claude", model: "claude-haiku-5-5", effort: "medium" },
+    medium: { provider: "claude", model: "claude-sonnet-5-5", effort: "medium" },
     large: { provider: "pi", model: "anthropic/claude-haiku-5-5", effort: "low" },
   });
+});
+
+test("@review is a claude-provider alias on the anthropic and budget rosters, on another model than @implement's: factory-review's node is Claude Code's", () => {
+  for (const roster of ["anthropic", "budget"] as const) {
+    const c = YAML.parse(emitArchon(p, roster)["run-config.yaml"]!);
+    expect([roster, c.aliases["@review"].provider]).toEqual([roster, "claude"]);
+    expect([roster, modelId(c.aliases["@review"].model) === modelId(c.aliases["@implement"].model)]).toEqual([roster, false]);
+  }
+  // portable has no claude tier: a review there is refused at start (H-249).
+  expect(YAML.parse(emitArchon(p, "portable")["run-config.yaml"]!).aliases["@review"].provider).toBe("pi");
 });
 
 test("archon defaults to the anthropic roster; portable runs every tier on Pi", () => {

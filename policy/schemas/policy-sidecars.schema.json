@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "policy-sidecars.schema.json",
+  "title": "policy/sidecars.yaml",
+  "description": "The central list of sidecars. A repo's overlay may name one and a data dir; it can't bring its own image or command.",
+  "type": "object",
+  "properties": {
+    "sidecars": {
+      "description": "The sidecars by name.",
+      "type": "object",
+      "propertyNames": {
+        "$ref": "policy-defs.schema.json#/$defs/slug"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "image": {
+            "description": "The image, pinned by digest.",
+            "$ref": "policy-defs.schema.json#/$defs/imagePin"
+          },
+          "command": {
+            "description": "The argv the sidecar runs.",
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "port": {
+            "description": "The port it listens on.",
+            "$ref": "policy-defs.schema.json#/$defs/port"
+          },
+          "limits": {
+            "description": "Fail-closed defaults to tune, always hard and central only: the container's pid and memory limits (docker run --pids-limit, --memory), and the most files and MiB the data exported to it from the run's commit may hold (a run whose data dir holds more is refused).",
+            "type": "object",
+            "properties": {
+              "pids": {
+                "description": "docker run --pids-limit.",
+                "$ref": "policy-defs.schema.json#/$defs/count"
+              },
+              "memory_mb": {
+                "description": "docker run --memory, in MiB.",
+                "$ref": "policy-defs.schema.json#/$defs/count"
+              },
+              "data_files": {
+                "description": "The most files the data dir may hold at the run's commit.",
+                "$ref": "policy-defs.schema.json#/$defs/count"
+              },
+              "data_mb": {
+                "description": "The most MiB the data dir's files may hold together.",
+                "$ref": "policy-defs.schema.json#/$defs/count"
+              }
+            },
+            "required": [
+              "pids",
+              "memory_mb",
+              "data_files",
+              "data_mb"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "image",
+          "command",
+          "port",
+          "limits"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": [
+    "sidecars"
+  ],
+  "additionalProperties": false
+}

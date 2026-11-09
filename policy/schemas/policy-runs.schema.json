@@ -2,15 +2,15 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "policy-runs.schema.json",
   "title": "policy/runs.yaml",
-  "description": "The run launcher's limits (Plan 02): how many runs may be live, how long finished runs are kept and how large each run output may be. Every key is required: the loader fills no defaults.",
+  "description": "The run engine's limits (Plans 02 and 03): how many runs may be live, how long finished runs are kept, how large each run output and each run's disk may be, how often the poller polls, which phases and fix rounds a run has, how many times the operator may queue a failed work order again and a maintainer may ask a PR for a rework, and how large a review or fix run's inputs and each work-order file may be. Every key is required: the loader fills no defaults.",
   "type": "object",
   "properties": {
     "max_live": {
-      "description": "Runs that may be live at once; the launcher refuses the next one (no queue until Plan 03's poller).",
+      "description": "Runs that may be live at once; the launcher refuses the next one and the poller waits for a free slot.",
       "$ref": "policy-defs.schema.json#/$defs/count"
     },
     "retention_days": {
-      "description": "Days after a run's harvestedAt (set by Plan 03's harvester) that the launcher removes its files; a run with no harvestedAt is never removed, so Plan 02 removes nothing yet (H-206).",
+      "description": "Days after a run's harvestedAt (set by Plan 03's harvester) that the launcher removes its files, and never before the UTC month it started in has ended (the poller's monthly cap reads them); a run with no harvestedAt is never removed.",
       "$ref": "policy-defs.schema.json#/$defs/count"
     },
     "output_limits_mb": {
@@ -41,12 +41,114 @@
         "result"
       ],
       "additionalProperties": false
+    },
+    "disk": {
+      "description": "The run disk: the one filesystem every run's volumes share, checked before each start. Central only.",
+      "type": "object",
+      "properties": {
+        "gb": {
+          "description": "The most the run disk may be, in GiB, so no run can grow past it: a bigger one, or one that isn't its own filesystem, fails the check.",
+          "$ref": "policy-defs.schema.json#/$defs/count"
+        },
+        "enforcement": {
+          "description": "hard: hapi run start refuses while the run disk's check fails; soft: it warns and starts anyway.",
+          "$ref": "policy-defs.schema.json#/$defs/enforcement"
+        }
+      },
+      "required": [
+        "gb",
+        "enforcement"
+      ],
+      "additionalProperties": false
+    },
+    "poll_interval_s": {
+      "description": "Seconds between the poller's passes over the registered repos, 30 to 3600. Central only.",
+      "type": "integer",
+      "minimum": 30,
+      "maximum": 3600
+    },
+    "max_auto_rounds": {
+      "description": "Automatic runs per work order with no human action between them. The poller counts it; always hard: the poller's check, never softened by budgets.enforcement.poller.",
+      "$ref": "policy-defs.schema.json#/$defs/count"
+    },
+    "max_retries": {
+      "description": "Times the operator may queue a failed work order again (hapi retry); the command refuses one more. Always hard: never softened by budgets.enforcement.poller. Central only; 0 turns hapi retry off.",
+      "$ref": "policy-defs.schema.json#/$defs/rounds"
+    },
+    "max_rework_rounds": {
+      "description": "Rework runs a maintainer's hapi:rework label may start on one factory PR; past it the poller starts none and the PR waits for the operator. Always hard: never softened by budgets.enforcement.poller. Central only; 0 turns rework off.",
+      "$ref": "policy-defs.schema.json#/$defs/rounds"
+    },
+    "inputs_mb": {
+      "description": "The most, in MiB, a review or fix run's inputs copy may be (diff.patch, verify.json and findings.md together): the engine and the launcher refuse a larger one, never truncate it. Central only.",
+      "$ref": "policy-defs.schema.json#/$defs/count"
+    },
+    "work_order_kb": {
+      "description": "The most, in KiB, discovery reads of each work-order file (order.yaml, task.md, .factory/config.yaml): a larger one is a problem the work order can't run with, never truncated. Central only.",
+      "$ref": "policy-defs.schema.json#/$defs/count"
+    },
+    "phases": {
+      "description": "What a run does, and how many fix rounds it may make. An overlay may switch a phase on, never off, and lower the numbers.",
+      "type": "object",
+      "properties": {
+        "verify": {
+          "description": "The verify container runs the repo's gates. The poller (src/engine/pipeline.ts) starts it once a worker or fix run's host gates pass, and the harvester reads it.",
+          "type": "boolean"
+        },
+        "review": {
+          "description": "The review container reviews the diff. The poller starts it after verify (or the gates, with verify off), and the harvester reads it.",
+          "type": "boolean"
+        },
+        "coderabbit": {
+          "description": "The CodeRabbit CLI in the review container (flags.coderabbit is CodeRabbit's PR review, a different thing). startRun writes it into the review's run.json, and the poller and the harvester read its result.",
+          "type": "boolean"
+        },
+        "require_acceptance": {
+          "description": "'Ready to merge' needs the work order's acceptance tests (.factory/work/<id>/acceptance/) to exist and pass in the verify container.",
+          "type": "boolean"
+        },
+        "fix_rounds_before_pr": {
+          "description": "Fix rounds a run makes before it opens its PR; 0 makes none.",
+          "$ref": "policy-defs.schema.json#/$defs/rounds"
+        },
+        "fix_rounds_on_pr": {
+          "description": "Fix rounds on an open PR after a review or CodeRabbit finding; 0 makes none.",
+          "$ref": "policy-defs.schema.json#/$defs/rounds"
+        },
+        "round_turns": {
+          "description": "The most agent turns in one fix round.",
+          "$ref": "policy-defs.schema.json#/$defs/count"
+        },
+        "round_usd": {
+          "description": "The most one fix round may spend; at most budgets.run_usd (the loader checks it).",
+          "$ref": "policy-defs.schema.json#/$defs/usd"
+        }
+      },
+      "required": [
+        "verify",
+        "review",
+        "coderabbit",
+        "require_acceptance",
+        "fix_rounds_before_pr",
+        "fix_rounds_on_pr",
+        "round_turns",
+        "round_usd"
+      ],
+      "additionalProperties": false
     }
   },
   "required": [
     "max_live",
     "retention_days",
-    "output_limits_mb"
+    "output_limits_mb",
+    "disk",
+    "poll_interval_s",
+    "max_auto_rounds",
+    "max_retries",
+    "max_rework_rounds",
+    "inputs_mb",
+    "work_order_kb",
+    "phases"
   ],
   "additionalProperties": false
 }

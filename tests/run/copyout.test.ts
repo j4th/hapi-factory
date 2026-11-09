@@ -8,7 +8,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { COPY_SCRIPT, copyOut, HELPER_HOST_TIMEOUT_S, HELPER_KILL_AFTER_S, HELPER_TIMEOUT_S, LIST_SCRIPT, OUTPUT_FILES } from "../../src/run/copyout";
+import { COPY_SCRIPT, copyOut, HELPER_HOST_TIMEOUT_S, HELPER_KILL_AFTER_S, HELPER_TIMEOUT_S, LIST_SCRIPT } from "../../src/run/copyout";
+import { kindProfile, RUN_KINDS } from "../../src/run/kinds";
 import { PROJECT_LABEL, RUN_LABEL } from "../../src/stack/up";
 import { cleanup, tempDir } from "../secrets/helpers";
 import { type FakeFile, type FakeOptions, fakeRun, file } from "./helpers";
@@ -18,7 +19,9 @@ afterEach(cleanup);
 const ID = "ab12cd34ef56";
 const VOL = `hapi-run-${ID}-out`;
 const LIMITS = { bundle: 256, transcript: 64, decisions: 16, result: 4 };
-const TIMED_OUT = `timed out (after ${HELPER_TIMEOUT_S} s in the helper, or ${HELPER_HOST_TIMEOUT_S} s in all)`;
+const TIMED_OUT = `timed out or was killed (a bound of ${HELPER_TIMEOUT_S} s in the helper, or ${HELPER_HOST_TIMEOUT_S} s in all)`;
+/** A worker's outputs: the four names a worker or fix run may leave. */
+const WORKER = kindProfile("worker").outputs;
 
 /** A world with one output volume holding `files`, and a fresh destination dir. */
 function withVolume(files: Record<string, FakeFile>, o: FakeOptions = {}) {
@@ -31,8 +34,34 @@ function withVolume(files: Record<string, FakeFile>, o: FakeOptions = {}) {
 const MB = 1024 * 1024;
 
 describe("copyOut", () => {
-  test("OUTPUT_FILES are the four names a run may leave, each with its limit", () => {
-    expect(OUTPUT_FILES).toEqual(["result.json", "transcript.jsonl", "decisions.jsonl", "run.bundle"]);
+  test("each kind copies out only its own outputs, each within its limit", async () => {
+    // Every name any kind may leave, each over a 1 MB cap, in every kind's volume.
+    const big = file(new Uint8Array(1 * MB + 1));
+    const all = ["result.json", "transcript.jsonl", "decisions.jsonl", "run.bundle", "verify.json", "acceptance.junit.xml", "coderabbit.ndjson"];
+    const want = {
+      worker: ["result.json", "transcript.jsonl", "decisions.jsonl", "run.bundle"],
+      fix: ["result.json", "transcript.jsonl", "decisions.jsonl", "run.bundle"],
+      verify: ["result.json", "transcript.jsonl", "verify.json", "acceptance.junit.xml"],
+      review: ["result.json", "transcript.jsonl", "decisions.jsonl", "coderabbit.ndjson"],
+    } as const;
+    for (const kind of RUN_KINDS) {
+      const { f, dest } = withVolume(Object.fromEntries(all.map((n) => [n, file("{}")])));
+      const r = await copyOut(VOL, dest, kindProfile(kind).outputs, LIMITS, f.deps);
+      expect([kind, r.copied]).toEqual([kind, [...want[kind]]]);
+      const others = all.filter((n) => !(want[kind] as readonly string[]).includes(n));
+      expect([kind, r.problems]).toEqual([kind, [`the run's output volume holds ${others.length} names that are not run outputs (${others.join(", ").replace(/, ([^,]*)$/, " and $1")}): not copied`]]);
+      // Only the kind's own names were read.
+      expect([kind, f.calls.filter((c) => c.bytes).map((c) => c.cmd.at(-2))]).toEqual([kind, [...want[kind]]]);
+    }
+    // Each output's cap is its own limit's: verify.json is held to `result`, coderabbit.ndjson to `decisions`.
+    const v = withVolume({ "verify.json": big });
+    expect((await copyOut(VOL, v.dest, kindProfile("verify").outputs, { ...LIMITS, result: 1 }, v.f.deps)).problems).toEqual([
+      "verify.json is over its 1 MB limit (runs.output_limits_mb.result, policy/runs.yaml): not copied",
+    ]);
+    const c = withVolume({ "coderabbit.ndjson": big });
+    expect((await copyOut(VOL, c.dest, kindProfile("review").outputs, { ...LIMITS, decisions: 1 }, c.f.deps)).problems).toEqual([
+      "coderabbit.ndjson is over its 1 MB limit (runs.output_limits_mb.decisions, policy/runs.yaml): not copied",
+    ]);
   });
 
   test("copy-out refuses symlinks and oversize files (Review Focus 5), and a non-regular file (FIFO) is refused", async () => {
@@ -42,7 +71,7 @@ describe("copyOut", () => {
       "transcript.jsonl": file(new Uint8Array(1 * MB + 1)),
       "run.bundle": { kind: "dir" },
     });
-    const r = await copyOut(VOL, dest, { ...LIMITS, transcript: 1 }, f.deps);
+    const r = await copyOut(VOL, dest, WORKER, { ...LIMITS, transcript: 1 }, f.deps);
     expect(r.copied).toEqual([]);
     expect(r.problems).toEqual([
       "result.json in the run's output volume is not a regular file (a symlink, a FIFO or a directory): not copied",
@@ -59,18 +88,18 @@ describe("copyOut", () => {
 
   test("a file at exactly its limit is copied", async () => {
     const { f, dest } = withVolume({ "result.json": file(new Uint8Array(1 * MB).fill(0x7b)) });
-    const r = await copyOut(VOL, dest, { ...LIMITS, result: 1 }, f.deps);
+    const r = await copyOut(VOL, dest, WORKER, { ...LIMITS, result: 1 }, f.deps);
     expect([r.copied, r.problems]).toEqual([["result.json"], []]);
   });
 
-  test("only OUTPUT_FILES are copied; any other name is reported, not copied", async () => {
+  test("only the kind's outputs are copied; any other name is reported, not copied", async () => {
     const { f, dest } = withVolume({
       "result.json": file("{}"),
       "debug.txt": file("x"),
       ".hidden": file("x"),
       "evil\u001b[2J\nname": file("x"),
     });
-    const r = await copyOut(VOL, dest, LIMITS, f.deps);
+    const r = await copyOut(VOL, dest, WORKER, LIMITS, f.deps);
     expect(r.copied).toEqual(["result.json"]);
     expect(r.problems).toEqual(["the run's output volume holds 3 names that are not run outputs (debug.txt, .hidden and 1 not shown): not copied"]);
     expect(readdirSync(dest)).toEqual(["result.json"]);
@@ -80,7 +109,7 @@ describe("copyOut", () => {
 
   test("a missing output is no problem: a bash-only run writes no decisions, an unchanged one no bundle", async () => {
     const { f, dest } = withVolume({ "result.json": file("{}"), "transcript.jsonl": file("{}\n") });
-    const r = await copyOut(VOL, dest, LIMITS, f.deps);
+    const r = await copyOut(VOL, dest, WORKER, LIMITS, f.deps);
     expect([r.copied, r.problems]).toEqual([["result.json", "transcript.jsonl"], []]);
   });
 
@@ -88,7 +117,7 @@ describe("copyOut", () => {
     const bytes = new Uint8Array(4096).map((_, i) => (i * 37 + 0x80) & 0xff);
     bytes.set([0xff, 0xfe, 0xc3, 0x28, 0x00], 0);
     const { f, dest } = withVolume({ "run.bundle": file(bytes) });
-    const r = await copyOut(VOL, dest, LIMITS, f.deps);
+    const r = await copyOut(VOL, dest, WORKER, LIMITS, f.deps);
     expect(r.copied).toEqual(["run.bundle"]);
     expect(new Uint8Array(readFileSync(join(dest, "run.bundle")))).toEqual(bytes);
     // The file itself went through the byte runner; the text runner only listed names.
@@ -101,7 +130,7 @@ describe("copyOut", () => {
     // A umask that would leave a plain write group- and world-readable.
     const old = process.umask(0);
     try {
-      await copyOut(VOL, dest, LIMITS, f.deps);
+      await copyOut(VOL, dest, WORKER, LIMITS, f.deps);
     } finally {
       process.umask(old);
     }
@@ -115,11 +144,11 @@ describe("copyOut", () => {
     writeFileSync(join(dest, "result.json"), "stale");
     const runBytes = f.deps.runBytes;
     f.deps.runBytes = async () => ({ code: 124, stdout: new Uint8Array([1, 2]), stderr: "" });
-    let r = await copyOut(VOL, dest, LIMITS, f.deps);
+    let r = await copyOut(VOL, dest, WORKER, LIMITS, f.deps);
     expect(r.problems).toEqual([`copying result.json out ${TIMED_OUT}: not copied`]);
     expect(existsSync(join(dest, "result.json"))).toBe(false);
     f.deps.runBytes = async () => ({ code: 125, stdout: new Uint8Array(), stderr: "daemon says no" });
-    r = await copyOut(VOL, dest, LIMITS, f.deps);
+    r = await copyOut(VOL, dest, WORKER, LIMITS, f.deps);
     expect(r.problems).toEqual(["copying result.json out failed (helper exit 125): not copied"]);
     f.deps.runBytes = runBytes;
   });
@@ -128,7 +157,7 @@ describe("copyOut", () => {
     const { f, dest } = withVolume({ "result.json": file("{}") });
     const run = f.deps.run;
     f.deps.run = async (cmd, o) => (cmd.includes(LIST_SCRIPT) ? { code: 125, stdout: "", stderr: "daemon says no" } : run(cmd, o));
-    const r = await copyOut(VOL, dest, LIMITS, f.deps);
+    const r = await copyOut(VOL, dest, WORKER, LIMITS, f.deps);
     expect(r.copied).toEqual([]);
     expect(r.problems).toEqual(["listing the run's output volume failed (helper exit 125): nothing was copied"]);
     expect(f.calls.some((c) => c.bytes)).toBe(false);
@@ -137,14 +166,14 @@ describe("copyOut", () => {
   test("a volume that isn't there is a problem, and no helper mounts it: Docker would make an unlabelled one that nothing removes", async () => {
     const { f, dest } = withVolume({});
     f.world.volumes.delete(VOL);
-    const r = await copyOut(VOL, dest, LIMITS, f.deps);
+    const r = await copyOut(VOL, dest, WORKER, LIMITS, f.deps);
     expect(r).toEqual({ copied: [], problems: [`cannot find the run's output volume ${VOL} (docker volume inspect exited 1): nothing was copied`] });
     expect(f.calls.map((c) => c.cmd)).toEqual([["docker", "volume", "inspect", "--format", "{{.Name}}", VOL]]);
   });
 
   test("the helper runs --network none --read-only --user 1001:1001 -v <vol>:/out:ro with entrypoint sh, image the archon image", async () => {
     const { f, dest } = withVolume({ "result.json": file("{}") });
-    await copyOut(VOL, dest, LIMITS, f.deps);
+    await copyOut(VOL, dest, WORKER, LIMITS, f.deps);
     expect(f.calls[0]!.cmd).toEqual(["docker", "volume", "inspect", "--format", "{{.Name}}", VOL]);
     const helpers = f.calls.filter((c) => c.cmd.includes("--entrypoint"));
     expect(helpers).toHaveLength(2);
@@ -154,7 +183,8 @@ describe("copyOut", () => {
         // The host's bound on the whole helper: TERM, which the docker CLI passes on, then KILL.
         "timeout", "-k", String(HELPER_KILL_AFTER_S), String(HELPER_HOST_TIMEOUT_S),
         "docker", "run", "--rm", "--pull", "never", "--network", "none", "--read-only", "--user", "1001:1001", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
-        "--label", RUN_LABEL, "--label", `${PROJECT_LABEL}=hapi`, "-v", `${VOL}:/out:ro`, "--entrypoint", "sh", "hapi-factory/archon:0.12.1", "-c", script,
+        // The run labels, so `down` finds it, and org.hapi.helper=copyout, so the audit holds it to the helpers' invariants.
+        "--label", RUN_LABEL, "--label", `${PROJECT_LABEL}=hapi`, "--label", "org.hapi.helper=copyout", "--label", "com.docker.compose.project=", "--label", "com.docker.compose.service=", "--label", "com.docker.compose.version=", "-v", `${VOL}:/out:ro`, "--entrypoint", "sh", "hapi-factory/archon:0.12.1", "-c", script,
       ]);
     }
     // The listing and every read are bounded in time inside the helper too, below the host's bound.
@@ -166,9 +196,9 @@ describe("copyOut", () => {
   test("a helper that never returns, as on a hung daemon, fails its step at the host's bound instead of hanging", async () => {
     const files = { "result.json": file("{}"), "transcript.jsonl": file("{}\n") };
     const list = withVolume(files, { hangs: (c) => c.includes(LIST_SCRIPT) });
-    expect(await copyOut(VOL, list.dest, LIMITS, list.f.deps)).toEqual({ copied: [], problems: [`listing the run's output volume ${TIMED_OUT}: nothing was copied`] });
+    expect(await copyOut(VOL, list.dest, WORKER, LIMITS, list.f.deps)).toEqual({ copied: [], problems: [`listing the run's output volume ${TIMED_OUT}: nothing was copied`] });
     const read = withVolume(files, { hangs: (c) => c.includes(COPY_SCRIPT) && c.at(-2) === "result.json" });
-    expect(await copyOut(VOL, read.dest, LIMITS, read.f.deps)).toEqual({ copied: ["transcript.jsonl"], problems: [`copying result.json out ${TIMED_OUT}: not copied`] });
+    expect(await copyOut(VOL, read.dest, WORKER, LIMITS, read.f.deps)).toEqual({ copied: ["transcript.jsonl"], problems: [`copying result.json out ${TIMED_OUT}: not copied`] });
     expect(readdirSync(read.dest)).toEqual(["transcript.jsonl"]);
   });
 });

@@ -5,7 +5,8 @@
  *   `hapi policy build` (src/generate/pi.ts; docs/generated-configs.md);
  * - the run file (`paths.runFile`, a `RunFile` from src/generate/archon.ts) the
  *   launcher binds read-only: the work order's id, its trace context, the run's
- *   budget and whether the repo is public;
+ *   budget, its turn budget (`turns`, which Task 7's launcher always writes, so a
+ *   missing one fails closed) and whether the repo is public;
  * - Archon's per-node env: `WORKFLOW_ID` and `ARCHON_NODE_EXECUTION`
  *   (`{runId, path, invocation, attempt: {id, ...}}`, spike 08 finding 3), the
  *   decision log's join keys for Task 7's guard-ran check.
@@ -92,9 +93,11 @@ function list<T>(v: unknown, at: string, each: (x: unknown, at: string) => T): T
   if (!Array.isArray(v)) throw new Problem(`${at} must be a list`);
   return v.map((x, i) => each(x, `${at}[${i}]`));
 }
+/** An absolute path with no ".." segment: the guard's roots are resolved with realpathSync, which applies ".." lexically (paths.ts realDir). */
 function absPath(v: unknown, at: string): string {
   const s = str(v, at);
   if (!isAbsolute(s)) throw new Problem(`${at} must be an absolute path`);
+  if (s.split("/").includes("..")) throw new Problem(`${at} must not hold ".."`);
   return s;
 }
 
@@ -201,7 +204,7 @@ export function loadSettings(file: string): GuardSettings {
 }
 
 /** Read and check the run file. Throws a Problem. */
-export function loadRunFile(file: string): RunFile {
+export function loadRunFile(file: string): RunFile & { turns: number } {
   const raw = readJson(file);
   if (!isObj(raw)) throw new Problem(`${file}: must be an object`);
   return inFile(file, () => {
@@ -214,8 +217,15 @@ export function loadRunFile(file: string): RunFile {
       public: bool(r.public, "public"),
       workflow: str(r.workflow, "workflow"),
       started_at: str(r.started_at, "started_at"),
+      turns: wholeAtLeastOne(r.turns, "turns"),
     };
   });
+}
+
+/** A limit's count: a whole number of at least 1. Required: a limit has no fail-open default (ruling m48(2)). */
+function wholeAtLeastOne(v: unknown, at: string): number {
+  if (typeof v !== "number" || !Number.isInteger(v) || v < 1) throw new Problem(`${at} must be a whole number of at least 1`);
+  return v;
 }
 
 /** The node attempt this process runs, from Archon's env (exec-environment.ts:81-90). Throws a Problem. */

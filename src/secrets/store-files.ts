@@ -129,7 +129,10 @@ interface Holder {
 /** Linux's largest pid (`/proc/sys/kernel/pid_max` can't exceed it). */
 const PID_MAX = 4_194_304;
 
-const HOLDER = /^hapi secrets ([a-z][a-z-]{0,30}), pid (\d{1,7})(?: \(start (\d{1,20})\))?, started (\d{4}-\d\d-\d\dT[0-9:.]+Z), id [0-9a-f]{8}, store /;
+/** A lock's line: the command that holds it (`hapi secrets drill`, `hapi poll`), its pid, start, time, id and store. */
+const HOLDER = /^(hapi [a-z][a-z -]{0,40}), pid (\d{1,7})(?: \(start (\d{1,20})\))?, started (\d{4}-\d\d-\d\dT[0-9:.]+Z), id [0-9a-f]{8}, store /;
+/** What a lock's `label` may be: `hapi`, then its command's words. */
+const LABEL = /^hapi [a-z][a-z -]{0,40}$/;
 
 /** A process's start time in clock ticks since boot (field 22 of `/proc/<pid>/stat`), or undefined if it can't be read. */
 function processStart(pid: number): string | undefined {
@@ -143,9 +146,9 @@ function processStart(pid: number): string | undefined {
 }
 
 /** The lock's one line: the command, this process (pid and start time), when, a random id (so each holder's line is its own) and the store. */
-function holderLine(what: string, store: string): string {
+function holderLine(label: string, store: string): string {
   const start = processStart(process.pid);
-  return `hapi secrets ${what}, pid ${process.pid}${start === undefined ? "" : ` (start ${start})`}, started ${new Date().toISOString()}, id ${randomUUID().slice(0, 8)}, store ${store}\n`;
+  return `${label}, pid ${process.pid}${start === undefined ? "" : ` (start ${start})`}, started ${new Date().toISOString()}, id ${randomUUID().slice(0, 8)}, store ${store}\n`;
 }
 
 function parseHolder(text: string): Holder | undefined {
@@ -156,7 +159,7 @@ function parseHolder(text: string): Holder | undefined {
   return { what: m[1]!, pid, ...(m[3] === undefined ? {} : { start: m[3] }), started: m[4]! };
 }
 
-const describeHolder = (h: Holder) => `hapi secrets ${h.what} (pid ${h.pid}, started ${h.started})`;
+const describeHolder = (h: Holder) => `${h.what} (pid ${h.pid}, started ${h.started})`;
 
 /** Whether the lock's process still runs: its pid exists, and (when both are known) started when the lock says. */
 function running(h: Holder): boolean {
@@ -203,9 +206,9 @@ async function removeIfOurs(path: string, text: string): Promise<void> {
  * both take a new one: only the command holding `.clearing` removes a lock it
  * didn't make, and only if the lock still holds the stale line it read.
  */
-async function clearStale(lock: string, seen: string, holder: Holder, o: { store: string; what: string }): Promise<void> {
+async function clearStale(lock: string, seen: string, holder: Holder, o: { store: string; label: string }): Promise<void> {
   const guard = `${lock}.clearing`;
-  const mine = holderLine(o.what, o.store);
+  const mine = holderLine(o.label, o.store);
   try {
     await writeNewSecretFile(guard, mine);
   } catch (e) {
@@ -218,7 +221,7 @@ async function clearStale(lock: string, seen: string, holder: Holder, o: { store
   try {
     if ((await readText(lock)) === seen) {
       await rm(lock, { force: true });
-      console.error(`hapi secrets ${o.what}: removed a stale lock on ${o.store}: ${describeHolder(holder)} is no longer running`);
+      console.error(`${o.label}: removed a stale lock on ${o.store}: ${describeHolder(holder)} is no longer running`);
     }
   } finally {
     await removeIfOurs(guard, mine);
@@ -229,7 +232,10 @@ async function clearStale(lock: string, seen: string, holder: Holder, o: { store
 /**
  * Run `fn` holding the lock on `store` (`lockPath`), so only one `hapi
  * secrets` command at a time reads and changes a store and its recipients
- * file. `what` names the command in the lock's line. The lock is made whole
+ * file. `what` names the command in the lock's line (`hapi secrets <what>`), or
+ * `o.label` does, whole, for a lock another command holds (`hapi poll`, `hapi
+ * retry`, `hapi run`), so a refusal and a signal's line name the real command.
+ * The lock is made whole
  * and at once (a temp file hard-linked into place, which fails if the lock
  * exists), and holds this process's pid. It guards this copy of the store on
  * this machine, for this user; other machines have their own copies, and
@@ -244,15 +250,17 @@ async function clearStale(lock: string, seen: string, holder: Holder, o: { store
  *   hapi removes it, says so in one line, and takes the lock;
  * - it names no process: a SecretError says to remove it by hand.
  */
-export async function withStoreLock<T>(store: string, what: string, fn: () => Promise<T>, o: { env: Env; uid?: number }): Promise<T> {
+export async function withStoreLock<T>(store: string, what: string, fn: () => Promise<T>, o: { env: Env; uid?: number; label?: string }): Promise<T> {
+  const label = o.label ?? `hapi secrets ${what}`;
+  if (!LABEL.test(label)) throw new Error(`not a lock label: ${JSON.stringify(label.slice(0, 60))}`);
   const rt = runtimeDir(o.env);
   const uid = o.uid === undefined ? {} : { uid: o.uid };
   await secureDir(rt, dirname(rt), uid);
   await secureDir(join(rt, "locks"), dirname(rt), uid);
   const lock = await lockPath(store, o.env);
-  const mine = holderLine(what, resolve(store));
+  const mine = holderLine(label, resolve(store));
   // Registered first, so a signal from here on never leaves this command's lock behind.
-  const release = onInterrupt(() => (removeIfOursSync(lock, mine) ? `released the lock on ${store}` : undefined), `hapi secrets ${what}`);
+  const release = onInterrupt(() => (removeIfOursSync(lock, mine) ? `released the lock on ${store}` : undefined), label);
   try {
     for (let attempt = 1; ; attempt++) {
       if (attempt > 4) throw new SecretError(`the lock on ${store} (${lock}) keeps changing hands: run this again`);
@@ -271,7 +279,7 @@ export async function withStoreLock<T>(store: string, what: string, fn: () => Pr
       if (running(holder)) {
         throw new SecretError(`another command, ${describeHolder(holder)}, is using ${store}: wait for it to end, or stop it, and run this again. hapi never takes the lock (${lock}) while its process runs`);
       }
-      await clearStale(lock, seen, holder, { store, what });
+      await clearStale(lock, seen, holder, { store, label });
     }
     return await fn();
   } finally {

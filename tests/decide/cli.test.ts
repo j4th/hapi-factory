@@ -77,6 +77,22 @@ test("an unknown decision name exits 2 and lists the known names", async () => {
   expect(text).not.toContain("write-gate");
 });
 
+test("hapi decide runs the engine's decisions", async () => {
+  const { out, err } = capture();
+  const state = JSON.stringify({ goal: "A fortune-cookie MCP server.", path: "src/a.ts", part: "whole", diff: "diff --git a/src/a.ts b/src/a.ts\n+export const a = 1;\n" });
+  expect(await decideCommand(["diff-screen", "--mock"], { readStdin: async () => state, env: {} })).toBe(0);
+  expect(out).toHaveLength(1);
+  const r = JSON.parse(out[0]!);
+  expect(r.via).toBe("mock");
+  expect(["pass", "note", "hold"]).toContain(r.verdict);
+  expect(Object.keys(r.answers).sort()).toEqual(["beyond_goal", "loosened_check", "reviewer_steer", "stand_in"]);
+  // An engine decision's state is the harvester's JSON object, never free text.
+  expect(await decideCommand(["diff-screen", "--mock"], { readStdin: async () => "not json", env: {} })).toBe(2);
+  expect(err.join("\n")).toContain("a JSON object");
+  expect(await main(["decide", "nope", "--mock"])).toBe(2);
+  expect(err.join("\n")).toContain("Known: bash-gate, result-screen, diff-screen");
+});
+
 test("keys come only from HAPI_JEV_OPENROUTER_API_KEY and ANTHROPIC_API_KEY", async () => {
   const { out } = capture();
   const seenUrls: string[] = [];

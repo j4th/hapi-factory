@@ -1,8 +1,10 @@
 # yaml-language-server: $schema=../schemas/policy-roster.schema.json
 #
-# budget: the first end-to-end runs (spec §12). Haiku 5.5 on every tier, with
-# the same providers and efforts as the anthropic roster. Keep prompts under
-# 100K tokens.
+# budget: the first end-to-end runs (spec §12). Haiku 5.5 on every Pi tier,
+# with the same providers and efforts as the anthropic roster. The review's
+# tier is Sonnet 5.5, so a review runs on another model than implement's
+# (Plan 03 Task 11; the launcher refuses a review on implement's own model).
+# Keep prompts under 100K tokens.
 small:  { provider: pi, model: anthropic/claude-haiku-5-5, effort: low }
-medium: { provider: claude, model: claude-haiku-5-5, effort: medium }
+medium: { provider: claude, model: claude-sonnet-5-5, effort: medium }        # review, eval judge
 large:  { provider: pi, model: anthropic/claude-haiku-5-5, effort: low, retry_effort: high }

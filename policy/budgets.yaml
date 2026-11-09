@@ -6,7 +6,8 @@
 # workspaces and the OpenRouter keys by hand or API (Plan 01 Task 4 runbook).
 # run_usd and hermes_max_turns are compiled into Hermes, Archon and hapi-guard.
 # enforcement says what each enforcer does at run_usd: hard stops the run, soft
-# flags it (spec §13.3) and lets it finish.
+# flags it (spec §13.3) and lets it finish. The poller applies the same two
+# modes to the repo_monthly_usd and daily_usd caps it checks before a run starts.
 # The total stays within the $200/month credit; the default workspace is unused.
 workspaces:               # monthly spend limit per Anthropic Console workspace
   hapi-hermes: 60
@@ -16,6 +17,9 @@ openrouter_monthly_usd: 20
 jev_monthly_usd: 2        # Jev's own OpenRouter key
 run_usd: 3.00             # per-run target
 hermes_max_turns: 60      # Hermes agent.max_turns
+repo_monthly_usd: 25.00   # per registered repo, per UTC calendar month; the poller sums a repo's runs against it (an overlay may lower it)
+daily_usd: 10.00          # all repos together, per UTC calendar day; the poller reads it (central only)
 enforcement:
   hapi_guard: hard        # Pi's hapi-guard extension (Plan 02 Task 5)
   archon: hard            # Archon's factory-task budget (Plan 03)
+  poller: hard            # the poller's repo_monthly_usd and daily_usd checks: hard refuses the run, soft starts it and flags it

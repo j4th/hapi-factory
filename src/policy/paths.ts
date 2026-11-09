@@ -40,8 +40,9 @@ export const UNPROTECTED: Readonly<PathModes> = Object.freeze({ interactive: "al
 
 const compiled = new Map<string, RegExp>();
 
-function globRegExp(glob: string): RegExp {
-  const cached = compiled.get(glob);
+function globRegExp(glob: string, caseSensitive = false): RegExp {
+  const cacheKey = `${caseSensitive ? "s" : "i"}\0${glob}`;
+  const cached = compiled.get(cacheKey);
   if (cached) return cached;
   // Consecutive "**" segments mean the same as one.
   const segs = glob.split("/").filter((s, i, all) => !(s === "**" && all[i - 1] === "**"));
@@ -60,8 +61,8 @@ function globRegExp(glob: string): RegExp {
     const body = seg.replace(/[.+^${}()|[\]\\*?]/g, (c) => (c === "*" ? "[^/]*" : c === "?" ? "[^/]" : `\\${c}`));
     src += sep + body;
   });
-  const re = new RegExp(`^${src}$`, "iu");
-  compiled.set(glob, re);
+  const re = new RegExp(`^${src}$`, caseSensitive ? "u" : "iu");
+  compiled.set(cacheKey, re);
   return re;
 }
 
@@ -69,9 +70,13 @@ function globRegExp(glob: string): RegExp {
  * Whether a protected-path glob matches a path. The path must already be
  * normalized and repo-relative ("a/b", no "./", "//" or trailing "/");
  * `effectiveModes` normalizes it for you.
+ *
+ * `caseSensitive` is for a glob that grants rather than protects, such as a work
+ * order's piece scope (the harvester's scope gate): there, ignoring case would
+ * let more files through, so it matches case as git's pathspecs do.
  */
-export function globMatches(glob: string, path: string): boolean {
-  return globRegExp(glob).test(path);
+export function globMatches(glob: string, path: string, o: { caseSensitive?: boolean } = {}): boolean {
+  return globRegExp(glob, o.caseSensitive === true).test(path);
 }
 
 /** The first control character in a string: Unicode category Cc, U+0000-U+001F and U+007F-U+009F. */

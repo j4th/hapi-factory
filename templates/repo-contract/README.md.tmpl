@@ -1,0 +1,21 @@
+# {{name}}
+
+Made from [hapi-factory](https://github.com/{{owner}}/hapi-factory)'s repo contract: work is planned in planning PRs, built by the factory, and merged by the maintainer.
+
+## Quick start
+
+You need [mise](https://mise.jdx.dev). It installs every other tool at its pinned version.
+
+```bash
+mise install && mise run setup && mise run check
+```
+
+`mise tasks` lists the rest: `fmt`, `lint`, `test`, `smoke` and `scan`.
+
+## How changes land
+
+Every change reaches `main` through a pull request, with the `ci / gates` check green and the maintainer's approval; a PR that touches `.github/workflows/` is reviewed by hand, since it runs its own copy of the checks, and so is one that changes the `mise` tasks, configs or tests that `ci / check` runs, since they change what it checks. Planning PRs bring work orders and their acceptance tests; the factory opens one PR per work order; only the maintainer merges. [CONTRIBUTING.md](CONTRIBUTING.md) has the details, and [SECURITY.md](SECURITY.md) says how to report a vulnerability.
+
+## License
+
+[MIT](LICENSE).

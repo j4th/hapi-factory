@@ -92,6 +92,21 @@ describe("secrets.provider and secrets.check", () => {
     expect(r.check.detail).toContain("hermes/SLACK_BOT_TOKEN (hapi-hermes-slack-bot-token) is empty");
   });
 
+  test("an absent optional secret doesn't fail secrets.check", async () => {
+    // fullStore() holds no CodeRabbit key: stack/secrets.yaml lists it optional, so resolve leaves it out.
+    expect(Object.keys(fullStore())).not.toContain("hapi-review-coderabbit-api-key");
+    const { w } = await sopsWorld();
+    const r = await results(w);
+    expect([r.check.status, r.check.detail]).toEqual(["pass", expect.stringContaining("17 of 18 secrets found")]);
+    expect(r.check.detail).toContain("1 optional one absent or empty (review/CODERABBIT_API_KEY)");
+    // Empty is the same; a value resolve would refuse is not.
+    const { w: e } = await sopsWorld({ ...fullStore(), "hapi-review-coderabbit-api-key": "" });
+    expect((await results(e)).check.status).toBe("pass");
+    const { w: q } = await sopsWorld({ ...fullStore(), "hapi-review-coderabbit-api-key": "it's quoted" });
+    const bad = await results(q);
+    expect([bad.check.status, bad.check.detail]).toEqual(["fail", expect.stringContaining("review/CODERABBIT_API_KEY (hapi-review-coderabbit-api-key) is invalid")]);
+  });
+
   test("a value resolve would refuse is invalid, and fails", async () => {
     const values = fullStore();
     values["hapi-research-exa-api-key"] = "it's quoted";

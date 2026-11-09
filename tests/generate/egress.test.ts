@@ -8,7 +8,7 @@ import type { Policy, ZoneName } from "../../src/policy/types";
 import { zoneHosts } from "../../src/policy/zones";
 
 const p = loadPolicy("policy");
-const ZONES: ZoneName[] = ["hermes", "archon", "research"];
+const ZONES: ZoneName[] = ["hermes", "archon", "research", "review"];
 const conf = (zone: ZoneName, policy: Policy = p) => emitEgress(policy)[`${zone}.squid.conf`]!;
 /** The directive lines: comments and blank lines dropped. */
 const directives = (text: string) =>
@@ -42,7 +42,30 @@ function withArchonHosts(hosts: string[]): Policy {
 }
 
 test("emitEgress returns one squid.conf per zone", () => {
-  expect(Object.keys(emitEgress(p)).sort()).toEqual(["archon.squid.conf", "hermes.squid.conf", "research.squid.conf"]);
+  expect(Object.keys(emitEgress(p)).sort()).toEqual(["archon.squid.conf", "hermes.squid.conf", "research.squid.conf", "review.squid.conf"]);
+});
+
+test("the review zone allows exactly .api.anthropic.com, .app.coderabbit.ai, .cli.coderabbit.ai and .ide.coderabbit.ai, and a forge host there is refused", () => {
+  const c = conf("review");
+  // The review model's API and CodeRabbit's three hosts: no tier (so no registry), no forge, nothing else.
+  expect(allowed(c)).toEqual([".api.anthropic.com", ".app.coderabbit.ai", ".cli.coderabbit.ai", ".ide.coderabbit.ai"]);
+  expect(p.trustedSources.zones.review).toEqual({ tiers: [], hosts: ["api.anthropic.com", "cli.coderabbit.ai", "app.coderabbit.ai", "ide.coderabbit.ai"] });
+  expect(directives(c).filter((l) => l.startsWith("http_access allow"))).toEqual(["http_access allow CONNECT allowed"]);
+  expect(c.trim().endsWith("http_access deny all")).toBe(true);
+  const head = c.split("\n").filter((l) => l.startsWith("# ")).map((l) => l.slice(2)).join(" ");
+  expect(head).toContain("Zone review (no tiers): the review container: the review model's API and CodeRabbit's CLI; no forge route, no registry.");
+  // A policy built in code that adds a forge host, directly or through a tier, is refused.
+  for (const host of ["github.com", "api.github.com", "GitLab.com"]) {
+    const q = structuredClone(p);
+    q.trustedSources.zones.review.hosts.push(host);
+    expect(() => emitEgress(q)).toThrow(`review zone: ${JSON.stringify(host)} is a forge host (${forgeDomain(host)}); the review zone has no forge route (design §3.5)`);
+  }
+  // A tier at all is refused there, as the schema's maxItems: 0 refuses it: a tier would add a registry, or a forge.
+  for (const tiers of [["T0"], ["T1"], ["T0", "T1"]] as const) {
+    const tiered = structuredClone(p);
+    tiered.trustedSources.zones.review.tiers = [...tiers];
+    expect(() => emitEgress(tiered)).toThrow(`review zone: it lists tiers (${tiers.length}), where it may list none: its allowlist is its own hosts alone (design §3.5)`);
+  }
 });
 
 test("egress archon allowlist is exact and denies by default", () => {
@@ -178,7 +201,7 @@ describe("no zone lets an IP-literal destination through, the research zone incl
     expect(directives(c).find((l) => l.startsWith("acl ip_literal "))).toBe(directives(conf("archon")).find((l) => l.startsWith("acl ip_literal ")));
   });
 
-  for (const zone of ["hermes", "archon"] as const) {
+  for (const zone of ["hermes", "archon", "review"] as const) {
     test(`${zone}: the allowlist matches by name only, and ip_literal refuses 1.2.3.4, [2001:db8::1] and ::ffff:1.2.3.4 before it`, () => {
       const c = conf(zone);
       const lines = directives(c);

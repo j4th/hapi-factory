@@ -1,14 +1,14 @@
 /**
- * The GitHub rulesets are a manual step (README, "Publishing, after Task 7b"; docs/runbooks/github-apps.md),
- * so the JSON the operator pastes is the only copy of them in the repo until Task 6's audit reads the
- * live ones. These tests hold that JSON to the rules it must keep (spec §5.1, §11.5):
+ * The GitHub rulesets are files, policy/github/rulesets/<name>.json, which the README and the runbook
+ * apply with `gh api --input` and `hapi new-repo` posts. Until Task 6's audit reads the live ones, those
+ * files are the only copy of them in the repo. These tests hold them to the rules they must keep (spec §5.1, §11.5):
  * - no App is ever a bypass actor;
  * - a ruleset with the required `ci` check has no bypass actors at all;
  * - `main-review` restricts updates, so only its bypass actor (the Admin role, PR-only) can
  *   update `main`. A merge is an update, so neither App can merge, even after an approval.
  */
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 
 interface Rule {
   type: string;
@@ -21,16 +21,10 @@ interface Ruleset {
   rules: Rule[];
 }
 
-const DOCS = ["README.md", "docs/runbooks/github-apps.md"];
+const DIR = "policy/github/rulesets";
+const FILES = readdirSync(DIR).sort();
 
-/** Every `gh api ... /rulesets --input - <<'EOF' ... EOF` body in a doc. */
-function rulesetsIn(file: string): Ruleset[] {
-  const text = readFileSync(file, "utf8");
-  const bodies = [...text.matchAll(/gh api -X (?:POST|PUT) "?repos\/\S+\/rulesets\S*"? --input - <<'EOF'\n([\s\S]*?)\n\s*EOF/g)];
-  return bodies.map((m) => JSON.parse(m[1]!) as Ruleset);
-}
-
-const all = DOCS.flatMap(rulesetsIn);
+const all = FILES.map((f) => JSON.parse(readFileSync(`${DIR}/${f}`, "utf8")) as Ruleset);
 const byName = (name: string): Ruleset => {
   const found = all.filter((r) => r.name === name);
   expect(found.length).toBe(1);
@@ -39,8 +33,28 @@ const byName = (name: string): Ruleset => {
 const rule = (r: Ruleset, type: string) => r.rules.find((x) => x.type === type);
 
 describe("the documented rulesets", () => {
-  test("are the four rulesets the runbook names, each defined once", () => {
-    expect(all.map((r) => r.name).sort()).toEqual(["agent-branch-scope", "main-protect", "main-review", "tags-admin-only"]);
+  test("one file per ruleset, named for it", () => {
+    expect(FILES).toEqual(["agent-branch-scope.json", "main-protect.json", "main-review.json", "tags-admin-only.json"]);
+    FILES.forEach((f, i) => expect(all[i]!.name).toBe(f.replace(/\.json$/, "")));
+  });
+
+  test("the README and the runbook apply each file with --input and paste no JSON of their own", () => {
+    const readme = readFileSync("README.md", "utf8");
+    const runbook = readFileSync("docs/runbooks/github-apps.md", "utf8");
+    for (const [text, names] of [
+      [readme, ["main-protect", "main-review"]],
+      [runbook, ["agent-branch-scope", "tags-admin-only"]],
+    ] as const) {
+      for (const n of names) {
+        expect(text).toContain(`gh api -X POST "repos/$OWNER/hapi-factory/rulesets" --input policy/github/rulesets/${n}.json`);
+      }
+    }
+    expect(readme).not.toMatch(/--input - <<'EOF'/);
+    expect(runbook).not.toMatch(/--input - <<'EOF'/);
+  });
+
+  test("main-review requires the last push's approval (design §3.2 step 5)", () => {
+    expect(rule(byName("main-review"), "pull_request")!.parameters!.require_last_push_approval).toBe(true);
   });
 
   test("never make an App (Integration) a bypass actor", () => {

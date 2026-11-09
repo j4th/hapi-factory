@@ -6,6 +6,10 @@
  * `--mock` answers offline with the vendored mock, for tests and demos, and
  * needs no policy directory.
  *
+ * The run engine's decisions (src/engine/decisions.ts) are here too, so one can be replayed offline: their state is
+ * the JSON object the harvester built (`{ goal, path, part, diff }`), so the state text must parse as a JSON object
+ * and is passed on as that object, exactly as the harvester sent it.
+ *
  * Keys come only from HAPI_JEV_OPENROUTER_API_KEY and ANTHROPIC_API_KEY. Without
  * `--mock` the gates and flags are read from the policy in `$HAPI_POLICY_DIR`
  * (default `policy`, relative to the working directory). This file is also a
@@ -17,15 +21,29 @@
  */
 import { readFileSync } from "node:fs";
 import bashGate from "../../policy/decisions/bash-gate";
+import diffScreen from "../../policy/decisions/diff-screen";
 import resultScreen from "../../policy/decisions/result-screen";
 import { loadPolicy } from "../policy/load";
 import type { Gates } from "../policy/types";
-import { type DecisionFile, decide } from "./index";
+import { type DecisionFile, decide, type State } from "./index";
 
 const USAGE = "usage: hapi decide <name> [--state-file file] [--public] [--mock]";
 
-/** The decisions `hapi decide` can run: the files that ask a classifier. */
-const DECISIONS: Record<string, DecisionFile> = { "bash-gate": bashGate, "result-screen": resultScreen };
+/** The decisions `hapi decide` can run: the files that ask a classifier, the guard's gates and the run engine's. */
+const DECISIONS: Record<string, DecisionFile<string>> = { "bash-gate": bashGate, "result-screen": resultScreen, "diff-screen": diffScreen };
+
+/** Whether a file is one of the run engine's (an `EngineDecisionFile`, which says its hold and note), whose state is a JSON object. */
+const isEngineFile = (file: DecisionFile<string>): boolean => Object.hasOwn(file, "says");
+
+/** An engine decision's state, the JSON object the harvester built; undefined when the text isn't one. */
+function engineState(text: string): State | undefined {
+  try {
+    const v: unknown = JSON.parse(text);
+    return v !== null && typeof v === "object" && !Array.isArray(v) ? (v as State) : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 /** What `--mock` uses in place of policy/gates.yaml: only `max_state_chars` matters to the mock, set to the shipped value. */
 const MOCK_GATES: Gates = {
@@ -70,7 +88,9 @@ export async function decideCommand(args: string[], deps: DecideDeps = {}): Prom
   const file = Object.hasOwn(DECISIONS, name) ? DECISIONS[name] : undefined;
   if (!file) return usageError(`hapi decide: unknown decision '${name}'. Known: ${Object.keys(DECISIONS).join(", ")}`);
 
-  const state = stateFile !== undefined ? readFileSync(stateFile, "utf8") : await (deps.readStdin ?? (async () => readFileSync(0, "utf8")))();
+  const text = stateFile !== undefined ? readFileSync(stateFile, "utf8") : await (deps.readStdin ?? (async () => readFileSync(0, "utf8")))();
+  const state = isEngineFile(file) ? engineState(text) : text;
+  if (state === undefined) return usageError(`hapi decide: ${name}'s state is the run engine's, a JSON object ({ goal, path, part, diff }), as the harvester built it`);
   const policy = mock ? undefined : loadPolicy(env.HAPI_POLICY_DIR || "policy");
   const result = await decide(file, state, {
     gates: policy?.gates ?? MOCK_GATES,

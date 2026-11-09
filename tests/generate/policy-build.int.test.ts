@@ -7,6 +7,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import YAML from "yaml";
 
 const REPO = resolve(import.meta.dir, "../..");
 
@@ -17,7 +18,7 @@ describe.skipIf(!process.env.HAPI_INT)("mise run policy:build", () => {
   });
   afterAll(() => rmSync(out, { recursive: true, force: true }));
 
-  test("-- --roster budget --out <dir>: writes the seventeen generated files there, with the budget roster", () => {
+  test("-- --roster budget --out <dir>: writes the twenty-two generated files there, with the budget roster", () => {
     const r = Bun.spawnSync(["mise", "run", "policy:build", "--", "--roster", "budget", "--out", out], { cwd: REPO, stdout: "pipe", stderr: "pipe" });
     expect([r.exitCode, r.stderr.toString().includes("ERROR")]).toEqual([0, false]);
     const written = r.stdout.toString().trim().split("\n");
@@ -27,10 +28,12 @@ describe.skipIf(!process.env.HAPI_INT)("mise run policy:build", () => {
       "archon/empty.env",
       "archon/gitconfig",
       "archon/run-config.yaml",
+      "claude/managed-settings.json",
       "decide/hapi-decide.js",
       "egress/archon.squid.conf",
       "egress/hermes.squid.conf",
       "egress/research.squid.conf",
+      "egress/review.squid.conf",
       "hermes/config.yaml",
       "mcp/hermes.mcp.json",
       "mcp/research.mcp.json",
@@ -39,11 +42,16 @@ describe.skipIf(!process.env.HAPI_INT)("mise run policy:build", () => {
       "pi/models-store.json",
       "pi/models.json",
       "pi/settings.json",
+      "roster",
+      "systemd/hapi-poll.service",
+      "systemd/hapi-poll.timer",
     ]);
-    // The budget roster: Haiku 5.5 on every Archon tier.
+    expect(readFileSync(join(out, "roster"), "utf8")).toBe("budget\n");
+    // The budget roster: Haiku 5.5 on every Archon tier but review's, Sonnet 5.5 (Plan 03 Task 11), and never Opus.
     const archon = readFileSync(join(out, "archon", "config.yaml"), "utf8");
     expect(archon).toContain("the budget roster");
-    expect(archon).not.toMatch(/claude-(opus|sonnet)-5-5/);
+    expect(archon).not.toMatch(/claude-opus-5-5/);
+    expect(YAML.parse(archon).tiers.medium.model).toBe("claude-sonnet-5-5");
   });
 
   test("an unknown roster is a usage error (exit 2), and writes nothing", () => {

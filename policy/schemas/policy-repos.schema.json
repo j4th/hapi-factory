@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "policy-repos.schema.json",
+  "title": "policy/repos.yaml",
+  "description": "The repo registry: the GitHub App installation ids and the repos the poller acts on. Every key but installations.coderabbit is required.",
+  "type": "object",
+  "properties": {
+    "installations": {
+      "description": "Where each GitHub App is installed. The ids are not secret.",
+      "type": "object",
+      "properties": {
+        "planner": {
+          "description": "The hapi-planner installation.",
+          "$ref": "policy-defs.schema.json#/$defs/installationId"
+        },
+        "factory": {
+          "description": "The hapi-factory installation.",
+          "$ref": "policy-defs.schema.json#/$defs/installationId"
+        },
+        "coderabbit": {
+          "description": "The CodeRabbit installation, once it exists.",
+          "$ref": "policy-defs.schema.json#/$defs/installationId"
+        }
+      },
+      "required": [
+        "planner",
+        "factory"
+      ],
+      "additionalProperties": false
+    },
+    "repos": {
+      "description": "The registered repos, by owner/name. The poller acts on no other.",
+      "type": "object",
+      "propertyNames": {
+        "$ref": "policy-defs.schema.json#/$defs/ownerRepo"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "registered": {
+            "description": "The date hapi new-repo registered it.",
+            "$ref": "policy-defs.schema.json#/$defs/date"
+          }
+        },
+        "required": [
+          "registered"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": [
+    "installations",
+    "repos"
+  ],
+  "additionalProperties": false
+}

@@ -12,13 +12,13 @@ import { PROXY_PORT } from "../../src/generate/egress";
 import { loadPolicy } from "../../src/policy/load";
 import { ENV_DIR } from "../../src/secrets/files";
 import { SECRET_ZONES } from "../../src/secrets/manifest";
-import { RESERVED_ENV_NAMES, serviceEnvironment, ZONE_SERVICES } from "../../src/stack/env";
+import { proxyEnv, RESERVED_ENV_NAMES, serviceEnvironment, SIDECAR_ALIAS, ZONE_SERVICES } from "../../src/stack/env";
 import { composeFile, REPO } from "./helpers";
 
 const c = composeFile();
 const text = readFileSync(join(REPO, "stack", "compose.yaml"), "utf8");
 const svc = (name: string) => c.services[name] as Record<string, any>;
-const ZONES = ["hermes", "archon", "research"] as const;
+const ZONES = ["hermes", "archon", "research", "review"] as const;
 const PROXIES = ZONES.map((z) => `egress-${z}`);
 const DIGEST = /@sha256:[0-9a-f]{64}$/;
 /** A pinned image: name:tag@sha256:digest, never latest. */
@@ -33,14 +33,14 @@ function dockerfileImages(path: string): string[] {
   return [...from, ...copy];
 }
 
-test("five services: hermes, archon and one egress proxy per zone (research's own service comes in Plan 04)", () => {
-  expect(Object.keys(c.services).sort()).toEqual(["archon", "egress-archon", "egress-hermes", "egress-research", "hermes"]);
+test("six services: hermes, archon and one egress proxy per zone (research's own service comes in Plan 04; a review is a run container of archon)", () => {
+  expect(Object.keys(c.services).sort()).toEqual(["archon", "egress-archon", "egress-hermes", "egress-research", "egress-review", "hermes"]);
   expect(c.name).toBe("hapi");
 });
 
 describe("networks", () => {
-  test("hermes-net, archon-net and research-net are internal; outbound is the proxies' only way out", () => {
-    expect(Object.keys(c.networks).sort()).toEqual(["archon-net", "hermes-net", "outbound", "research-net"]);
+  test("hermes-net, archon-net, research-net and review-net are internal; outbound is the proxies' only way out", () => {
+    expect(Object.keys(c.networks).sort()).toEqual(["archon-net", "hermes-net", "outbound", "research-net", "review-net"]);
     for (const z of ZONES) expect([z, c.networks[`${z}-net`]?.internal]).toEqual([z, true]);
     expect(c.networks.outbound?.internal).toBeUndefined();
     // The proxies can't reach each other on outbound.
@@ -129,6 +129,56 @@ describe("pins", () => {
     expect(svc("egress-archon").image).toMatch(/^ubuntu\/squid:[\d.]+-\d\d\.\d\d_\w+@sha256:/);
   });
 
+  test("the run image carries mise by digest, the repo contract's tools at their pins, and CodeRabbit's CLI by checksum (H-208; spike 09, T18)", () => {
+    const docker = readFileSync(join(REPO, "stack", "archon", "Dockerfile"), "utf8");
+    const lines = docker.split("\n");
+    const froms = lines.filter((l) => l.startsWith("FROM "));
+    // mise's stage, by tag and digest, before the archon FROM, which stays last.
+    const mise = froms.findIndex((l) => /^FROM jdxcode\/mise:2026\.10\.9@sha256:[0-9a-f]{64} AS mise$/.test(l));
+    expect(mise).toBeGreaterThan(-1);
+    expect(mise).toBeLessThan(froms.length - 1);
+    expect(froms.at(-1)).toMatch(/^FROM ghcr\.io\/coleam00\/archon:0\.12\.1@/);
+    expect(docker).toContain("COPY --from=mise /usr/local/bin/mise /usr/local/bin/mise");
+    // The tools install from the contract's own lock, so each download is checked against its checksum (fix round 1):
+    // the image's [tools] are the template mise.toml's (Bun.TOML.parse, as mise reads it) and its mise.lock is the
+    // template's, byte for byte, both as COPY heredocs; `mise install --locked` installs each tool at its pin.
+    const heredoc = (dst: string) => {
+      const start = docker.indexOf(`COPY <<'EOF' ${dst}\n`);
+      expect([dst, start]).not.toEqual([dst, -1]);
+      const body = docker.slice(start + `COPY <<'EOF' ${dst}\n`.length);
+      return body.slice(0, body.indexOf("\nEOF\n") + 1);
+    };
+    const template = Bun.TOML.parse(readFileSync(join(REPO, "templates", "repo-contract", "mise.toml.tmpl"), "utf8")) as { tools: Record<string, string> };
+    expect(Object.keys(template.tools).length).toBeGreaterThan(0);
+    expect((Bun.TOML.parse(heredoc("/tmp/hapi-tools/mise.toml")) as { tools: Record<string, string> }).tools).toEqual(template.tools);
+    expect(heredoc("/tmp/hapi-tools/mise.lock")).toBe(readFileSync(join(REPO, "templates", "repo-contract", "mise.lock.tmpl"), "utf8"));
+    const joined = docker.replace(/\\\n\s*/g, " ");
+    const install = joined.split("\n").find((l) => l.includes("mise install --locked "))!;
+    expect(install).toContain("cd /tmp/hapi-tools");
+    for (const [name, version] of Object.entries(template.tools)) expect([name, install.split(/\s+/).includes(`${name}@${version}`)]).toEqual([name, true]);
+    expect(docker).toContain("RUN mise --version | grep -q '^2026\\.10\\.9 '");
+    // mise's settings are the image's ENV lines, never the run's environment (ARCHON_ENV is unchanged).
+    const env = (name: string) => new RegExp(`^ENV (?:.*\\s)?${name}=`, "m");
+    // And its global config from an empty dir in the read-only image, never the run's $HOME the worker can write.
+    const settings = {
+      MISE_DATA_DIR: "/opt/hapi/mise", MISE_CACHE_DIR: "/opt/hapi/mise-cache", MISE_TRUSTED_CONFIG_PATHS: "/work/repo", MISE_OFFLINE: "1", MISE_LOCKED: "1", MISE_SHIMS_DIR: "/tmp/mise-shims",
+      MISE_CONFIG_DIR: "/opt/hapi/mise-config", MISE_GLOBAL_CONFIG_FILE: "/opt/hapi/mise-config/config.toml",
+    };
+    expect(docker).toContain("mkdir -p /opt/hapi/mise-config");
+    for (const [name, value] of Object.entries(settings)) {
+      expect([name, env(name).test(docker.replace(/\\\n\s*/g, " "))]).toEqual([name, true]);
+      expect([name, docker.replace(/\\\n\s*/g, " ").includes(`${name}=${value}`)]).toEqual([name, true]);
+      expect([name, ARCHON_ENV.some(([n]) => n === name)]).toEqual([name, false]);
+    }
+    // Never the auto-installs at 0: mise run would fall back to the image's own Bun without a word (T18 finding 5).
+    for (const name of ["MISE_EXEC_AUTO_INSTALL", "MISE_TASK_RUN_AUTO_INSTALL", "MISE_NOT_FOUND_AUTO_INSTALL"]) expect([name, docker.includes(name)]).toEqual([name, false]);
+    // The install runs before the settings that make mise read-only and offline.
+    expect(docker.indexOf("mise install --locked ")).toBeLessThan(docker.indexOf("MISE_OFFLINE=1"));
+    // CodeRabbit's CLI 0.9.1 (the review's CodeRabbit node), checked against its signed release's SHA-256.
+    expect(docker).toMatch(/^ADD --checksum=sha256:[0-9a-f]{64} https:\/\/cli\.coderabbit\.ai\/releases\/0\.9\.1\/coderabbit-linux-x64\.zip /m);
+    expect(docker).toContain('test "$(HOME=/tmp/coderabbit-home CODERABBIT_CLI_DISABLE_AUTO_UPDATE=1 CR_CLI_TELEMETRY_DISABLED=1 cr --version)" = 0.9.1');
+  });
+
   test("the built images get fixed local names, so a test project reuses them instead of making one per run", () => {
     expect(svc("hermes").image).toBe("hapi-factory/hermes:v0.22.5");
     expect(svc("archon").image).toBe("hapi-factory/archon:0.12.1");
@@ -163,10 +213,10 @@ describe("the zone services", () => {
   });
 
   for (const z of ZONE_SERVICES) {
-    test(`${z}: HTTP(S)_PROXY points at egress-${z}, loopback goes direct${z === "archon" ? ", and it depends on nothing (a run container starts when the launcher says)" : ", and it starts once its proxy is healthy"}`, () => {
+    test(`${z}: HTTP(S)_PROXY points at egress-${z}, loopback goes direct${z === "archon" ? " and so does the run's sidecar, and it depends on nothing (a run container starts when the launcher says)" : ", and it starts once its proxy is healthy"}`, () => {
       const env = svc(z).environment as Record<string, string>;
       for (const v of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]) expect([v, env[v]]).toEqual([v, `http://egress-${z}:${PROXY_PORT}`]);
-      for (const v of ["NO_PROXY", "no_proxy"]) expect([v, env[v]]).toEqual([v, "localhost,127.0.0.1,::1"]);
+      for (const v of ["NO_PROXY", "no_proxy"]) expect([v, env[v]]).toEqual([v, z === "archon" ? "localhost,127.0.0.1,::1,hapi-sidecar" : "localhost,127.0.0.1,::1"]);
       expect(svc(z).depends_on).toEqual(z === "archon" ? undefined : { [`egress-${z}`]: { condition: "service_healthy" } });
     });
 
@@ -176,6 +226,24 @@ describe("the zone services", () => {
       for (const name of Object.keys(svc(z).environment)) expect([name, RESERVED_ENV_NAMES.includes(name)]).toEqual([name, true]);
     });
   }
+
+  test("the archon zone's NO_PROXY names hapi-sidecar, so a run reaches its sidecar directly; no other zone's does", () => {
+    // Directly, so the proxies' to_localnet is never loosened: the sidecar's address is on the run's private network.
+    expect(SIDECAR_ALIAS).toBe("hapi-sidecar");
+    for (const zone of ["hermes", "archon", "research", "review"] as const) {
+      const direct = zone === "archon" ? "localhost,127.0.0.1,::1,hapi-sidecar" : "localhost,127.0.0.1,::1";
+      expect([zone, proxyEnv(zone).NO_PROXY, proxyEnv(zone).no_proxy]).toEqual([zone, direct, direct]);
+    }
+    for (const v of ["NO_PROXY", "no_proxy"]) {
+      expect([v, svc("archon").environment[v].split(",").includes(SIDECAR_ALIAS)]).toEqual([v, true]);
+      expect([v, svc("hermes").environment[v].split(",").includes(SIDECAR_ALIAS)]).toEqual([v, false]);
+    }
+  });
+
+  test("egress-review is the review zone's proxy alone: no service has review.env as its env_file, since the launcher gives a review run its zone's keys itself", () => {
+    expect(svc("egress-review").networks).toEqual({ "review-net": {}, outbound: {} });
+    for (const [name, s] of Object.entries(c.services)) expect([name, JSON.stringify(s.env_file ?? []).includes("review.env")]).toEqual([name, false]);
+  });
 
   test("archon: every setting of the generated build/archon/archon.env is in its environment:, with the same value, and there are ARCHON_ENV.length of them", () => {
     const generated = emitArchon(loadPolicy(join(REPO, "policy")))["archon.env"]!

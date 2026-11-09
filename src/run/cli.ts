@@ -1,7 +1,8 @@
 /**
  * The `hapi run` command line (design §3.1, §3.2): its usage lines and argument
  * parsers, and the host-side defaults of `RunDeps` (./spec.ts): the real
- * docker runners, the run state dir, and the detached supervisor. The commands
+ * docker runners, the run state dir, the run disk and its probe, and the
+ * detached supervisor. The commands
  * themselves are ./lifecycle.ts's and ./view.ts's.
  */
 import { spawn } from "node:child_process";
@@ -12,6 +13,8 @@ import { REPO_ROOT } from "../generate/header";
 import { loadPolicy } from "../policy/load";
 import { composeServices } from "../stack/compose";
 import { definedEnv, type Env, PROJECT, runCommand } from "../stack/up";
+import { probeFs } from "./disk";
+import { RUN_DISK } from "./locks";
 import { RUN_ID } from "./records";
 import type { RunDeps } from "./spec";
 
@@ -21,7 +24,8 @@ export const SUPERVISE_USAGE = "usage: hapi run supervise <run-id>";
 export const WATCH_USAGE = "usage: hapi run watch <run-id>";
 export const LIST_USAGE = "usage: hapi run list";
 
-export interface StartOptions {
+/** `hapi run start`'s flags (`StartOptions` is the launcher API's, ./lifecycle.ts `startRun`). */
+export interface StartFlags {
   /** A checkout (its .git dir is bound) or a bare repo: the run starts from its HEAD. */
   repo: string;
   workOrder: string;
@@ -34,10 +38,10 @@ export interface StartOptions {
 }
 
 /** `hapi run start`'s flags, each at most once; undefined on any usage error. */
-export function parseStart(args: string[]): StartOptions | undefined {
+export function parseStart(args: string[]): StartFlags | undefined {
   let repo: string | undefined;
   let workOrder: string | undefined;
-  const out: Omit<StartOptions, "repo" | "workOrder"> = { public: false };
+  const out: Omit<StartFlags, "repo" | "workOrder"> = { public: false };
   const seen = new Set<string>();
   for (let i = 0; i < args.length; i++) {
     const flag = args[i]!;
@@ -74,11 +78,11 @@ export function stateDirOf(env: Env): string {
   return join(base, "hapi", "runs");
 }
 
-/** The real byte runner: stdout read whole as bytes (`arrayBuffer`), never decoded. */
-export const runBytes: RunDeps["runBytes"] = async (cmd, env) => {
-  let proc: Bun.Subprocess<"ignore", "pipe", "pipe">;
+/** The real byte runner: stdout read whole as bytes (`arrayBuffer`), never decoded; `stdin`, when given, is the process's whole stdin. */
+export const runBytes: RunDeps["runBytes"] = async (cmd, env, stdin) => {
+  let proc: Bun.Subprocess<"ignore" | Uint8Array, "pipe", "pipe">;
   try {
-    proc = Bun.spawn(cmd, { env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    proc = Bun.spawn(cmd, { env, stdin: stdin === undefined ? "ignore" : new TextEncoder().encode(stdin), stdout: "pipe", stderr: "pipe" });
   } catch {
     throw new Error(`cannot run ${cmd[0]}: is it installed and on PATH?`);
   }
@@ -155,7 +159,7 @@ function spawnDetached(root: string, stateDir: string, env: Env): RunDeps["spawn
   };
 }
 
-/** `p`, with every field it leaves out set to the host's: hapi's project, image, state dir, checkout and policy. */
+/** `p`, with every field it leaves out set to the host's: hapi's project, image, state dir, run disk, checkout and policy. */
 export async function runDeps(p: Partial<RunDeps>): Promise<RunDeps> {
   const env = p.env ?? process.env;
   const root = p.root ?? REPO_ROOT;
@@ -174,6 +178,8 @@ export async function runDeps(p: Partial<RunDeps>): Promise<RunDeps> {
     image,
     egress: p.egress ?? `${project}-egress-archon-1`,
     stateDir,
+    diskDir: p.diskDir ?? RUN_DISK,
+    probeFs: p.probeFs ?? probeFs,
     root,
     buildDir: p.buildDir ?? join(root, "build"),
     packDir: p.packDir ?? join(root, "archon", "workflows", "hapi"),

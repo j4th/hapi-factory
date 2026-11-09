@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { parse } from "yaml";
 import { effectiveModes } from "../../src/policy/paths";
-import { loadWorkOrder, validateWorkOrder, WorkOrderError } from "../../src/workorder/validate";
+import { isWorkOrderId, loadWorkOrder, validateWorkOrder, WORK_ORDER_ID, WORK_ORDER_ID_MAX, WorkOrderError } from "../../src/workorder/validate";
 
 const load = (file: string): unknown => parse(readFileSync(file, "utf8"));
 /** A fresh copy of the spec §6 example, to break one field at a time. */
@@ -174,4 +174,13 @@ describe("loadWorkOrder", () => {
       expect((e as WorkOrderError).path).toBe("");
     }
   });
+});
+
+test("WORK_ORDER_ID is the schema's id pattern, and isWorkOrderId its pattern within its length", () => {
+  const schema = JSON.parse(readFileSync("policy/schemas/work-order.schema.json", "utf8"));
+  expect(WORK_ORDER_ID.source).toBe(schema.properties.id.pattern);
+  expect(WORK_ORDER_ID_MAX).toBe(schema.properties.id.maxLength);
+  expect(isWorkOrderId("0001-one")).toBe(true);
+  expect(isWorkOrderId(`0001-${"a".repeat(WORK_ORDER_ID_MAX - 5)}`)).toBe(true);
+  for (const bad of [`0001-${"a".repeat(WORK_ORDER_ID_MAX - 4)}`, "001-one", "0001-One", "0001-one/x", "0001-", "*", "0001-one\n", ""]) expect([bad, isWorkOrderId(bad)]).toEqual([bad, false]);
 });

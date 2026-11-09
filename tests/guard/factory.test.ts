@@ -31,7 +31,7 @@ test("the factory never throws: a Pi whose on() throws, or a broken env, still r
 test("good settings register exactly the guard's hooks; no tool or flag is registered", () => {
   const h = setup({ settings: gatesOff });
   expect([...h.pi.handlers.keys()].sort()).toEqual(
-    ["before_provider_headers", "before_provider_request", "message_end", "session_start", "tool_call", "tool_result", "turn_end"],
+    ["before_agent_start", "before_provider_headers", "before_provider_request", "message_end", "session_start", "tool_call", "tool_result", "turn_end"],
   );
   expect(h.pi.registered).toEqual([]);
 });

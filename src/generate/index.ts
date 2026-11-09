@@ -4,11 +4,14 @@
  *
  *   build/hermes/config.yaml
  *   build/archon/config.yaml, run-config.yaml, archon.env, empty.env, gitconfig
+ *   build/claude/managed-settings.json  (Claude Code's managed settings, bound into a review run alone)
  *   build/pi/models.json, models-store.json, settings.json, hapi-guard.json
  *   build/pi/extensions/hapi-guard.js   (bundled from src/guard/index.ts)
  *   build/decide/hapi-decide.js         (bundled from src/decide/cli.ts)
- *   build/egress/{hermes,archon,research}.squid.conf
+ *   build/egress/{hermes,archon,research,review}.squid.conf
  *   build/mcp/{hermes,research}.mcp.json
+ *   build/roster                        (the roster's name: each run's own guard settings and run config are made for it)
+ *   build/systemd/hapi-poll.{service,timer}  (the poller's systemd user units: `up` links them and starts the timer)
  *
  * The emitters are pure and deterministic (stable key order, no timestamps),
  * so a fresh build is byte-identical to the deployed files unless someone
@@ -20,11 +23,13 @@ import { loadPolicy } from "../policy/load";
 import { o11yEnabled } from "../policy/mcp";
 import type { Policy, RosterName } from "../policy/types";
 import { emitArchon } from "./archon";
+import { emitClaude } from "./claude";
 import { emitEgress } from "./egress";
 import { notice, REPO_ROOT, slashComment } from "./header";
 import { emitHermes } from "./hermes";
 import { emitMcp } from "./mcp";
 import { emitPi } from "./pi";
+import { emitSystemd } from "./systemd";
 
 export { REPO_ROOT };
 
@@ -108,7 +113,11 @@ export async function buildAll(p: Policy, outDir: string, opts: BuildOptions = {
     ["pi", withBundle(emitPi(p, roster), "extensions/hapi-guard.js", GUARD_ENTRY)],
     ["egress", emitEgress(p)],
     ["mcp", emitMcp(p)],
+    ["claude", emitClaude(p)],
     ["decide", withBundle({}, "hapi-decide.js", DECIDE_ENTRY)],
+    ["systemd", emitSystemd(p)],
+    // One bare word, with no notice: `hapi run start` reads it (src/run/spec.ts `readRoster`) to make each run's own files.
+    ["", { roster: `${roster}\n` }],
   ];
   const built = await Promise.all(groups.map(async ([dir, files]) => [dir, await files] as const));
   const written: string[] = [];

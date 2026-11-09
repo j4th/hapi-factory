@@ -47,7 +47,7 @@ nodes:
     depends_on: [read-only]
     bash: |
       echo "uid=$(id -u)"; grep -E '^(CapEff|NoNewPrivs)' /proc/self/status
-      echo "archon=$(jq -r .version /app/package.json) pi=$(jq -r .version /app/node_modules/@earendil-works/pi-coding-agent/package.json) node=$(node --version) uv=$(uv --version) python=$(python3.14 --version)"
+      echo "archon=$(jq -r .version /app/package.json) pi=$(jq -r .version /app/node_modules/@earendil-works/pi-coding-agent/package.json) node=$(node --version) uv=$(uv --version) python=$(python3.14 --version) mise=$(mise --version)"
       for u in https://api.anthropic.com/ https://github.com/; do echo "$u $(curl -s -o /dev/null -m 5 -w '%{http_connect} %{http_code}' "$u")"; done
       for mp in /tmp "$HOME" /.archon /opt/hapi/pi-agent; do
         while read -r _ _ _ _ at opts _; do if [ "$at" = "$mp" ]; then echo "mount $mp $opts"; fi; done < /proc/self/mountinfo

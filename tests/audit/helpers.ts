@@ -11,16 +11,20 @@
  */
 import { spyOn } from "bun:test";
 import { generateKeyPairSync } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import YAML from "yaml";
 import type { AuditContext, ExecResult } from "../../src/audit/types";
 import { buildAll } from "../../src/generate/index";
 import { loadPolicy } from "../../src/policy/load";
+import { type FsProbe, GIB } from "../../src/run/disk";
+import { RUN_DISK } from "../../src/run/locks";
 import { envFileText } from "../../src/secrets/files";
+import { loadManifest, MANIFEST_FILE, manifestEntries } from "../../src/secrets/manifest";
 import { serviceEnvironment } from "../../src/stack/env";
 import { buildDigest } from "../../src/stack/up";
+import { emptyRegistry } from "../policy/helpers";
 
 export const REPO = resolve(import.meta.dir, "../..");
 export const FIXTURES = join(import.meta.dir, "fixtures");
@@ -89,9 +93,32 @@ export interface Container {
   State: { Running: boolean };
   Path: string;
   Args: string[];
-  Config: { Labels: Record<string, string>; Env: string[]; Cmd: string[] | null; Entrypoint: string[] | null; User?: string; StopTimeout?: number };
-  Mounts: { Type: string; Source: string; Destination: string; RW: boolean }[];
-  HostConfig?: { PortBindings: Record<string, unknown>; Tmpfs?: Record<string, string>; CapDrop?: string[]; ReadonlyRootfs?: boolean; SecurityOpt?: string[]; PidsLimit?: number; Memory?: number };
+  Config: { Labels: Record<string, string>; Env: string[]; Cmd: string[] | null; Entrypoint: string[] | null; User?: string; StopTimeout?: number; Image?: string; WorkingDir?: string };
+  Mounts: { Type: string; Name?: string; Source: string; Destination: string; RW: boolean }[];
+  NetworkSettings?: { Networks: Record<string, unknown> };
+  HostConfig?: {
+    NetworkMode?: string;
+    Init?: boolean | null;
+    AutoRemove?: boolean;
+    Privileged?: boolean;
+    CapAdd?: string[] | null;
+    PortBindings: Record<string, unknown>;
+    Tmpfs?: Record<string, string>;
+    CapDrop?: string[];
+    ReadonlyRootfs?: boolean;
+    SecurityOpt?: string[];
+    PidsLimit?: number;
+    Memory?: number;
+  };
+}
+
+/** A network as `docker network inspect` prints one (the fields the audit reads). */
+export interface Network {
+  Name: string;
+  Internal: boolean;
+  IPAM: { Config: { Subnet: string }[] };
+  /** By container id: each endpoint's container name. */
+  Containers: Record<string, { Name: string }>;
 }
 
 export interface Reply {
@@ -111,14 +138,21 @@ export interface World {
   /** Its digest, as `hapi stack up` labels the containers. */
   digest: string;
   containers: Container[];
+  /** The networks `docker network inspect` finds, by name: each run container's own (`runContainer` adds it). */
+  networks: Map<string, Network>;
   /** What the archon validation run prints: Archon's `validate workflows --json` output (an object or raw text). */
   archonValidate: { code: number; out: unknown };
   /** What the `assistants.pi.enableExtensions` read-back prints (and its exit code). */
   enableExtensions: { code: number; out: string };
   /** What the Hermes validation run prints (Hermes's defaults, effective config, issues). */
   hermes: { defaults: unknown; issues: { severity: string; message: string }[]; config_version: number; latest_config_version: number; effective?: unknown };
-  /** Images `docker image inspect` finds. */
+  /** Images `docker image inspect` finds: the zone images and every policy sidecar's, by default. */
   images: Set<string>;
+  /**
+   * What `systemctl --user show hapi-poll.timer --property=ActiveState` answers in hapi's user manager (run through
+   * `env` with `systemctlEnv`'s two names): its exit code, and `out` on stdout when it is 0, else on stderr.
+   */
+  timer: { code: number; out: string };
   /** Every command run, and every request made. */
   calls: string[][];
   requests: FetchCall[];
@@ -165,7 +199,7 @@ export function goodRulesets(): Record<string, unknown>[] {
       rules: [
         {
           type: "pull_request",
-          parameters: { required_approving_review_count: 1, dismiss_stale_reviews_on_push: true, require_code_owner_review: true, require_last_push_approval: false, required_review_thread_resolution: false },
+          parameters: { required_approving_review_count: 1, dismiss_stale_reviews_on_push: true, require_code_owner_review: true, require_last_push_approval: true, required_review_thread_resolution: false },
         },
         { type: "update" },
       ],
@@ -216,16 +250,89 @@ export function appOf(c: FetchCall): "planner" | "factory" {
 /** The token the fake GitHub mints for the audit (never to be printed). */
 export const MINTED_TOKEN = "fake-installation-token-audit";
 
+/** Docker's data root as `docker info --format {{.DockerRootDir}}` prints it for hapi's rootless Docker. */
+export const DOCKER_ROOT = "/home/hapi/.local/share/docker";
+
+/** The filesystems a clean world's run disk check sees: the run disk on its own (dev 2), its parent (dev 1) and Docker's data root (dev 3). */
+export const goodDisks: FsProbe = (path) => {
+  if (path === RUN_DISK) return { dev: 2, bytes: 19.5 * GIB, writable: true };
+  if (path === dirname(RUN_DISK)) return { dev: 1, bytes: 500 * GIB, writable: true };
+  if (path === DOCKER_ROOT) return { dev: 3, bytes: 500 * GIB, writable: true };
+  return undefined;
+};
+
+/** The settings `hapi new-repo` sets (src/newrepo/steps.ts, step 5), as GitHub's GETs return them to the repo's admin. */
+export function goodSettings() {
+  return {
+    repo: {
+      allow_merge_commit: true,
+      allow_squash_merge: false,
+      allow_rebase_merge: false,
+      allow_auto_merge: false,
+      delete_branch_on_merge: true,
+      merge_commit_title: "MERGE_MESSAGE",
+      merge_commit_message: "PR_TITLE",
+      security_and_analysis: { secret_scanning: { status: "enabled" }, secret_scanning_push_protection: { status: "enabled" }, dependabot_security_updates: { status: "disabled" } },
+    } as Record<string, unknown>,
+    workflow: { default_workflow_permissions: "read", can_approve_pull_request_reviews: false } as Record<string, unknown>,
+    actions: { enabled: true, allowed_actions: "selected", sha_pinning_required: true, selected_actions_url: `${API}/repos/${OWNER}/${NAME}/actions/permissions/selected-actions` } as Record<string, unknown>,
+    selected: { github_owned_allowed: true, verified_allowed: false, patterns_allowed: ["jdx/mise-action@*", `${OWNER}/hapi-factory/.github/workflows/gates.yml@*`] } as Record<string, unknown>,
+    fork: { approval_policy: "all_external_contributors" } as Record<string, unknown>,
+    pvr: { enabled: true } as Record<string, unknown>,
+  };
+}
+export type Settings = ReturnType<typeof goodSettings>;
+
+/** The five labels `hapi new-repo` makes, by name. */
+export const LABEL_NAMES = ["lane:planning", "lane:factory", "lane:direct", "hapi:rework", "hapi:flagged"];
+
+/**
+ * A copy of the shipped policy/ with no repo registered (`emptyRegistry`): every check reads the shipped policy, but
+ * not what the committed registry lists (the sandbox, since Task 16), whose content tests/policy/load.test.ts pins.
+ * Each world starts from it. Removed by `cleanup`.
+ */
+export function shippedPolicy(): string {
+  const dir = join(tempDir("hapi-audit-policy-"), "policy");
+  cpSync(join(REPO, "policy"), dir, { recursive: true });
+  writeFileSync(join(dir, "repos.yaml"), emptyRegistry(readFileSync(join(dir, "repos.yaml"), "utf8")));
+  return dir;
+}
+
+/**
+ * A copy of policy/ whose repos.yaml registers `OWNER/NAME`, so the contract's checks (github.repo-settings,
+ * github.labels) apply to it. Removed by `cleanup`.
+ */
+export function registeredPolicy(): string {
+  const dir = join(tempDir("hapi-audit-policy-"), "policy");
+  cpSync(join(REPO, "policy"), dir, { recursive: true });
+  writeFileSync(join(dir, "repos.yaml"), `installations: { planner: 11, factory: 12 }\nrepos:\n  ${OWNER}/${NAME}: { registered: "2026-10-31" }\n`);
+  return dir;
+}
+
 /** The routes of a GitHub repo set up as the runbook says, read with a token file or with an App. */
 export function githubRoutes(
-  o: { rulesets?: Record<string, any>[]; workflows?: Record<string, string>; appPermissions?: Record<string, Record<string, string>>; defaultBranch?: string | null } = {},
+  o: {
+    rulesets?: Record<string, any>[];
+    workflows?: Record<string, string>;
+    appPermissions?: Record<string, Record<string, string>>;
+    defaultBranch?: string | null;
+    settings?: Settings;
+    labels?: string[];
+  } = {},
 ): Record<string, Reply | ((c: FetchCall) => Reply)> {
   const rulesets = o.rulesets ?? goodRulesets();
   const repo = `${API}/repos/${OWNER}/${NAME}`;
   const defaultBranch = o.defaultBranch === undefined ? "main" : o.defaultBranch;
+  const settings = o.settings ?? goodSettings();
   const routes: Record<string, Reply | ((c: FetchCall) => Reply)> = {
     // null: GitHub's answer without default_branch.
-    [`GET ${repo}`]: { status: 200, body: { full_name: `${OWNER}/${NAME}`, ...(defaultBranch === null ? {} : { default_branch: defaultBranch }) } },
+    [`GET ${repo}`]: { status: 200, body: { full_name: `${OWNER}/${NAME}`, ...(defaultBranch === null ? {} : { default_branch: defaultBranch }), ...settings.repo } },
+    [`GET ${repo}/actions/permissions/workflow`]: { status: 200, body: settings.workflow },
+    [`GET ${repo}/actions/permissions`]: { status: 200, body: settings.actions },
+    [`GET ${repo}/actions/permissions/selected-actions`]: { status: 200, body: settings.selected },
+    [`GET ${repo}/actions/permissions/fork-pr-contributor-approval`]: { status: 200, body: settings.fork },
+    [`GET ${repo}/private-vulnerability-reporting`]: { status: 200, body: settings.pvr },
+    [`GET ${repo}/labels?per_page=100&page=1`]: { status: 200, body: (o.labels ?? LABEL_NAMES).map((name, i) => ({ id: i + 1, name, color: "ededed", description: "" })) },
     [`GET ${repo}/rules/branches/main?per_page=100&page=1`]: { status: 200, body: branchRules(rulesets) },
     [`GET ${repo}/rulesets?per_page=100&page=1`]: { status: 200, body: rulesets.map(({ rules, conditions, bypass_actors, ...summary }) => summary) },
     [`GET ${repo}/contents/.github/workflows`]: {
@@ -240,7 +347,7 @@ export function githubRoutes(
   }
   const perms = o.appPermissions ?? {
     planner: { contents: "write", pull_requests: "write", issues: "read", metadata: "read" },
-    factory: { contents: "write", pull_requests: "write", metadata: "read" },
+    factory: { contents: "write", pull_requests: "write", checks: "read", metadata: "read" },
   };
   const app = appOf;
   routes[`GET ${API}/app`] = (c) => ({ status: 200, body: { id: APP_IDS[app(c)], slug: `hapi-${app(c)}`, permissions: perms[app(c)], events: [] } });
@@ -281,6 +388,20 @@ export function hostEnv(env: Record<string, string>): void {
 }
 
 /**
+ * The review zone's env names, as Task 8's tests wrote them before the zone was real: its Claude Code keys
+ * (`ANTHROPIC_API_KEY`, which Claude Code sends, and `CLAUDE_API_KEY`, Archon's name for it) and CodeRabbit's.
+ * tests/audit/runtime.test.ts checks that stack/secrets.yaml's review zone is exactly this, so the two can't drift.
+ */
+export const REVIEW_ZONE_KEYS = ["ANTHROPIC_API_KEY", "CLAUDE_API_KEY", "CODERABBIT_API_KEY"];
+
+/** Each zone's env names, as the clean world gives the audit: stack/secrets.yaml's zones, each entry read as the audit reads it. */
+export function zoneKeys(): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const e of manifestEntries(loadManifest(join(REPO, MANIFEST_FILE)))) (out[e.zone] ??= []).push(e.key);
+  return out;
+}
+
+/**
  * A clean world: everything as `hapi stack up` leaves it. `o.repos` adds the
  * repo above to `--repo`; `o.workflows` its workflow files.
  */
@@ -303,7 +424,7 @@ export async function cleanWorld(o: { repos?: boolean; workflows?: Record<string
   });
   const envList = (e: Record<string, string>) => [...Object.entries(e).map(([k, v]) => `${k}=${v}`), "PATH=/usr/local/bin:/usr/bin:/bin"];
   const containers: Container[] = [
-    ...["egress-hermes", "egress-archon", "egress-research"].map(
+    ...["egress-hermes", "egress-archon", "egress-research", "egress-review"].map(
       (service): Container => ({
         Id: `id-${service}`,
         Name: `/hapi-${service}-1`,
@@ -334,10 +455,13 @@ export async function cleanWorld(o: { repos?: boolean; workflows?: Record<string
     build,
     digest,
     containers,
-    archonValidate: { code: 0, out: readJson("archon-validate-v0.12.1.json") },
+    networks: new Map(),
+    // As 0.12.1 exited with the pack bound (re-captured 2026-11-01): 1, for the pack nodes' custom-alias lint alone.
+    archonValidate: { code: 1, out: readJson("archon-validate-v0.12.1.json") },
     enableExtensions: { code: 0, out: "true" },
     hermes: { defaults, issues: [], config_version: 0, latest_config_version: 51, effective: hermesMerge(defaults, ours) },
-    images: new Set([ARCHON_IMAGE, HERMES_IMAGE]),
+    images: new Set([ARCHON_IMAGE, HERMES_IMAGE, ...Object.values(loadPolicy(join(REPO, "policy")).sidecars).map((s) => s.image)]),
+    timer: { code: 0, out: "ActiveState=active\n" },
     calls: [],
     requests: [],
     routes: githubRoutes({ workflows: o.workflows ?? {} }),
@@ -346,7 +470,7 @@ export async function cleanWorld(o: { repos?: boolean; workflows?: Record<string
   };
   world.ctx = {
     root: REPO,
-    policyDir: join(REPO, "policy"),
+    policyDir: shippedPolicy(),
     buildDir: build,
     repos: o.repos ? [{ owner: OWNER, name: NAME }] : [],
     strict: false,
@@ -354,6 +478,8 @@ export async function cleanWorld(o: { repos?: boolean; workflows?: Record<string
     env,
     user: "hapi",
     exec: async (cmd) => fakeExec(world, cmd),
+    probeFs: goodDisks,
+    zoneKeys: zoneKeys(),
     fetch: (async (input: string | URL | Request, init: RequestInit = {}) => {
       const call: FetchCall = { method: init.method ?? "GET", url: String(input), headers: Object.fromEntries(new Headers(init.headers).entries()) };
       world.requests.push(call);
@@ -367,20 +493,45 @@ export async function cleanWorld(o: { repos?: boolean; workflows?: Record<string
   return world;
 }
 
+/** The run kinds, as the audit's fixtures name them. */
+export type Kind = "worker" | "verify" | "review" | "fix";
+
 /**
- * A live run container as `docker inspect` prints one: the labels and mounts a launcher-made container has
- * (src/run/spec.ts; the Compose labels blank), Archon's whole environment, and no published port. Written out here,
- * not read from `runArgs`, so the check's expectation is checked against an independent list.
+ * A live run container as `docker inspect` prints one: the labels and mounts a launcher-made container of `over.kind`
+ * has (src/run/spec.ts; the Compose labels blank), Archon's whole environment with its kind's proxy, its prelude's
+ * command, and no published port. With no kind it has no `org.hapi.kind` label, as a Plan 02 worker had. Written out
+ * here, not read from `runArgs` or `kindProfile`, so the check's expectation is checked against an independent list:
+ * - worker and fix: run.sh, the work order's workflow, egress-archon; a fix's inputs dir too;
+ * - verify: verify.sh, factory-verify, egress-archon, no inputs;
+ * - review: review.sh, factory-review, egress-review, its inputs dir, and Claude Code's managed settings (Task 11).
+ * It is on its own network, named as it is, which this adds to `w.networks`: internal, on a private subnet, and
+ * holding the container and its kind's proxy (`hapi-egress-archon-1`, or `hapi-egress-review-1` for a review).
  */
-export function runContainer(w: World, id = "ab12cd34ef56", over: { labels?: Record<string, string> } = {}): Container {
+export function runContainer(w: World, id = "ab12cd34ef56", over: { labels?: Record<string, string>; kind?: Kind; sidecar?: string } = {}): Container {
   const name = `hapi-run-${id}`;
+  const kind = over.kind ?? "worker";
+  const egress = kind === "review" ? "hapi-egress-review-1" : "hapi-egress-archon-1";
+  w.networks.set(name, {
+    Name: name,
+    Internal: true,
+    IPAM: { Config: [{ Subnet: "172.30.0.0/16" }] },
+    Containers: { [`id-run-${id}`]: { Name: name }, [`id-${egress}`]: { Name: egress }, ...(over.sidecar === undefined ? {} : { [`id-sidecar-${id}`]: { Name: `${name}-sidecar` } }) },
+  });
+  const prelude = { worker: "run.sh", fix: "run.sh", verify: "verify.sh", review: "review.sh" }[kind];
+  const workflow = { worker: "hapi-check-run", fix: "hapi-check-run", verify: "factory-verify", review: "factory-review" }[kind];
+  const env = { ...serviceEnvironment("archon") };
+  if (kind === "review") {
+    for (const k of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]) env[k] = "http://egress-review:3128";
+    // A review has no sidecar to reach: loopback only.
+    for (const k of ["NO_PROXY", "no_proxy"]) env[k] = "localhost,127.0.0.1,::1";
+  }
   const bind = (Source: string, Destination: string) => ({ Type: "bind", Source, Destination, RW: false });
   return {
     Id: `id-run-${id}`,
     Name: `/${name}`,
     State: { Running: true },
     Path: "sh",
-    Args: ["/opt/hapi/run.sh", "hapi-check-run"],
+    Args: [`/opt/hapi/${prelude}`, workflow],
     Config: {
       Labels: {
         "com.docker.compose.project": "",
@@ -388,13 +539,15 @@ export function runContainer(w: World, id = "ab12cd34ef56", over: { labels?: Rec
         "com.docker.compose.version": "",
         "org.hapi.run": id,
         "org.hapi.project": "hapi",
+        ...(over.kind === undefined ? {} : { "org.hapi.kind": over.kind }),
+        ...(over.sidecar === undefined ? {} : { "org.hapi.sidecar": over.sidecar }),
         "org.hapi.stack": "hapi-factory",
         "org.hapi.started-by": "hapi",
         "org.hapi.dev-override": "0",
         "org.hapi.build-sha256": w.digest,
         ...over.labels,
       },
-      Env: [...Object.entries(serviceEnvironment("archon")).map(([k, v]) => `${k}=${v}`), "PATH=/usr/local/bin:/usr/bin:/bin"],
+      Env: [...Object.entries(env).map(([k, v]) => `${k}=${v}`), "PATH=/usr/local/bin:/usr/bin:/bin"],
       Cmd: null,
       Entrypoint: ["sh"],
       User: "1001:1001",
@@ -409,13 +562,20 @@ export function runContainer(w: World, id = "ab12cd34ef56", over: { labels?: Rec
       bind(join(REPO, "archon", "workflows", "hapi"), "/.archon/workflows/hapi"),
       bind(join(w.build, "archon", "run-config.yaml"), "/opt/hapi/run-config.yaml"),
       bind(join(w.build, "archon", "gitconfig"), "/home/appuser/.gitconfig"),
-      bind(join(REPO, "stack", "archon", "run.sh"), "/opt/hapi/run.sh"),
+      bind(join(REPO, "stack", "archon", prelude), `/opt/hapi/${prelude}`),
       bind("/state/runs/run.json", "/run/hapi/run.json"),
+      bind("/state/runs/order.json", "/run/hapi/order.json"),
+      bind("/state/runs/task.md", "/run/hapi/task.md"),
       bind("/srv/src/.git", "/src/repo.git"),
+      ...(kind === "review" || kind === "fix" ? [bind("/state/runs/inputs", "/run/hapi/inputs")] : []),
+      ...(kind === "review" ? [bind("/srv/build/claude/managed-settings.json", "/etc/claude-code/managed-settings.json")] : []),
       { Type: "volume", Source: `/var/lib/docker/volumes/${name}-work/_data`, Destination: "/work", RW: true },
       { Type: "volume", Source: `/var/lib/docker/volumes/${name}-out/_data`, Destination: "/out", RW: true },
     ],
+    NetworkSettings: { Networks: { [name]: { NetworkID: `net-${id}` } } },
     HostConfig: {
+      NetworkMode: name,
+      Init: false,
       PortBindings: {},
       Tmpfs: {
         "/tmp": "size=1g,uid=1001,gid=1001,mode=1777",
@@ -428,6 +588,103 @@ export function runContainer(w: World, id = "ab12cd34ef56", over: { labels?: Rec
       SecurityOpt: ["no-new-privileges:true"],
       PidsLimit: 2048,
       Memory: 4 * 1024 ** 3,
+    },
+  };
+}
+
+/** policy/sidecars.yaml's bun-http image, as a sidecar of it runs it (`Config.Image` is the reference `docker run` was given). */
+export const SIDECAR_IMAGE = "oven/bun:1.4.4-slim@sha256:1846adf22496bd711036aae8be147e57bdebbaea2e5264e3e0b5af1db187d9a4";
+
+/**
+ * A run's smoke sidecar as `docker inspect` printed one on Docker 29.9.2 (probed for Task 9), following its real argv
+ * (src/run/sidecar.ts): named `<run>-sidecar`, the run's labels with `org.hapi.kind=sidecar` and the stack's
+ * started-by and dev-override, the Compose labels blank, on the run's network alone as hapi-sidecar, bun-http's image
+ * and command, read-only as 1001 with every capability dropped, bun-http's limits, its data read-only at /data and
+ * its working dir there, a /tmp tmpfs, HOME and PORT, and no key. Written out here, not read from `sidecarArgs`.
+ * Pair it with `runContainer(w, id, { sidecar: "bun-http" })`, whose network holds it.
+ */
+export function sidecarContainer(id = "ab12cd34ef56"): Container {
+  const run = `hapi-run-${id}`;
+  return {
+    Id: `id-sidecar-${id}`,
+    Name: `/${run}-sidecar`,
+    State: { Running: true },
+    Path: "bun",
+    Args: ["/data/server.ts"],
+    Config: {
+      Labels: {
+        "com.docker.compose.project": "",
+        "com.docker.compose.service": "",
+        "com.docker.compose.version": "",
+        "org.hapi.run": id,
+        "org.hapi.project": "hapi",
+        "org.hapi.kind": "sidecar",
+        "org.hapi.started-by": "hapi",
+        "org.hapi.dev-override": "0",
+      },
+      // The image's own env follows the argv's.
+      Env: ["HOME=/tmp", "PORT=8080", "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "BUN_RUNTIME_TRANSPILER_CACHE_PATH=0"],
+      Cmd: ["/data/server.ts"],
+      Entrypoint: ["bun"],
+      User: "1001:1001",
+      Image: SIDECAR_IMAGE,
+      WorkingDir: "/data",
+    },
+    Mounts: [{ Type: "bind", Source: `/state/runs/${id}/sidecar`, Destination: "/data", RW: false }],
+    NetworkSettings: { Networks: { [run]: { Aliases: ["hapi-sidecar"], DNSNames: [`${run}-sidecar`, "hapi-sidecar", "7777aeb2b08e"] } } },
+    HostConfig: {
+      NetworkMode: run,
+      PortBindings: {},
+      Tmpfs: { "/tmp": "size=64m,uid=1001,gid=1001,mode=0700" },
+      CapDrop: ["ALL"],
+      CapAdd: null,
+      AutoRemove: false,
+      ReadonlyRootfs: true,
+      SecurityOpt: ["no-new-privileges:true"],
+      PidsLimit: 128,
+      Memory: 512 * 1024 ** 2,
+    },
+  };
+}
+
+/**
+ * A one-shot helper container as `docker inspect` prints one mid-flight, following its real argv: the copy-out
+ * (src/run/copyout.ts: a bare org.hapi.run, 1001, /out read-only), the volume chown (src/run/lifecycle.ts:
+ * org.hapi.run=<id>, 0:0, CHOWN added, which Docker keeps as CAP_CHOWN) or the run disk's cleanup (src/run/disk.ts:
+ * org.hapi.run=<id>, 1001). Each carries `org.hapi.helper=<kind>`, a name of Docker's choosing, `--rm`,
+ * `--network none`, a read-only root, every capability dropped, and no key.
+ */
+export function helperContainer(kind: "copyout" | "chown" | "clean", runId = "ab12cd34ef56", name = "quirky_name"): Container {
+  const vol = (v: string, dest: string, rw: boolean) => ({ Type: "volume", Name: `hapi-run-${runId}-${v}`, Source: `/var/lib/docker/volumes/hapi-run-${runId}-${v}/_data`, Destination: dest, RW: rw });
+  return {
+    Id: `id-helper-${kind}-${runId}`,
+    Name: `/${name}`,
+    State: { Running: true },
+    Path: kind === "chown" ? "chown" : "sh",
+    Args: kind === "chown" ? ["1001:1001", "/w", "/o"] : ["-c", "(the helper's fixed script)"],
+    Config: {
+      Labels: { "org.hapi.run": kind === "copyout" ? "" : runId, "org.hapi.project": "hapi", "org.hapi.helper": kind },
+      Env: ["PATH=/usr/local/bin:/usr/bin:/bin"],
+      Cmd: null,
+      Entrypoint: [kind === "chown" ? "chown" : "sh"],
+      User: kind === "chown" ? "0:0" : "1001:1001",
+    },
+    Mounts:
+      kind === "copyout"
+        ? [vol("out", "/out", false)]
+        : kind === "chown"
+          ? [vol("work", "/w", true), vol("out", "/o", true)]
+          : [{ Type: "bind", Source: `/var/lib/hapi/rundisk/hapi-run-${runId}-work`, Destination: "/w", RW: true }],
+    NetworkSettings: { Networks: { none: {} } },
+    HostConfig: {
+      NetworkMode: "none",
+      Init: null,
+      AutoRemove: true,
+      PortBindings: {},
+      CapDrop: ["ALL"],
+      CapAdd: kind === "chown" ? ["CAP_CHOWN"] : null,
+      ReadonlyRootfs: true,
+      SecurityOpt: ["no-new-privileges:true"],
     },
   };
 }
@@ -446,9 +703,11 @@ function archonBindings(configFile: string): { aliases: unknown; tiers: unknown 
 function fakeExec(w: World, cmd: string[]): ExecResult {
   w.calls.push(cmd);
   if (cmd[0] === "getent") return ok("hapi:x:1001:1001::/home/hapi:/bin/bash\n");
+  if (cmd[0] === "env" && cmd.includes("systemctl")) return w.timer.code === 0 ? ok(w.timer.out) : { code: w.timer.code, stdout: "", stderr: w.timer.out };
   if (cmd[0] === "env" && cmd.includes("git")) return fakeGit(w, cmd.slice(cmd.indexOf("git") + 1));
   if (cmd[0] !== "docker") return { code: 127, stdout: "", stderr: `${cmd[0]}: not found` };
   if (w.dockerDown) return { code: 1, stdout: "", stderr: "Cannot connect to the Docker daemon at unix:///run/user/1001/docker.sock. Is the docker daemon running?" };
+  if (cmd[1] === "info" && cmd[2] === "--format" && cmd[3] === "{{.DockerRootDir}}") return ok(`${DOCKER_ROOT}\n`);
   if (cmd[1] === "ps") {
     // `--filter label=k` or `label=k=v`, all of which must match.
     const wanted = cmd.flatMap((a, i) => (cmd[i - 1] === "--filter" && a.startsWith("label=") ? [a.slice(6)] : []));
@@ -464,6 +723,11 @@ function fakeExec(w: World, cmd: string[]): ExecResult {
   if (cmd[1] === "inspect") {
     const ids = cmd.slice(2);
     return ok(JSON.stringify(w.containers.filter((c) => ids.includes(c.Id))));
+  }
+  if (cmd[1] === "network" && cmd[2] === "inspect") {
+    const nets = cmd.slice(3).map((n) => w.networks.get(n));
+    if (nets.some((n) => n === undefined)) return { code: 1, stdout: "[]", stderr: `Error response from daemon: network ${cmd[3]} not found` };
+    return ok(JSON.stringify(nets));
   }
   if (cmd[1] === "image" && cmd[2] === "inspect") {
     const image = cmd.at(-1)!;

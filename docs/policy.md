@@ -18,9 +18,12 @@
 | `protected_paths.yaml` | `policy-protected-paths` | Paths agents can't change freely, with a mode per session kind | Hermes `security.protected_instruction_files`, the hapi-path-guard plugin and a command allowlist; Pi hapi-guard; later, Claude Code permission rules; CI path checks |
 | `commands.yaml` | `policy-commands` | Hermes's command allowlist, as argv-exact rules; the Pi built-in tools workers get | The Hermes `hapi-cmd-allow` hook (default-deny, fail-closed; Plan 04); Archon `allowed_tools` per node |
 | `trusted_sources.yaml` | `policy-trusted-sources` | Source tiers T0–T3, and the hosts each egress zone may reach | The egress proxy allowlists (the real boundary); Hermes's web backend pins and blocklist; Anthropic `allowed_domains` |
-| `budgets.yaml` | `policy-budgets` | Workspace and key caps, the per-run target, Hermes's turn limit | Hermes `max_turns`; Archon `budget` on per-task children; hapi-guard limits; provider key limits (documented, applied by hand or API) |
-| `runs.yaml` | `policy-runs` | The run launcher's limits: live runs, retention, output sizes | The run launcher (Plan 02 Task 7) |
-| `gates.yaml` | `policy-gates` | The level-6 gates: the bash gate, the result screen and their classifiers | Pi hapi-guard and the gate classifiers (Plan 02 Tasks 3 and 5) |
+| `budgets.yaml` | `policy-budgets` | Workspace and key caps, the per-run target, the per-repo and per-day caps, Hermes's turn limit | Hermes `max_turns`; Archon `budget` on per-task children; hapi-guard limits; the poller's repo and day checks; provider key limits (documented, applied by hand or API) |
+| `runs.yaml` | `policy-runs` | The run engine's limits: live runs, retention, output sizes, the disk cap, the poll interval, the automatic-round cap, the retries, the rework rounds, the inputs and work-order file caps, and the phase and round knobs | The run launcher (Plan 02 Task 7); the poller, the harvester and hapi-guard (Plan 03) |
+| `repos.yaml` | `policy-repos` | The repo registry: the GitHub App installation ids and the repos the poller acts on | The poller; `hapi new-repo` adds a repo to it |
+| `sidecars.yaml` | `policy-sidecars` | The central list of sidecars (a pinned image, a command and a port each) that a repo's overlay may name, and their `limits` (pids, memory, data files and size) | The run engine, which starts the sidecar a repo names |
+| `github/rulesets/*.json` | none (GitHub's ruleset API body) | The four GitHub rulesets, one file each | `loadPolicy` doesn't load them. `hapi new-repo` posts them, the README and the runbook apply them with `gh api --input`, and `tests/docs/rulesets.test.ts` holds them to their rules |
+| `gates.yaml` | `policy-gates` | The level-6 gates: the bash gate, the result screen and their classifiers; and the run engine's decisions (the `decisions` block) | Pi hapi-guard and the gate classifiers (Plan 02 Tasks 3 and 5); the harvester's `decide()` questions (Plan 03 Task 12) |
 | `approvals.yaml` | `policy-approvals` | The fixed short list of actions that always need the operator | Not compiled in Plan 01; later plans enforce it |
 | `roles.yaml` | `policy-roles` | The default model tier per role | With the rosters: Archon tiers and aliases; Hermes model, auxiliary and delegation settings |
 | `rosters/{budget,anthropic,portable}.yaml` | `policy-roster` | Tier → provider, model and effort, one file per roster | See `roles.yaml` |
@@ -39,7 +42,9 @@ protected_paths:
   # ... and the other agent instruction files at any depth (**/CLAUDE.md, **/.claude/** ...), .factory/**, .github/**, mise.toml and every
   # other mise config file and lockfile at any depth (**/mise.toml, **/.mise.toml, **/mise.*.toml, **/mise/**, **/.tool-versions, **/mise.lock ...), .agents/**,
   # .archon/**, .coderabbit.yaml, .coderabbit.yml, .coderabbit.config.ts, git's own files (**/.git/**, deny everywhere), and gitleaks's
-  # **/.gitleaks.toml and **/.gitleaksignore (exactly spec §8.2)
+  # **/.gitleaks.toml and **/.gitleaksignore, the MCP configs **/.mcp.json and **/.vscode/mcp.json, and **/.gitattributes (exactly spec §8.2,
+  # plus design §3.3's two: Claude Code loads a project's .mcp.json without asking under -p; and H-302's: a .gitattributes tells GitHub's PR
+  # view and reviewers how to show files, so a worker's could hide a change from review)
 ```
 
 Keys are globs relative to a repo's root. Each entry sets all three modes:
@@ -74,6 +79,10 @@ The error names the problem, with the path JSON-escaped so it prints safely, e.g
 - a guard that isn't TypeScript, such as the Python hapi-path-guard (Plan 04), must implement the same rule and pass the same vectors.
 
 When you change `protected_paths.yaml` or the matching rule, update the vectors in the same change.
+
+**Hermes and the MCP configs.** Hermes's gate keeps only a glob's last segment, so `**/.vscode/mcp.json` protects every `mcp.json` for Hermes, not just the one under `.vscode/`. That is stricter, so it is allowed; the other enforcers match the whole glob.
+
+**`.gitattributes` (H-302).** GitHub's PR view and CodeRabbit's review honour a repo's `.gitattributes`: `linguist-generated` collapses a file's diff on the PR page. So `**/.gitattributes` is protected, at any depth and in any case, and the host gates refuse a run that adds, changes or deletes one. The host's own reads of a run's change already ignore every in-tree `.gitattributes` (`scratchGit` sets `GIT_ATTR_SOURCE` to git's empty tree, `src/engine/decisions.ts`). What it doesn't reach is the `.gitattributes` a factory PR inherits: `main`'s (the contract's, which `hapi new-repo` writes under the operator's login, or any the operator merges later, a planning PR's included) still shapes GitHub's PR view and CodeRabbit's review of every factory PR, and the CodeRabbit CLI in the review container probably reads it in the run's checkout. A planning PR's own `.gitattributes` shapes that PR's view before its merge. GitHub also collapses files Linguist's own rules class as generated (by path, such as `__generated__/`, or by content, such as minified JavaScript) with no `.gitattributes` at all, and no protected path can close that: open every collapsed file in a factory PR's Files changed tab before you merge (H-302).
 
 #### Glob syntax
 
@@ -199,12 +208,13 @@ The patterns are a second line of defense: no positional pattern accepts `$`, a 
 | `hermes` | T0–T1 | `api.anthropic.com`, `openrouter.ai`, `api.github.com`, `github.com`, `slack.com` | The Hermes main session. T2 and T3 content reaches it only as schema-validated briefs from hapi-research (spec §10, amended by §10.1). |
 | `archon` | T0–T1 | `api.anthropic.com`, `openrouter.ai`, `opencode.ai`, `registry.npmjs.org`, `pypi.org`, `files.pythonhosted.org` | Archon and its Pi workers. **No forge host**: the Archon zone has no route to GitHub (spec §4.3). |
 | `research` | T0–T3 | None | `openWeb: true`. Only hapi-research touches the open web. Private address ranges stay blocked. |
+| `review` | none | `api.anthropic.com`, `cli.coderabbit.ai`, `app.coderabbit.ai`, `ide.coderabbit.ai` | The review container (design §3.5), behind `egress-review`: the review model's API and CodeRabbit's CLI, and nothing else. No tier, so no package registry (it runs none of the repo's code), and **no forge host**: the harvester posts the review, never the container. |
 
 A zone's allowlist is its own `hosts` **plus** the hosts of every tier it lists (`zoneHosts` in `src/policy/zones.ts` computes it; the egress generator uses it). Hosts are plain, lowercase domains with at least two labels: no scheme, port, path, wildcard or leading dot, and no IP addresses. The egress generator allows each domain and its subdomains, so `slack.com` also covers `wss-primary.slack.com`. It checks every host again before writing it, for a policy built in code ([generated configs](generated-configs.md#buildegresssquidconf)).
 
-The schema enforces spec §10's tier entitlements: the `hermes` and `archon` zones may list only T0–T1, and only the `research` zone may set `openWeb`. Until Task 3b the `hermes` zone also listed T2; spec §10.1 moved the aggregators (Context7, DeepWiki) to the research zone, so `context7.com` and `deepwiki.com` left the hermes allowlist.
+The schema enforces spec §10's tier entitlements: the `hermes` and `archon` zones may list only T0–T1, the `review` zone no tier at all (`maxItems: 0`), and only the `research` zone may set `openWeb`. Until Task 3b the `hermes` zone also listed T2; spec §10.1 moved the aggregators (Context7, DeepWiki) to the research zone, so `context7.com` and `deepwiki.com` left the hermes allowlist.
 
-**Forge hosts.** The `archon` zone has no route to a forge (spec §4.3). So the schema rejects a **forge host** in the `archon` zone's `hosts`, and in tiers `T0` and `T1`, which that zone reaches. A forge host is one of these domains or a subdomain of one: `github.com`, `githubusercontent.com`, `githubassets.com`, `ghcr.io`, `gitlab.com` and `bitbucket.org`. The stack is meant to stay forge-agnostic, so GitLab and Bitbucket count too. The list is defined once, as `forgeHost` in `policy-defs.schema.json`. The same check covers [overlay](#repo-overlays-factoryconfigyaml) and [work-order](#work-orders) `egress_extra` hosts, and `forgeDomain` in `src/policy/hosts.ts` reads the same pattern. The `hermes` zone may reach the forge.
+**Forge hosts.** The `archon` zone has no route to a forge (spec §4.3). So the schema rejects a **forge host** in the `archon` zone's `hosts`, and in tiers `T0` and `T1`, which that zone reaches. A forge host is one of these domains or a subdomain of one: `github.com`, `githubusercontent.com`, `githubassets.com`, `ghcr.io`, `gitlab.com` and `bitbucket.org`. The stack is meant to stay forge-agnostic, so GitLab and Bitbucket count too. The list is defined once, as `forgeHost` in `policy-defs.schema.json`. The same check covers [overlay](#repo-overlays-factoryconfigyaml) and [work-order](#work-orders) `egress_extra` hosts and the `review` zone's `hosts` (`"github.com" is a forge host (github.com); the review zone has no forge route (design §3.5)`), and `forgeDomain` in `src/policy/hosts.ts` reads the same pattern; the egress generator refuses one in either zone again, for a policy built in code. The `hermes` zone may reach the forge.
 
 ### `budgets.yaml`
 
@@ -220,30 +230,80 @@ All amounts are in USD.
 | `run_usd` | 3.00 | Target spend per factory run |
 | `hermes_max_turns` | 60 | Hermes `agent.max_turns` |
 | `enforcement.hapi_guard` | `hard` | What Pi's hapi-guard does when the run crosses `run_usd` (Plan 02 Task 5) |
-| `enforcement.archon` | `hard` | The same for Archon's `factory-task` budget (Plan 03) |
+| `repo_monthly_usd` | 25.00 | Most one registered repo's runs may spend per UTC calendar month. The poller reads it. An overlay may lower it. |
+| `daily_usd` | 10.00 | Most all registered repos together may spend per UTC calendar day. The poller reads it. Central only: an overlay naming it is an unknown key. |
+| `enforcement.archon` | `hard` | The same for Archon's `factory-task` budget (Plan 03). Archon bounds nodes, never dollars: `factory-task`'s `max_work_units` is pinned to its node count whatever this says (ruling m7), so it is **hard-only** for `factory-task`, and `tests/run/workflows.test.ts` holds it `hard`. `soft` isn't applied there yet (H-257). |
+| `enforcement.poller` | `hard` | What the poller does when a run would cross `repo_monthly_usd` or `daily_usd`: `hard` refuses the run, `soft` starts it and flags it (`hapi:flagged` on its PR, once there is one). It applies to those two spend caps only; the round counts, `max_retries` and `max_rework_rounds` in `runs.yaml` are always hard. |
 
-`enforcement` is a setting per enforcement point: `hard` stops the run at `run_usd`; `soft` lets it finish and flags it (`hapi:flagged`, spec §13.3). Both ship as `hard` and are required: the loader fills no defaults, so the fail-closed value lives in the YAML. An overlay may harden a mode but never soften it (soft < hard).
+`enforcement` is a setting per enforcement point: `hard` stops the run at `run_usd`; `soft` lets it finish and flags it (`hapi:flagged`, spec §13.3). All three ship as `hard` and are required: the loader fills no defaults, so the fail-closed value lives in the YAML. An overlay may harden a mode but never soften it (soft < hard). An overlay may also lower `repo_monthly_usd`, never raise it.
 
 The monthly caps are enforced at the provider. The operator sets them on the Console workspaces and OpenRouter keys; the [provider-keys runbook](runbooks/provider-keys.md) covers it. An OpenRouter key's cap is set as a limit that resets daily, the monthly cap divided by 31 (the runbook's rule), so a leaked key can spend only one day's share. The workspaces add up to the $200/month credit, and the default workspace is unused.
 
 ### `runs.yaml`
 
-The run launcher's limits (Plan 02 Task 7; [the runs runbook](runbooks/runs.md) covers the launcher, the outputs and retention). Every key is required. An overlay may lower any of them, never raise one.
+The run engine's limits (Plan 02 Task 7 and Plan 03; [the runs runbook](runbooks/runs.md) covers the launcher, the outputs and retention, and [the engine runbook](runbooks/engine.md#the-pipeline) the pipeline). Every key is required. An overlay may lower `max_auto_rounds`, `output_limits_mb.bundle` (the harvest enforces it) and the `phases` numbers, never raise one, and may switch a `phases` flag on, never off. The rest are central only: the launcher's own limits (`max_live`, `retention_days`, `output_limits_mb`'s `transcript`, `decisions` and `result`, and `disk`, one filesystem every run shares), which it reads only from this file, so an overlay that sets one is refused, naming it as central only (final review I6); and `poll_interval_s`, `max_retries`, `max_rework_rounds`, `inputs_mb` and `work_order_kb` (an overlay naming one is an unknown key).
 
 | Key | Value | Meaning |
 |---|---|---|
-| `max_live` | 1 | Live runs at once; the launcher refuses the next (no queue until Plan 03's poller) |
-| `retention_days` | 14 | A run's files are removed this many days after its `harvestedAt`. Plan 02 sets none, so nothing is removed yet (H-206) |
+| `max_live` | 1 | Live runs at once; the launcher refuses the next, and the poller waits for a free slot |
+| `retention_days` | 14 | A run's files are removed this many days after its `harvestedAt`, and never before the UTC month it started in has ended: the poller's monthly cap reads each run of the month from its record. A run with no `harvestedAt` is never removed (H-244) |
 | `output_limits_mb.bundle` | 256 | The most the result bundle may be, in MB |
 | `output_limits_mb.transcript` | 64 | The most the run transcript may be |
 | `output_limits_mb.decisions` | 16 | The most the decisions log may be |
 | `output_limits_mb.result` | 4 | The most the result summary may be |
+| `disk.gb` | 20 | The run disk: the one filesystem every run's volumes share (`/var/lib/hapi/rundisk`), at most this many GiB, so no run can grow past it. `hapi run start` checks it before each start: its own filesystem, apart from Docker's data root, writable, and no bigger than this. Central only. |
+| `disk.enforcement` | `hard` | What a failed check does, before the start: `hard` refuses the run; `soft` warns and starts it anyway. Central only. |
+| `poll_interval_s` | 120 | Seconds between the poller's passes over the registered repos, 30 to 3600. Central only. |
+| `max_auto_rounds` | 3 | Automatic runs per work order with no human action between them. The poller counts it; always hard: the poller's check, never softened by `budgets.enforcement.poller`. |
+| `max_retries` | 2 | Times the operator may queue a failed work order again (`hapi retry`); the command refuses one more. Always hard: never softened by `budgets.enforcement.poller`. Central only; 0 turns `hapi retry` off. |
+| `max_rework_rounds` | 3 | Rework runs a maintainer's `hapi:rework` label may start on one factory PR; past it the poller starts none, and the PR waits, **Needs your decision**, with `<n> rework rounds on #<pr> (runs.max_rework_rounds: <n>): close the PR, or plan the work again under a new work order id`. Always hard: never softened by `budgets.enforcement.poller`. Central only; 0 turns rework off. |
+| `inputs_mb` | 16 | The most a review or fix run's inputs copy may be, in MiB (`diff.patch`, `verify.json` and `findings.md` together): the engine refuses to build a larger one and the launcher to copy it, never truncating it. Central only. |
+| `work_order_kb` | 1024 | The most discovery reads of each work-order file (`order.yaml`, `task.md`, `.factory/config.yaml`), in KiB, by its size in git before the read: a larger one is a problem the work order can't run with ("Can't run"), never truncated. Central only. |
+| `phases.verify` | true | The verify container runs the repo's gates. The poller starts it once a worker or fix run's host gates pass, and the harvester reads it |
+| `phases.review` | true | The review container reviews the diff. The poller starts it after verify (or the gates, with verify off), and the harvester reads it |
+| `phases.coderabbit` | false | The CodeRabbit CLI in the review container. `startRun` writes it into the review's `run.json`, and the poller and the harvester read its result. Off until an unattended key exists (H-167) |
+| `phases.require_acceptance` | true | See below |
+| `phases.fix_rounds_before_pr` | 1 | Fix rounds a run makes before it opens its PR. 0 makes none. The poller enforces the count; always hard: the poller's check, never softened by `budgets.enforcement.poller`. |
+| `phases.fix_rounds_on_pr` | 1 | Fix rounds on an open PR after a review or CodeRabbit finding. 0 makes none. The poller enforces the count; always hard, as above. |
+| `phases.round_turns` | 40 | The most agent turns in one fix round; hapi-guard enforces it, under `budgets.enforcement.hapi_guard` |
+| `phases.round_usd` | 1.00 | The most one fix round may spend. At most `budgets.run_usd`: `loadPolicy` and `applyOverlay` refuse a larger one (`phaseIssues`). So lowering `run_usd` below `round_usd` in an overlay needs `round_usd` lowered in the same overlay. hapi-guard enforces it. |
 
-An output file over its `output_limits_mb` cap is not copied out, and the run is recorded `failed`; the run itself is never stopped for it. All counts are whole numbers, at least 1 (`max_live: 0` is rejected).
+An output file over its `output_limits_mb` cap is not copied out, and the run is recorded `failed`; the run itself is never stopped for it. All counts are whole numbers, at least 1 (`max_live: 0` is rejected), except the two fix-round counts, `max_retries` and `max_rework_rounds`, which may be 0.
+
+`phases.coderabbit` is the CodeRabbit CLI in the review container. `flags.coderabbit` is CodeRabbit's PR review, whose automatic fix runs are capped by `phases.fix_rounds_on_pr`.
+
+`phases.require_acceptance` is on by default, and an overlay may only switch it on. The acceptance tests live at `.factory/work/<id>/acceptance/`. That path is protected by `.factory/**`, the planner writes the tests, and the planning PR's merge approves them. When the directory exists, the verify container runs it with `bun test ./.factory/work/<id>/acceptance`. With the key on, a work order with no acceptance tests gets at best "Needs your decision", and a failing one makes a draft "Do not merge".
+
+### `repos.yaml`
+
+The repo registry (Plan 03). The poller acts only on a repo listed here. Every key but `installations.coderabbit` is required.
+
+| Key | Meaning |
+|---|---|
+| `installations.planner`, `installations.factory` | The installation id of `hapi-planner` and of `hapi-factory`: the number at the end of `/settings/installations/<id>` (Settings, Applications, Installed GitHub Apps, Configure). Not secret. A positive integer. |
+| `installations.coderabbit` | CodeRabbit's installation id, once it exists. Optional. |
+| `repos` | A map from `owner/name` to `{ registered: "YYYY-MM-DD" }`. A key that isn't `owner/name` (or whose name is `.` or `..`) is rejected, and so is a second key that differs from an earlier one only in case (GitHub names ignore case, so it is the same repo registered twice: `loadPolicy` names it at `/repos/<key>`). `hapi new-repo` adds an entry as an uncommitted change, which the operator reviews and commits. |
+
+An overlay can't name `repos`: it is central only.
+
+### `sidecars.yaml`
+
+The central list of sidecars (Plan 03, design §3.3). A repo's overlay names one with `sidecar: { name, data_dir }`; it can't bring its own image or command. Each entry under `sidecars` is keyed by a slug and has four required keys:
+
+| Key | Meaning |
+|---|---|
+| `image` | An OCI image pinned by digest (`name[:tag]@sha256:<64 hex>`); a tag alone is rejected. `mise run up` pulls it by that reference, unless it is here already |
+| `command` | The argv it runs: a non-empty list of non-empty strings |
+| `port` | The port it listens on, 1 to 65535 (set as `PORT`, Bun's default port) |
+| `limits` | Fail-closed defaults, a starting point to tune, central only (an overlay can't change them) and always hard, each a whole number of at least 1: `pids` (`docker run --pids-limit`) and `memory_mb` (`--memory`, in MiB), which Docker enforces on the sidecar's container; `data_files` and `data_mb` (MiB), the most files and bytes its data dir may hold at the run's commit, which the run engine enforces on the export, refusing the run when there is more |
+
+`bun-http` ships: `oven/bun:1.4.4-slim` pinned by digest, running `bun /data/server.ts` on port 8080, with `limits: { pids: 128, memory_mb: 512, data_files: 256, data_mb: 16 }`. The repo's `data_dir` is exported from the run's commit and mounted read-only at `/data`, so `server.ts` is the repo's own code, which is why `applyOverlay` denies `data_dir/**` to workers. Its server must use Bun's default host, so the run can reach it by its alias, `hapi-sidecar`. How a run starts it, and what the export refuses: [the runs runbook](runbooks/runs.md#the-smoke-sidecar).
 
 ### `gates.yaml`
 
 The level-6 gate settings (Plan 02 Tasks 3 and 5). Every key is required. The file is central only: an overlay naming `gates` is an unknown key. A gate that is on needs a classifier, so `loadPolicy` refuses `enabled: true` while `flags.jev.fallback` is `none`, whatever `flags.jev.enabled` says. Jev answers only for a public repo, so Haiku is the only classifier a run that isn't public has. Set `fallback: haiku`, or turn the gate off in `gates.yaml`.
+
+The `decisions` block is the run engine's, not the guard's: the harvester's `decide()` questions about a head it will push, keyed by decision file ([In the run engine](#in-the-run-engine)). `loadPolicy` loads it apart from the gates, as `Policy.decisions`, so `Policy.gates` (and the `hapi-guard.json` generated from it) keeps Plan 02's shape. The same classifier rule holds: while `flags.jev.fallback` is `none`, a decision whose `mode` isn't `off` is refused at `/decisions/by_name/<name>/mode`, unless `decisions.mode` is `off`. The loader fills no defaults.
 
 | Key | Value | Meaning |
 |---|---|---|
@@ -257,6 +317,11 @@ The level-6 gate settings (Plan 02 Tasks 3 and 5). Every key is required. The fi
 | `classifiers.haiku.model` | `claude-haiku-5-5` | The fallback classifier, used when `flags.jev.fallback` is `haiku` |
 | `classifiers.haiku.input_per_mtok` | 0.1 | USD per million input tokens (Anthropic first-party rate, prompts up to 100K tokens) |
 | `classifiers.haiku.output_per_mtok` | 0.5 | USD per million output tokens (same rate card) |
+| `decisions.mode` | `enforce` | The operator's one switch for the engine's decisions. `enforce`: each decision acts as its `by_name` entry says. `notes`: each is asked and recorded as in `enforce`, but no answer holds a PR: a hold, an unscreened file's included, is listed as a note instead (a `shadow` decision stays shadow). `off`: decision models are off: the harvester builds no subject, asks nothing and appends nothing to the decision ledger, and no decision holds or notes a PR; it is never silent: the PR's Evidence row and "Check this yourself" say so, the planning PR's status comment says so, and each run record the harvest first reads carries `decisions: "off"`. Only the operator sets `off`, by a reviewed change to this protected file: in `enforce`, an unset key, a failing provider or a spent Jev share still gives each subject its file's fallback through `on_unscreened` (a hold), never "off" |
+| `decisions.max_calls_per_head` | 24 | Classifier calls for one pushed head, over every harvest of it, crash replays and re-asks included (each written to the ledger before it is made). A subject past it is not asked, and its decision's `on_unscreened` applies. At `unknown_call_usd` a call, that is $0.024 a head at worst |
+| `decisions.by_name.<name>.mode` | `enforce` | One decision's mode: `off` (never asked; it doesn't cap the verdict, and its Evidence row says it is off), `shadow` (asked and recorded, but it changes nothing on the PR except its Evidence row, `shadow: would hold <n>`: how a question is calibrated before it is enforced), or `enforce` (a hold keeps the PR at Needs your decision; a note goes under Check this yourself). One key, not two booleans, so no meaningless pair |
+| `decisions.by_name.<name>.on_unscreened` | `hold` | What a subject no classifier answered does: no key, a provider error, over `max_state_chars`, content the diff doesn't show (a binary or a gitlink), past `max_calls_per_head`, or a re-render that asks nothing. `hold` (fail-closed) or `note` |
+| `decisions.by_name.diff-screen.skip_paths` | `[bun.lock]` | Exact repo paths of lockfiles the diff screen never screens; OSV-Scanner and the review cover dependencies. Each is matched against the changed file's full path exactly and case-sensitively, never as a glob (the schema refuses `*`, `?`, `[`, `]`, `{`, `}` and a backslash), so `bun.lock` is the root `bun.lock` only: `Bun.lock` and `src/bun.lock` are screened. A skipped file must also be, structurally, the lockfile its name says. For `bun.lock` that is Bun's text lockfile: JSON with trailing commas, no comment, no duplicate key (at any depth, however escaped) and no nesting deeper than 16, printable ASCII only; only Bun's top-level keys (`lockfileVersion` 0 to 2, `workspaces`, `packages`, and optionally `configVersion`, `trustedDependencies`, `patchedDependencies`, `overrides`, `catalog`, `catalogs`); workspaces and package entries in the shapes Bun writes; every string a package name, resolution, version spec (a protocol spec with no space), registry, integrity, path or platform of at most 256 characters; and at most 16 dist-tag specs. One that isn't is unscreened, so `on_unscreened` applies, and a worker can't hide free text from the screen behind a lockfile's name. What the grammar still admits (hyphenated words as package names; up to 16 dist-tags of up to 32 characters each, lower-case words joined by hyphens; words joined without spaces in a `workspace:` path, a `catalog:` name, a `file:`, `link:` or `github:` path, an https or git+https URL, a registry URL, a prerelease tag or a bin path) is H-275's residual. A lockfile nested deeper than 16, or one whose check fails in any way, isn't one. A name with no such check is unscreened too. A deleted lockfile adds nothing, and is skipped. Only a decision whose subjects are changed files takes it |
 
 ### `approvals.yaml`
 
@@ -289,7 +354,7 @@ large:  { provider: pi, model: anthropic/claude-opus-5-5, effort: low, retry_eff
 | Roster | Use (spec §12) | small | medium | large |
 |---|---|---|---|---|
 | `anthropic` | Normal operation | Haiku 5.5 on Pi | Sonnet 5.5 via the Claude provider | Opus 5.5 on Pi, effort low, retry high |
-| `budget` | The first end-to-end runs | Haiku 5.5 on Pi | Haiku 5.5 via the Claude provider | Haiku 5.5 on Pi |
+| `budget` | The first end-to-end runs | Haiku 5.5 on Pi | Sonnet 5.5 via the Claude provider (the review's tier since Task 11, so a review runs on another model than implement's) | Haiku 5.5 on Pi |
 | `portable` | Proving model portability | `opencode-go/glm-5.3-flash` | `opencode-go/glm-5.3` | `opencode-go/kimi-k3`, retry high |
 
 **The `portable` roster** runs every tier on Pi through OpenCode Go. It may use **only models with 0-day retention and no training**. The ids and terms were checked against <https://opencode.ai/docs/go/> on 2026-10-26. DeepSeek is left out because its zero-retention agreement is renewed monthly. Review (GLM) runs on a different model family from implement (Kimi).
@@ -497,22 +562,25 @@ In a JSON Pointer, a `/` inside a key is written `~1` and a `~` is written `~0`.
 
 A target repo can adjust the central policy with an overlay in its `.factory/config.yaml` (spec §7). **An overlay may only tighten policy.** The one exception is `egress_extra`: it may add hosts, and the overlay file is itself protected (`.factory/**`), so adding one goes through a reviewed planning PR.
 
-An overlay has the six keys below. **Any other key is rejected.** Four of them change policy, and those may only tighten it, except for `egress_extra`. The other two, `default_risk` and `workflow`, are repo settings (spec §7). They don't loosen any policy, so the tighten-only rule doesn't apply to them.
+An overlay has the seven keys below. **Any other key is rejected**, `repos`, `sidecars`, `gates`, `budgets.daily_usd`, `runs.poll_interval_s`, `runs.max_retries`, `runs.max_rework_rounds`, `runs.inputs_mb` and `runs.work_order_kb` included; and `runs.disk`, `max_live`, `retention_days` and `output_limits_mb`'s `transcript`, `decisions` and `result` are refused by name as central only, so an overlay written for an older schema fails loudly instead of being ignored. Four of them change policy, and those may only tighten it, except for `egress_extra`. The other three, `default_risk`, `workflow` and `sidecar`, are repo settings (spec §7). They don't loosen any policy, so the tighten-only rule doesn't apply to them.
 
 | Key | What it may do |
 |---|---|
 | `protected_paths` | **Add** a glob, or **raise** a listed glob's modes (allow < ask < deny). An entry may name only some of the three modes. For a glob the base policy lists, the others keep their base value. A **new** glob may name only `ask` or `deny`; naming `allow` is rejected, because under [strictest-wins](#how-globs-combine) it can't change anything and so reads as a loosening attempt. Its unnamed modes are stored as `allow`, which adds no rule. A new glob that overlaps a protected one can tighten files under it but never loosen them. `null` asks to remove the glob, and that is **always rejected**. |
 | `egress_extra` | **Add** hosts to the `archon` zone's allowlist. The rules are the same as for any host. A [**forge host**](#trusted_sourcesyaml) (`github.com`, `githubusercontent.com`, `githubassets.com`, `ghcr.io`, `gitlab.com`, `bitbucket.org`, or a subdomain of one) is rejected, because the Archon zone must never reach the forge (spec §4.3). |
-| `budgets` | **Lower** any budget in `budgets.yaml`. Each value must be at most the base value. `enforcement` modes may be **hardened** (soft to hard), never softened. |
-| `runs` | **Lower** any limit in `runs.yaml` (`max_live`, `retention_days`, `output_limits_mb.*`). Never raise one. |
+| `budgets` | **Lower** any budget in `budgets.yaml`, `repo_monthly_usd` included, except `daily_usd`, which is central only. Each value must be at most the base value. `enforcement` modes (`hapi_guard`, `archon`, `poller`) may be **hardened** (soft to hard), never softened. |
+| `runs` | **Lower** `max_auto_rounds`, `output_limits_mb.bundle` (which the harvest enforces), and `phases.fix_rounds_before_pr`, `fix_rounds_on_pr`, `round_turns` and `round_usd`, never raise one. A `phases` flag (`verify`, `review`, `coderabbit`, `require_acceptance`) may be switched **on**, never off. The launcher's own limits (`disk`, `max_live`, `retention_days`, `output_limits_mb`'s `transcript`, `decisions` and `result`) are central only, refused by name, since the launcher reads only `runs.yaml`'s; so are `poll_interval_s`, `max_retries`, `max_rework_rounds`, `inputs_mb` and `work_order_kb`. After the merge the result must still satisfy `phases.round_usd <= budgets.run_usd`. |
 | `default_risk` | The risk new work orders for this repo start from: `low`, `medium` or `high`. A repo setting, not policy: any value is accepted, `low` included. |
 | `workflow` | The Archon workflow this repo's work orders use by default. A lowercase slug, the same rule as a work order's `workflow` (so `factory-task`, not `Factory_Task` or `factory-`). A repo setting, not policy. `hapi run start` runs only a workflow of hapi's pack (`archon/workflows/hapi/`), never one of Archon's bundled ones. |
+| `sidecar` | `{ name, data_dir }`: the sidecar this repo's runs start and the repo directory mounted into it. `name` must be one `sidecars.yaml` lists (otherwise a `PolicyError` at `/sidecar/name`); `data_dir` is a repo-relative directory with no `*` or `?`. `applyOverlay` adds `<data_dir>/**` as denied to workers (merged with any overlay `protected_paths` entry for it, strictest wins), because the directory holds the code the sidecar runs. A repo setting, not policy. |
 
 The overlay is checked in two stages:
 1. **`loadOverlay(file)`** checks the file against `repo-overlay.schema.json`. That catches unknown keys, bad modes, globs outside the [glob syntax](#glob-syntax) and malformed hosts, and throws a `PolicyError`.
 2. **`applyOverlay(policy, overlay)`** compares the overlay with the base policy. It throws a `PolicyLoosenError` at the **first** change that would loosen policy. The error's `path` is a JSON Pointer into the overlay, and its message names the path or glob as written. **A loosening change is never merged silently.** `applyOverlay` returns a new policy that shares no objects with either input, so changing the result never changes the base policy. It also re-runs the schema check, so an overlay built in code gets the same checks as one read from a file.
 
-`default_risk` and `workflow` are copied to the result's **`repo`** field, `{ default_risk?, workflow? }`, which Plan 03 reads. `repo` is set only when the overlay names one of them; `loadPolicy` never sets it.
+`default_risk`, `workflow` and `sidecar` are copied to the result's **`repo`** field, `{ default_risk?, workflow?, sidecar? }`, which Plan 03 reads. `repo` is set only when the overlay names one of them; `loadPolicy` never sets it.
+
+**`overlayFromText(text, label)`** checks overlay text read as a git blob (H-172) the way `loadOverlay` checks a file, and names `label` (say `abc1234:.factory/config.yaml`) in its `PolicyError`.
 
 ### An accepted overlay
 
@@ -641,16 +709,17 @@ Exit codes are the CLI's: `0` success, `1` a failed check or a failed command (a
 
 ## `decide()` and the decision files
 
-`decide()` (`src/decide/index.ts`) is the one helper every typed decision goes through: the level-6 gates in hapi-guard (the bash gate and the result screen), and `hapi decide` on the command line.
+`decide()` (`src/decide/index.ts`) is the one helper every typed decision goes through: the level-6 gates in hapi-guard (the bash gate and the result screen), the run engine's harvester (the diff screen, [below](#in-the-run-engine)), and `hapi decide` on the command line. Every caller asks through one wrapper, `ask()` (`src/decide/record.ts`), which takes a throw as the file's fallback (`error: "decide failed"`), and records an answer as its type and numbers only (`classifierRecord`).
 
 ### A decision file
 
-A decision file is `policy/decisions/<name>.ts` and default-exports a `DecisionFile`: `name` (a slug equal to the file name), `questions` (Jev's typed questions: `noul`, `choice` or `score`), `fallback` (the careful verdict) and `verdict(answers)`. The thresholds live in `verdict`, in code, so changing one is a reviewed change to a protected path (`policy/**`). The three files:
+A decision file is `policy/decisions/<name>.ts` and default-exports a `DecisionFile`: `name` (a slug equal to the file name), `questions` (Jev's typed questions: `noul`, `choice` or `score`), `fallback` (the careful verdict) and `verdict(answers)`. The thresholds live in `verdict`, in code, so changing one is a reviewed change to a protected path (`policy/**`). A run-engine decision is an `EngineDecisionFile`: its verdicts are `pass`, `note` and `hold` (`EngineVerdict`), and it also says the words of its hold and its note (`says`), beside its thresholds. The four files:
 
 | File | Decides | Questions | Verdict | Fallback |
 |---|---|---|---|---|
 | `bash-gate.ts` | a worker's bash call, before it runs | `effect` (read_only, reversible, irreversible), `destructive_intent` | `block` at irreversible >= 0.6 or destructive >= 0.7; `flag` at >= 0.4 or >= 0.5; else `allow` | `block` |
 | `result-screen.ts` | what a tool returned, before the worker reads it | `injection` | `wrap` at >= 0.7; `flag` at >= 0.5; else `allow` | `wrap` |
+| `diff-screen.ts` | each changed file of a head the harvester will push (in windows of whole lines when long), with the work order's goal as context | `reviewer_steer` (text addressed to whoever reviews or checks the change), `loosened_check`, `stand_in`, `beyond_goal` | `hold` at reviewer_steer >= 0.7 (the only question that may hold: the review reads the diff with no result screen); `note` at >= 0.5 on any question; else `pass`. Its `says`: hold "it holds text addressed to whoever reviews or checks the change"; note "a check may be loosened, code may stand in for real behaviour, it may go beyond the goal, or text in it may address its reviewer" | `hold` |
 | `write-gate.ts` | a write whose content holds a credential | none: it exports `KEY_PATTERNS` and nothing goes to a classifier | (local pattern check) | n/a |
 
 ### The order
@@ -669,9 +738,53 @@ The result says which one answered (`via`: `jev`, `haiku`, `default`, or `mock` 
 - **State** longer than `max_state_chars` is never classified, because the part past the limit would go unassessed yet could still be allowed. `decide()` sends nothing, charges nothing and returns the file's `fallback` (`block` for the bash gate, `wrap` for the result screen) with `via: "default"`, `fallback: true` and `truncated: true`. A state of exactly `max_state_chars` is sent whole.
 - **Cost** is added to the run's spend. Haiku: input tokens at `input_per_mtok` plus output tokens at `output_per_mtok`. Jev: the cost it reports, or `classifiers.jev.unknown_call_usd` when it reports none. A classifier that fails costs nothing.
 
+### In the run engine
+
+The harvester (Plan 03 Task 12, `src/engine/decisions.ts`) asks `decide()` before it renders a factory PR's verdict, about a head it will push, on the host, with the archon zone's `HAPI_JEV_OPENROUTER_API_KEY` and `ANTHROPIC_API_KEY` read in-process (never an env, argv, a record or an error). Jev is asked only for a public repo (the forge's `private` field); for a private one, Haiku.
+
+- **What an answer may do.** `pass`: nothing. `note`: a line under the PR's "Check this yourself" (in `enforce` or `notes` mode); it never changes the verdict, the reasons, push or draft. `hold`, in `enforce` mode only: its reason joins the outcome's reasons, after every other one, and a verdict that would be `ready` becomes `decision`; `decision` and `do-not-merge` stay. No answer ever changes `push` or `draft`, moves a phase, starts or skips a run, adds `hapi:flagged`, or closes, dismisses or resolves anything; a "pass" never makes a verdict better. `shadow` only records, and the Evidence row says what it would have done.
+- **`decisions.mode`** (`enforce`, `notes`, `off`) is the switch for the whole block, as [the table above](#gatesyaml) says.
+- **The registry**, `ENGINE_DECISIONS`: each decision file and the source of its subjects (`"diff"`). Adding a decision is a decision file, a registry line and a `decisions.by_name` entry with its schema line (a test holds the schema's names to the registry's); a new kind of subject, such as a CodeRabbit finding (H-263), also needs a subject builder and its call site.
+- **The subjects** of the diff screen: each file of `git diff --name-only <merge> <head>` in the harvester's scratch (the merge commit, so a fix round's harvest screens the whole change), ordered by path, but a `skip_paths` lockfile (an exact path, whose content parses as that lockfile). The state is `{ goal, path, part, diff }`: the goal is `task.md`'s first paragraph (at most 600 characters), the diff that file's `diff -U3`. Every string of a state is redacted first (both zones' exact values, raw and base64, and every `KEY_PATTERNS` format), then a diff over `max_state_chars` is cut into windows of whole lines, each carrying the file's header lines and starting at a hunk where it fits, covering every line once (`part k of n`); a deleted file's diff is its header and `(this change deletes the file: <n> lines)`. Content the diff doesn't show (a binary or a gitlink; no in-tree `.gitattributes` applies to the host's reads, so a `-diff` attribute hides nothing) is unscreened, never asked.
+- **The decision ledger**, `<engineDir>/decisions/<owner>/<name>/<id>.jsonl` (0600, in dirs of 0700, append-only, kept with the work order's state): an `asking` line before each call and an `answer` line after it, or for a subject that wasn't asked. A line holds names and numbers: the decision and its `version` (the first 12 hex of the sha256 of its file, which pins the questions, glosses, thresholds and wording), the run, head, subject and part, the typed answers, `via`, `model`, `public`, `models` and `mode` at the time, `verdict`, `effect` and `error`; never the state's text or a key. Its `key` is the sha256 of the decision, version and state, so Plan 06 can rebuild a state from the mirror and check it before it replays one (H-262). A torn last line (a crash during an append) is ignored and cut before the next append; any other bad line fails the repo's tick closed (`<file> line <n> is not a decision entry`).
+- **Reuse and re-renders.** Before any call the harvester reads the ledger and reuses the newest answered line (`via` jev or haiku) with the same key: no call, no spend, the same verdict, its effect worked out again under the current modes. So a crash replay gives the same verdict and PR body, and a later head asks only about files whose diff changed. A default (unanswered) line is never reused: a later harvest asks again, within the cap. A re-render (Task 13) asks and appends nothing: a subject with no answered line is unscreened (`not asked: a re-render asks nothing`), so `on_unscreened` applies and no re-render drops a hold.
+- **Spend.** Each call is written before it is made, and counts at its answer's `cost_usd` when a classifier answered, else at `classifiers.jev.unknown_call_usd` (never $0). `decisionSpend` sums it for the repo's month and the day's caps (`budgets.repo_monthly_usd`, `budgets.daily_usd`), which Plan 03 Task 13 adds it to, and the PR's "Cost and turns" line names the work order's whole ledger. Jev's daily share (the archon zone's key: $0.06 a day, shared with the guard's gates) is a few hundred to a few thousand calls, depending on the states' size; past it, OpenRouter answers HTTP 402 and Haiku answers instead.
+
 ### `hapi decide <name> [--state-file file] [--public] [--mock]`
 
-Runs one decision on a state and prints the result as one JSON line. The state comes from `--state-file` or stdin, never from argv. `--public` marks the run public; `--mock` answers offline with the vendored mock and needs no policy directory. Without `--mock` it reads the gates and flags from `$HAPI_POLICY_DIR` (default `policy`). Exit 0: a result was printed (a fallback verdict counts); 1: the decision could not run; 2: a usage error or an unknown name.
+Runs one decision (`bash-gate`, `result-screen` or the run engine's `diff-screen`) on a state and prints the result as one JSON line. The state comes from `--state-file` or stdin, never from argv. An engine decision's state is the JSON object the harvester built (`{ goal, path, part, diff }`), so its text must parse as one, and is passed on as that object. `--public` marks the run public; `--mock` answers offline with the vendored mock and needs no policy directory. Without `--mock` it reads the gates and flags from `$HAPI_POLICY_DIR` (default `policy`). To replay an engine decision offline, rebuild its state from the mirror by the ledger line's `run`, `head`, `subject` and `part`, check it against the line's `key`, and run `hapi decide diff-screen --state-file <file>`, passing `--public` only when the line's `public` is true. Exit 0: a result was printed (a fallback verdict counts); 1: the decision could not run; 2: a usage error, an unknown name, or an engine decision's state that isn't a JSON object.
+
+## Running without decision models
+
+hapi-factory runs with no classifier at all when the operator chooses it (the operator's "failthrough option", 2026-11-02): no `decide()` question in the run engine, and none in the guard. It is one recipe, for both halves, made as a protected change and undone by reverting it. Nothing automatic ever sets it.
+
+**The recipe.** One PR that changes two files, both protected (`policy/**`), which the operator reviews and merges:
+
+```yaml
+# policy/gates.yaml
+bash_gate:
+  enabled: false
+  # ...
+result_screen:
+  enabled: false
+  # ...
+decisions:
+  mode: off
+  # ...
+```
+
+```yaml
+# policy/flags.yaml
+jev:          { enabled: false, fallback: none, via: openrouter }
+```
+
+Then, as hapi in hapi's checkout, `git pull --ff-only` and `mise run up` ([runs.md's form](runbooks/runs.md#rollout-on-hapis-checkout)): the poller reads `policy/` there at every tick, and `hapi run start` writes each run's own `hapi-guard.json` from it, so the next tick and every later run follow the recipe; a run already live keeps the gates it started with.
+
+- **The engine.** `decisions.mode: off`: the harvester builds no subject and asks no `decide()` question, appends nothing to the decision ledger, and no decision holds or notes a PR. Everything else that stands between a worker and `main` is unchanged: the host gates on the bundle (protected paths, scope, sizes, the secret scan), verify and the planner's acceptance tests, the independent review, CodeRabbit, the required `ci / gates` check, and the operator's merge. `decisions.mode: notes` is the half-way setting: each decision is asked and recorded as in `enforce`, but nothing holds a PR: a hold, an unscreened file's included, becomes a note under "Check this yourself".
+- **The guard's gates (level 6).** `bash_gate.enabled: false` and `result_screen.enabled: false` turn off the classifier on a worker's bash calls and on what its tools return. With `jev: { enabled: false, fallback: none, … }` there is no classifier at all, so `loadPolicy` refuses any gate or engine decision switched back on alone ([`gates.yaml`](#gatesyaml)): turning one back on means reverting the whole recipe. hapi-guard's deterministic rules still apply: the command rules, the protected paths, the write gate's key patterns and the budget.
+- **What shows it.** Each factory PR's Evidence row (`off: decision models are off (gates.decisions.mode)`) and its "Check this yourself" line; the planning PR's status comment and `hapi status` (`Decision models are off (gates.decisions.mode: off): …`); `decisions: "off"` on each run record the harvest first read; and the audit's [`policy.decision-models`](audit.md#policydecision-models) note, a pass, never a fail.
+- **What never sets it.** Nothing automatic. In `enforce`, a missing key, a failing provider or a spent Jev share gives each subject its decision's `on_unscreened` (`hold`, so the PR waits at Needs your decision), and the guard's gates take their fallbacks (`block` for a bash call, `wrap` for a tool result). A missing key never turns decision models off.
+- **How, and how back.** A protected change to `policy/gates.yaml` and `policy/flags.yaml`, in a PR the operator merges; undo it by reverting that PR. A PR whose head was harvested while decision models were off reads as held at its next re-render after they're back on, since a re-render asks nothing: merge it anyway (the verdict is advice), or send it back with `hapi:rework` ([the engine runbook](runbooks/engine.md#troubleshooting)).
 
 ## TypeScript API
 
@@ -681,13 +794,16 @@ Later plans build on these functions:
 |---|---|---|
 | `loadPolicy(dir): Policy` | `src/policy/load.ts` | Loads and validates `policy/`, `mcp.yaml` included (not the lock). Throws `PolicyError { file, path, message, issues }`. |
 | `loadOverlay(file): RepoOverlay` | `src/policy/overlay.ts` | Loads and schema-checks an overlay. Throws `PolicyError`. |
-| `applyOverlay(p, o): Policy` | `src/policy/overlay.ts` | Tighten-only merge. Throws `PolicyLoosenError { path, message }`. The result's `repo` holds the overlay's `default_risk` and `workflow`. |
+| `overlayFromText(text, label): RepoOverlay` | `src/policy/overlay.ts` | Checks overlay text (a git blob) as `loadOverlay` checks a file; `label` names it in the `PolicyError`. |
+| `applyOverlay(p, o): Policy` | `src/policy/overlay.ts` | Tighten-only merge. Throws `PolicyLoosenError { path, message }`. The result's `repo` holds the overlay's `default_risk`, `workflow` and `sidecar`. |
+| `phaseIssues(budgets, runs): Issue[]` | `src/policy/load.ts` | `phases.round_usd` above `budgets.run_usd`, as an issue at `/phases/round_usd`. `loadPolicy` and `applyOverlay` run it. |
+| `parseYaml(text): unknown` | `src/policy/schema.ts` | Parses YAML text; a duplicate key or bad syntax throws `invalid YAML: ...`. `readYaml` and `overlayFromText` use it. |
 | `matchCommand(rules, argv): {allowed, rule?, reason}` | `src/policy/commands.ts` | Whether `commands.yaml`'s `hermes.allow` rules allow an argv ([how a rule matches](#how-a-rule-matches)) |
 | `commandRuleIssues(rules): Issue[]` | `src/policy/commands.ts` | The command patterns that don't compile. `loadPolicy` runs it. |
 | `forgeDomain(host): string \| undefined` | `src/policy/hosts.ts` | The forge domain a host belongs to, e.g. `raw.githubusercontent.com` → `githubusercontent.com`. Case is ignored, as Squid ignores it, so `GitHub.com` → `github.com`. `FORGE_DOMAINS` lists them. |
 | `isHostname(host): boolean` | `src/policy/hosts.ts` | Whether a host is a plain, lowercase domain name: the schema's `hostname` pattern. The egress generator checks every host with it before writing `squid.conf`. |
 | `effectiveModes(p, path): PathModes` | `src/policy/paths.ts` | A file's modes: the strictest across every matching glob ([how globs combine](#how-globs-combine)). Every guard and generator uses it, or the same rule. Throws on a path outside the repo, or one with NUL, a control character or a backslash. |
-| `globMatches(glob, path): boolean` | `src/policy/paths.ts` | Whether one glob matches an already-normalized repo path |
+| `globMatches(glob, path, { caseSensitive? }): boolean` | `src/policy/paths.ts` | Whether one glob matches an already-normalized repo path, ignoring case (which only tightens a protection); `caseSensitive` for a glob that grants, such as a piece's scope in the harvester's scope gate |
 | `zoneHosts(p, zone): string[]` | `src/policy/zones.ts` | A zone's allowlist: its own hosts plus its tiers' hosts, sorted and de-duplicated. A zone with `openWeb` also reaches any public host, which this list doesn't say. |
 | `serversForZone(p, zone, { o11y? }): [name, McpServer][]` | `src/policy/mcp.ts` | A zone's enabled MCP servers, sorted by name. `o11y` defaults to `flags.otel.enabled` (`o11yEnabled`). `[]` for a zone outside `MCP_ZONES`, and never a server that lists one, even for a policy built in code. |
 | `MCP_ZONES`, `isMcpZone(zone)` | `src/policy/mcp.ts` | The zones that may load MCP servers: `hermes` and `research`, never `archon` |
@@ -699,6 +815,9 @@ Later plans build on these functions:
 | `verifyLock(p, lock, fetchSurface): Promise<{name, status, expected?, actual?}[]>` | `src/mcp/lock.ts` | Every catalog server's live surface against the lock: `ok`, `changed` or `unpinned`; and `orphaned` (no `actual`; never fetched) for a lock entry whose server isn't in the catalog. It rejects, fetching nothing, if any server lists a zone outside `MCP_ZONES`, as a policy built in code could |
 | `loadLock(file): McpLock` | `src/mcp/lock.ts` | Reads and checks a lock file. Throws `PolicyError`. |
 | `decide(file, state, options): Promise<DecideResult>` | `src/decide/index.ts` | Asks a classifier and applies a decision file's verdict ([the order](#decide-and-the-decision-files)). Throws only when no classifier is enabled. |
+| `ask(file, state, options)`, `classifierRecord(file, result)` | `src/decide/record.ts` | `decide()` with a throw taken as the file's fallback (`error: "decide failed"`); an answer as recorded, type and numbers only. The guard re-exports both. |
+| `stateLength(state): number` | `src/decide/index.ts` | How `decide()` measures a state against `max_state_chars` |
+| `screenHarvest(d, o)`, `diffSubjects(d, o)`, `decisionSpend(engineDir, o)` | `src/engine/decisions.ts` | The run engine's decisions ([In the run engine](#in-the-run-engine)) |
 | `pinOf(server)`, `canonicalJson(value)`, `lockJson(lock)` | `src/mcp/lock.ts` | A server's pin fields as a lock entry records them; the canonical JSON the hash uses; the lock as written to disk |
 | `validateWorkOrder(obj): WorkOrder` | `src/workorder/validate.ts` | Validates a parsed work order. Throws `WorkOrderError { path, message, issues }`. |
 | `loadWorkOrder(file): WorkOrder` | `src/workorder/validate.ts` | Reads, parses and validates a work-order file |

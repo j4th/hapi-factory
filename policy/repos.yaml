@@ -1,0 +1,13 @@
+# yaml-language-server: $schema=schemas/policy-repos.schema.json
+#
+# The repo registry (Plan 03). The poller acts only on a repo listed here;
+# `hapi new-repo` adds one as an uncommitted change that the operator reviews and
+# commits. The installation ids are not secret: they name where each GitHub App
+# is installed (Settings -> Applications -> Installed GitHub Apps -> Configure;
+# the page's URL ends in /settings/installations/<id>).
+installations:
+  planner: 176015763     # hapi-planner
+  factory: 176015322     # hapi-factory
+  coderabbit: 175947293     # coderabbitai
+repos:                   # "owner/name": { registered: "YYYY-MM-DD" }
+  "j4th/hapi-sandbox-fortune": { registered: "2026-11-09" }

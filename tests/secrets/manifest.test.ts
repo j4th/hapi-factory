@@ -32,20 +32,20 @@ function policyError(f: () => unknown): PolicyError {
   throw new Error("expected a PolicyError");
 }
 const full = (extra = "") =>
-  `hermes:\n  A: hapi-a\narchon:\n  B: hapi-b\nresearch:\n  C: hapi-c\nhost:\n  D: hapi-a\n${extra}`;
+  `hermes:\n  A: hapi-a\narchon:\n  B: hapi-b\nresearch:\n  C: hapi-c\nreview:\n  E: hapi-e\nhost:\n  D: hapi-a\n${extra}`;
 
 describe("stack/secrets.yaml, the manifest", () => {
   const m = loadManifest(MANIFEST_FILE);
 
   test("the manifest holds logical names only, and covers every MCP secret: reference", () => {
     expect(MANIFEST_FILE).toBe("stack/secrets.yaml");
-    expect(Object.keys(m).sort()).toEqual([...SECRET_ZONES].sort());
+    expect(Object.keys(m).sort()).toEqual([...SECRET_ZONES, "optional"].sort());
     for (const zone of SECRET_ZONES) for (const name of Object.values(m[zone]!)) expect(name).toMatch(LOGICAL_NAME);
     // The file text assigns nothing but logical names (comments aside): no id, no value.
     const assignments = readFileSync(MANIFEST_FILE, "utf8")
       .split("\n")
       .map((l) => l.replace(/#.*$/, "").trim())
-      .filter((l) => l !== "" && !/^[a-z]+:$/.test(l));
+      .filter((l) => l !== "" && !/^[a-z]+:$/.test(l) && !/^optional: \[hapi-[a-z0-9-]+\]$/.test(l));
     for (const line of assignments) expect(line).toMatch(/^[A-Z][A-Z0-9_]*: hapi-[a-z0-9]+(-[a-z0-9]+)*$/);
     expect(mcpSecretGaps(loadPolicy("policy"), m)).toEqual([]);
   });
@@ -69,15 +69,37 @@ describe("stack/secrets.yaml, the manifest", () => {
         EXA_API_KEY: "hapi-research-exa-api-key",
         HAPI_MCP_CONTEXT7_API_KEY: "hapi-mcp-context7-api-key",
       },
+      review: {
+        ANTHROPIC_API_KEY: "hapi-archon-anthropic-api-key",
+        CLAUDE_API_KEY: "hapi-archon-anthropic-api-key",
+        CODERABBIT_API_KEY: "hapi-review-coderabbit-api-key",
+      },
       host: {
         HAPI_PLANNER_APP_ID: "hapi-host-planner-app-id",
         HAPI_PLANNER_APP_PRIVATE_KEY: "hapi-host-planner-app-private-key",
         HAPI_FACTORY_APP_ID: "hapi-host-factory-app-id",
         HAPI_FACTORY_APP_PRIVATE_KEY: "hapi-host-factory-app-private-key",
       },
+      optional: ["hapi-review-coderabbit-api-key"],
     });
-    // One logical name fills two env vars; every other name is used once.
-    expect(manifestNames(m).length).toBe(14);
+    // One logical name fills four env vars (archon's and review's two each); every other name is used once.
+    expect(manifestNames(m).length).toBe(15);
+  });
+
+  test("the review zone holds the hapi-factory workspace's key under both names and CodeRabbit's, which is optional", () => {
+    // The review reuses the hapi-factory workspace's Anthropic key (the Console limit caps it); CodeRabbit's key is
+    // the review zone's alone, so it never enters the archon zone a worker holds.
+    expect([m.review!.ANTHROPIC_API_KEY, m.review!.CLAUDE_API_KEY]).toEqual([m.archon!.ANTHROPIC_API_KEY!, m.archon!.ANTHROPIC_API_KEY!]);
+    expect(Object.values(m.archon!)).not.toContain(m.review!.CODERABBIT_API_KEY);
+    for (const zone of SECRET_ZONES.filter((z) => z !== "review")) expect([zone, Object.keys(m[zone]!).includes("CODERABBIT_API_KEY")]).toEqual([zone, false]);
+    const entries = manifestEntries(m).filter((e) => e.zone === "review");
+    expect(entries).toEqual([
+      { zone: "review", key: "ANTHROPIC_API_KEY", name: "hapi-archon-anthropic-api-key" },
+      { zone: "review", key: "CLAUDE_API_KEY", name: "hapi-archon-anthropic-api-key" },
+      { zone: "review", key: "CODERABBIT_API_KEY", name: "hapi-review-coderabbit-api-key", optional: true },
+    ]);
+    // Only CodeRabbit's is optional: every other entry is required.
+    expect(manifestEntries(m).filter((e) => e.optional).map((e) => `${e.zone}/${e.key}`)).toEqual(["review/CODERABBIT_API_KEY"]);
   });
 
   test("GitHub App private keys stay in the host zone, never in a container's env file (spec §4.3)", () => {
@@ -110,8 +132,27 @@ describe("stack/secrets.yaml, the manifest", () => {
 describe("loadManifest", () => {
   test("loads a valid manifest; manifestNames de-duplicates and sorts", () => {
     const m = loadManifest(manifestFile(full()));
-    expect(m).toEqual({ hermes: { A: "hapi-a" }, archon: { B: "hapi-b" }, research: { C: "hapi-c" }, host: { D: "hapi-a" } });
-    expect(manifestNames(m)).toEqual(["hapi-a", "hapi-b", "hapi-c"]);
+    expect(m).toEqual({ hermes: { A: "hapi-a" }, archon: { B: "hapi-b" }, research: { C: "hapi-c" }, review: { E: "hapi-e" }, host: { D: "hapi-a" } });
+    expect(manifestNames(m)).toEqual(["hapi-a", "hapi-b", "hapi-c", "hapi-e"]);
+  });
+
+  test("the optional list may name only a secret a zone uses", () => {
+    const m = loadManifest(manifestFile(full("optional: [hapi-e]\n")));
+    expect(m.optional).toEqual(["hapi-e"]);
+    expect(manifestEntries(m).find((e) => e.name === "hapi-e")).toEqual({ zone: "review", key: "E", name: "hapi-e", optional: true });
+    // Every entry of a listed name is optional, in any zone; the rest stay required.
+    const shared = manifestEntries({ hermes: { A: "hapi-a" }, host: { D: "hapi-a", F: "hapi-f" }, optional: ["hapi-a"] });
+    expect(shared.map((e) => [e.key, e.optional ?? false])).toEqual([["A", true], ["D", true], ["F", false]]);
+    // A name no zone uses is refused, by the loader and for a manifest built in code.
+    expect(() => loadManifest(manifestFile(full("optional: [hapi-z]\n")))).toThrow("the manifest's optional list names hapi-z, which no zone uses");
+    expect(() => manifestEntries({ hermes: { A: "hapi-a" }, optional: ["hapi-b"] })).toThrow("the manifest's optional list names hapi-b, which no zone uses");
+    // Not a logical name (a pasted value, say): refused by the schema without echoing it; nor a duplicate, nor a non-list.
+    const pasted = policyError(() => loadManifest(manifestFile(full(`optional: [${FAKE}]\n`))));
+    expect(pasted.issues.map((i) => i.path)).toEqual(["/optional/0"]);
+    expect(pasted.message).not.toContain(FAKE);
+    expect(() => manifestEntries({ hermes: { A: "hapi-a" }, optional: [FAKE] })).toThrow("the manifest's optional list names (a name that is not a logical name, not shown), which no zone uses");
+    expect(policyError(() => loadManifest(manifestFile(full("optional: [hapi-e, hapi-e]\n")))).issues.map((i) => i.path)).toEqual(["/optional/1"]);
+    expect(policyError(() => loadManifest(manifestFile(full("optional: hapi-e\n")))).issues.map((i) => i.path)).toEqual(["/optional"]);
   });
 
   test("a secret pasted in place of a logical name is refused without echoing it", () => {
@@ -127,7 +168,7 @@ describe("loadManifest", () => {
     const asZone = policyError(() => loadManifest(manifestFile(full(`${FAKE}:\n  E: hapi-e\n`))));
     expect(asZone.issues.map((i) => i.path)).toEqual(["/<zone>"]);
     expect(asZone.message).not.toContain(FAKE);
-    // Even a zone-shaped key that isn't one of the four is not shown.
+    // Even a zone-shaped key that isn't one of the five is not shown.
     expect(policyError(() => loadManifest(manifestFile(full("extra:\n  E: hapi-e\n")))).message).toMatch(/\/<zone>: unknown key/);
   });
 

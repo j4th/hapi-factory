@@ -36,6 +36,13 @@ describe("globMatches (shared vectors)", () => {
   }
 });
 
+test("caseSensitive matches case, for a glob that grants (a piece's scope); the default ignores it", () => {
+  expect(globMatches("src/**", "SRC/a.ts")).toBe(true);
+  expect(globMatches("src/**", "SRC/a.ts", { caseSensitive: true })).toBe(false);
+  expect(globMatches("src/**", "src/a.ts", { caseSensitive: true })).toBe(true);
+  expect(globMatches("**/AGENTS.md", "pkg/agents.md", { caseSensitive: true })).toBe(false);
+});
+
 describe("effectiveModes", () => {
   test("every shared path vector: the base policy's modes, or an error naming the problem (and deny)", () => {
     for (const { path, reason, ...modes } of vectors.paths) {

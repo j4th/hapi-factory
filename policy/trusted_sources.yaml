@@ -50,3 +50,12 @@ zones:
     tiers: [T0, T1, T2, T3]
     hosts: []
     openWeb: true
+  # The review container (design §3.5): the review model's API and CodeRabbit's CLI. No tier (so no
+  # registry: it runs none of the repo's code) and no forge route: the harvester posts the review.
+  review:
+    tiers: []
+    hosts:
+      - api.anthropic.com
+      - cli.coderabbit.ai
+      - app.coderabbit.ai
+      - ide.coderabbit.ai

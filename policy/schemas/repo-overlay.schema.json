@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "repo-overlay.schema.json",
   "title": ".factory/config.yaml",
-  "description": "A target repo's overlay on the central policy (spec §7, §8.1). It may add or tighten protected paths, add egress_extra hosts, lower budgets and run limits and harden enforcement modes, and it may set the repo's default_risk and workflow, which are repo settings rather than policy. Any other key is rejected. Loosening is caught by applyOverlay, which needs the base policy to compare against.",
+  "description": "A target repo's overlay on the central policy (spec §7, §8.1). It may add or tighten protected paths, add egress_extra hosts, lower budgets (including repo_monthly_usd) and run limits (max_auto_rounds, output_limits_mb.bundle and the phase round counts, turns and cap), harden budgets.enforcement (including poller), switch a run phase on, and set the repo's default_risk, workflow and sidecar, which are repo settings rather than policy. Any other key is rejected, daily_usd, poll_interval_s, repos, sidecars and runs.disk included: the run disk is central only. Loosening is caught by applyOverlay, which needs the base policy to compare against.",
   "type": "object",
   "properties": {
     "protected_paths": {
@@ -25,7 +25,7 @@
       "$ref": "policy-defs.schema.json#/$defs/hostList"
     },
     "budgets": {
-      "description": "Budgets to lower. Each value must be at most the base value.",
+      "description": "Budgets to lower and enforcement modes to harden. Each value must be at most the base value. daily_usd is central only.",
       "type": "object",
       "properties": {
         "workspaces": {
@@ -41,12 +41,14 @@
         "jev_monthly_usd": { "$ref": "policy-defs.schema.json#/$defs/usd" },
         "run_usd": { "$ref": "policy-defs.schema.json#/$defs/usd" },
         "hermes_max_turns": { "$ref": "policy-defs.schema.json#/$defs/count" },
+        "repo_monthly_usd": { "$ref": "policy-defs.schema.json#/$defs/usd" },
         "enforcement": {
           "description": "Enforcement modes to harden: soft may become hard, never the reverse.",
           "type": "object",
           "properties": {
             "hapi_guard": { "$ref": "policy-defs.schema.json#/$defs/enforcement" },
-            "archon": { "$ref": "policy-defs.schema.json#/$defs/enforcement" }
+            "archon": { "$ref": "policy-defs.schema.json#/$defs/enforcement" },
+            "poller": { "$ref": "policy-defs.schema.json#/$defs/enforcement" }
           },
           "additionalProperties": false
         }
@@ -54,18 +56,29 @@
       "additionalProperties": false
     },
     "runs": {
-      "description": "Run limits to lower. Each value must be at most the base value.",
+      "description": "Run limits to lower and phases to switch on. Each number must be at most the base value, and a phase may not go from on to off. The launcher's limits are central only, since it reads only policy/runs.yaml's: disk (one shared filesystem), max_live, retention_days and output_limits_mb's transcript, decisions and result, as are poll_interval_s, max_retries, max_rework_rounds, inputs_mb and work_order_kb. output_limits_mb.bundle may be lowered: the harvest enforces it.",
       "type": "object",
       "properties": {
-        "max_live": { "$ref": "policy-defs.schema.json#/$defs/count" },
-        "retention_days": { "$ref": "policy-defs.schema.json#/$defs/count" },
         "output_limits_mb": {
           "type": "object",
           "properties": {
-            "bundle": { "$ref": "policy-defs.schema.json#/$defs/count" },
-            "transcript": { "$ref": "policy-defs.schema.json#/$defs/count" },
-            "decisions": { "$ref": "policy-defs.schema.json#/$defs/count" },
-            "result": { "$ref": "policy-defs.schema.json#/$defs/count" }
+            "bundle": { "$ref": "policy-defs.schema.json#/$defs/count" }
+          },
+          "additionalProperties": false
+        },
+        "max_auto_rounds": { "$ref": "policy-defs.schema.json#/$defs/count" },
+        "phases": {
+          "description": "Switch a phase on (true; applyOverlay refuses false) and lower the round counts, turns and cap.",
+          "type": "object",
+          "properties": {
+            "verify": { "type": "boolean" },
+            "review": { "type": "boolean" },
+            "coderabbit": { "type": "boolean" },
+            "require_acceptance": { "type": "boolean" },
+            "fix_rounds_before_pr": { "$ref": "policy-defs.schema.json#/$defs/rounds" },
+            "fix_rounds_on_pr": { "$ref": "policy-defs.schema.json#/$defs/rounds" },
+            "round_turns": { "$ref": "policy-defs.schema.json#/$defs/count" },
+            "round_usd": { "$ref": "policy-defs.schema.json#/$defs/usd" }
           },
           "additionalProperties": false
         }
@@ -79,6 +92,19 @@
     "workflow": {
       "description": "The Archon workflow this repo's work orders use by default (spec §7), a slug like a work order's workflow. A repo setting, not policy: tighten-only doesn't apply. applyOverlay exposes it as repo.workflow.",
       "$ref": "policy-defs.schema.json#/$defs/slug"
+    },
+    "sidecar": {
+      "description": "The sidecar this repo's runs start (a name policy/sidecars.yaml lists) and the repo directory mounted into it, which is protected from workers. A repo setting, not policy: applyOverlay exposes it as repo.sidecar.",
+      "type": "object",
+      "properties": {
+        "name": { "$ref": "policy-defs.schema.json#/$defs/slug" },
+        "data_dir": {
+          "description": "A repo-relative directory, with no wildcard.",
+          "allOf": [{ "$ref": "policy-defs.schema.json#/$defs/pathGlob" }, { "type": "string", "pattern": "^[^*?]+$" }]
+        }
+      },
+      "required": ["name", "data_dir"],
+      "additionalProperties": false
     }
   },
   "additionalProperties": false

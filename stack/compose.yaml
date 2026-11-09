@@ -12,11 +12,14 @@
 #   archon    archon-net    egress-archon     archon  (the run template: one container per run, none long-lived;
 #                                                       the launcher joins each run to the proxy on a network of its own)
 #   research  research-net  egress-research   none yet: the hapi-research container is Plan 04's
+#   review    review-net    egress-review     none: a review run is a run container of archon, which the launcher
+#                                                       joins to egress-review instead (src/run/kinds.ts)
 #
 # Secrets. Each zone service's one env_file is its own zone's secrets,
 # $XDG_RUNTIME_DIR/hapi/env/<zone>.env, which `hapi secrets resolve` writes on the
 # user's tmpfs (docs/secrets.md#the-env-files). The host zone's file holds the
-# GitHub App keys and is never given to a container. Everything else a zone
+# GitHub App keys and is never given to a container. The review zone's is no
+# service's: the launcher passes its names to a review run's container alone. Everything else a zone
 # service is given, the proxy variables and the generated hardening settings, is
 # in its `environment:`, which Compose puts above env_file, so no secret can
 # override it; src/stack/env.ts is the list, tests/stack/compose.test.ts checks
@@ -105,6 +108,15 @@ services:
       - ../build/egress/research.squid.conf:/etc/squid/hapi.conf:ro
     networks:
       research-net: {}
+      outbound: {}
+
+  # The review container's proxy (design §3.5): the launcher joins it to a review run's own network.
+  egress-review:
+    <<: *egress
+    volumes:
+      - ../build/egress/review.squid.conf:/etc/squid/hapi.conf:ro
+    networks:
+      review-net: {}
       outbound: {}
 
   # Hermes, the coordinator (spec §9.1): the pinned official image, its generated
@@ -240,13 +252,15 @@ services:
       HTTPS_PROXY: http://egress-archon:3128
       http_proxy: http://egress-archon:3128
       https_proxy: http://egress-archon:3128
-      NO_PROXY: localhost,127.0.0.1,::1
-      no_proxy: localhost,127.0.0.1,::1
+      # And the run's smoke sidecar, by its alias on the run's network, directly (src/stack/env.ts SIDECAR_ALIAS).
+      NO_PROXY: localhost,127.0.0.1,::1,hapi-sidecar
+      no_proxy: localhost,127.0.0.1,::1,hapi-sidecar
 
 networks:
   hermes-net: { internal: true }
   archon-net: { internal: true }
   research-net: { internal: true }
+  review-net: { internal: true }
   # The proxies' only way out. They can't reach each other on it.
   outbound:
     driver_opts:

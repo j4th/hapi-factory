@@ -1,0 +1,20 @@
+# Dependabot version updates for {{name}}: the Bun dependencies and the pinned
+# actions (the gates' SHA in workflows/hapi-gates.yml among them), weekly. The
+# cooldown waits for a release to age before proposing it, as bunfig.toml's
+# minimumReleaseAge does for installs. GitHub Actions takes default-days only:
+# its updates aren't SemVer-typed.
+version: 2
+updates:
+  - package-ecosystem: bun
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7

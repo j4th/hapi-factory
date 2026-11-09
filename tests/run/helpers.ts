@@ -3,16 +3,21 @@
  * networks, volumes, and the files in a run's output volume) and answers the
  * commands src/run makes as Docker would, plus a temp state dir, runtime dir,
  * build dir, source repo and work order. No Docker, git, sudo or network: the
- * git calls (the source's HEAD, the bundle's heads) are answered too,
+ * git calls (the source's HEAD and commits, its `.factory/config.yaml`, the
+ * bundle's heads) are answered too,
  * `docker logs --follow` streams `logs`, and `docker logs --tail` prints a
- * container's `world.logs`.
+ * container's `world.logs`. The run disk is a temp dir (`deps.diskDir`) whose
+ * filesystem facts come from `deps.probeFs`, never from a real mount; the
+ * cleanup helper empties the host dirs it is given.
  */
-import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { createHash } from "node:crypto";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import YAML from "yaml";
 import { envFileText } from "../../src/secrets/files";
 import { COPY_SCRIPT, LIST_SCRIPT } from "../../src/run/copyout";
-import { LOGS_SCRIPT } from "../../src/run/lifecycle";
+import { CLEAN_SCRIPT, type FsFacts, type FsProbe, GIB } from "../../src/run/disk";
+import { EXIT_FORMAT, LOGS_SCRIPT } from "../../src/run/lifecycle";
 import { recordDir, type RunRecord, writeRecord } from "../../src/run/records";
 import type { RunDeps } from "../../src/run/spec";
 import { tempDir } from "../secrets/helpers";
@@ -29,6 +34,10 @@ interface Container {
   name: string;
   labels: Record<string, string>;
   running: boolean;
+  /** What `docker inspect --format EXIT_FORMAT` prints for its exit code: FakeOptions.exitCode, 0 by default. */
+  exitCode?: number;
+  /** Its `.State.Status`: `running` or `exited` from `running`, unless a test sets another (`created`). */
+  state?: string;
 }
 interface Network {
   labels: Record<string, string>;
@@ -54,6 +63,16 @@ export interface World {
 }
 
 export const SHA = "4bf92f3577b34da6a3ce929d0e0e47364bf92f35";
+/** A second commit the fake source holds: a parent run seeded there has a base that isn't the run's own commit. */
+export const SHA2 = "0d1e2f3a4b5c6d7e8f90a1b2c3d4e5f60718293a";
+/** The commits the fake source holds. `rev-parse <x>^{commit}` echoes one of them; any other name resolves to SHA, so a check that doesn't compare the answer with what it asked for takes it. */
+const COMMITS = [SHA, SHA2];
+/** The blob id the fake's `ls-tree` gives `.factory/config.yaml`. */
+const OVERLAY_BLOB = "e".repeat(40);
+/** The blob id the fake's `ls-tree -r` gives a file of `FakeOptions.tree`: the SHA-1 of its path. */
+const blobOf = (path: string) => createHash("sha1").update(path).digest("hex");
+/** What the fake `docker info --format {{.DockerRootDir}}` prints: Docker's data root, on a filesystem of its own (dev 3). */
+export const DATA_ROOT = "/fake/docker-root";
 export const NOW = new Date("2026-10-29T12:00:00.000Z");
 
 /** The value of `flag` (the argv entry after it), or undefined. */
@@ -114,8 +133,18 @@ export interface FakeOptions {
   hangs?: (cmd: string[]) => boolean;
   /** The exit code of `timeout <s> docker wait <run>`: 0 (the run exited) or 124 (the deadline came first). */
   waitCode?: number;
+  /** The run container's exit code, as `docker inspect --format EXIT_FORMAT` prints it (0 by default). */
+  exitCode?: number;
   /** What `git bundle list-heads` prints. */
   heads?: string;
+  /** The source's `.factory/config.yaml`, at every commit (`ls-tree` lists it, `cat-file blob` prints it); none by default. */
+  overlay?: string;
+  /**
+   * The source's files at every commit, path to text, for the sidecar's data export: `ls-tree -r` lists the regular
+   * files under the asked prefix, each as `100644 blob <sha1 of its path> <size>\t<path>\0`, and `cat-file blob <oid>`
+   * prints one's bytes, through `runBytes`. None by default.
+   */
+  tree?: Record<string, string>;
   /** The run network's subnet and whether it is internal, as `docker network inspect` says. */
   subnet?: string;
   internal?: boolean;
@@ -123,6 +152,11 @@ export interface FakeOptions {
   now?: Date;
   /** Called before each command is answered. */
   onCall?: (cmd: string[]) => void;
+  /**
+   * What `deps.probeFs` says of the run disk: "missing", or its facts (default: its own filesystem, dev 2, 19.5 GiB,
+   * writable). `ownFs: false` puts it on its parent's filesystem (dev 1), `onDataRoot` on Docker's data root's (dev 3).
+   */
+  disk?: "missing" | (Partial<FsFacts> & { ownFs?: boolean; onDataRoot?: boolean });
 }
 
 /** A fake `RunDeps` and the world behind it. `deps.stateDir`, `xdg` and `buildDir` are fresh temp dirs. */
@@ -139,6 +173,15 @@ export function fakeRun(o: FakeOptions = {}) {
   const calls: Call[] = [];
   const spawned: string[][] = [];
   const project = o.project ?? "hapi";
+  const diskDir = join(tmp, "run-disk");
+  mkdirSync(diskDir, { mode: 0o700 });
+  const probeFs: FsProbe = (path) => {
+    if (path === dirname(diskDir)) return { dev: 1, bytes: 500 * GIB, writable: true };
+    if (path === DATA_ROOT) return { dev: 3, bytes: 500 * GIB, writable: true };
+    if (path !== diskDir || o.disk === "missing") return undefined;
+    const { ownFs, onDataRoot, ...facts } = o.disk ?? {};
+    return { dev: ownFs === false ? 1 : onDataRoot ? 3 : 2, bytes: 19.5 * GIB, writable: true, ...facts };
+  };
 
   const run: RunDeps["run"] = async (full, opts) => {
     calls.push({ cmd: full, env: opts.env, bytes: false });
@@ -161,11 +204,26 @@ export function fakeRun(o: FakeOptions = {}) {
     }
     if (cmd[0] === "env" && cmd[1] === "-i") {
       if (cmd.includes("list-heads")) return ok(o.heads ?? `${SHA} HEAD\n`);
-      if (cmd.includes("rev-parse")) return ok(`${SHA}\n`);
+      if (cmd.includes("rev-parse")) {
+        const asked = cmd.at(-1)!.replace(/\^\{commit\}$/, "");
+        return ok(`${COMMITS.includes(asked) ? asked : SHA}\n`);
+      }
+      if (cmd.includes("ls-tree") && cmd.includes("-r")) {
+        const prefix = cmd.at(-1)!;
+        const rows = Object.entries(o.tree ?? {}).filter(([p]) => p.startsWith(prefix));
+        return ok(rows.map(([p, text]) => `100644 blob ${blobOf(p)} ${String(Buffer.byteLength(text)).padStart(7)}\t${p}\0`).join(""));
+      }
+      if (cmd.includes("ls-tree")) return ok(o.overlay === undefined ? "" : `100644 blob ${OVERLAY_BLOB}\t${cmd.at(-1)}\0`);
+      if (cmd.includes("cat-file") && cmd.at(-1) === OVERLAY_BLOB && o.overlay !== undefined) return ok(o.overlay);
       throw new Error(`fake: unexpected command ${joined}`);
     }
     if (cmd[0] !== "docker") throw new Error(`fake: unexpected command ${joined}`);
     const [, a, b] = cmd;
+    if (a === "info" && after(cmd, "--format") === "{{.DockerRootDir}}") return ok(`${DATA_ROOT}\n`);
+    if (a === "inspect" && after(cmd, "--format") === EXIT_FORMAT) {
+      const c = world.containers.get(cmd.at(-1)!);
+      return c === undefined ? fail(`Error: No such object: ${cmd.at(-1)}`) : ok(`${c.state ?? (c.running ? "running" : "exited")} ${c.exitCode ?? o.exitCode ?? 0}\n`);
+    }
     if (a === "ps") {
       const all = cmd.includes("-aq") || cmd.includes("-a");
       const found = [...world.containers.values()].filter((c) => (all || c.running) && matches(cmd, c.labels));
@@ -234,6 +292,14 @@ export function fakeRun(o: FakeOptions = {}) {
         for (const [f, x] of Object.entries(world.outputs)) vol?.files.set(f, x);
         return ok("0123456789abcdef\n");
       }
+      if (cmd.at(-1) === CLEAN_SCRIPT) {
+        // The run disk's cleanup helper: it empties each host dir bound at /w or /o.
+        for (const dest of ["/w", "/o"]) {
+          const dir = volumeAt(cmd, dest);
+          if (dir !== undefined) for (const e of readdirSync(dir)) rmSync(join(dir, e), { recursive: true, force: true });
+        }
+        return ok();
+      }
       if (after(cmd, "--entrypoint") === "chown") {
         for (const dest of ["/w", "/o"]) {
           const v = world.volumes.get(volumeAt(cmd, dest) ?? "");
@@ -256,6 +322,10 @@ export function fakeRun(o: FakeOptions = {}) {
     o.onCall?.(full);
     const cmd = unbounded(full);
     if (o.hangs?.(cmd)) return cmd === full ? new Promise<never>(() => {}) : { code: 137, stdout: new Uint8Array(), stderr: "" };
+    if (cmd[0] === "env" && cmd[1] === "-i" && cmd.includes("cat-file")) {
+      const found = Object.entries(o.tree ?? {}).find(([p]) => blobOf(p) === cmd.at(-1));
+      return found === undefined ? { code: 128, stdout: new Uint8Array(), stderr: `fatal: Not a valid object name ${cmd.at(-1)}` } : { code: 0, stdout: new TextEncoder().encode(found[1]), stderr: "" };
+    }
     if (!cmd.includes(COPY_SCRIPT)) throw new Error(`fake: unexpected byte command ${cmd.join(" ")}`);
     const v = world.volumes.get(volumeAt(cmd, "/out") ?? "");
     if (v === undefined) return { code: 125, stdout: new Uint8Array(), stderr: "no such volume" };
@@ -287,10 +357,12 @@ export function fakeRun(o: FakeOptions = {}) {
     image: "hapi-factory/archon:0.12.1",
     egress: `${project}-egress-archon-1`,
     stateDir: join(tmp, "state"),
+    diskDir,
+    probeFs,
     root: REPO,
     buildDir,
     packDir: join(REPO, "archon", "workflows", "hapi"),
-    runs: { max_live: 1, retention_days: 14, ...o.runs, output_limits_mb: { bundle: 256, transcript: 64, decisions: 16, result: 4, ...o.runs?.output_limits_mb } },
+    runs: { max_live: 1, retention_days: 14, disk: { gb: 20, enforcement: "hard" }, poll_interval_s: 120, max_auto_rounds: 3, max_retries: 2, max_rework_rounds: 3, inputs_mb: 16, work_order_kb: 1024, phases: { verify: true, review: true, coderabbit: false, require_acceptance: true, fix_rounds_before_pr: 1, fix_rounds_on_pr: 1, round_turns: 40, round_usd: 1 }, ...o.runs, output_limits_mb: { bundle: 256, transcript: 64, decisions: 16, result: 4, ...o.runs?.output_limits_mb } },
     spawnDetached: async (argv) => void spawned.push(argv),
   };
   return {
@@ -314,24 +386,43 @@ export const BUILD_FILES: Record<string, string> = {
   "archon/gitconfig": "[user]\n",
   "archon/empty.env": "# empty\n",
   "archon/archon.env": "PI_OFFLINE=1\n",
+  "claude/managed-settings.json": "{}\n",
+  roster: "anthropic\n",
 };
 
-/** The archon zone's env file, as `hapi secrets resolve` writes it, at `<xdg>/hapi/env/archon.env`. Values are built at run time. */
-export function writeArchonEnv(xdg: string, values: Record<string, string>): string {
+/**
+ * A zone's env file, as `hapi secrets resolve` writes it, at `<xdg>/hapi/env/<zone>.env`. Values are built at run
+ * time. The review zone's values here are its own, none of them the archon zone's, though the real zone reuses the
+ * archon zone's Anthropic key (stack/secrets.yaml): so a test sees which zone's file a value came from.
+ */
+export function writeZoneEnv(xdg: string, zone: "archon" | "review", values: Record<string, string>): string {
   const dir = join(xdg, "hapi", "env");
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const path = join(dir, "archon.env");
-  writeFileSync(path, envFileText("archon", values), { mode: 0o600 });
+  const path = join(dir, `${zone}.env`);
+  writeFileSync(path, envFileText(zone, values), { mode: 0o600 });
   return path;
+}
+
+/**
+ * A workflow pack in a temp dir: hapi's own (archon/workflows/hapi/*.yaml), copied, plus a bash-only stand-in for
+ * each of `names` the pack doesn't have yet (Task 11 writes factory-verify and factory-review).
+ */
+export function stubPack(names: string[]): string {
+  const dir = tempDir("hapi-run-pack-");
+  const pack = join(REPO, "archon", "workflows", "hapi");
+  for (const f of readdirSync(pack).filter((n) => n.endsWith(".yaml"))) copyFileSync(join(pack, f), join(dir, f));
+  for (const n of names) if (!existsSync(join(dir, `${n}.yaml`))) writeFileSync(join(dir, `${n}.yaml`), `name: ${n}\nnodes:\n  - id: noop\n    bash: "true"\n`);
+  return dir;
 }
 
 /** A fake secret value, built at run time so no scanner sees a key in the source. */
 export const fakeSecret = (name: string) => ["fake", "hapi", "run", name.toLowerCase(), "value", "0123456789"].join("-");
 
-/** A source "repository": a directory with a .git dir (the fake answers git). */
+/** A source "repository": a directory with a .git dir that looks like a git dir (HEAD, objects/, refs/), so it is a source on its own too (the fake answers git). */
 export function fakeRepo(tmp: string, name = "src"): string {
   const repo = join(tmp, name);
-  mkdirSync(join(repo, ".git"), { recursive: true });
+  for (const dir of ["objects", "refs"]) mkdirSync(join(repo, ".git", dir), { recursive: true });
+  writeFileSync(join(repo, ".git", "HEAD"), "ref: refs/heads/main\n");
   return repo;
 }
 
@@ -356,20 +447,27 @@ export function writeOrder(tmp: string, over: Record<string, unknown> = {}, name
   return path;
 }
 
-/** A run that already exists: its record, and (as asked) its container, network and volumes in the world. */
+/** What a seeded run's volume dirs on the run disk hold, so the cleanup helper has something to empty. */
+export const LEFT_BY_THE_RUN = "left-by-the-run";
+
+/**
+ * A run that already exists: its record, and (as asked) its container, network and volumes in the world, with their
+ * dirs on the run disk, each holding LEFT_BY_THE_RUN.
+ */
 export async function seedRun(
   f: ReturnType<typeof fakeRun>,
-  o: { id: string; repo?: string; key?: string; status?: RunRecord["status"]; running?: boolean; startedAt?: string; deadline?: string; outputs?: Record<string, FakeFile>; objects?: boolean } & Partial<RunRecord>,
+  o: { id: string; repo?: string; key?: string; sha?: string; status?: RunRecord["status"]; running?: boolean; startedAt?: string; deadline?: string; outputs?: Record<string, FakeFile>; objects?: boolean } & Partial<RunRecord>,
 ): Promise<RunRecord> {
   const { deps, world } = f;
   const name = `${deps.project}-run-${o.id}`;
+  const optional = ["kind", "parent", "round", "budgetUsd", "spendUsd", "roster", "policyHash", "retry", "turns", "model", "forgeRepo", "exitCode"] as const;
   const rec: RunRecord = {
     runId: o.id,
     key: o.key ?? "k".repeat(64),
     project: deps.project,
     repo: o.repo ?? "/srv/repo/.git",
-    sha: SHA,
-    workOrder: "0003-check-run",
+    sha: o.sha ?? SHA,
+    workOrder: o.workOrder ?? "0003-check-run",
     workflow: "hapi-check-run",
     container: name,
     network: name,
@@ -381,15 +479,22 @@ export async function seedRun(
     ...(o.retryOf === undefined ? {} : { retryOf: o.retryOf }),
     ...(o.stopRequested === undefined ? {} : { stopRequested: o.stopRequested }),
     ...(o.harvestedAt === undefined ? {} : { harvestedAt: o.harvestedAt }),
+    ...Object.fromEntries(optional.filter((k) => o[k] !== undefined).map((k) => [k, o[k]])),
   };
   mkdirSync(recordDir(deps.stateDir, o.id), { recursive: true, mode: 0o700 });
   await writeRecord(deps.stateDir, rec);
   if (o.objects !== false) {
     const labels = { "org.hapi.run": o.id, "org.hapi.project": deps.project };
     world.containers.set(name, { name, labels, running: o.running ?? true });
-    world.networks.set(name, { labels, internal: true, endpoints: new Set([deps.egress]) });
+    // The proxy its kind joined: egress-review for a review, the project's egress-archon for every other kind.
+    const egress = o.kind === "review" ? `${deps.project}-egress-review-1` : deps.egress;
+    world.networks.set(name, { labels, internal: true, endpoints: new Set([egress]) });
     world.volumes.set(`${name}-work`, { labels, owner: "1001:1001", files: new Map() });
     world.volumes.set(`${name}-out`, { labels, owner: "1001:1001", files: new Map(Object.entries(o.outputs ?? {})) });
+    for (const v of [`${name}-work`, `${name}-out`]) {
+      mkdirSync(join(deps.diskDir, v), { mode: 0o700 });
+      writeFileSync(join(deps.diskDir, v, LEFT_BY_THE_RUN), "a run's file\n");
+    }
   }
   return rec;
 }

@@ -24,12 +24,35 @@
  * the earlier spend. A session resumed by another attempt is counted twice:
  * the safe direction.
  *
+ * Each file also counts its process's turns (`turns`, at every turn_end), which
+ * the run's turn budget is held to (index.ts).
+ *
+ * The totals never fall (Task 7's `spendOfRun` reads a falling ledger as an
+ * unknown spend, counted at the run's whole budget):
+ *
+ * - this process's session spend is counted, not re-read: a reading below the
+ *   last (a message counted at message_end, before Pi persisted it, that never
+ *   landed) keeps what was counted;
+ * - another process's file counts at the highest this process has read from it,
+ *   so a file that goes, or turns unreadable, mid-attempt still counts;
+ * - a file that was already unreadable when this process started is covered by
+ *   the decision log's highest total so far (log.ts `highest`, index.ts).
+ *
+ * Each process's totals never fall, but two Pi nodes running at once would each
+ * write their own into the one log, interleaved, and a lower one after a higher
+ * one makes spendOfRun read the run's spend as unknown: a false unknown, which
+ * fails closed (the run counts at its whole budget). Today's workflows run their
+ * Pi nodes one after another.
+ *
  * The residual: the ledger is in the worker's own tmpfs, so its shell can edit or
  * delete it (the write tool can't: rule 1). An unreadable file counts as 0, and
  * so does a started attempt that left no file (known from its session_start in
- * the decision log); each is logged as rule `ledger-reset` and flags the run.
- * Archon's `max_spend_usd` and the provider caps stay as the second and third
- * lines (spike T10).
+ * the decision log), unless this process read it before; each, and a file that
+ * goes, is logged as rule `ledger-reset` and flags the run,
+ * and the run's total still starts from the log's highest. A worker that rewrites
+ * both its ledger and the log can still lower it (H-250). Archon's
+ * `max_spend_usd` and the provider caps stay as the second and third lines
+ * (spike T10).
  */
 import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -67,10 +90,14 @@ export interface LedgerRecord {
   classifier_usd: number;
   /** Requests started (before_provider_headers), retries included. */
   sends: number;
+  /** Turns ended (turn_end); absent in an older file, which counts as 0. */
+  turns?: number;
   updated: string;
 }
 
 const isUsd = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0;
+/** A record's turns: a whole number of at least 0, else 0. */
+const turnsOf = (r: Partial<LedgerRecord>): number => (typeof r.turns === "number" && Number.isInteger(r.turns) && r.turns >= 0 ? r.turns : 0);
 
 /** A ledger file's record, or undefined when it isn't one. */
 function parseRecord(text: string, run: string): LedgerRecord | undefined {
@@ -88,6 +115,14 @@ export class Ledger {
   readonly file: string;
   private classifierUsd = 0;
   private sends = 0;
+  private turns = 0;
+  /** This process's session spend as counted: the last reading, plus every fall since (see the module comment). */
+  private lastSession: number | undefined;
+  private sessionKept = 0;
+  /** The session spend the file held when this process started, for a later process of the same attempt and session. */
+  private resumedUsd = 0;
+  /** The highest spend and turns read from each other process's file. */
+  private readonly seen = new Map<string, { usd: number; turns: number }>();
 
   constructor(
     ledgerDir: string,
@@ -99,9 +134,9 @@ export class Ledger {
   }
 
   /**
-   * At session_start: carry this attempt and session's classifier cost forward,
-   * write the file, and say which ledgers counted as 0. `started` are the
-   * attempts of this run the decision log saw start.
+   * At session_start: carry this attempt and session's classifier cost, sends,
+   * turns and session spend forward, and say which ledgers counted as 0.
+   * `started` are the attempts of this run the decision log saw start.
    */
   open(started: Set<string>): string[] {
     mkdirSync(this.dir, { recursive: true });
@@ -110,6 +145,8 @@ export class Ledger {
     if (mine) {
       this.classifierUsd = mine.classifier_usd;
       this.sends = typeof mine.sends === "number" ? mine.sends : 0;
+      this.turns = turnsOf(mine);
+      this.resumedUsd = mine.session_usd;
     }
     const covered = new Set(records.map(([, r]) => r.attempt));
     const resets = bad.map((name) => `the ledger file ${name} can't be read, so its spend counts as 0`);
@@ -143,10 +180,31 @@ export class Ledger {
     return { records, bad };
   }
 
-  /** The other processes' spend, and the names of files that count as 0 (re-read each time: parallel nodes spend too). */
-  others(): { usd: number; bad: string[] } {
+  /**
+   * The other processes' spend and turns, each file at the highest this process has read from it, and the names of
+   * files that can't be read now, or that went since this process read them (re-read each time: parallel nodes spend
+   * too).
+   */
+  others(): { usd: number; turns: number; bad: string[] } {
     const { records, bad } = this.read(false);
-    return { usd: records.reduce((sum, [, r]) => sum + r.session_usd + r.classifier_usd, 0), bad };
+    for (const [name, r] of records) {
+      const was = this.seen.get(name) ?? { usd: 0, turns: 0 };
+      this.seen.set(name, { usd: Math.max(was.usd, r.session_usd + r.classifier_usd), turns: Math.max(was.turns, turnsOf(r)) });
+    }
+    const read = new Set([...records.map(([name]) => name), ...bad]);
+    const gone = [...this.seen.keys()].filter((name) => !read.has(name));
+    let usd = 0;
+    let turns = 0;
+    for (const v of this.seen.values()) {
+      usd += v.usd;
+      turns += v.turns;
+    }
+    return { usd, turns, bad: [...bad, ...gone] };
+  }
+
+  /** The spend this process last counted for another process's file, if it has read it. */
+  held(name: string): number | undefined {
+    return this.seen.get(name)?.usd;
   }
 
   addClassifier(usd: number): void {
@@ -157,21 +215,44 @@ export class Ledger {
     this.sends++;
   }
 
-  /** This process's own spend: the session's plus its classifier calls. */
+  /** One more turn ended in this process. */
+  countTurn(): void {
+    this.turns++;
+  }
+
+  /** This process's turns, a resumed session's earlier ones included. */
+  mineTurns(): number {
+    return this.turns;
+  }
+
+  /**
+   * Count a reading of this session's spend (`sessionUsd`: its entries, plus a message not yet persisted), and return
+   * this process's own spend: the session's as counted, plus its classifier calls. A reading below the last keeps what
+   * was counted, and the first starts no lower than the file this attempt and session left.
+   */
   mine(sessionUsd: number): number {
-    return sessionUsd + this.classifierUsd;
+    if (this.lastSession === undefined) this.sessionKept = Math.max(0, this.resumedUsd - sessionUsd);
+    else if (sessionUsd < this.lastSession) this.sessionKept += this.lastSession - sessionUsd;
+    this.lastSession = sessionUsd;
+    return this.counted() + this.classifierUsd;
+  }
+
+  /** The session's spend as counted (see mine). */
+  private counted(): number {
+    return (this.lastSession ?? this.resumedUsd) + this.sessionKept;
   }
 
   /** Write this process's record whole: a temp file, then rename. */
-  save(sessionUsd: number): void {
+  save(): void {
     const record: LedgerRecord = {
       run: this.id.run,
       node: this.id.node,
       attempt: this.id.attempt,
       session: this.session,
-      session_usd: sessionUsd,
+      session_usd: this.counted(),
       classifier_usd: this.classifierUsd,
       sends: this.sends,
+      turns: this.turns,
       updated: new Date().toISOString(),
     };
     mkdirSync(this.dir, { recursive: true });
