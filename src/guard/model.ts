@@ -4,7 +4,7 @@
  *
  * At session_start the resolved `ctx.model` must equal its pin in
  * hapi-guard.json's `models[<provider>/<id>]` field for field: `baseUrl`, the
- * whole `cost` (tiers included), the whole `compat`, and `maxTokens`; and it has
+ * whole `cost` (tiers included; a key Pi's merge left undefined is no key), the whole `compat`, and `maxTokens`; and it has
  * no `headers`, which no pin sets (an `anthropic-beta` header would replace
  * Pi's beta list). A planted `models-store.json` can otherwise zero the cost
  * (blinding this budget and Archon's), drop compat (and with it `drop_block`)
@@ -44,6 +44,18 @@ export function pinOf(model: PiModel | undefined, s: GuardSettings): { ref: stri
   return pin ? { ref, pin } : { problem: `${ref} has no pin in hapi-guard.json's models` };
 }
 
+/**
+ * The resolved model's cost with its undefined keys left out. Pi 1.3.0's override merge writes every cost key
+ * (`applyModelOverride`, pi-coding-agent/dist/core/provider-composer.js: `tiers: override.cost.tiers ??
+ * model.cost.tiers`), so a model with no price tiers (Opus 5.5) resolves with `tiers: undefined`, a key its pin, read
+ * from JSON, doesn't have. An undefined key prices nothing; every other difference still fails the pin.
+ */
+function costOf(model: PiModel): unknown {
+  const cost: unknown = model.cost;
+  if (cost === null || typeof cost !== "object" || Array.isArray(cost)) return cost;
+  return Object.fromEntries(Object.entries(cost).filter(([, v]) => v !== undefined));
+}
+
 /** Why the resolved model doesn't match its pin, or undefined when it does. */
 export function modelProblem(model: PiModel | undefined, s: GuardSettings): string | undefined {
   const found = pinOf(model, s);
@@ -54,7 +66,7 @@ export function modelProblem(model: PiModel | undefined, s: GuardSettings): stri
     return `${ref} resolved without compat.supportsMidConvoEffort, so Pi won't send drop_block (H-184)`;
   }
   if (m.baseUrl !== pin.base_url) return `${ref}: baseUrl is ${JSON.stringify(m.baseUrl)}, not the pinned ${JSON.stringify(pin.base_url)}`;
-  if (!isDeepStrictEqual(m.cost, pin.cost)) return `${ref}: cost differs from the pin`;
+  if (!isDeepStrictEqual(costOf(m), pin.cost)) return `${ref}: cost differs from the pin`;
   if (!isDeepStrictEqual(m.compat ?? null, pin.compat)) return `${ref}: compat differs from the pin`;
   if (m.maxTokens !== pin.max_tokens) return `${ref}: maxTokens is ${JSON.stringify(m.maxTokens)}, not the pinned ${pin.max_tokens}`;
   if (m.headers !== undefined && Object.keys(m.headers).length > 0) return `${ref} has headers, which no pin sets`;

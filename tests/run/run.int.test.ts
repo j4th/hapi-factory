@@ -36,6 +36,8 @@ import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "n
 import { join } from "node:path";
 import YAML from "yaml";
 import { buildAll } from "../../src/generate/index";
+import { emitPi } from "../../src/generate/pi";
+import { modelProblem } from "../../src/guard/model";
 import { loadPolicy } from "../../src/policy/load";
 import { runDeps } from "../../src/run/cli";
 import { bundleProblem, reapRuns, runStart, runStop } from "../../src/run/lifecycle";
@@ -242,6 +244,52 @@ describe.skipIf(!INT || !ONLINE)("hapi run on a real Docker (a throwaway project
     // ...and nothing outside it was touched: the checkout's build/ is as it was, inode for inode.
     expect(treeSnapshot(join(REPO, "build"))).toEqual(liveBuild);
   }, 300_000);
+
+  describe("Pi's own model resolution against hapi-guard's pins (Task 16's first run)", () => {
+    // What Archon's Pi provider does to resolve a node's model (ModelRuntime.create, then ModelRegistry.find), printing
+    // what ctx.model would hold. A key whose value is undefined is printed as UNDEFINED: Pi's override merge leaves
+    // `cost.tiers` so for a model with no price tiers, which a pin read from JSON has no key for.
+    const PROBE = [
+      'const pi = await import("@earendil-works/pi-coding-agent");',
+      "const registry = new pi.ModelRegistry(await pi.ModelRuntime.create({}));",
+      "const out = {};",
+      "for (const ref of JSON.parse(process.env.REFS)) {",
+      '  const i = ref.indexOf("/");',
+      "  const m = registry.find(ref.slice(0, i), ref.slice(i + 1));",
+      "  out[ref] = m ? { provider: m.provider, id: m.id, baseUrl: m.baseUrl, cost: m.cost, compat: m.compat, maxTokens: m.maxTokens, headers: m.headers } : null;",
+      "}",
+      'console.log("RESOLVED " + JSON.stringify(out, (_k, v) => (v === undefined ? "UNDEFINED" : v)));',
+      "",
+    ].join("\n");
+    const revive = (v: unknown): unknown =>
+      v === "UNDEFINED" ? undefined : Array.isArray(v) ? v.map(revive) : v !== null && typeof v === "object" ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, revive(x)])) : v;
+
+    for (const roster of ["anthropic", "budget", "portable"] as const) {
+      test(`every Pi model of the ${roster} roster resolves, in the run image, to a model its pin accepts`, async () => {
+        const dir = join(p.root, `pins-${roster}`);
+        mkdirSync(dir);
+        const files = emitPi(loadPolicy(join(REPO, "policy")), roster);
+        for (const f of ["models.json", "models-store.json", "settings.json"]) writeFileSync(join(dir, f), files[f]!);
+        writeFileSync(join(dir, "probe.mjs"), PROBE);
+        const settings = JSON.parse(files["hapi-guard.json"]!);
+        const refs = Object.keys(settings.models);
+        expect(refs.length).toBeGreaterThan(0);
+        // As a run lays Pi's directory out: a tmpfs, with the three generated files bound read-only. No network.
+        const out = await must([
+          ...["docker", "run", "--rm", "--pull", "never", "--label", `org.hapi.int=${p.name}`, "--network", "none", "--read-only", "--user", "1001:1001"],
+          ...["--tmpfs", "/tmp:uid=1001,gid=1001", "--tmpfs", "/agent:uid=1001,gid=1001", "-e", "HOME=/tmp", "-e", "PI_CODING_AGENT_DIR=/agent"],
+          ...["-e", `REFS=${JSON.stringify(refs)}`],
+          ...["models.json", "models-store.json", "settings.json"].flatMap((f) => ["-v", `${join(dir, f)}:/agent/${f}:ro`]),
+          ...["-v", `${join(dir, "probe.mjs")}:/app/probe.mjs:ro`, "-w", "/app", "--entrypoint", "bun", image, "/app/probe.mjs"],
+        ]);
+        const line = out.split("\n").find((l) => l.startsWith("RESOLVED "));
+        expect(line).toBeDefined();
+        const resolved = revive(JSON.parse(line!.slice("RESOLVED ".length))) as Record<string, any>;
+        expect(Object.keys(resolved).sort()).toEqual([...refs].sort());
+        for (const ref of refs) expect([ref, resolved[ref] === null ? "Pi has no such model" : modelProblem(resolved[ref], settings)]).toEqual([ref, undefined]);
+      }, 120_000);
+    }
+  });
 
   describe("hapi-check-run, the bash-only check", () => {
     let check: string;
