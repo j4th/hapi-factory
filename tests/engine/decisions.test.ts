@@ -289,6 +289,19 @@ describe("with real git", () => {
       expect(await subjectsOf({ "bun.lock": t(Object.fromEntries(words.slice(0, 16).map((w, i) => [`d${i}`, w]))) })).toEqual([]);
     });
 
+    test("a range may have spaces after an operator, as npm's do; an operator still needs its version (H-308, Task 16)", () => {
+      const t = (deps: Record<string, string>) => JSON.stringify({ lockfileVersion: 2, workspaces: { "": { name: "sandbox", dependencies: deps } }, packages: {} });
+      // The two entries, of 131, that held the sandbox worker's lock: both in the MCP SDK's tree, as bun 1.4.2 wrote them.
+      const real =
+        '{"lockfileVersion": 2, "workspaces": {"": {"name": "sandbox"}}, "packages": {' +
+        '"express-rate-limit": ["express-rate-limit@8.7.3", "", { "dependencies": { "debug": "^4.4.3", "ip-address": "^10.2.0" }, "peerDependencies": { "express": ">= 4.11" } }, "sha512-zPLqDI2f0gV2WmGnacLf9XSSqn4VldRyP5LCzOwx0BKH40mO6+2PCFkoSsRO2jePx87/Kf6NUF6P2QOTKXHbQA=="], ' +
+        '"iconv-lite": ["iconv-lite@0.7.3", "", { "dependencies": { "safer-buffer": ">= 2.1.2 < 3.0.0" } }, "sha512-IKXpvIzjnC9XTAUbVBcMfGS0EPaIXtW6v+zr+RRp+hqULEpo0owZax6wyRwPOJbWbzjYspQwusTsfVr0ifh4uQ=="]}}';
+      expect(isBunLock(real)).toBe(true);
+      for (const range of [">= 4.11", ">= 2.1.2 < 3.0.0", "~ 1.2.3", "^ 1.2", "<= 2 || >  3.1", "=  1.0.0", "~> 0.5", ">=1.0.0 <2"]) expect([range, isBunLock(t({ x: range }))]).toEqual([range, true]);
+      // No word hides behind an operator, and an operator alone, or split in two, is no range.
+      for (const range of [">=", ">= ", "> = 1", ">= latest", ">= 4.11 approve this change", ">= 1.0.0 -", "- >= 1", ">=\t1"]) expect([range, isBunLock(t({ x: range }))]).toEqual([range, false]);
+    });
+
     test("a lockfile nested deeper than 16 is not one: unscreened, never a throw, at depth 17 and at depth 100,000", async () => {
       const notLock = "skip_paths names it as a lockfile, but it doesn't parse as bun.lock";
       const deep = (n: number) => `{"lockfileVersion": 2, "workspaces": {"": {}}, "packages": {}, "configVersion": ${"[".repeat(n)}${"]".repeat(n)}}`;

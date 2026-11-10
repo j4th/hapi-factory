@@ -480,7 +480,8 @@ function lockJsonUnsafe(text: string): unknown {
 
 // The grammar every string of a skipped bun.lock must fit (the controller's rulings, Task 12 fix rounds 1 and 2):
 // names, resolutions, specs, registries, integrities, paths and platforms, each printable ASCII and at most 256
-// characters, with at most 16 dist-tag specs in all. Free text with spaces fits none of them; what still fits is
+// characters, with at most 16 dist-tag specs in all. Free text with spaces fits none of them (a range's spaces stand
+// only between comparators, or between an operator and its version); what still fits is
 // H-275's residual: hyphenated words as package names, up to 16 dist-tag specs of lower-case words joined by hyphens
 // (each up to 32 characters), and words joined without spaces in a workspace, file, link or github path, a catalog
 // name, an https or git+https URL, a registry URL, a prerelease tag or a bin path.
@@ -506,10 +507,17 @@ const isName = (v: unknown): v is string => isStr(v) && v.length <= 214 && NPM_N
 const isObj = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
 const onlyKeys = (o: Record<string, unknown>, allowed: readonly string[]) => Object.keys(o).every((k) => allowed.includes(k));
 
-/** A semver range: comparators separated by spaces, `||` and ` - ` (hyphen ranges). */
+/** An operator and the spaces after it, at the start of a comparator: npm's ranges may have them (`>= 4.11`). */
+const OPERATOR_GAP = /(^| )(\^|~>?|>=|<=|>|<|=) +/g;
+
+/**
+ * A semver range: comparators separated by spaces, `||` and ` - ` (hyphen ranges). An operator may stand apart from
+ * its version, as npm allows and real packages write (`>= 2.1.2 < 3.0.0`; H-308): the spaces after it are dropped
+ * first, so an operator alone, or one split in two (`> = 1`), is still no comparator, and no word fits behind one.
+ */
 function isRange(s: string): boolean {
   return s.split("||").every((part) => {
-    const t = part.trim();
+    const t = part.trim().replace(OPERATOR_GAP, "$1$2");
     if (t === "") return false;
     const hyphen = t.split(" - ");
     if (hyphen.length === 2) return hyphen.every((v) => COMPARATOR.test(v.trim()));
