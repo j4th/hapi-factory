@@ -27,15 +27,20 @@ const policy = loadPolicy("policy");
 /** hapi-guard.json as `hapi policy build` writes it for the anthropic roster, parsed. */
 export const BASE_SETTINGS = JSON.parse(emitPi(policy)["hapi-guard.json"]!);
 
-/** The resolved model Pi would give for a pinned ref: the pin itself, as spike 08 r1 saw it. */
+/**
+ * The resolved model Pi would give for a pinned ref: the pin's values, as spike 08 r1 saw them, in the shape Pi 1.3.0's
+ * override merge builds (`applyModelOverride`, pi-coding-agent/dist/core/provider-composer.js): it writes every cost
+ * key, so a model with no price tiers (Opus 5.5) carries `tiers: undefined`, a key its pin, read from JSON, lacks.
+ */
 export function pinnedModel(ref = "anthropic/claude-haiku-5-5", settings = BASE_SETTINGS): PiModel {
   const pin = settings.models[ref];
   const slash = ref.indexOf("/");
+  const cost = structuredClone(pin.cost);
   return {
     provider: ref.slice(0, slash),
     id: ref.slice(slash + 1),
     baseUrl: pin.base_url,
-    cost: structuredClone(pin.cost),
+    cost: { input: cost.input, output: cost.output, cacheRead: cost.cacheRead, cacheWrite: cost.cacheWrite, tiers: cost.tiers },
     compat: structuredClone(pin.compat),
     maxTokens: pin.max_tokens,
   };

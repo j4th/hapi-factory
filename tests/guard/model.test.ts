@@ -8,7 +8,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import catalog from "../../src/generate/pi-catalog-1.3.0.json";
-import { cleanupAll, gatesOff, pinnedModel, setup } from "./harness";
+import { BASE_SETTINGS, cleanupAll, gatesOff, pinnedModel, setup } from "./harness";
 
 afterEach(cleanupAll);
 
@@ -22,6 +22,7 @@ async function startError(h: ReturnType<typeof setup>): Promise<string> {
 }
 
 const HAIKU = "anthropic/claude-haiku-5-5";
+const OPUS = "anthropic/claude-opus-5-5";
 
 describe("at session_start, the resolved model must equal its pin", () => {
   test("the pinned model starts, and the record says so", async () => {
@@ -29,6 +30,33 @@ describe("at session_start, the resolved model must equal its pin", () => {
     await h.start();
     const r = h.log()[0];
     expect([r.event, r.decision, r.rule]).toEqual(["session_start", "allow", "session-start"]);
+  });
+
+  test("a model with no price tiers starts too: Pi's merge gives it `tiers: undefined`, which is no tier (Task 16's first run)", async () => {
+    const model: any = pinnedModel(OPUS);
+    expect(Object.hasOwn(BASE_SETTINGS.models[OPUS].cost, "tiers")).toBe(false);
+    expect(Object.hasOwn(model.cost, "tiers") && model.cost.tiers === undefined).toBe(true);
+    const h = setup({ settings: gatesOff, model });
+    await h.start();
+    expect(h.log().map((r) => [r.event, r.decision, r.rule])).toEqual([["session_start", "allow", "session-start"]]);
+  });
+
+  test("a tier the pin lacks still fails, and so does a cost key set to undefined that the pin holds", async () => {
+    const tiered: any = pinnedModel(OPUS);
+    tiered.cost.tiers = [{ inputTokensAbove: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }];
+    expect(await startError(setup({ settings: gatesOff, model: tiered }))).toBe(`hapi-guard: ${OPUS}: cost differs from the pin; the node fails`);
+    // Only an undefined key is no key: null and an empty list are values the pin doesn't hold.
+    for (const tiers of [null, []]) {
+      const odd: any = pinnedModel(OPUS);
+      odd.cost.tiers = tiers;
+      expect(await startError(setup({ settings: gatesOff, model: odd }))).toBe(`hapi-guard: ${OPUS}: cost differs from the pin; the node fails`);
+    }
+    const holed: any = pinnedModel(OPUS);
+    holed.cost.output = undefined;
+    expect(await startError(setup({ settings: gatesOff, model: holed }))).toBe(`hapi-guard: ${OPUS}: cost differs from the pin; the node fails`);
+    const none: any = pinnedModel(OPUS);
+    none.cost = undefined;
+    expect(await startError(setup({ settings: gatesOff, model: none }))).toBe(`hapi-guard: ${OPUS}: cost differs from the pin; the node fails`);
   });
 
   test("it fails unless ctx.model.compat.supportsMidConvoEffort === true (anthropic)", async () => {
