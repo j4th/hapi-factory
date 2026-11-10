@@ -119,7 +119,7 @@ The month and the day are UTC calendar ones, by each run's `startedAt`. The mont
 The one automatic round on a PR (design §3.6) starts only from CodeRabbit's own review of the head commit the factory pushed:
 
 - the head counts as reviewed only when CodeRabbit's check run (`CodeRabbit`, App 347564) on it is completed, `success` and titled `Finished…`; any other title (`Review paused`, `Review skipped`, `Rate limited`) is named (`CodeRabbit did not review <h7>: <title>`) and fails closed;
-- a finding is a root review comment (never a reply) by CodeRabbit's bot user (id 136622811, never matched by login), on the head commit, in a review CodeRabbit submitted on that commit, starting with its generated-comment marker, whose first `**<Severity>**` is Critical or Major, in a thread no one else has replied in; its "Supported by static analysis" sections are stripped;
+- a finding is a root review comment (never a reply) by CodeRabbit's bot user (id 136622811, never matched by login), on the head commit, in a review CodeRabbit submitted on that commit, starting with its generated-comment marker, whose severity is Critical or Major, in a thread no one else has replied in; its "Supported by static analysis" sections are stripped. The severity is the word of the comment's first bold span, with any HTML in the span left out: CodeRabbit writes `**Major** · **<category>**`, and since 2026-11 an icon before the word (`**<picture>…</picture> Major**`; H-309). Bold text further down, such as a note's `**IMPORTANT**`, is never the severity. With no finding at major or above, a comment whose first bold span names none of CodeRabbit's severities (Critical, Major, Minor, Trivial, Info) is not taken for a clean review: the work order waits with `CodeRabbit left <n> comments on <h7> whose severity hapi could not read: read them on the PR`;
 - check runs are read with the `checks` token, reviews and comments with the `pr` token.
 
 **What turns it off:** a draft PR; `flags.coderabbit.enabled: false`; `phases.fix_rounds_on_pr` used up; any human action on the PR or a rework so far; and a comment or review from anyone but the operator, hapi's Apps (`hapi-factory[bot]`, `hapi-planner[bot]`) and CodeRabbit (`<login> commented on #<n>, so the automatic CodeRabbit round is off: the PR is the operator's`, or `user <id> reviewed #<n>, …` for a review, which carries no login). The PR's round doesn't yet drop a finding the fix before the PR declined (H-277).
@@ -586,7 +586,7 @@ gh api --paginate "repos/$R/issues/$PLAN/comments" \
     "\(.user.login) \(.user.type) via-app:\(.performed_via_github_app != null) \(.updated_at)", .body'
 ```
 
-**A factory PR.** Set `WO` to the work order's id. It prints the PR's number and head, its commits (subject, author, committer, how many of the six factory trailers it has, and whether its message holds a `Co-authored-by`), the check runs on its head, CodeRabbit's root review comments by commit and severity (its first `**<Severity>**`, as the engine reads it; H-168), and the host's part of the body down to the worker's account:
+**A factory PR.** Set `WO` to the work order's id. It prints the PR's number and head, its commits (subject, author, committer, how many of the six factory trailers it has, and whether its message holds a `Co-authored-by`), the check runs on its head, CodeRabbit's root review comments by commit and severity (the word that ends its first bold span, close to what the engine reads; H-168, H-309), and the host's part of the body down to the worker's account:
 
 ```bash
 OWNER="$(gh api user --jq .login)"; R="$OWNER/hapi-sandbox-fortune"
@@ -605,7 +605,9 @@ gh api "repos/$R/commits/$SHA/check-runs" \
   --jq '.check_runs[] | [.name, .app.id, .status, .conclusion, .output.title] | @tsv'
 gh api --paginate "repos/$R/pulls/$PR/comments" --jq '.[] |
   select(.user.id == 136622811 and .in_reply_to_id == null) |
-  [.commit_id[0:7], ([.body | match("\\*\\*([A-Za-z]+)\\*\\*").captures[0].string][0] // "none")]
+  [.commit_id[0:7],
+   ([.body | match("\\*\\*(?:<[^>]*>| )*([A-Za-z]+)\\*\\*")
+     .captures[0].string][0] // "none")]
   | @tsv' | sort | uniq -c
 gh pr view "$PR" --repo "$R" --json body --jq .body \
   | sed -n '/^<!-- hapi:begin -->/,/^## The worker.s account/p'

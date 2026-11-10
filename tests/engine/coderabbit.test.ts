@@ -5,7 +5,7 @@
  * rework, and the operator's own actions are read by login (comments, labels) and by the id those show (reviews).
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { CODERABBIT, crFindings, maintainerComments, operatorActions, othersOnPr, reworkRequest, stripStaticAnalysis } from "../../src/engine/coderabbit";
+import { CODERABBIT, CR_CLEAN, crFindings, maintainerComments, operatorActions, othersOnPr, reworkRequest, stripStaticAnalysis } from "../../src/engine/coderabbit";
 import type { WorkOrderState } from "../../src/engine/state";
 import { cleanup } from "../secrets/helpers";
 import { CODERABBIT_BOT, FACTORY_BOT, OPERATOR } from "../forge/helpers";
@@ -17,6 +17,12 @@ const HH = "d".repeat(40);
 const OLD = "b".repeat(40);
 const READER = { id: 6, login: "reader", type: "User" };
 const MAJOR = `${CODERABBIT.marker} -->\n_⚠️ Potential issue_\n\n**Major** · **Functional Correctness**\n\nThe check is inverted.\n`;
+/**
+ * A CodeRabbit comment as it writes them since 2026-11 (PR #16 here, factory PR #3 on the sandbox): an icon inside the
+ * severity's bold span, then the category and the effort, a static-analysis block, and bold text further down.
+ */
+const iconed = (severity: string, category = "Functional Correctness") =>
+  `${CODERABBIT.marker}:v1 -->\n\n**<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/${severity.toLowerCase()}-16.svg" width="16" height="16" align="absmiddle" alt=""></picture> ${severity}** · **${category}** · **Quick win**\n\n**Preserve the selected roster during recovery.**\n\nUnflagged \`up\` rebuilds with the default.\n\n> **IMPORTANT**\n> Review the replacement, then test.\n`;
 
 /** A world with ORDER's factory PR #1 at HH, and its state at pr-review. */
 async function prWorld() {
@@ -61,6 +67,62 @@ describe("the CodeRabbit round", () => {
     const crit = c.ff.reviewComment(1, { reviewId: rid, user: CODERABBIT_BOT, commitId: HH, body: MAJOR.replace("**Major**", "**Critical**") });
     const rc = await findC();
     expect("findings" in rc && rc.findings.map((x) => x.id)).toEqual([crit]);
+  });
+
+  test("the severity is the word of the comment's first bold span, whatever icon CodeRabbit puts before it (H-309, Task 16)", async () => {
+    const { w, find } = await prWorld();
+    checkOn(w, HH);
+    const own = w.ff.review(1, CODERABBIT_BOT, HH);
+    const major = w.ff.reviewComment(1, { reviewId: own, user: CODERABBIT_BOT, commitId: HH, path: "src/a.ts", body: iconed("Major") });
+    const critical = w.ff.reviewComment(1, { reviewId: own, user: CODERABBIT_BOT, commitId: HH, path: "src/b.ts", body: iconed("Critical", "Data Integrity & Integration") });
+    // Below major, and read as such: neither opens the round, and the bold IMPORTANT further down is no severity.
+    for (const low of ["Minor", "Trivial", "Info"]) w.ff.reviewComment(1, { reviewId: own, user: CODERABBIT_BOT, commitId: HH, path: "src/c.ts", body: iconed(low) });
+    const r = await find();
+    expect("findings" in r && r.findings.map((c) => c.id)).toEqual([major, critical]);
+  });
+
+  test("a comment whose severity can't be read is never taken for a clean review: the round waits and says so", async () => {
+    const { w, find } = await prWorld();
+    checkOn(w, HH);
+    const own = w.ff.review(1, CODERABBIT_BOT, HH);
+    // Only findings below major: clean.
+    w.ff.reviewComment(1, { reviewId: own, user: CODERABBIT_BOT, commitId: HH, body: iconed("Minor") });
+    expect(await find()).toEqual({ none: `${CR_CLEAN} ${HH.slice(0, 7)}` });
+    // No bold span; a first span that is no severity word; a word CodeRabbit doesn't use; a span cut by a line end.
+    const unread = [
+      `${CODERABBIT.marker}:v1 -->\n\nA finding with no bold text at all.\n`,
+      `${CODERABBIT.marker}:v1 -->\n\n**Data Integrity & Integration** · **Quick win**\n\n**Major**\n`,
+      `${CODERABBIT.marker}:v1 -->\n\n**Severe** · **Functional Correctness**\n`,
+      `${CODERABBIT.marker}:v1 -->\n\n**<picture></picture>\nMajor**\n`,
+    ];
+    for (const body of unread) w.ff.reviewComment(1, { reviewId: own, user: CODERABBIT_BOT, commitId: HH, body });
+    expect(await find()).toEqual({ none: `CodeRabbit left 4 comments on ${HH.slice(0, 7)} whose severity hapi could not read: read them on the PR` });
+    // With a finding at major beside them, the round opens on that finding.
+    const major = w.ff.reviewComment(1, { reviewId: own, user: CODERABBIT_BOT, commitId: HH, body: iconed("Major") });
+    const r = await find();
+    expect("findings" in r && r.findings.map((c) => c.id)).toEqual([major]);
+  });
+
+  test("only CodeRabbit's own unjoined root comments in its review of the head count as unread, and one is named in the singular", async () => {
+    const { w, find } = await prWorld();
+    checkOn(w, HH);
+    const own = w.ff.review(1, CODERABBIT_BOT, HH);
+    // A severity behind an emoji is no word of CodeRabbit's five: unread.
+    const unread = `${CODERABBIT.marker}:v1 -->\n\n**🟠 Major** · **Functional Correctness**\n\nText.\n`;
+    const minor = w.ff.reviewComment(1, { reviewId: own, user: CODERABBIT_BOT, commitId: HH, body: iconed("Minor") });
+    // Its own reply, one on an older commit, one in someone else's review, an impostor's, one with no marker, and a joined thread.
+    w.ff.reviewComment(1, { reviewId: own, inReplyTo: minor, user: CODERABBIT_BOT, commitId: HH, body: unread });
+    const older = w.ff.review(1, CODERABBIT_BOT, OLD);
+    w.ff.reviewComment(1, { reviewId: older, user: CODERABBIT_BOT, commitId: OLD, body: unread });
+    const theirs = w.ff.review(1, SOMEONE, HH);
+    w.ff.reviewComment(1, { reviewId: theirs, user: CODERABBIT_BOT, commitId: HH, body: unread });
+    w.ff.reviewComment(1, { reviewId: own, user: IMPOSTOR, commitId: HH, body: unread });
+    w.ff.reviewComment(1, { reviewId: own, user: CODERABBIT_BOT, commitId: HH, body: "No marker, **🟠 Major**" });
+    const joined = w.ff.reviewComment(1, { reviewId: own, user: CODERABBIT_BOT, commitId: HH, body: unread });
+    w.ff.reviewComment(1, { reviewId: theirs, inReplyTo: joined, user: SOMEONE, commitId: HH, body: "no" });
+    expect(await find()).toEqual({ none: `${CR_CLEAN} ${HH.slice(0, 7)}` });
+    w.ff.reviewComment(1, { reviewId: own, user: CODERABBIT_BOT, commitId: HH, body: unread });
+    expect(await find()).toEqual({ none: `CodeRabbit left 1 comment on ${HH.slice(0, 7)} whose severity hapi could not read: read it on the PR` });
   });
 
   test("crFindings reads check runs with the checks forge and reviews with the pr forge", async () => {

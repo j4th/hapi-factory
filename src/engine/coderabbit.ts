@@ -7,8 +7,9 @@
  *   `CODERABBIT.appId`) on it is completed, `success` and titled `Finished…`; any other title (paused, skipped,
  *   rate-limited) is named and fails closed. A finding is a root review comment (`inReplyTo` null) by CodeRabbit's
  *   bot user (`CODERABBIT.userId`, never matched by login) on the head, in a review CodeRabbit submitted on that
- *   commit, carrying its generated-comment marker and a first `**<Severity>**` of Critical or Major, in a thread no
- *   one else replied in. Its "Supported by static analysis" sections are stripped. Check runs are read with the
+ *   commit, carrying its generated-comment marker and a first bold span whose word is Critical or Major
+ *   (`severityOf`), in a thread no one else replied in. With no such finding, a comment whose severity can't be
+ *   read is named, never taken for a clean review. Its "Supported by static analysis" sections are stripped. Check runs are read with the
  *   `checks` token, reviews with the `pr` token (Task 3's tokens split them).
  * - **`othersOnPr`**: a comment or review from anyone but the operator, hapi's Apps and CodeRabbit turns the
  *   automatic round off: the PR is the operator's.
@@ -71,8 +72,21 @@ async function operatorIds(forge: Forge, n: number, operator: string, comments?:
   return ids;
 }
 
-/** A comment's severity: the first `**<Word>**` of its body. */
-const severityOf = (body: string) => /\*\*([A-Za-z]+)\*\*/.exec(body)?.[1];
+/** The severities CodeRabbit gives a finding. Only the first two open the automatic round. */
+const SEVERITIES: readonly string[] = ["Critical", "Major", "Minor", "Trivial", "Info"];
+
+/**
+ * A comment's severity: the word of its first bold span, with any HTML in the span left out, if it is one of
+ * CodeRabbit's. It writes `**Major** · **<category>**`, and since 2026-11 an icon before the word:
+ * `**<picture>…</picture> Major** · **<category>** · **<effort>**` (H-309). Bold text further down, such as the
+ * `**IMPORTANT**` of a note, is never the severity; a first span that names none reads as undefined, which
+ * `crFindings` reports and never takes for a finding below major.
+ */
+function severityOf(body: string): string | undefined {
+  const span = /\*\*((?:(?!\*\*)[^\n])+)\*\*/.exec(body)?.[1];
+  const word = span?.replace(/<[^>]*>/g, "").trim();
+  return word !== undefined && SEVERITIES.includes(word) ? word : undefined;
+}
 
 /**
  * `body` with every `<details>` block (`<details open>` and any attributes too) whose own `<summary>` holds "static
@@ -120,20 +134,16 @@ export async function crFindings(forges: { pr: Forge; checks: Forge }, pr: PrInf
   const own = new Set((await forges.pr.reviews(pr.number)).filter((r) => r.userId === CODERABBIT.userId && r.commitId === head).map((r) => r.id));
   const comments = await forges.pr.reviewComments(pr.number);
   const joined = new Set(comments.filter((c) => c.inReplyTo !== null && c.userId !== CODERABBIT.userId).map((c) => c.inReplyTo));
-  const findings = comments
-    .filter(
-      (c) =>
-        c.inReplyTo === null &&
-        c.userId === CODERABBIT.userId &&
-        c.commitId === head &&
-        c.reviewId !== null &&
-        own.has(c.reviewId) &&
-        c.body.startsWith(CODERABBIT.marker) &&
-        ["Critical", "Major"].includes(severityOf(c.body) ?? "") &&
-        !joined.has(c.id),
-    )
-    .map((c) => ({ ...c, body: stripStaticAnalysis(c.body) }));
-  return findings.length > 0 ? { findings } : { none: `${CR_CLEAN} ${h7(head)}` };
+  const roots = comments.filter(
+    (c) => c.inReplyTo === null && c.userId === CODERABBIT.userId && c.commitId === head && c.reviewId !== null && own.has(c.reviewId) && c.body.startsWith(CODERABBIT.marker) && !joined.has(c.id),
+  );
+  const findings = roots.filter((c) => ["Critical", "Major"].includes(severityOf(c.body) ?? "")).map((c) => ({ ...c, body: stripStaticAnalysis(c.body) }));
+  if (findings.length > 0) return { findings };
+  // A comment whose severity can't be read may be a major one in a form CodeRabbit changed: the round says so, and
+  // the work order waits for the operator, where a clean review would wait with nothing to say.
+  const unread = roots.filter((c) => severityOf(c.body) === undefined).length;
+  if (unread > 0) return { none: `CodeRabbit left ${unread} comment${unread === 1 ? "" : "s"} on ${h7(head)} whose severity hapi could not read: read ${unread === 1 ? "it" : "them"} on the PR` };
+  return { none: `${CR_CLEAN} ${h7(head)}` };
 }
 
 /** Why anyone else on PR `n` turns the automatic round off, or undefined: see the module comment. */
