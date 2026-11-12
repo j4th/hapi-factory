@@ -279,6 +279,22 @@ describe("every transition", () => {
     expect((await step(d, d.state({ phase: "pr", pr: 1, prHead: headAt(0), verdict: "do-not-merge", runs: [W0, V0, R0], autoRounds: 1 }))).s.phase).toBe("waiting");
   });
 
+  test("pr-review with the round switched off since: no read of CodeRabbit, no fix, waiting as it stood, a comment or not", async () => {
+    // A work order entered pr-review while the flag was on; central policy is read at each tick, so the flag off stops it there.
+    for (const comment of [false, true]) {
+      const w = pipelineDeps({ central: SHIPPED });
+      await reviewed(w, { harvestedAt: "2026-10-29T11:00:00.000Z" });
+      prAt(w);
+      crReview(w, headAt(0));
+      if (comment) w.ff.comment(1, SOMEONE, "nice");
+      const before = w.ff.calls.length;
+      const r = await step(w, w.state({ phase: "pr-review", pr: 1, prHead: headAt(0), verdict: "ready", runs: [W0, V0, R0], autoRounds: 1 }));
+      expect([comment, r.s.phase, r.s.verdict, r.s.reasons, r.starts]).toEqual([comment, "waiting", "ready", [], []]);
+      // CodeRabbit's check runs and review comments are never asked for.
+      expect(w.ff.calls.slice(before).filter((c) => /\/check-runs|\/pulls\/\d+\/(comments|reviews)/.test(new URL(c.url).pathname))).toEqual([]);
+    }
+  });
+
   test("pr-review: a pending check changes nothing; findings → pr-fix on the PR's head; nothing found → waiting", async () => {
     const pending = pipelineDeps();
     await reviewed(pending, { harvestedAt: "2026-10-29T11:00:00.000Z" });
