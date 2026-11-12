@@ -897,6 +897,18 @@ describe("Review Focus", () => {
     expect([r.s.phase, r.s.verdict, r.s.reasons.at(-1), r.starts]).toEqual(["waiting", "decision", "someone commented on #1, so the automatic CodeRabbit round is off: the PR is the operator's", []]);
   });
 
+  test("at pr with the round off, as shipped, a comment has no round to turn off: waiting, Ready to merge, whoever wrote it", async () => {
+    for (const who of [OPERATOR, SOMEONE]) {
+      const w = pipelineDeps({ central: SHIPPED });
+      await reviewed(w, { harvestedAt: "2026-10-29T11:00:00.000Z" });
+      prAt(w);
+      w.ff.comment(1, who, "nice");
+      const r = await step(w, w.state({ phase: "pr", pr: 1, prHead: headAt(0), verdict: "ready", runs: [W0, V0, R0], autoRounds: 1 }));
+      // The same as a comment that lands once the work order is at `waiting`: the verdict never turns on the tick it came in.
+      expect([who.login, r.s.phase, r.s.verdict, r.s.reasons, r.starts]).toEqual([who.login, "waiting", "ready", [], []]);
+    }
+  });
+
   test("a soft cap starts the run with the text in its event, and flags the PR once there is one (m8)", async () => {
     const w = pipelineDeps({ central: policy((p) => ((p.budgets.daily_usd = 2), (p.budgets.enforcement.poller = "soft"))) });
     const r = await step(w, w.state());

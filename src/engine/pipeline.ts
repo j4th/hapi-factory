@@ -746,7 +746,10 @@ async function prTop(c: Ctx): Promise<WorkOrderState | undefined> {
     const seen = latest([before, ...acts.filter((a) => rework === undefined || ms(a.at) < ms(rework.at)).map((a) => a.at)]);
     c.s = { ...c.s, autoRounds: 0, ...(seen === undefined ? {} : { lastHumanAt: seen }) };
   }
-  if (c.s.reworkRounds === 0 && CHAIN.includes(c.s.phase)) {
+  // What follows turns the automatic CodeRabbit round off. With the flag off there is none to turn off at `pr`, which
+  // goes to `waiting` as it stands: a comment that lands in that one tick changes no more than one that lands after it.
+  const noRound = c.s.phase === "pr" && !c.policy.flags.coderabbit.enabled;
+  if (c.s.reworkRounds === 0 && CHAIN.includes(c.s.phase) && !noRound) {
     const round = IN_ROUND.includes(c.s.phase);
     // A replayed harvest whose push is adopted above was pushed already (D77): nothing more is.
     const tail = !round ? "the automatic CodeRabbit round is off" : adopted ? "its result was pushed before the operator acted: nothing more is pushed" : "its result is not pushed";

@@ -315,6 +315,7 @@ Plan 03 is done when, on the sandbox repo:
 4. Each run passes `preflight` and builds; its verify container passes `check`, `smoke` against the bakery and the work order's acceptance tests; the host's gates pass; its review container gives the review's verdict and CodeRabbit's (or names why CodeRabbit was skipped); at most one fix round runs.
 5. The harvester opens one factory PR per work order, with §3.7's description and the trailers.
 6. CodeRabbit's PR review starts one automatic fix run, and a rework the operator asks for by label works too.
+   > **As built (noted 2026-11-11, Task 16, H-312):** the round on the PR ships off (§3.6's note), so as shipped no PR review starts a fix run. The automatic fix run a CodeRabbit finding starts is the one before the PR, from its CLI in the review run (§3.5). The live run's record says which of the two it saw.
 7. Planning PR 2's status comment shows both work orders' states as their runs move.
 8. The operator merges the three factory PRs, and the strict audit still passes.
 9. Total spend stays under $15, and every cap that tripped along the way stopped things and said so.

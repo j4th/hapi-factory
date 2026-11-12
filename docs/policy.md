@@ -370,7 +370,7 @@ This file is spec §13.3, but for `coderabbit.enabled`, which ships `false` (H-3
 | `metrics` | `{ enabled: true, merge_outcomes: true }` |
 | `otel` | `{ enabled: false, content_capture: off }` (`off` or `preview`) |
 | `jev` | `{ enabled: true, fallback: haiku, via: openrouter }` (`fallback` is `haiku` or `none`) |
-| `coderabbit` | `{ enabled: false, include_in_rework: true }`. `enabled` is CodeRabbit's round on an open PR ([engine.md](runbooks/engine.md#the-coderabbit-round)), not its CLI in the review run (`runs.phases.coderabbit`). It ships off: under a paid plan CodeRabbit skips a PR an App opened unless the App's bot holds a seat. |
+| `coderabbit` | `{ enabled: false, include_in_rework: true }`. `enabled` is the engine's reading of CodeRabbit's own review of an open PR ([engine.md](runbooks/engine.md#the-coderabbit-round)): its one automatic round, and `include_in_rework` with it, which does nothing while `enabled` is off. It is not CodeRabbit's CLI in the review run (`runs.phases.coderabbit`). It ships off: under a paid plan CodeRabbit skips a PR an App opened unless the App's bot holds a seat. |
 | `thresholds` | `{ run_usd: 3.00, interventions: 1, review_rounds: 2 }`. Crossing any one flags the run. |
 | `on_flag` | `[label_pr, chat_alert]`. A flagged run gets `hapi:flagged` on its PR and an alert in Slack `#hapi-alerts`. |
 

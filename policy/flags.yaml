@@ -6,8 +6,9 @@
 metrics:      { enabled: true, merge_outcomes: true }
 otel:         { enabled: false, content_capture: off }   # off | preview
 jev:          { enabled: true, fallback: haiku, via: openrouter }  # fallback: haiku | none
-# coderabbit.enabled is the round on an open PR (CodeRabbit's own PR review), not its CLI in the review run
-# (runs.phases.coderabbit). Off: CodeRabbit skips a PR an App opened unless the App's bot holds a seat (H-312).
+# coderabbit.enabled is the engine's reading of CodeRabbit's own review of an open PR: its one automatic round,
+# and include_in_rework with it. It is not CodeRabbit's CLI in the review run (runs.phases.coderabbit).
+# Off: CodeRabbit skips a PR an App opened unless the App's bot holds a seat (H-312).
 coderabbit:   { enabled: false, include_in_rework: true }
 thresholds:                                              # crossing one flags the run
   run_usd: 3.00
