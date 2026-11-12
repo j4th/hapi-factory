@@ -269,6 +269,16 @@ export function policyWith(o: { models?: DecisionModels; max?: number; diff?: Pa
 
 /** `loadPolicy("policy")`, once. */
 export const SHIPPED: Policy = loadPolicy("policy");
+/**
+ * The shipped policy with CodeRabbit's round on an open PR switched on (`flags.coderabbit.enabled`). It ships off
+ * (H-312), and the pipeline's tests are of the engine with that round in play, so `pipelineDeps` runs on this unless
+ * a test passes its own `central`. tests/policy/load.test.ts pins the shipped value.
+ */
+export const ROUND_ON: Policy = (() => {
+  const p = structuredClone(SHIPPED);
+  p.flags.coderabbit.enabled = true;
+  return p;
+})();
 
 /** Write `text` to `<stateDir>/<runId>/out/<name>` (the outputs copy-out brought back); returns its path. */
 export function writeOut(f: { deps: { stateDir: string } }, runId: string, name: string, text: string | Uint8Array): string {
@@ -445,7 +455,7 @@ export function pipelineDeps(o: { central?: Policy; decide?: HarvestDeps["decide
     run,
     engineDir,
     repo: ORDER.repo,
-    central: o.central ?? SHIPPED,
+    central: o.central ?? ROUND_ON,
     forge: async (p) => forges[p],
     token: async () => "fake-push-token",
     secrets: async () => ({}),

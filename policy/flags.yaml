@@ -1,11 +1,14 @@
 # yaml-language-server: $schema=schemas/policy-flags.schema.json
 #
-# Flags and thresholds, exactly as spec §13.3. A flagged run gets hapi:flagged
-# on its PR and an alert in #hapi-alerts.
+# Flags and thresholds, as spec §13.3 but for coderabbit.enabled (see its
+# comment). A flagged run gets hapi:flagged on its PR and an alert in
+# #hapi-alerts.
 metrics:      { enabled: true, merge_outcomes: true }
 otel:         { enabled: false, content_capture: off }   # off | preview
 jev:          { enabled: true, fallback: haiku, via: openrouter }  # fallback: haiku | none
-coderabbit:   { enabled: true, include_in_rework: true }
+# coderabbit.enabled is the round on an open PR (CodeRabbit's own PR review), not its CLI in the review run
+# (runs.phases.coderabbit). Off: CodeRabbit skips a PR an App opened unless the App's bot holds a seat (H-312).
+coderabbit:   { enabled: false, include_in_rework: true }
 thresholds:                                              # crossing one flags the run
   run_usd: 3.00
   interventions: 1

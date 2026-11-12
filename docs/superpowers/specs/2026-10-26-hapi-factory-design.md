@@ -971,6 +971,8 @@ on_flag: [label_pr, chat_alert]          # chat_alert posts to Slack #hapi-alert
 
 A flagged run gets `hapi:flagged` on its PR and an alert in `#hapi-alerts`.
 
+> **As built (noted 2026-11-11, Plan 03 Task 16, H-312):** `coderabbit.enabled` ships `false`. It is CodeRabbit's round on an open PR, and under a paid plan CodeRabbit skips a PR an App opened (`Review skipped: bot user not eligible for review`) unless the App's bot holds a seat, so with it on every factory PR waited at Needs your decision. CodeRabbit's review of a work order is its CLI's, in the review run (`runs.phases.coderabbit`; Plan 03's design §3.5), on the key of the operator's own seat.
+
 ### 13.4 Optional observability profile (`mise run o11y:up`) [call; from `observability_stack.md`]
 
 - **Stack:** an OpenTelemetry Collector (redaction processor, token-authenticated ingest) feeding **Arize Phoenix**, with the tag pinned and a mounted volume. **Langfuse v4** is the documented alternative.

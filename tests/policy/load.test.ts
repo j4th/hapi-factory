@@ -110,12 +110,13 @@ describe("policy values (spec §8.2, §10, §12, §13.3)", () => {
     });
   });
 
-  test("flags are exactly spec §13.3", () => {
+  // spec §13.3 has coderabbit.enabled true; it ships false since Plan 03's live run (H-312; the spec's as-built note).
+  test("flags are spec §13.3's, but for CodeRabbit's round on an open PR, which ships off", () => {
     expect(p.flags).toEqual({
       metrics: { enabled: true, merge_outcomes: true },
       otel: { enabled: false, content_capture: "off" },
       jev: { enabled: true, fallback: "haiku", via: "openrouter" },
-      coderabbit: { enabled: true, include_in_rework: true },
+      coderabbit: { enabled: false, include_in_rework: true },
       thresholds: { run_usd: 3, interventions: 1, review_rounds: 2 },
       on_flag: ["label_pr", "chat_alert"],
     });

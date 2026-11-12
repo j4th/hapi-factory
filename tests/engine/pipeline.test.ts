@@ -16,7 +16,7 @@ import { SecretError } from "../../src/secrets/provider";
 import { CODERABBIT_BOT, OPERATOR } from "../forge/helpers";
 import { seedRun } from "../run/helpers";
 import { cleanup } from "../secrets/helpers";
-import { decisionsOf, fakeDecide, FAKE_PATCH, headAt, HOLD, MAINT, MERGE, ORDER, PASSING_VERIFY, pipelineDeps, READY_REVIEW, SHIPPED, SOMEONE, writeOut, writes } from "./helpers";
+import { decisionsOf, fakeDecide, FAKE_PATCH, headAt, HOLD, MAINT, MERGE, ORDER, PASSING_VERIFY, pipelineDeps, READY_REVIEW, ROUND_ON, SHIPPED, SOMEONE, writeOut, writes } from "./helpers";
 
 afterEach(cleanup);
 
@@ -43,9 +43,9 @@ type World = ReturnType<typeof pipelineDeps>;
 const mirror = (w: World) => mirrorPath(w.engineDir, ORDER.repo);
 const scratchOf = (w: World) => scratchPath(w.engineDir, ORDER.repo, ORDER.id);
 
-/** The shipped policy, changed by `f`. */
+/** `pipelineDeps`' own policy (the shipped one with CodeRabbit's round on the PR switched on), changed by `f`. */
 function policy(f: (p: Policy) => void): Policy {
-  const p = structuredClone(SHIPPED);
+  const p = structuredClone(ROUND_ON);
   f(p);
   return p;
 }
@@ -263,7 +263,9 @@ describe("every transition", () => {
     prAt(w);
     const s0 = w.state({ phase: "pr", pr: 1, prHead: headAt(0), verdict: "ready", runs: [W0, V0, R0], autoRounds: 1 });
     expect((await step(w, s0)).s.phase).toBe("pr-review");
-    for (const p of [policy((x) => (x.runs.phases.fix_rounds_on_pr = 0)), policy((x) => (x.flags.coderabbit.enabled = false))]) {
+    // No round: its count used up, the flag off, and the shipped policy, which ships the flag off (H-312).
+    expect(SHIPPED.flags.coderabbit.enabled).toBe(false);
+    for (const p of [policy((x) => (x.runs.phases.fix_rounds_on_pr = 0)), policy((x) => (x.flags.coderabbit.enabled = false)), SHIPPED]) {
       const n = pipelineDeps({ central: p });
       await reviewed(n, { harvestedAt: "2026-10-29T11:00:00.000Z" });
       prAt(n);

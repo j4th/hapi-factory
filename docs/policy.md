@@ -270,7 +270,7 @@ The run engine's limits (Plan 02 Task 7 and Plan 03; [the runs runbook](runbooks
 
 An output file over its `output_limits_mb` cap is not copied out, and the run is recorded `failed`; the run itself is never stopped for it. All counts are whole numbers, at least 1 (`max_live: 0` is rejected), except the two fix-round counts, `max_retries` and `max_rework_rounds`, which may be 0.
 
-`phases.coderabbit` is the CodeRabbit CLI in the review container. `flags.coderabbit` is CodeRabbit's PR review, whose automatic fix runs are capped by `phases.fix_rounds_on_pr`.
+`phases.coderabbit` is the CodeRabbit CLI in the review container. `flags.coderabbit` is CodeRabbit's PR review, whose automatic fix runs are capped by `phases.fix_rounds_on_pr`. They are separate switches, and both ship off: an overlay may switch the CLI on for its repo, and the PR review's round is central only.
 
 `phases.require_acceptance` is on by default, and an overlay may only switch it on. The acceptance tests live at `.factory/work/<id>/acceptance/`. That path is protected by `.factory/**`, the planner writes the tests, and the planning PR's merge approves them. When the directory exists, the verify container runs it with `bun test ./.factory/work/<id>/acceptance`. With the key on, a work order with no acceptance tests gets at best "Needs your decision", and a failing one makes a draft "Do not merge".
 
@@ -363,14 +363,14 @@ A unit test enforces both of these rules. If you change the roster, check the mo
 
 ### `flags.yaml`
 
-This file is exactly spec §13.3:
+This file is spec §13.3, but for `coderabbit.enabled`, which ships `false` (H-312):
 
 | Key | Value |
 |---|---|
 | `metrics` | `{ enabled: true, merge_outcomes: true }` |
 | `otel` | `{ enabled: false, content_capture: off }` (`off` or `preview`) |
 | `jev` | `{ enabled: true, fallback: haiku, via: openrouter }` (`fallback` is `haiku` or `none`) |
-| `coderabbit` | `{ enabled: true, include_in_rework: true }` |
+| `coderabbit` | `{ enabled: false, include_in_rework: true }`. `enabled` is CodeRabbit's round on an open PR ([engine.md](runbooks/engine.md#the-coderabbit-round)), not its CLI in the review run (`runs.phases.coderabbit`). It ships off: under a paid plan CodeRabbit skips a PR an App opened unless the App's bot holds a seat. |
 | `thresholds` | `{ run_usd: 3.00, interventions: 1, review_rounds: 2 }`. Crossing any one flags the run. |
 | `on_flag` | `[label_pr, chat_alert]`. A flagged run gets `hapi:flagged` on its PR and an alert in Slack `#hapi-alerts`. |
 

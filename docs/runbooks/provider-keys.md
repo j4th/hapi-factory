@@ -107,7 +107,7 @@ CodeRabbit's CLI runs in the review container, after the review session, when `r
 2. Store it with `mise run secrets:edit`, under `hapi-review-coderabbit-api-key`.
 3. Run `mise run up`, so `review.env` gets it, and `mise run secrets:check`: it should say `found    review/CODERABBIT_API_KEY (hapi-review-coderabbit-api-key) (optional)`.
 
-Without such a key, store nothing: leave `phases.coderabbit` off, and CodeRabbit's PR review carries its part. When the trial ends without a seat, delete the key from the store and revoke it in CodeRabbit.
+Without such a key, store nothing and leave `phases.coderabbit` off. CodeRabbit's PR review carries its part only on a PR it reviews: under a paid plan it skips one an App opened unless the App's bot holds a seat, so its round on a factory PR ships off too (`flags.coderabbit.enabled`; [engine.md](engine.md#the-coderabbit-round)). When the seat ends, delete the key from the store and revoke it in CodeRabbit.
 
 ## Kill switch: zero or revoke the keys
 
