@@ -326,7 +326,7 @@ function renderWith(i: PrInput, caps: Caps): string {
   out.push(`| smoke | ${evidenceHead} | \`mise run smoke\` | ${cell(v.smoke)} |`);
   out.push(`| acceptance | ${evidenceHead} | ${acceptanceCmd.startsWith("bun") ? `\`${acceptanceCmd}\`` : acceptanceCmd} | ${cell(v.acceptance)} |`);
   out.push(`| the independent review | ${evidenceHead} | factory-review, read-only | ${cell(review)} |`);
-  out.push(`| CodeRabbit's CLI | ${evidenceHead} | \`cr review --agent --committed --gate major\` | ${cell(cr)} |`);
+  out.push(`| CodeRabbit's CLI | ${evidenceHead} | \`cr review --deep --agent --committed --gate major\` | ${cell(cr)} |`);
   for (const s of e.screens) out.push(decisionRow(s, evidenceHead));
   out.push(`| \`ci / gates\` | ${head} | GitHub Actions, on the pushed head | ${ci} |`);
   if (i.unpushed !== undefined) {

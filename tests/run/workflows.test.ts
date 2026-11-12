@@ -420,7 +420,8 @@ describe("the factory workflows (Plan 03 Task 11, design §3.5)", () => {
       const b: string = cr.bash;
       for (const x of [
         "jq -r '.coderabbit // false' /run/hapi/run.json", "jq -r .base /run/hapi/run.json", "^[0-9a-f]{40}$", "run.json holds no base commit",
-        'timeout "$t" cr review --agent --committed --base-commit "$base" --gate major', "> /out/coderabbit.ndjson", ">> /out/coderabbit.ndjson",
+        // --deep's value is optional: an option follows it, never a bare word it would take as its focus text.
+        'timeout "$t" cr review --deep --agent --committed --base-commit "$base" --gate major', "> /out/coderabbit.ndjson", ">> /out/coderabbit.ndjson",
         "CODERABBIT_CLI_DISABLE_AUTO_UPDATE=1", "CR_CLI_TELEMETRY_DISABLED=1", TIME_LEFT, '{type: "hapi", skipped: $why}', '{type: "hapi", exit: $rc}',
       ]) expect([x, b.includes(x)]).toEqual([x, true]);
       expect(b).not.toContain("base.txt");
