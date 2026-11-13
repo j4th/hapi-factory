@@ -165,23 +165,34 @@ sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
 
 Expected: `hapi-poll.timer` activates `hapi-poll.service`, with NEXT within `runs.poll_interval_s`; after a tick, the service's last run shows `status=0/SUCCESS`, or `status=1/FAILURE` when a repo's tick failed closed or the tick's reap failed (the journal, `journalctl --user -u hapi-poll.service`, has each repo's line, `<repo>: failed closed: <error>; the next tick retries`). The service runs with `KillMode=process`, because each run's detached `hapi run supervise` lives in its cgroup and must outlive the tick; systemd may log the leftover supervisors at the next tick's start, which is expected. A stop (`up`, `down`, kill switch 3) sends SIGTERM to the tick alone (bun, the unit's main process): it releases its locks and exits, and after `TimeoutStopSec=15` systemd kills it, so a stop takes seconds, 15 s at worst ([the units](../generated-configs.md#buildsystemd)). **Never run `systemctl --user kill hapi-poll.service`** except as part of `mise run down`: its default (`--kill-whom=all`) signals every process in the service's cgroup, every live run's supervisor included, and those runs are then reaped at their deadline instead of finalized when they end.
 
-**The live check of the stop** (Task 16 runs it, as hapi; none of it has run on the real host yet): it starts one tick by hand, waits until its main process is bun, times a stop, and counts the ticks and supervisors left. Run it while a run is live, and the supervisor count is the same before and after the stop:
+**The live check of the stop** (as hapi; Task 16 ran it on the real host, below): it starts one tick by hand, waits until its main process is bun, times a stop, and counts the ticks and supervisors left. Run it while a run is live, and the supervisor count is the same before and after the stop:
 
 ```bash
 sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
-  export XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus" PATH="$HOME/.local/bin:$PATH"; \
-  echo "supervisors before: $(pgrep -u "$(id -u)" -f "run [s]upervise" | wc -l)"; \
+  export XDG_RUNTIME_DIR \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus" \
+    PATH="$HOME/.local/bin:$PATH"; \
+  echo "supervisors before: $(pgrep -u "$(id -u)" \
+    -f "run [s]upervise" | wc -l)"; \
   systemctl --user start --no-block hapi-poll.service; pid=0; seen=; \
-  for i in $(seq 25); do pid=$(systemctl --user show -p MainPID --value hapi-poll.service); \
-    if [ "$pid" = 0 ]; then seen=; else seen=$(ps -o comm= -p "$pid"); fi; \
+  for i in $(seq 25); do \
+    pid=$(systemctl --user show -p MainPID --value \
+      hapi-poll.service); \
+    if [ "$pid" = 0 ]; then seen=; \
+    else seen=$(ps -o comm= -p "$pid"); fi; \
     [ "$seen" = bun ] && break; sleep 0.2; done; \
   echo "main process: ${seen:-none} (MainPID $pid, after $i asks)"; \
-  t=$(date +%s); systemctl --user stop hapi-poll.service; echo "stop took $(( $(date +%s) - t )) s"; \
-  echo "ticks left: $(pgrep -u "$(id -u)" -f "cli[.]ts poll" | wc -l)"; \
-  echo "supervisors after: $(pgrep -u "$(id -u)" -f "run [s]upervise" | wc -l)"'
+  t=$(date +%s); systemctl --user stop hapi-poll.service; \
+  echo "stop took $(( $(date +%s) - t )) s"; \
+  echo "ticks left: $(pgrep -u "$(id -u)" \
+    -f "cli[.]ts poll" | wc -l)"; \
+  echo "supervisors after: $(pgrep -u "$(id -u)" \
+    -f "run [s]upervise" | wc -l)"'
 ```
 
-It asks for the service's main process up to 25 times, 0.2 s apart (5 s), until `ps` names it bun: systemd sets MainPID when it starts `mise`, which execs bun some 30 to 40 ms later, so an early answer is `mise`. Expected: `main process: bun`, `stop took` at most 15 s (a tick exits at once on SIGTERM), `ticks left: 0`, and the two supervisor counts equal. `main process: mise … after 25 asks` means mise never exec'd bun, so a stop's SIGTERM (`KillMode=process`: the main process alone) would reach mise, not the tick: report it before relying on a stop. `main process: none (MainPID 0 …)` means the tick had ended (or never started) before the check saw it, since a MainPID of 0 clears what was seen: run it again. The brackets in the patterns keep `pgrep` from matching this script's own command line. It stops only the service, never the timer, so the timer's next tick runs as scheduled.
+It asks for the service's main process up to 25 times, 0.2 s apart (5 s), until `ps` names it bun: systemd sets MainPID when it starts `mise`, which execs bun some 30 to 40 ms later, so an early answer is `mise`. Expected: `main process: bun`, `stop took` at most 15 s (a tick exits at once on SIGTERM), `ticks left: 0`, and the two supervisor counts equal. Two more lines are expected, and neither is a fault. At the stop, systemd warns `Stopping 'hapi-poll.service', but its triggering units are still active: hapi-poll.timer`: the check leaves the timer running. And the journal then has `hapi-poll.service: Failed with result 'signal'` for the tick started by hand, since SIGTERM ends it as a failed unit. `main process: mise … after 25 asks` means mise never exec'd bun, so a stop's SIGTERM (`KillMode=process`: the main process alone) would reach mise, not the tick: report it before relying on a stop. `main process: none (MainPID 0 …)` means the tick had ended (or never started) before the check saw it, since a MainPID of 0 clears what was seen: run it again. The brackets in the patterns keep `pgrep` from matching this script's own command line. It stops only the service, never the timer, so the timer's next tick runs as scheduled.
+
+> **As built (noted 2026-11-12, Task 16, H-281):** the check ran on the real host on 2026-11-10, as hapi, while a worker run of the sandbox was live, and passed on all five points: one supervisor before the stop and one after, the main process bun at the first ask, a stop of 0 s, and no tick left. It also gave the two lines above, which the expected text did not have then.
 
 **`mise run down`** is `hapi stack down`. It stops the poller's timer and its service first (`systemctl --user stop hapi-poll.timer hapi-poll.service`, with the same env as `up`'s), so no tick starts a new run. A timer that was never installed is no error; a stop that fails (no user manager to reach) doesn't stop the rest: `down` still removes the runs and runs `compose down`, then exits non-zero with `could not stop the poller timer (<command> exited <n>: <stderr line>)`. It removes the runs next (the run containers and their sidecars with `docker rm -f`, then `egress-archon`'s and `egress-review`'s attachment to each run network, since Docker refuses to remove a network with an endpoint attached, then the run networks and volumes: only objects labelled `org.hapi.run` and `org.hapi.project=hapi`), then runs `docker compose -p hapi down`. It removes the runs holding the run disk's lock, which a run's finalize holds while it copies the run out, and never waits for it: held, or with no `XDG_RUNTIME_DIR` to take it in, `down` says so on one line and leaves the runs' volumes: the finalize that is copying its run out removes that run's own, and the rest stay until a `mise run down` that takes the lock, so run it again then (H-209, H-210, [the runs runbook](runs.md#the-run-disk)). If removing the runs fails, `compose down` still runs, and `down` then exits non-zero naming what is left. It goes by project name, so it needs no compose file, `build/` or `XDG_RUNTIME_DIR`. It does load the whole CLI (`bun run src/cli.ts`), so it needs a checkout that loads (`src/` parses, `node_modules` installed) and a working mise, yours and hapi's: a merge conflict in `src/`, or a pull that brought a new dependency without `mise run setup`, stops it before Compose runs. Then use [kill switch 3b](kill-switches.md#3b-without-a-checkout-or-mise), which needs neither. It keeps the volumes. As any other user, it re-execs as hapi, as `up` does.
 
@@ -218,7 +229,7 @@ It checks that the deployed `build/` is what policy builds and that the containe
 mise run audit -- --strict --repo <owner>/<name> --github-token-file <file> | grep -v '^pass'
 ```
 
-For one `--repo` it must print exactly two lines: the `mcp.tool-hashes` fail, its detail starting `--strict: skipped: the live tool surfaces can't be compared with the lock until Plan 04`, and the summary `hapi audit: 21 pass, 1 fail, 0 skip`. Any other line is a real failure: fix it and run the audit again. So is an `mcp.tool-hashes` fail whose detail doesn't start `--strict: skipped:` (a lock problem). When H-101 closes, the exception goes: stage b, and any scheduled strict audit, then expect exit 0 and `0 fail`.
+For one `--repo` that `policy/repos.yaml` doesn't register (hapi-factory itself) it must print exactly two lines: the `mcp.tool-hashes` fail, its detail starting `--strict: skipped: the live tool surfaces can't be compared with the lock until Plan 04`, and the summary `hapi audit: 21 pass, 1 fail, 0 skip`. A repo the register holds adds one expected fail when the token is read-only, as the audit's is: `github.repo-settings`, its detail also starting `--strict: skipped:`, naming seven merge settings, each as `isn't visible with the operator's token (--github-token-file)`, and going on `the rest match` (H-306: GitHub shows those settings only to a token with Contents: write). Task 16's audits of hapi-factory and the sandbox together printed `hapi audit: 25 pass, 2 fail, 0 skip`, on 2026-11-09 and again on 2026-11-11. Any other line is a real failure: fix it and run the audit again. So is a `github.repo-settings` line that names a setting that differs, and an `mcp.tool-hashes` fail whose detail doesn't start `--strict: skipped:` (a lock problem). When H-101 closes, its exception goes: stage b, and any scheduled strict audit of hapi-factory alone, then expect exit 0 and `0 fail`; a registered repo's `github.repo-settings` fail stays until H-306 closes.
 
 ## Kill switches
 

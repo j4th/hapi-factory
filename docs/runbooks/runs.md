@@ -437,7 +437,7 @@ Once this branch has landed on `main`, and before the first run. Each step runs 
      --repo <owner>/<name> --strict --github-token-file <file>' | grep -v '^pass'
    ```
 
-   Expected: two lines, the `mcp.tool-hashes` fail and `hapi audit: 21 pass, 1 fail, 0 skip`, as [the stack runbook's audit](stack.md#5-the-audit) says (Plan 03 added seven checks; Plan 02's rollout got `14 pass, 1 fail, 0 skip` on 2026-10-31). mise then prints `[audit] ERROR task failed`: `--strict` exits non-zero on the one fail.
+   Expected, for hapi-factory itself: two lines, the `mcp.tool-hashes` fail and `hapi audit: 21 pass, 1 fail, 0 skip`, as [the stack runbook's audit](stack.md#5-the-audit) says (Plan 03 added seven checks; Plan 02's rollout got `14 pass, 1 fail, 0 skip` on 2026-10-31). For a repo `policy/repos.yaml` registers, a read-only token gives one fail more, `github.repo-settings`, which is the token's view and no fault in the repo (H-306; the stack runbook has its text): Task 16's audit of hapi-factory and the sandbox together printed `hapi audit: 25 pass, 2 fail, 0 skip`. mise then prints `[audit] ERROR task failed`: `--strict` exits non-zero on a fail.
 
 5. **Remove the old Archon volumes, once.** The long-lived Archon container is gone, and its two volumes are left over, holding the old Archon's run database and Claude Code state. Nothing reads them, and the factory keeps nothing in them. The operator removes them. The old container is gone after the `down` in step 2, so nothing uses them and the stack can stay up:
 

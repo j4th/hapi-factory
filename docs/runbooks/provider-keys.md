@@ -102,10 +102,12 @@ CodeRabbit's CLI runs in the review container, after the review session, when `r
 
 **The key is optional.** `stack/secrets.yaml` lists `hapi-review-coderabbit-api-key` under `optional`, so `mise run up` starts without it, `review.env` simply has no `CODERABBIT_API_KEY`, and `mise run secrets:check` reports it `missing ... (optional)` and passes ([docs/secrets.md](../secrets.md#the-manifest-stacksecretsyaml)). A review run with `phases.coderabbit` on and no key is refused, never run without its CodeRabbit step.
 
-**Store one only if the account check found an unattended key** (H-167; Task 1's check, [spike 09](../spikes/09-run-engine-offline.md#the-coderabbit-key): the Advanced trial, until 2026-11-10, offers an "Agentic" key type, and unattended use needs one "from an organization where the user has an assigned seat"). Then:
+**Store one only if you hold a seat in a CodeRabbit organization** (H-167; Task 1's check, [spike 09](../spikes/09-run-engine-offline.md#the-coderabbit-key)): unattended use needs an "Agentic" key "from an organization where the user has an assigned seat". An Essentials seat issues one, and on 2026-11-12 it worked unattended in a review run (Task 16). Then:
 1. In CodeRabbit's API keys page, create a dedicated **Agentic** key for hapi alone, so it can be revoked on its own.
 2. Store it with `mise run secrets:edit`, under `hapi-review-coderabbit-api-key`.
 3. Run `mise run up`, so `review.env` gets it, and `mise run secrets:check`: it should say `found    review/CODERABBIT_API_KEY (hapi-review-coderabbit-api-key) (optional)`.
+
+hapi never passes `--use-credits`, so in CodeRabbit's usage-based add-on set the organization's "After included review limits" to Off or On demand: under Automatic, CodeRabbit goes on reviewing past the included limit and bills the overage, with no flag asked.
 
 Without such a key, store nothing and leave `phases.coderabbit` off. CodeRabbit's PR review carries its part only on a PR it reviews: under a paid plan it skips one an App opened unless the App's bot holds a seat, so its round on a factory PR ships off too (`flags.coderabbit.enabled`; [engine.md](engine.md#the-coderabbit-round)). When the seat ends, delete the key from the store and revoke it in CodeRabbit.
 
