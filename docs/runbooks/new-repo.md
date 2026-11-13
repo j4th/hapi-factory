@@ -131,6 +131,8 @@ rm -f ~/.config/hapi/audit-token
 
 For another repo, set `REPO` to its name. `github.app-perms` passes when both Apps have only the runbook's permissions, are installed on selected repositories and are no ruleset's bypass actor.
 
+Expected, once the repo's registration is in hapi's checkout: two fails, each a `--strict: skipped:` line, and a non-zero exit. One is `mcp.tool-hashes` (H-101, until Plan 04). The other is `github.repo-settings`: it names the seven merge settings a read-only token can't see and goes on `the rest match` (H-306). Step 11 has already checked those settings with your `gh` login, so this fail is the token's view, not a setting. Any other fail is a real one, and so is a `github.repo-settings` line that names a setting that differs. Task 16 ran the strict audit for hapi-factory and the sandbox together, with the engine runbook's command ([Step 4](engine.md#step-4-deploy-then-audit)), not this block: `hapi audit: 25 pass, 2 fail, 0 skip`.
+
 ## Deleting a sandbox
 
 `gh` can't delete a repo until you give it the `delete_repo` scope, which it lacks by default. It is a runbook step, not a command:
