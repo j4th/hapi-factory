@@ -16,7 +16,7 @@ import { SecretError } from "../../src/secrets/provider";
 import { CODERABBIT_BOT, OPERATOR } from "../forge/helpers";
 import { seedRun } from "../run/helpers";
 import { cleanup } from "../secrets/helpers";
-import { decisionsOf, fakeDecide, FAKE_PATCH, headAt, HOLD, MAINT, MERGE, ORDER, PASSING_VERIFY, pipelineDeps, READY_REVIEW, SHIPPED, SOMEONE, writeOut, writes } from "./helpers";
+import { decisionsOf, fakeDecide, FAKE_PATCH, headAt, HOLD, MAINT, MERGE, ORDER, PASSING_VERIFY, pipelineDeps, READY_REVIEW, ROUND_ON, SHIPPED, SOMEONE, writeOut, writes } from "./helpers";
 
 afterEach(cleanup);
 
@@ -43,9 +43,9 @@ type World = ReturnType<typeof pipelineDeps>;
 const mirror = (w: World) => mirrorPath(w.engineDir, ORDER.repo);
 const scratchOf = (w: World) => scratchPath(w.engineDir, ORDER.repo, ORDER.id);
 
-/** The shipped policy, changed by `f`. */
+/** `pipelineDeps`' own policy (the shipped one with CodeRabbit's round on the PR switched on), changed by `f`. */
 function policy(f: (p: Policy) => void): Policy {
-  const p = structuredClone(SHIPPED);
+  const p = structuredClone(ROUND_ON);
   f(p);
   return p;
 }
@@ -263,7 +263,9 @@ describe("every transition", () => {
     prAt(w);
     const s0 = w.state({ phase: "pr", pr: 1, prHead: headAt(0), verdict: "ready", runs: [W0, V0, R0], autoRounds: 1 });
     expect((await step(w, s0)).s.phase).toBe("pr-review");
-    for (const p of [policy((x) => (x.runs.phases.fix_rounds_on_pr = 0)), policy((x) => (x.flags.coderabbit.enabled = false))]) {
+    // No round: its count used up, the flag off, and the shipped policy, which ships the flag off (H-312).
+    expect(SHIPPED.flags.coderabbit.enabled).toBe(false);
+    for (const p of [policy((x) => (x.runs.phases.fix_rounds_on_pr = 0)), policy((x) => (x.flags.coderabbit.enabled = false)), SHIPPED]) {
       const n = pipelineDeps({ central: p });
       await reviewed(n, { harvestedAt: "2026-10-29T11:00:00.000Z" });
       prAt(n);
@@ -275,6 +277,22 @@ describe("every transition", () => {
     await reviewed(d, { harvestedAt: "2026-10-29T11:00:00.000Z" });
     prAt(d, headAt(0), { draft: true });
     expect((await step(d, d.state({ phase: "pr", pr: 1, prHead: headAt(0), verdict: "do-not-merge", runs: [W0, V0, R0], autoRounds: 1 }))).s.phase).toBe("waiting");
+  });
+
+  test("pr-review with the round switched off since: no read of CodeRabbit, no fix, waiting as it stood, a comment or not", async () => {
+    // A work order entered pr-review while the flag was on; central policy is read at each tick, so the flag off stops it there.
+    for (const comment of [false, true]) {
+      const w = pipelineDeps({ central: SHIPPED });
+      await reviewed(w, { harvestedAt: "2026-10-29T11:00:00.000Z" });
+      prAt(w);
+      crReview(w, headAt(0));
+      if (comment) w.ff.comment(1, SOMEONE, "nice");
+      const before = w.ff.calls.length;
+      const r = await step(w, w.state({ phase: "pr-review", pr: 1, prHead: headAt(0), verdict: "ready", runs: [W0, V0, R0], autoRounds: 1 }));
+      expect([comment, r.s.phase, r.s.verdict, r.s.reasons, r.starts]).toEqual([comment, "waiting", "ready", [], []]);
+      // CodeRabbit's check runs and review comments are never asked for.
+      expect(w.ff.calls.slice(before).filter((c) => /\/check-runs|\/pulls\/\d+\/(comments|reviews)/.test(new URL(c.url).pathname))).toEqual([]);
+    }
   });
 
   test("pr-review: a pending check changes nothing; findings → pr-fix on the PR's head; nothing found → waiting", async () => {
@@ -893,6 +911,18 @@ describe("Review Focus", () => {
     w.ff.comment(1, SOMEONE, "nice");
     const r = await step(w, w.state({ phase: "pr", pr: 1, prHead: headAt(0), verdict: "ready", runs: [W0, V0, R0], autoRounds: 1 }));
     expect([r.s.phase, r.s.verdict, r.s.reasons.at(-1), r.starts]).toEqual(["waiting", "decision", "someone commented on #1, so the automatic CodeRabbit round is off: the PR is the operator's", []]);
+  });
+
+  test("at pr with the round off, as shipped, a comment has no round to turn off: waiting, Ready to merge, whoever wrote it", async () => {
+    for (const who of [OPERATOR, SOMEONE]) {
+      const w = pipelineDeps({ central: SHIPPED });
+      await reviewed(w, { harvestedAt: "2026-10-29T11:00:00.000Z" });
+      prAt(w);
+      w.ff.comment(1, who, "nice");
+      const r = await step(w, w.state({ phase: "pr", pr: 1, prHead: headAt(0), verdict: "ready", runs: [W0, V0, R0], autoRounds: 1 }));
+      // The same as a comment that lands once the work order is at `waiting`: the verdict never turns on the tick it came in.
+      expect([who.login, r.s.phase, r.s.verdict, r.s.reasons, r.starts]).toEqual([who.login, "waiting", "ready", [], []]);
+    }
   });
 
   test("a soft cap starts the run with the text in its event, and flags the PR once there is one (m8)", async () => {

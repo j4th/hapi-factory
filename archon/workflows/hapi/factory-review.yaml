@@ -93,7 +93,9 @@ nodes:
       left=$(sh /.archon/workflows/hapi/time-left.sh) || skip "the run's deadline can't be read"
       t=$((left - 120))
       [ "$t" -ge 60 ] || skip "too little of the run's budget.minutes is left for CodeRabbit's CLI (${left} s)"
-      CODERABBIT_CLI_DISABLE_AUTO_UPDATE=1 CR_CLI_TELEMETRY_DISABLED=1 timeout "$t" cr review --agent --committed --base-commit "$base" --gate major --api-key "$CODERABBIT_API_KEY" > /out/coderabbit.ndjson 2> /dev/null
+      # --deep: CodeRabbit's pull request review policy, on the same limits and billing as a plain CLI review. Its
+      # value is optional, so the token after it must be an option.
+      CODERABBIT_CLI_DISABLE_AUTO_UPDATE=1 CR_CLI_TELEMETRY_DISABLED=1 timeout "$t" cr review --deep --agent --committed --base-commit "$base" --gate major --api-key "$CODERABBIT_API_KEY" > /out/coderabbit.ndjson 2> /dev/null
       rc=$?
       jq -cn --argjson rc "$rc" '{type: "hapi", exit: $rc}' >> /out/coderabbit.ndjson
       exit 0
