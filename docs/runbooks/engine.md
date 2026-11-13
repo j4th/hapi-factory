@@ -1262,16 +1262,19 @@ Run [the watch](#commands-you-run-more-than-once) every few minutes until the fa
 
 #### Redeploying during the run
 
-When the cause is a defect in hapi-factory, its fix merges into hapi-factory's `main` first, and hapi's checkout then takes it. `mise run down` removes a live run with its outputs, so first stop the poller's timer, as hapi: a tick already running finishes, and none starts after it, so no run can start between your check and `down`.
+When the cause is a defect in hapi-factory, its fix merges into hapi-factory's `main` first, and hapi's checkout then takes it. `mise run down` removes a live run with its outputs, so first stop the poller's timer and wait out a tick that is already running, as hapi. Stopping the timer keeps later ticks from starting; a tick that is running goes on to its end, and may still start a run.
 
 ```bash
 sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
   export XDG_RUNTIME_DIR \
     DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"; \
-  systemctl --user stop hapi-poll.timer'
+  systemctl --user stop hapi-poll.timer; \
+  while [ "$(systemctl --user show -p MainPID --value \
+    hapi-poll.service)" != 0 ]; do sleep 1; done; \
+  echo "the timer is stopped, and no tick is running"'
 ```
 
-Then wait until no run is live (the watch's `hapi run list`; a work order at `failed` or `waiting` has none), and redeploy, as hapi (`up` starts the timer again):
+Once it prints its line, no run can start before `down`. Then wait until no run is live (the watch's `hapi run list`; a work order at `failed` or `waiting` has none), and redeploy, as hapi (`up` starts the timer again):
 
 ```bash
 sudo -u hapi -H -- sh -c ': "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; \
